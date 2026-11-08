@@ -158,7 +158,8 @@ private:
 
     /**
      * Draws the average FPS over the last minute as a smooth white curve with a fading fill,
-     * scrolling continuously between stats ticks.
+     * scrolling continuously between stats ticks. The curve breaks across freezes and loading
+     * screens instead of bridging them.
      */
     void drawFpsGraph(QPainter& p, const QRectF& r) const;
 

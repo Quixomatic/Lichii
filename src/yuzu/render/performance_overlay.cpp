@@ -56,6 +56,9 @@ constexpr std::chrono::milliseconds GRAPH_WINDOW{60000};
 constexpr std::chrono::milliseconds GRAPH_DELAY{600};
 /// Average FPS below this is a freeze or loading screen and is left out of the graph
 constexpr double GRAPH_MIN_FPS = 3.0;
+/// Samples further apart than this had readings left out between them (or no ticks at all),
+/// so the curve breaks there instead of bridging the gap. Ticks are 500 ms apart normally.
+constexpr std::chrono::milliseconds GRAPH_GAP{1250};
 
 /// Animation tick interval, about 60 Hz
 constexpr int ANIMATION_INTERVAL_MS = 16;
@@ -295,8 +298,10 @@ qreal PerformanceOverlay::drawValue(QPainter& p, qreal right, qreal baseline, co
 
 /**
  * Places each tick's sample at its arrival time inside a window that trails real time by
- * GRAPH_DELAY, then draws a curve through the midpoints between samples using the samples as
- * control points. The curve stays within the samples' range, so it never overshoots.
+ * GRAPH_DELAY. Samples are split into runs wherever two are more than GRAPH_GAP apart (left-out
+ * freeze or loading readings), and each run with at least two samples is drawn as a curve
+ * through the midpoints between samples, using the samples as control points. The curve stays
+ * within the samples' range, so it never overshoots; gaps stay empty rather than showing 0 FPS.
  */
 void PerformanceOverlay::drawFpsGraph(QPainter& p, const QRectF& r) const {
     if (m_fpsSamples.size() < 2 || !m_graphScale.valid) {
@@ -313,38 +318,53 @@ void PerformanceOverlay::drawFpsGraph(QPainter& p, const QRectF& r) const {
         return QPointF(r.left() + x, r.bottom() - y);
     };
 
-    QPainterPath line;
-    QPointF previous = point_of(m_fpsSamples.front());
-    line.moveTo(previous);
-    for (size_t i = 1; i < m_fpsSamples.size(); ++i) {
-        const QPointF current = point_of(m_fpsSamples[i]);
-        const QPointF mid = (previous + current) / 2.0;
-        if (i == 1) {
-            line.lineTo(mid);
-        } else {
-            line.quadTo(previous, mid);
-        }
-        previous = current;
-    }
-    line.lineTo(previous);
-
-    QPainterPath fill = line;
-    fill.lineTo(previous.x(), r.bottom());
-    fill.lineTo(line.elementAt(0).x, r.bottom());
-    fill.closeSubpath();
-
     QLinearGradient gradient(r.topLeft(), r.bottomLeft());
     gradient.setColorAt(0.0, QColor(255, 255, 255, 46));
     gradient.setColorAt(1.0, QColor(255, 255, 255, 0));
-    p.setPen(Qt::NoPen);
-    p.setBrush(gradient);
-    p.drawPath(fill);
-
     QPen pen(QColor(255, 255, 255, 230), 1.5);
     pen.setJoinStyle(Qt::RoundJoin);
-    p.setPen(pen);
-    p.setBrush(Qt::NoBrush);
-    p.drawPath(line);
+
+    // Draws samples [first, last) as one filled curve
+    const auto draw_run = [&](size_t first, size_t last) {
+        if (last - first < 2) {
+            return;
+        }
+        QPainterPath line;
+        QPointF previous = point_of(m_fpsSamples[first]);
+        line.moveTo(previous);
+        for (size_t i = first + 1; i < last; ++i) {
+            const QPointF current = point_of(m_fpsSamples[i]);
+            const QPointF mid = (previous + current) / 2.0;
+            if (i == first + 1) {
+                line.lineTo(mid);
+            } else {
+                line.quadTo(previous, mid);
+            }
+            previous = current;
+        }
+        line.lineTo(previous);
+
+        QPainterPath fill = line;
+        fill.lineTo(previous.x(), r.bottom());
+        fill.lineTo(line.elementAt(0).x, r.bottom());
+        fill.closeSubpath();
+
+        p.setPen(Qt::NoPen);
+        p.setBrush(gradient);
+        p.drawPath(fill);
+        p.setPen(pen);
+        p.setBrush(Qt::NoBrush);
+        p.drawPath(line);
+    };
+
+    size_t run_start = 0;
+    for (size_t i = 1; i < m_fpsSamples.size(); ++i) {
+        if (m_fpsSamples[i].first - m_fpsSamples[i - 1].first > GRAPH_GAP) {
+            draw_run(run_start, i);
+            run_start = i;
+        }
+    }
+    draw_run(run_start, m_fpsSamples.size());
 }
 
 /**
