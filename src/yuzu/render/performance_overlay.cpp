@@ -13,6 +13,7 @@
 #include <QGuiApplication>
 #include <QLinearGradient>
 #include <QMouseEvent>
+#include <QPaintEvent>
 #include <QPainter>
 #include <QPainterPath>
 #include <QWindow>
@@ -95,18 +96,19 @@ QFont MakeFont(const QFont& base, int pixel_size, QFont::Weight weight, bool tab
 } // namespace
 
 /**
- * Moves `value` toward `target` with exponential easing. Returns true while still moving.
+ * Moves `value` toward `target` with exponential easing, snapping once it is close enough.
+ * Returns true if the value changed, including the final snap.
  */
 bool PerformanceOverlay::Smoothed::Step(double dt) {
-    if (!valid) {
+    if (!valid || value == target) {
         return false;
     }
     const double remaining = target - value;
     if (std::abs(remaining) < 1e-3 * std::max(1.0, std::abs(target))) {
         value = target;
-        return false;
+    } else {
+        value += remaining * (1.0 - std::exp(-dt / EASE_TIME_CONSTANT));
     }
-    value += remaining * (1.0 - std::exp(-dt / EASE_TIME_CONSTANT));
     return true;
 }
 
@@ -132,6 +134,7 @@ PerformanceOverlay::PerformanceOverlay(MainWindow* parent)
     setWindowFlags(Qt::FramelessWindowHint | Qt::Tool);
     setFixedSize(WIDTH, HEIGHT);
     raise();
+    computeLayout();
 
     m_fpsText = m_frametimeText = QStringLiteral("--");
     updateMeters();
@@ -148,6 +151,39 @@ PerformanceOverlay::PerformanceOverlay(MainWindow* parent)
 PerformanceOverlay::~PerformanceOverlay() = default;
 
 /**
+ * Lays the card out top to bottom: FPS row, edge-to-edge graph strip, frametime row, divider
+ * and the 2x2 meter grid, each meter split into its text line and bar track. The sections don't
+ * overlap (text, shadows included, stays inside its row), so repainting one never clips another.
+ */
+void PerformanceOverlay::computeLayout() {
+    m_cardPath = QPainterPath();
+    m_cardPath.addRoundedRect(QRectF(rect()).adjusted(0.5, 0.5, -0.5, -0.5), 8, 8);
+
+    const qreal inner_w = width() - PAD * 2;
+    qreal y = PAD;
+
+    m_fpsRow = QRectF(PAD, y, inner_w, FPS_ROW_H);
+    y += FPS_ROW_H;
+    m_graphRect = QRectF(0, y, width(), GRAPH_H);
+    m_graphDirty = m_graphRect.toAlignedRect();
+    y += GRAPH_H + 8.0;
+    m_frametimeRow = QRectF(PAD, y, inner_w, FRAMETIME_ROW_H);
+    y += FRAMETIME_ROW_H + DIVIDER_TOP_GAP;
+    m_divider = QRectF(PAD, y, inner_w, 1.0);
+    y += 1.0 + DIVIDER_BOTTOM_GAP;
+
+    const qreal col_w = (inner_w - METER_COL_GAP) / 2.0;
+    for (size_t i = 0; i < m_meters.size(); ++i) {
+        const qreal x = PAD + qreal(i % 2) * (col_w + METER_COL_GAP);
+        const qreal top = y + qreal(i / 2) * (METER_H + METER_ROW_GAP);
+        m_meterLabels[i] = QRectF(x, top, col_w, METER_LABEL_H);
+        m_meterTracks[i] = QRectF(x, top + METER_LABEL_H + METER_BAR_GAP, col_w, METER_BAR_H);
+        // One extra pixel each side covers antialiasing at the rounded ends
+        m_trackDirty[i] = m_meterTracks[i].toAlignedRect().adjusted(-1, -1, 1, 1);
+    }
+}
+
+/**
  * Keeps the overlay at its offset from the main window.
  */
 void PerformanceOverlay::resetPosition(const QPoint& _) {
@@ -156,8 +192,9 @@ void PerformanceOverlay::resetPosition(const QPoint& _) {
 }
 
 /**
- * Formats the latest FPS and frametime, records the graph sample, refreshes the meters and
- * makes sure the animation timer is running. Does nothing while the overlay is hidden.
+ * Formats the latest FPS and frametime, records the graph sample, refreshes the meters,
+ * repaints the whole card (the text changed) and makes sure the animation timer is running.
+ * Does nothing while the overlay is hidden.
  */
 void PerformanceOverlay::updateStats(const Core::PerfStatsResults& results,
                                      const VideoCore::ShaderNotify& shaders) {
@@ -174,6 +211,7 @@ void PerformanceOverlay::updateStats(const Core::PerfStatsResults& results,
 
     recordFpsSample(results.average_game_fps);
     updateMeters();
+    update();
 
     if (!m_animationTimer.isActive()) {
         m_animationClock.start();
@@ -242,21 +280,26 @@ void PerformanceOverlay::updateMeters() {
 }
 
 /**
- * Steps every eased value by the real time since the last tick and repaints. The timer
- * stops once nothing is left to scroll or settle, and the next stats tick restarts it.
+ * Steps every eased value by the real time since the last tick. The graph strip is repainted
+ * every tick because it scrolls; a bar's track only while its fill is still changing. Text is
+ * left alone until the next stats tick. The timer stops once nothing is left to scroll or
+ * settle, and the next stats tick restarts it.
  */
 void PerformanceOverlay::onAnimationTick() {
     const double dt = double(m_animationClock.restart()) / 1000.0;
 
     bool moving = m_graphScale.Step(dt);
-    for (auto& meter : m_meters) {
-        moving |= meter.fill.Step(dt);
+    update(m_graphDirty);
+    for (size_t i = 0; i < m_meters.size(); ++i) {
+        if (m_meters[i].fill.Step(dt)) {
+            moving = true;
+            update(m_trackDirty[i]);
+        }
     }
 
     if (!moving && !graphHasSamples(Clock::now())) {
         m_animationTimer.stop();
     }
-    update();
 }
 
 /**
@@ -368,17 +411,26 @@ void PerformanceOverlay::drawFpsGraph(QPainter& p, const QRectF& r) const {
 }
 
 /**
- * Draws one meter cell: colored label, value and unit, and a rounded fill bar at its eased
- * width that turns red at 90% or more. Without a valid fill only the empty track is drawn.
+ * Draws the parts of one meter cell inside `dirty`: the colored label with its value and unit,
+ * and the rounded fill bar at its eased width, which turns red at 90% or more. Without a valid
+ * fill only the empty track is drawn.
  */
-void PerformanceOverlay::drawMeter(QPainter& p, const QRectF& r, const Meter& meter) const {
-    const qreal baseline = r.top() + (METER_LABEL_H + m_metricMetrics.capHeight()) / 2.0;
+void PerformanceOverlay::drawMeter(QPainter& p, const QRegion& dirty, size_t index) const {
+    const Meter& meter = m_meters[index];
+    const QRectF& label = m_meterLabels[index];
+    const QRectF& track = m_meterTracks[index];
 
-    drawText(p, QPointF(r.left(), baseline), meter.label, m_labelFont, meter.accent);
-    drawValue(p, r.right(), baseline, meter.value, m_metricFont, m_metricMetrics, VALUE_COLOR,
-              meter.unit);
+    if (dirty.intersects(label.toAlignedRect())) {
+        const qreal baseline =
+            label.top() + (METER_LABEL_H + m_metricMetrics.capHeight()) / 2.0;
+        drawText(p, QPointF(label.left(), baseline), meter.label, m_labelFont, meter.accent);
+        drawValue(p, label.right(), baseline, meter.value, m_metricFont, m_metricMetrics,
+                  VALUE_COLOR, meter.unit);
+    }
 
-    const QRectF track(r.left(), r.top() + METER_LABEL_H + METER_BAR_GAP, r.width(), METER_BAR_H);
+    if (!dirty.intersects(m_trackDirty[index])) {
+        return;
+    }
     p.setPen(Qt::NoPen);
     p.setBrush(TRACK_COLOR);
     p.drawRoundedRect(track, METER_BAR_H / 2, METER_BAR_H / 2);
@@ -406,67 +458,60 @@ void PerformanceOverlay::drawMeter(QPainter& p, const QRectF& r, const Meter& me
 }
 
 /**
- * Paints the card top to bottom: FPS row, edge-to-edge FPS graph, frametime row,
- * divider and the 2x2 CPU/GPU/RAM/VRAM grid, with the border drawn last.
+ * Paints the sections that intersect the repaint region: FPS row, edge-to-edge FPS graph,
+ * frametime row, divider and the 2x2 CPU/GPU/RAM/VRAM grid. Qt clears and clips to the region,
+ * so the background and border are drawn every time and come out identical to a full repaint,
+ * while sections outside the region (usually all the text) are skipped entirely.
  */
 void PerformanceOverlay::paintEvent(QPaintEvent* event) {
+    const QRegion& dirty = event->region();
     QPainter p(this);
     p.setRenderHint(QPainter::Antialiasing);
     p.setRenderHint(QPainter::TextAntialiasing);
 
-    const QRectF card = QRectF(rect()).adjusted(0.5, 0.5, -0.5, -0.5);
-    QPainterPath card_path;
-    card_path.addRoundedRect(card, 8, 8);
-
     p.setPen(Qt::NoPen);
     p.setBrush(PANEL_COLOR);
-    p.drawPath(card_path);
+    p.drawPath(m_cardPath);
 
-    const qreal inner_w = width() - PAD * 2;
-    qreal y = PAD;
-
-    // FPS
-    {
-        const qreal baseline = y + (FPS_ROW_H + m_fpsMetrics.capHeight()) / 2.0;
-        drawText(p, QPointF(PAD, baseline), tr("FPS"), m_labelFont, DIM_COLOR);
-        drawValue(p, width() - PAD, baseline, m_fpsText, m_fpsFont, m_fpsMetrics, VALUE_COLOR,
-                  tr("fps"));
-        y += FPS_ROW_H;
+    if (dirty.intersects(m_fpsRow.toAlignedRect())) {
+        const qreal baseline = m_fpsRow.top() + (FPS_ROW_H + m_fpsMetrics.capHeight()) / 2.0;
+        drawText(p, QPointF(m_fpsRow.left(), baseline), tr("FPS"), m_labelFont, DIM_COLOR);
+        drawValue(p, m_fpsRow.right(), baseline, m_fpsText, m_fpsFont, m_fpsMetrics,
+                  VALUE_COLOR, tr("fps"));
     }
 
     // The graph runs edge to edge, clipped by the card's rounded corners and its own band
-    p.save();
-    p.setClipPath(card_path);
-    p.setClipRect(QRectF(0, y, width(), GRAPH_H), Qt::IntersectClip);
-    drawFpsGraph(p, QRectF(0, y, width(), GRAPH_H));
-    p.restore();
-    y += GRAPH_H + 8.0;
-
-    // Frametime
-    {
-        const qreal baseline = y + (FRAMETIME_ROW_H + m_metricMetrics.capHeight()) / 2.0;
-        drawText(p, QPointF(PAD, baseline), tr("FRAMETIME"), m_labelFont, DIM_COLOR);
-        drawValue(p, width() - PAD, baseline, m_frametimeText, m_metricFont, m_metricMetrics,
-                  FRAMETIME_ACCENT, tr("ms"));
-        y += FRAMETIME_ROW_H + DIVIDER_TOP_GAP;
+    if (dirty.intersects(m_graphDirty)) {
+        p.save();
+        p.setClipPath(m_cardPath);
+        p.setClipRect(m_graphRect, Qt::IntersectClip);
+        drawFpsGraph(p, m_graphRect);
+        p.restore();
     }
 
-    p.setPen(QPen(QColor(255, 255, 255, 22), 1));
-    p.drawLine(QPointF(PAD, y + 0.5), QPointF(width() - PAD, y + 0.5));
-    y += 1.0 + DIVIDER_BOTTOM_GAP;
+    if (dirty.intersects(m_frametimeRow.toAlignedRect())) {
+        const qreal baseline =
+            m_frametimeRow.top() + (FRAMETIME_ROW_H + m_metricMetrics.capHeight()) / 2.0;
+        drawText(p, QPointF(m_frametimeRow.left(), baseline), tr("FRAMETIME"), m_labelFont,
+                 DIM_COLOR);
+        drawValue(p, m_frametimeRow.right(), baseline, m_frametimeText, m_metricFont,
+                  m_metricMetrics, FRAMETIME_ACCENT, tr("ms"));
+    }
 
-    // Hardware meters
-    const qreal col_w = (inner_w - METER_COL_GAP) / 2.0;
+    if (dirty.intersects(m_divider.toAlignedRect())) {
+        p.setPen(QPen(QColor(255, 255, 255, 22), 1));
+        const qreal line_y = m_divider.top() + 0.5;
+        p.drawLine(QPointF(m_divider.left(), line_y), QPointF(m_divider.right(), line_y));
+    }
+
     for (size_t i = 0; i < m_meters.size(); ++i) {
-        const qreal x = PAD + qreal(i % 2) * (col_w + METER_COL_GAP);
-        const qreal top = y + qreal(i / 2) * (METER_H + METER_ROW_GAP);
-        drawMeter(p, QRectF(x, top, col_w, METER_H), m_meters[i]);
+        drawMeter(p, dirty, i);
     }
 
     // Border last so the graph doesn't paint over it
     p.setPen(QPen(BORDER_COLOR, 1));
     p.setBrush(Qt::NoBrush);
-    p.drawPath(card_path);
+    p.drawPath(m_cardPath);
 }
 
 /**

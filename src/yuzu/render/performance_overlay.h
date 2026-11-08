@@ -10,6 +10,8 @@
 #include <QElapsedTimer>
 #include <QFont>
 #include <QFontMetricsF>
+#include <QPainterPath>
+#include <QRegion>
 #include <QTimer>
 #include <QWidget>
 
@@ -105,7 +107,7 @@ private:
 
         /**
          * Moves the value toward the target for `dt` seconds of animation.
-         * Returns true while the value is still moving.
+         * Returns true if the value changed, so the caller knows to repaint it.
          */
         bool Step(double dt);
     };
@@ -121,6 +123,12 @@ private:
         QColor accent;
         Smoothed fill;
     };
+
+    /**
+     * Computes the card outline and the rectangle of every section once, so painting and
+     * partial repaints share the same fixed layout.
+     */
+    void computeLayout();
 
     /**
      * Moves the overlay to keep its offset from the main window when that window moves.
@@ -145,8 +153,9 @@ private:
     void updateMeters();
 
     /**
-     * Advances the animations by the time since the previous tick and repaints. Stops the
-     * timer once the graph has nothing left to scroll and every value has settled.
+     * Advances the animations by the time since the previous tick and repaints only what moves:
+     * the graph strip, and the track of any bar that is still easing. Stops the timer once the
+     * graph has nothing left to scroll and every value has settled.
      */
     void onAnimationTick();
 
@@ -164,9 +173,10 @@ private:
     void drawFpsGraph(QPainter& p, const QRectF& r) const;
 
     /**
-     * Draws one meter cell: colored label, value and unit, and a fill bar.
+     * Draws the parts of meter `index` that intersect `dirty`: its colored label, value and
+     * unit, and its fill bar.
      */
-    void drawMeter(QPainter& p, const QRectF& r, const Meter& meter) const;
+    void drawMeter(QPainter& p, const QRegion& dirty, size_t index) const;
 
     /**
      * Draws "<value> <unit>" right-aligned to `right` on the given baseline.
@@ -195,6 +205,18 @@ private:
     QFontMetricsF m_fpsMetrics;
     QFontMetricsF m_metricMetrics;
     QFontMetricsF m_unitMetrics;
+
+    // Fixed layout from computeLayout()
+    QPainterPath m_cardPath;
+    QRectF m_fpsRow;
+    QRectF m_graphRect;
+    QRectF m_frametimeRow;
+    QRectF m_divider;
+    std::array<QRectF, 4> m_meterLabels;
+    std::array<QRectF, 4> m_meterTracks;
+    /// Pixel rectangles invalidated on animation ticks
+    QRect m_graphDirty;
+    std::array<QRect, 4> m_trackDirty;
 
     QString m_fpsText;
     QString m_frametimeText;
