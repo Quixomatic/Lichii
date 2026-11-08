@@ -4,11 +4,12 @@
 #include "system_monitor.h"
 
 #include <algorithm>
-#include <cctype>
 #include <chrono>
-#include <cstdio>
-#include <map>
+#include <cwchar>
+#include <iterator>
 #include <string>
+#include <string_view>
+#include <utility>
 #include <vector>
 
 #include "common/polyfill_thread.h"
@@ -41,41 +42,51 @@ u64 ToU64(const FILETIME& ft) {
 }
 
 /**
- * Returns an ASCII-lowercased copy of the string.
+ * Returns the part of a PDH GPU counter instance name from "luid_" up to `end_marker`, or to
+ * the end of the name. Engine instances look like
+ * "pid_1234_luid_0x00000000_0x0000D1B5_phys_0_eng_3_engtype_3D" and adapter memory instances
+ * like "luid_0x00000000_0x0000D1B5_phys_0". The result views `name`, so nothing is allocated.
+ * Returns an empty view if the name has no luid.
  */
-std::string Lower(std::string s) {
-    std::transform(s.begin(), s.end(), s.begin(),
-                   [](unsigned char c) { return char(std::tolower(c)); });
-    return s;
+std::wstring_view InstanceKey(std::wstring_view name, std::wstring_view end_marker) {
+    const auto begin = name.find(L"luid_");
+    if (begin == std::wstring_view::npos) {
+        return {};
+    }
+    const auto end = name.find(end_marker, begin);
+    return name.substr(begin, end == std::wstring_view::npos ? end : end - begin);
 }
 
 /**
  * Extracts the adapter key ("luid_0x..._0x...") from a PDH GPU counter instance name.
- * Instances look like "pid_1234_luid_0x00000000_0x0000D1B5_phys_0_eng_0_engtype_3D"; the
- * luid identifies the adapter, so per-process values can be summed per GPU.
- * Returns an empty string if the name has no luid.
  */
-std::string AdapterKey(const wchar_t* instance) {
-    std::string name;
-    for (const wchar_t* c = instance; *c; ++c) {
-        name.push_back(char(*c));
-    }
-    name = Lower(name);
-    const auto begin = name.find("luid_");
-    if (begin == std::string::npos) {
-        return {};
-    }
-    const auto end = name.find("_phys", begin);
-    return name.substr(begin, end == std::string::npos ? std::string::npos : end - begin);
+std::wstring_view AdapterKey(std::wstring_view name) {
+    return InstanceKey(name, L"_phys");
+}
+
+/**
+ * Extracts the engine key ("luid_0x..._0x..._phys_0_eng_3") from a PDH GPU engine counter
+ * instance name. Engines run independently, so process values are summed per engine and
+ * never across engines.
+ */
+std::wstring_view EngineKey(std::wstring_view name) {
+    return InstanceKey(name, L"_engtype");
+}
+
+/**
+ * Compares two keys, ignoring case, since PDH and DXGI may format hex digits differently.
+ */
+bool SameKey(std::wstring_view a, std::wstring_view b) {
+    return a.size() == b.size() && _wcsnicmp(a.data(), b.data(), a.size()) == 0;
 }
 
 /**
  * Formats a DXGI adapter LUID the same way PDH counter instance names do,
  * so DXGI adapters can be matched against PDH counters.
  */
-std::string AdapterKey(const LUID& luid) {
-    char buf[32];
-    std::snprintf(buf, sizeof(buf), "luid_0x%08lx_0x%08lx",
+std::wstring AdapterKey(const LUID& luid) {
+    wchar_t buf[32];
+    std::swprintf(buf, std::size(buf), L"luid_0x%08lX_0x%08lX",
                   static_cast<unsigned long>(luid.HighPart),
                   static_cast<unsigned long>(luid.LowPart));
     return buf;
@@ -93,7 +104,7 @@ public:
      */
     Sampler() {
         if (PdhOpenQueryW(nullptr, 0, &query) == ERROR_SUCCESS) {
-            PdhAddEnglishCounterW(query, L"\\GPU Engine(*engtype_3D)\\Utilization Percentage", 0,
+            PdhAddEnglishCounterW(query, L"\\GPU Engine(*)\\Utilization Percentage", 0,
                                   &gpu_counter);
             PdhAddEnglishCounterW(query, L"\\GPU Adapter Memory(*)\\Dedicated Usage", 0,
                                   &vram_counter);
@@ -141,23 +152,12 @@ public:
         }
 
         if (gpu_counter) {
-            std::map<std::string, double> per_adapter;
-            ForEachItem(gpu_counter, PDH_FMT_DOUBLE | PDH_FMT_NOCAP100,
-                        [&](const PDH_FMT_COUNTERVALUE_ITEM_W& item) {
-                            per_adapter[AdapterKey(item.szName)] += item.FmtValue.doubleValue;
-                        });
-            if (!per_adapter.empty()) {
-                double busiest = 0.0;
-                for (const auto& [key, value] : per_adapter) {
-                    busiest = std::max(busiest, value);
-                }
-                out.gpu_percent = std::min(busiest, 100.0);
-            }
+            SampleGpuLoad(out);
         }
 
         if (vram_counter && main_adapter_vram > 0) {
             ForEachItem(vram_counter, PDH_FMT_LARGE, [&](const PDH_FMT_COUNTERVALUE_ITEM_W& item) {
-                if (AdapterKey(item.szName) == main_adapter_key) {
+                if (SameKey(AdapterKey(item.szName), main_adapter_key)) {
                     out.vram =
                         SystemMonitor::Usage{u64(item.FmtValue.largeValue), main_adapter_vram};
                 }
@@ -166,6 +166,41 @@ public:
     }
 
 private:
+    /**
+     * Computes GPU load the way Task Manager does: sums every process's utilization per
+     * engine (3D, compute, copy, video...), then reports the busiest engine on the main
+     * adapter, or on any adapter if the main one wasn't found. Keys view the PDH buffer
+     * and the engine list keeps its capacity, so nothing is allocated per sample.
+     */
+    void SampleGpuLoad(SystemMonitor::Snapshot& out) {
+        engine_loads.clear();
+        ForEachItem(gpu_counter, PDH_FMT_DOUBLE | PDH_FMT_NOCAP100,
+                    [&](const PDH_FMT_COUNTERVALUE_ITEM_W& item) {
+                        const auto key = EngineKey(item.szName);
+                        const auto it = std::find_if(
+                            engine_loads.begin(), engine_loads.end(),
+                            [&](const auto& entry) { return entry.first == key; });
+                        if (it != engine_loads.end()) {
+                            it->second += item.FmtValue.doubleValue;
+                        } else {
+                            engine_loads.emplace_back(key, item.FmtValue.doubleValue);
+                        }
+                    });
+        if (engine_loads.empty()) {
+            return;
+        }
+
+        std::optional<double> busiest_main;
+        double busiest_any = 0.0;
+        for (const auto& [key, load] : engine_loads) {
+            busiest_any = std::max(busiest_any, load);
+            if (!main_adapter_key.empty() && SameKey(AdapterKey(key), main_adapter_key)) {
+                busiest_main = std::max(busiest_main.value_or(0.0), load);
+            }
+        }
+        out.gpu_percent = std::min(busiest_main.value_or(busiest_any), 100.0);
+    }
+
     /**
      * Picks the hardware adapter with the most dedicated memory, which is the one
      * games render on, and records its key and VRAM total.
@@ -218,8 +253,9 @@ private:
     PDH_HCOUNTER gpu_counter = nullptr;
     PDH_HCOUNTER vram_counter = nullptr;
     std::vector<std::byte> buffer;
+    std::vector<std::pair<std::wstring_view, double>> engine_loads;
 
-    std::string main_adapter_key;
+    std::wstring main_adapter_key;
     u64 main_adapter_vram = 0;
 
     u64 last_idle = 0;
