@@ -72,7 +72,8 @@ double NiceCeil(double value, double step, double floor) {
 
 /**
  * Returns a copy of `base` at the given pixel size, weight and letter spacing. With `tabular`,
- * digits are fixed-width so values don't jitter as they change.
+ * digits are fixed-width so values don't jitter as they change; that needs Qt 6.7 or newer, and
+ * older Qt keeps the font's default digit spacing.
  */
 QFont MakeFont(const QFont& base, int pixel_size, QFont::Weight weight, bool tabular = false,
                qreal letter_spacing = 100.0) {
@@ -81,7 +82,9 @@ QFont MakeFont(const QFont& base, int pixel_size, QFont::Weight weight, bool tab
     font.setWeight(weight);
     font.setLetterSpacing(QFont::PercentageSpacing, letter_spacing);
     if (tabular) {
+#if QT_VERSION >= QT_VERSION_CHECK(6, 7, 0)
         font.setFeature(QFont::Tag("tnum"), 1);
+#endif
     }
     return font;
 }
