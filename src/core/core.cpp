@@ -589,6 +589,13 @@ struct System::Impl {
         return perf_stats->GetAndResetStats(core_timing.GetGlobalTimeUs());
     }
 
+    void ReadGameFrameTimes(u64& next_frame,
+                            std::vector<std::chrono::steady_clock::time_point>& out) const {
+        if (perf_stats) {
+            perf_stats->ReadGameFrameTimes(next_frame, out);
+        }
+    }
+
     Timing::CoreTiming core_timing;
     Kernel::KernelCore kernel;
     /// RealVfsFilesystem instance
@@ -758,6 +765,11 @@ void System::GatherGPUDirtyMemory(std::function<void(PAddr, size_t)>& callback) 
 
 PerfStatsResults System::GetAndResetPerfStats() {
     return impl->GetAndResetPerfStats();
+}
+
+void System::ReadGameFrameTimes(u64& next_frame,
+                                std::vector<std::chrono::steady_clock::time_point>& out) const {
+    impl->ReadGameFrameTimes(next_frame, out);
 }
 
 Kernel::PhysicalCore& System::CurrentPhysicalCore() {
