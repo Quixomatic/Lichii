@@ -20,6 +20,7 @@
 
 namespace {
 
+// Full layout
 constexpr int WIDTH = 272;
 constexpr qreal PAD = 14.0;
 constexpr qreal FPS_ROW_H = 30.0;
@@ -36,8 +37,24 @@ constexpr qreal DIVIDER_BOTTOM_GAP = 12.0;
 constexpr int HEIGHT = int(PAD + FPS_ROW_H + GRAPH_H + 8.0 + FRAMETIME_ROW_H + DIVIDER_TOP_GAP +
                            1.0 + DIVIDER_BOTTOM_GAP + METER_H * 2 + METER_ROW_GAP + PAD);
 
+// Compact layout: FPS and frametime on the left, four stacked meter rows on the right
+constexpr qreal COMPACT_PAD = 10.0;
+constexpr qreal COMPACT_LEFT_W = 150.0;
+/// Space between the FPS/frametime text and the graph beside it, and the graph and divider
+constexpr qreal COMPACT_GRAPH_GAP = 8.0;
+constexpr qreal COMPACT_COL_GAP = 12.0;
+constexpr qreal COMPACT_CELL_GAP = 6.0;
+constexpr qreal COMPACT_ROW_H = 12.0;
+constexpr qreal COMPACT_ROW_GAP = 2.0;
+constexpr qreal COMPACT_BAR_W = 72.0;
+constexpr qreal COMPACT_BAR_H = 4.0;
+constexpr qreal COMPACT_TEXT_GAP = 9.0;
+constexpr int COMPACT_HEIGHT =
+    int(COMPACT_PAD * 2 + COMPACT_ROW_H * 4 + COMPACT_ROW_GAP * 3);
+
 const QColor PANEL_COLOR{10, 11, 15, 220};
 const QColor BORDER_COLOR{255, 255, 255, 30};
+const QColor DIVIDER_COLOR{255, 255, 255, 22};
 const QColor VALUE_COLOR{245, 245, 245};
 const QColor DIM_COLOR{140, 145, 158};
 const QColor TRACK_COLOR{255, 255, 255, 20};
@@ -113,8 +130,8 @@ bool PerformanceOverlay::Smoothed::Step(double dt) {
 }
 
 /**
- * Sets up the frameless translucent window, fonts, their cached metrics and the animation
- * timer, then follows the main window's position and stats updates.
+ * Sets up the frameless translucent window, fonts for both layouts, their cached metrics and
+ * the animation timer, then follows the main window's position and stats updates.
  */
 // TODO(crueter): Reset samples when user changes turbo, slow, etc.
 PerformanceOverlay::PerformanceOverlay(MainWindow* parent)
@@ -122,19 +139,24 @@ PerformanceOverlay::PerformanceOverlay(MainWindow* parent)
       m_labelFont{MakeFont(font(), 11, QFont::Bold, false, 110.0)},
       m_fpsFont{MakeFont(font(), 26, QFont::Bold, true)},
       m_metricFont{MakeFont(font(), 14, QFont::Bold, true)},
-      m_unitFont{MakeFont(font(), 10, QFont::DemiBold)}, m_fpsMetrics{m_fpsFont},
+      m_unitFont{MakeFont(font(), 10, QFont::DemiBold)},
+      m_compactFpsFont{MakeFont(font(), 22, QFont::Bold, true)},
+      m_compactFrametimeFont{MakeFont(font(), 12, QFont::DemiBold, true)},
+      m_compactLabelFont{MakeFont(font(), 9, QFont::Bold, false, 105.0)},
+      m_compactValueFont{MakeFont(font(), 10, QFont::Bold, true)}, m_fpsMetrics{m_fpsFont},
       m_metricMetrics{m_metricFont}, m_unitMetrics{m_unitFont},
+      m_compactFpsMetrics{m_compactFpsFont}, m_compactFrametimeMetrics{m_compactFrametimeFont},
+      m_compactLabelMetrics{m_compactLabelFont}, m_compactValueMetrics{m_compactValueFont},
       m_meters{{
-          {tr("CPU"), {}, {}, CPU_ACCENT, {}},
-          {tr("GPU"), {}, {}, GPU_ACCENT, {}},
-          {tr("RAM"), {}, {}, RAM_ACCENT, {}},
-          {tr("VRAM"), {}, {}, VRAM_ACCENT, {}},
+          {tr("CPU"), {}, {}, {}, CPU_ACCENT, {}},
+          {tr("GPU"), {}, {}, {}, GPU_ACCENT, {}},
+          {tr("RAM"), {}, {}, {}, RAM_ACCENT, {}},
+          {tr("VRAM"), {}, {}, {}, VRAM_ACCENT, {}},
       }} {
     setAttribute(Qt::WA_TranslucentBackground);
     setWindowFlags(Qt::FramelessWindowHint | Qt::Tool);
-    setFixedSize(WIDTH, HEIGHT);
-    raise();
     computeLayout();
+    raise();
 
     m_fpsText = m_frametimeText = QStringLiteral("--");
     updateMeters();
@@ -151,13 +173,66 @@ PerformanceOverlay::PerformanceOverlay(MainWindow* parent)
 PerformanceOverlay::~PerformanceOverlay() = default;
 
 /**
- * Lays the card out top to bottom: FPS row, edge-to-edge graph strip, frametime row, divider
- * and the 2x2 meter grid, each meter split into its text line and bar track. The sections don't
- * overlap (text, shadows included, stays inside its row), so repainting one never clips another.
+ * Sizes the window for the current mode and lays it out. Full: FPS row, edge-to-edge graph
+ * strip, frametime row, divider and the 2x2 meter grid, each meter split into its text line and
+ * bar track. Compact: a left column with FPS and frametime, the graph beside them up to the
+ * divider, and four meter rows whose label and percentage columns are sized from the font
+ * metrics so the bars line up. The text block is sized for its widest values, so the graph
+ * doesn't shift as numbers change. Sections don't overlap, so repainting one never clips
+ * another.
  */
 void PerformanceOverlay::computeLayout() {
+    const qreal label_w = m_compactLabelMetrics.horizontalAdvance(QStringLiteral("VRAM"));
+    const qreal percent_w = m_compactValueMetrics.horizontalAdvance(QStringLiteral("100%"));
+    const qreal right_x = COMPACT_PAD + COMPACT_LEFT_W + COMPACT_COL_GAP;
+    const qreal right_w =
+        label_w + COMPACT_CELL_GAP + COMPACT_BAR_W + COMPACT_CELL_GAP + percent_w;
+
+    if (m_compact) {
+        setFixedSize(int(std::ceil(right_x + right_w + COMPACT_PAD)), COMPACT_HEIGHT);
+    } else {
+        setFixedSize(WIDTH, HEIGHT);
+    }
+
     m_cardPath = QPainterPath();
     m_cardPath.addRoundedRect(QRectF(rect()).adjusted(0.5, 0.5, -0.5, -0.5), 8, 8);
+
+    if (m_compact) {
+        const qreal divider_x = COMPACT_PAD + COMPACT_LEFT_W + COMPACT_COL_GAP / 2.0;
+        m_divider = QRectF(divider_x, COMPACT_PAD, 1.0, height() - COMPACT_PAD * 2);
+
+        // Widest the FPS and frametime lines get, value plus the 4 px gap and unit
+        const qreal fps_w = m_compactFpsMetrics.horizontalAdvance(QStringLiteral("000")) + 4 +
+                            m_unitMetrics.horizontalAdvance(tr("fps"));
+        const qreal frametime_w =
+            m_compactFrametimeMetrics.horizontalAdvance(QStringLiteral("00.00")) + 4 +
+            m_unitMetrics.horizontalAdvance(tr("ms"));
+        const qreal text_w = std::ceil(std::max(fps_w, frametime_w));
+        m_fpsRow = QRectF(COMPACT_PAD, 0, text_w, height());
+
+        const qreal graph_left = COMPACT_PAD + text_w + COMPACT_GRAPH_GAP;
+        m_graphRect = QRectF(graph_left, COMPACT_PAD,
+                             divider_x - COMPACT_GRAPH_GAP - graph_left,
+                             height() - COMPACT_PAD * 2);
+        m_graphDirty = m_graphRect.toAlignedRect();
+
+        const qreal fps_cap = m_compactFpsMetrics.capHeight();
+        const qreal frametime_cap = m_compactFrametimeMetrics.capHeight();
+        const qreal block_top = (height() - (fps_cap + COMPACT_TEXT_GAP + frametime_cap)) / 2.0;
+        m_compactFpsBaseline = block_top + fps_cap;
+        m_compactFrametimeBaseline = m_compactFpsBaseline + COMPACT_TEXT_GAP + frametime_cap;
+
+        for (size_t i = 0; i < m_meters.size(); ++i) {
+            const qreal top = COMPACT_PAD + qreal(i) * (COMPACT_ROW_H + COMPACT_ROW_GAP);
+            m_meterLabels[i] = QRectF(right_x, top, right_w, COMPACT_ROW_H);
+            m_meterTracks[i] = QRectF(right_x + label_w + COMPACT_CELL_GAP,
+                                      top + (COMPACT_ROW_H - COMPACT_BAR_H) / 2.0, COMPACT_BAR_W,
+                                      COMPACT_BAR_H);
+            // One extra pixel each side covers antialiasing at the rounded ends
+            m_trackDirty[i] = m_meterTracks[i].toAlignedRect().adjusted(-1, -1, 1, 1);
+        }
+        return;
+    }
 
     const qreal inner_w = width() - PAD * 2;
     qreal y = PAD;
@@ -178,9 +253,17 @@ void PerformanceOverlay::computeLayout() {
         const qreal top = y + qreal(i / 2) * (METER_H + METER_ROW_GAP);
         m_meterLabels[i] = QRectF(x, top, col_w, METER_LABEL_H);
         m_meterTracks[i] = QRectF(x, top + METER_LABEL_H + METER_BAR_GAP, col_w, METER_BAR_H);
-        // One extra pixel each side covers antialiasing at the rounded ends
         m_trackDirty[i] = m_meterTracks[i].toAlignedRect().adjusted(-1, -1, 1, 1);
     }
+}
+
+/**
+ * Flips the layout, resizes the window (its top-left corner stays put) and repaints it all.
+ */
+void PerformanceOverlay::toggleCompact() {
+    m_compact = !m_compact;
+    computeLayout();
+    update();
 }
 
 /**
@@ -243,33 +326,37 @@ void PerformanceOverlay::recordFpsSample(double fps) {
 }
 
 /**
- * Rebuilds the meter text from the latest host snapshot and retargets the fills. Readings
- * the platform doesn't provide show "--" with an empty track.
+ * Rebuilds the meter text for both layouts from the latest host snapshot and retargets the
+ * fills. Readings the platform doesn't provide show "--" with an empty track.
  */
 void PerformanceOverlay::updateMeters() {
     const SystemMonitor::Snapshot snapshot = m_monitor.Get();
     const QString none = QStringLiteral("--");
 
+    const auto clear = [&](Meter& meter) {
+        meter.value = none;
+        meter.unit.clear();
+        meter.percent = none;
+        meter.fill.Reset();
+    };
     const auto set_percent = [&](Meter& meter, const std::optional<double>& percent) {
         if (!percent) {
-            meter.value = none;
-            meter.unit.clear();
-            meter.fill.Reset();
+            clear(meter);
             return;
         }
         meter.value = QString::number(*percent, 'f', 0);
         meter.unit = QStringLiteral("%");
+        meter.percent = meter.value + meter.unit;
         meter.fill.Set(*percent / 100.0);
     };
     const auto set_memory = [&](Meter& meter, const std::optional<SystemMonitor::Usage>& usage) {
         if (!usage) {
-            meter.value = none;
-            meter.unit.clear();
-            meter.fill.Reset();
+            clear(meter);
             return;
         }
         meter.value = QString::number(double(usage->used) / GIB, 'f', 1);
         meter.unit = tr("/ %1 GB").arg(std::round(double(usage->total) / GIB), 0, 'f', 0);
+        meter.percent = QString::number(usage->Fraction() * 100.0, 'f', 0) + QStringLiteral("%");
         meter.fill.Set(usage->Fraction());
     };
 
@@ -280,8 +367,8 @@ void PerformanceOverlay::updateMeters() {
 }
 
 /**
- * Steps every eased value by the real time since the last tick. The graph strip is repainted
- * every tick because it scrolls; a bar's track only while its fill is still changing. Text is
+ * Steps every eased value by the real time since the last tick. The graph is repainted every
+ * tick because it scrolls; a bar's track only while its fill is still changing. Other text is
  * left alone until the next stats tick. The timer stops once nothing is left to scroll or
  * settle, and the next stats tick restarts it.
  */
@@ -337,6 +424,21 @@ qreal PerformanceOverlay::drawValue(QPainter& p, qreal right, qreal baseline, co
     x -= value_metrics.horizontalAdvance(value);
     drawText(p, QPointF(x, baseline), value, value_font, value_color);
     return x;
+}
+
+/**
+ * Draws "<value> <unit>" starting at `left` on the given baseline, with the unit in the
+ * smaller dim font after the value.
+ */
+void PerformanceOverlay::drawValueLeft(QPainter& p, qreal left, qreal baseline,
+                                       const QString& value, const QFont& value_font,
+                                       const QFontMetricsF& value_metrics,
+                                       const QColor& value_color, const QString& unit) const {
+    drawText(p, QPointF(left, baseline), value, value_font, value_color);
+    if (!unit.isEmpty()) {
+        const qreal unit_x = left + value_metrics.horizontalAdvance(value) + 4;
+        drawText(p, QPointF(unit_x, baseline), unit, m_unitFont, DIM_COLOR);
+    }
 }
 
 /**
@@ -411,29 +513,15 @@ void PerformanceOverlay::drawFpsGraph(QPainter& p, const QRectF& r) const {
 }
 
 /**
- * Draws the parts of one meter cell inside `dirty`: the colored label with its value and unit,
- * and the rounded fill bar at its eased width, which turns red at 90% or more. Without a valid
- * fill only the empty track is drawn.
+ * Draws the track, then the fill at its eased width with a gradient that deepens toward the
+ * right, red at 90% or more. The fill is kept at least as wide as the bar is tall so its
+ * rounded ends don't collapse. Without a valid fill only the track is drawn.
  */
-void PerformanceOverlay::drawMeter(QPainter& p, const QRegion& dirty, size_t index) const {
-    const Meter& meter = m_meters[index];
-    const QRectF& label = m_meterLabels[index];
-    const QRectF& track = m_meterTracks[index];
-
-    if (dirty.intersects(label.toAlignedRect())) {
-        const qreal baseline =
-            label.top() + (METER_LABEL_H + m_metricMetrics.capHeight()) / 2.0;
-        drawText(p, QPointF(label.left(), baseline), meter.label, m_labelFont, meter.accent);
-        drawValue(p, label.right(), baseline, meter.value, m_metricFont, m_metricMetrics,
-                  VALUE_COLOR, meter.unit);
-    }
-
-    if (!dirty.intersects(m_trackDirty[index])) {
-        return;
-    }
+void PerformanceOverlay::drawBar(QPainter& p, const QRectF& track, const Meter& meter) const {
+    const qreal radius = track.height() / 2.0;
     p.setPen(Qt::NoPen);
     p.setBrush(TRACK_COLOR);
-    p.drawRoundedRect(track, METER_BAR_H / 2, METER_BAR_H / 2);
+    p.drawRoundedRect(track, radius, radius);
 
     if (!meter.fill.valid) {
         return;
@@ -450,29 +538,57 @@ void PerformanceOverlay::drawMeter(QPainter& p, const QRegion& dirty, size_t ind
     gradient.setColorAt(0.0, start);
     gradient.setColorAt(1.0, color);
 
-    // Keep the fill at least as wide as it is tall so the rounded ends don't collapse
-    const qreal fill_w = std::max(track.width() * fraction, METER_BAR_H);
+    const qreal fill_w = std::max(track.width() * fraction, track.height());
     p.setBrush(gradient);
-    p.drawRoundedRect(QRectF(track.left(), track.top(), fill_w, track.height()), METER_BAR_H / 2,
-                      METER_BAR_H / 2);
+    p.drawRoundedRect(QRectF(track.left(), track.top(), fill_w, track.height()), radius, radius);
 }
 
 /**
- * Paints the sections that intersect the repaint region: FPS row, edge-to-edge FPS graph,
- * frametime row, divider and the 2x2 CPU/GPU/RAM/VRAM grid. Qt clears and clips to the region,
- * so the background and border are drawn every time and come out identical to a full repaint,
- * while sections outside the region (usually all the text) are skipped entirely.
+ * Draws the parts of one full-layout meter cell inside `dirty`: the colored label with its
+ * value and unit on one line, and the bar below it.
  */
-void PerformanceOverlay::paintEvent(QPaintEvent* event) {
-    const QRegion& dirty = event->region();
-    QPainter p(this);
-    p.setRenderHint(QPainter::Antialiasing);
-    p.setRenderHint(QPainter::TextAntialiasing);
+void PerformanceOverlay::drawMeter(QPainter& p, const QRegion& dirty, size_t index) const {
+    const Meter& meter = m_meters[index];
+    const QRectF& label = m_meterLabels[index];
 
-    p.setPen(Qt::NoPen);
-    p.setBrush(PANEL_COLOR);
-    p.drawPath(m_cardPath);
+    if (dirty.intersects(label.toAlignedRect())) {
+        const qreal baseline =
+            label.top() + (METER_LABEL_H + m_metricMetrics.capHeight()) / 2.0;
+        drawText(p, QPointF(label.left(), baseline), meter.label, m_labelFont, meter.accent);
+        drawValue(p, label.right(), baseline, meter.value, m_metricFont, m_metricMetrics,
+                  VALUE_COLOR, meter.unit);
+    }
+    if (dirty.intersects(m_trackDirty[index])) {
+        drawBar(p, m_meterTracks[index], meter);
+    }
+}
 
+/**
+ * Draws the parts of one compact meter row inside `dirty`: the colored label on the left, the
+ * percentage right-aligned, and the bar between them. A bar-only repaint skips the text.
+ */
+void PerformanceOverlay::drawCompactMeter(QPainter& p, const QRegion& dirty, size_t index) const {
+    const Meter& meter = m_meters[index];
+    const QRectF& row = m_meterLabels[index];
+
+    if (dirty.subtracted(QRegion(m_trackDirty[index])).intersects(row.toAlignedRect())) {
+        const qreal baseline =
+            row.top() + (COMPACT_ROW_H + m_compactValueMetrics.capHeight()) / 2.0;
+        drawText(p, QPointF(row.left(), baseline), meter.label, m_compactLabelFont, meter.accent);
+        const qreal percent_x =
+            row.right() - m_compactValueMetrics.horizontalAdvance(meter.percent);
+        drawText(p, QPointF(percent_x, baseline), meter.percent, m_compactValueFont, VALUE_COLOR);
+    }
+    if (dirty.intersects(m_trackDirty[index])) {
+        drawBar(p, m_meterTracks[index], meter);
+    }
+}
+
+/**
+ * Paints the full card's sections that intersect `dirty`. The graph is clipped to its strip
+ * and the card's rounded corners.
+ */
+void PerformanceOverlay::paintFull(QPainter& p, const QRegion& dirty) const {
     if (dirty.intersects(m_fpsRow.toAlignedRect())) {
         const qreal baseline = m_fpsRow.top() + (FPS_ROW_H + m_fpsMetrics.capHeight()) / 2.0;
         drawText(p, QPointF(m_fpsRow.left(), baseline), tr("FPS"), m_labelFont, DIM_COLOR);
@@ -480,7 +596,6 @@ void PerformanceOverlay::paintEvent(QPaintEvent* event) {
                   VALUE_COLOR, tr("fps"));
     }
 
-    // The graph runs edge to edge, clipped by the card's rounded corners and its own band
     if (dirty.intersects(m_graphDirty)) {
         p.save();
         p.setClipPath(m_cardPath);
@@ -499,13 +614,67 @@ void PerformanceOverlay::paintEvent(QPaintEvent* event) {
     }
 
     if (dirty.intersects(m_divider.toAlignedRect())) {
-        p.setPen(QPen(QColor(255, 255, 255, 22), 1));
+        p.setPen(QPen(DIVIDER_COLOR, 1));
         const qreal line_y = m_divider.top() + 0.5;
         p.drawLine(QPointF(m_divider.left(), line_y), QPointF(m_divider.right(), line_y));
     }
 
     for (size_t i = 0; i < m_meters.size(); ++i) {
         drawMeter(p, dirty, i);
+    }
+}
+
+/**
+ * Paints the compact strip's sections that intersect `dirty`: the FPS and frametime text, the
+ * graph beside it clipped to its own area, the divider and the meter rows.
+ */
+void PerformanceOverlay::paintCompact(QPainter& p, const QRegion& dirty) const {
+    if (dirty.intersects(m_fpsRow.toAlignedRect())) {
+        drawValueLeft(p, m_fpsRow.left(), m_compactFpsBaseline, m_fpsText, m_compactFpsFont,
+                      m_compactFpsMetrics, VALUE_COLOR, tr("fps"));
+        drawValueLeft(p, m_fpsRow.left(), m_compactFrametimeBaseline, m_frametimeText,
+                      m_compactFrametimeFont, m_compactFrametimeMetrics, FRAMETIME_ACCENT,
+                      tr("ms"));
+    }
+
+    if (dirty.intersects(m_graphDirty)) {
+        p.save();
+        p.setClipRect(m_graphRect);
+        drawFpsGraph(p, m_graphRect);
+        p.restore();
+    }
+
+    if (dirty.intersects(m_divider.toAlignedRect())) {
+        p.setPen(QPen(DIVIDER_COLOR, 1));
+        const qreal line_x = m_divider.left() + 0.5;
+        p.drawLine(QPointF(line_x, m_divider.top()), QPointF(line_x, m_divider.bottom()));
+    }
+
+    for (size_t i = 0; i < m_meters.size(); ++i) {
+        drawCompactMeter(p, dirty, i);
+    }
+}
+
+/**
+ * Paints the background, the current layout's sections inside the repaint region, and the
+ * border. Qt clears and clips to the region, so the background and border are drawn every time
+ * and partial repaints come out identical to full ones, while untouched sections (usually all
+ * the text) are skipped.
+ */
+void PerformanceOverlay::paintEvent(QPaintEvent* event) {
+    const QRegion& dirty = event->region();
+    QPainter p(this);
+    p.setRenderHint(QPainter::Antialiasing);
+    p.setRenderHint(QPainter::TextAntialiasing);
+
+    p.setPen(Qt::NoPen);
+    p.setBrush(PANEL_COLOR);
+    p.drawPath(m_cardPath);
+
+    if (m_compact) {
+        paintCompact(p, dirty);
+    } else {
+        paintFull(p, dirty);
     }
 
     // Border last so the graph doesn't paint over it
@@ -524,7 +693,7 @@ void PerformanceOverlay::showEvent(QShowEvent* event) {
 
 /**
  * Stops host sampling and the animation timer, and clears the graph and meters so the next
- * show starts fresh instead of animating from stale values.
+ * show starts fresh instead of animating from stale values. The layout mode is kept.
  */
 void PerformanceOverlay::hideEvent(QHideEvent* event) {
     m_monitor.Stop();
@@ -536,10 +705,14 @@ void PerformanceOverlay::hideEvent(QHideEvent* event) {
 }
 
 /**
- * Begins a left-button drag. On Wayland, where move() is ignored for top-level
- * windows, hands the drag to the compositor instead.
+ * Right-click switches between the full and compact layouts. Left-click begins a drag; on
+ * Wayland, where move() is ignored for top-level windows, the compositor drags it instead.
  */
 void PerformanceOverlay::mousePressEvent(QMouseEvent* event) {
+    if (event->button() == Qt::RightButton) {
+        toggleCompact();
+        return;
+    }
     if (event->button() != Qt::LeftButton) {
         return;
     }

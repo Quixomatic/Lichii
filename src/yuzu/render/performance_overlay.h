@@ -28,9 +28,10 @@ class MainWindow;
 
 /**
  * Frameless, draggable card that floats over the main window and shows FPS with a history
- * graph, frametime, and host CPU, GPU, RAM and VRAM meters. The graph scrolls continuously and
- * the meters ease toward new readings on an animation timer that only runs while the overlay is
- * visible and something is moving.
+ * graph, frametime, and host CPU, GPU, RAM and VRAM meters. Right-clicking switches between the
+ * full card and a compact strip. The graph scrolls continuously and the meters ease toward new
+ * readings on an animation timer that only runs while the overlay is visible and something is
+ * moving.
  */
 class PerformanceOverlay : public QWidget {
     Q_OBJECT
@@ -45,7 +46,7 @@ public:
 
 protected:
     /**
-     * Paints the whole card: FPS row and graph, frametime row, divider and meter grid.
+     * Paints the parts of the card in the repaint region, in the current mode.
      */
     void paintEvent(QPaintEvent* event) override;
 
@@ -61,7 +62,8 @@ protected:
     void hideEvent(QHideEvent* event) override;
 
     /**
-     * Begins a drag. On Wayland, hands the drag to the compositor instead.
+     * Begins a drag on left-click; on Wayland, hands the drag to the compositor instead.
+     * Right-click switches between the full and compact layouts.
      */
     void mousePressEvent(QMouseEvent* event) override;
 
@@ -113,22 +115,32 @@ private:
     };
 
     /**
-     * Display data for one cell of the meter grid. Text is prepared once per stats update;
-     * only the fill animates between updates. An invalid fill draws only the empty track.
+     * Display data for one meter. Text is prepared once per stats update; only the fill
+     * animates between updates. An invalid fill draws only the empty track.
      */
     struct Meter {
         QString label;
+        /// Full layout: value and unit, e.g. "12.1" and "/ 32 GB"
         QString value;
         QString unit;
+        /// Compact layout: the fill as a percentage, e.g. "41%"
+        QString percent;
         QColor accent;
         Smoothed fill;
     };
 
     /**
-     * Computes the card outline and the rectangle of every section once, so painting and
-     * partial repaints share the same fixed layout.
+     * Computes the window size, card outline and the rectangle of every section for the
+     * current mode, and resizes the window to match. Painting and partial repaints share
+     * this fixed layout.
      */
     void computeLayout();
+
+    /**
+     * Switches between the full and compact layouts. The choice lasts as long as the overlay
+     * does, like its dragged position.
+     */
+    void toggleCompact();
 
     /**
      * Moves the overlay to keep its offset from the main window when that window moves.
@@ -154,8 +166,8 @@ private:
 
     /**
      * Advances the animations by the time since the previous tick and repaints only what moves:
-     * the graph strip, and the track of any bar that is still easing. Stops the timer once the
-     * graph has nothing left to scroll and every value has settled.
+     * the graph, and the track of any bar that is still easing. Stops the timer once the graph
+     * has nothing left to scroll and every value has settled.
      */
     void onAnimationTick();
 
@@ -166,6 +178,19 @@ private:
     bool graphHasSamples(Clock::time_point now) const;
 
     /**
+     * Paints the full card's sections that intersect `dirty`: FPS row, edge-to-edge graph,
+     * frametime row, divider and the 2x2 meter grid.
+     */
+    void paintFull(QPainter& p, const QRegion& dirty) const;
+
+    /**
+     * Paints the compact strip's sections that intersect `dirty`: FPS and frametime with the
+     * graph beside them on the left, and four stacked label, bar and percentage rows on the
+     * right.
+     */
+    void paintCompact(QPainter& p, const QRegion& dirty) const;
+
+    /**
      * Draws the average FPS over the last minute as a smooth white curve with a fading fill,
      * scrolling continuously between stats ticks. The curve breaks across freezes and loading
      * screens instead of bridging them.
@@ -173,10 +198,21 @@ private:
     void drawFpsGraph(QPainter& p, const QRectF& r) const;
 
     /**
-     * Draws the parts of meter `index` that intersect `dirty`: its colored label, value and
-     * unit, and its fill bar.
+     * Draws the parts of meter `index` that intersect `dirty` in the full layout: its colored
+     * label, value and unit, and its fill bar.
      */
     void drawMeter(QPainter& p, const QRegion& dirty, size_t index) const;
+
+    /**
+     * Draws the parts of meter `index` that intersect `dirty` in the compact layout: its colored
+     * label, fill bar and percentage on one row.
+     */
+    void drawCompactMeter(QPainter& p, const QRegion& dirty, size_t index) const;
+
+    /**
+     * Draws a meter's empty track and its rounded fill at the eased width, red at 90% or more.
+     */
+    void drawBar(QPainter& p, const QRectF& track, const Meter& meter) const;
 
     /**
      * Draws "<value> <unit>" right-aligned to `right` on the given baseline.
@@ -185,6 +221,13 @@ private:
     qreal drawValue(QPainter& p, qreal right, qreal baseline, const QString& value,
                     const QFont& value_font, const QFontMetricsF& value_metrics,
                     const QColor& value_color, const QString& unit) const;
+
+    /**
+     * Draws "<value> <unit>" left-aligned at `left` on the given baseline.
+     */
+    void drawValueLeft(QPainter& p, qreal left, qreal baseline, const QString& value,
+                       const QFont& value_font, const QFontMetricsF& value_metrics,
+                       const QColor& value_color, const QString& unit) const;
 
     /**
      * Draws text with a one-pixel drop shadow so it stays readable over bright frames.
@@ -196,24 +239,38 @@ private:
 
     QPoint m_offset{25, 75};
     QPoint m_drag_start_pos;
+    bool m_compact = false;
 
     // Fonts and their metrics are created once; metrics are declared after the fonts they use
     QFont m_labelFont;
     QFont m_fpsFont;
     QFont m_metricFont;
     QFont m_unitFont;
+    QFont m_compactFpsFont;
+    QFont m_compactFrametimeFont;
+    QFont m_compactLabelFont;
+    QFont m_compactValueFont;
     QFontMetricsF m_fpsMetrics;
     QFontMetricsF m_metricMetrics;
     QFontMetricsF m_unitMetrics;
+    QFontMetricsF m_compactFpsMetrics;
+    QFontMetricsF m_compactFrametimeMetrics;
+    QFontMetricsF m_compactLabelMetrics;
+    QFontMetricsF m_compactValueMetrics;
 
-    // Fixed layout from computeLayout()
+    // Layout from computeLayout(); which fields are used depends on the mode
     QPainterPath m_cardPath;
+    /// Full: the FPS row. Compact: the FPS and frametime text block.
     QRectF m_fpsRow;
     QRectF m_graphRect;
     QRectF m_frametimeRow;
     QRectF m_divider;
+    /// Full: each meter's text line. Compact: each meter's whole row.
     std::array<QRectF, 4> m_meterLabels;
     std::array<QRectF, 4> m_meterTracks;
+    /// Compact: baselines of the FPS and frametime lines
+    qreal m_compactFpsBaseline = 0.0;
+    qreal m_compactFrametimeBaseline = 0.0;
     /// Pixel rectangles invalidated on animation ticks
     QRect m_graphDirty;
     std::array<QRect, 4> m_trackDirty;
