@@ -2359,17 +2359,19 @@ bool MainWindow::OnShutdownBegin() {
     Settings::values.use_speed_limit.SetValue(true);
     Settings::values.current_speed_mode = Settings::SpeedMode::Standard;
 
+    // Before the early return, so a shutdown the emulation thread started also removes the
+    // overlay and stops its sampler
+    if (perf_overlay) {
+        perf_overlay->hide();
+        perf_overlay->deleteLater();
+        perf_overlay = nullptr;
+    }
+
     if (QtCommon::system->IsShuttingDown()) {
         status_bar_update_timer.stop();
         connect(QtCommon::emu_thread.get(), &QThread::finished, this,
                 &MainWindow::OnEmulationStopped, Qt::UniqueConnection);
         return false;
-    }
-
-    if (perf_overlay) {
-        perf_overlay->hide();
-        perf_overlay->deleteLater();
-        perf_overlay = nullptr;
     }
 
     QtCommon::system->SetShuttingDown(true);
