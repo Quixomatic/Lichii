@@ -85,28 +85,6 @@ void PerfStats::EndSystemFrame() {
 
 void PerfStats::EndGameFrame() {
     game_frames.fetch_add(1, std::memory_order_relaxed);
-
-    // Claim the slot first so the ring stays consistent even with more than one writer
-    const auto now = Clock::now().time_since_epoch().count();
-    const u64 frame = game_frame_count.fetch_add(1, std::memory_order_acq_rel);
-    game_frame_times[frame % GameFrameRingSize].store(now, std::memory_order_release);
-}
-
-void PerfStats::ReadGameFrameTimes(u64& next_frame, std::vector<Clock::time_point>& out) const {
-    const u64 count = game_frame_count.load(std::memory_order_acquire);
-    if (next_frame > count) {
-        next_frame = count;
-    }
-    // Stay well behind the writer so a slot isn't overwritten while it is copied
-    constexpr u64 MaxReadable = GameFrameRingSize / 2;
-    if (count - next_frame > MaxReadable) {
-        next_frame = count - MaxReadable;
-    }
-    for (; next_frame < count; ++next_frame) {
-        const auto ticks =
-            game_frame_times[next_frame % GameFrameRingSize].load(std::memory_order_acquire);
-        out.emplace_back(Clock::duration{ticks});
-    }
 }
 
 double PerfStats::GetMeanFrametime() const {

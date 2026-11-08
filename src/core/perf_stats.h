@@ -8,7 +8,6 @@
 #include <chrono>
 #include <cstddef>
 #include <mutex>
-#include <vector>
 #include "common/common_types.h"
 
 namespace Core {
@@ -52,19 +51,7 @@ public:
      */
     double GetLastFrameTimeScale() const;
 
-    /**
-     * Appends the end times of game frames presented since `next_frame` to `out`, oldest first,
-     * and advances `next_frame` past them. Frames that have already left the history ring are
-     * skipped. Lock-free, so a reader never blocks the GPU thread that records frames. A slot
-     * that is being written while it is read may hold an older time; callers should ignore
-     * times that don't increase.
-     */
-    void ReadGameFrameTimes(u64& next_frame, std::vector<Clock::time_point>& out) const;
-
 private:
-    /// Number of recent game frame end times kept for ReadGameFrameTimes
-    static constexpr std::size_t GameFrameRingSize = 1024;
-
     mutable std::mutex object_mutex;
 
     /// Title ID for the game that is running. 0 if there is no game running yet
@@ -86,12 +73,6 @@ private:
     u32 system_frames = 0;
     /// Cumulative number of game frames (GSP frame submissions) since last reset
     std::atomic<u32> game_frames = 0;
-
-    /// End times of the most recent game frames as steady clock ticks, indexed by frame number
-    /// modulo GameFrameRingSize
-    std::array<std::atomic<Clock::rep>, GameFrameRingSize> game_frame_times{};
-    /// Total number of game frames recorded in game_frame_times; never reset
-    std::atomic<u64> game_frame_count = 0;
 
     /// Point when the previous system frame ended
     Clock::time_point previous_frame_end = reset_point;

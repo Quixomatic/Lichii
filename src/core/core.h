@@ -8,7 +8,6 @@
 
 #include <array>
 #include <atomic>
-#include <chrono>
 #include <cstddef>
 #include <deque>
 #include <functional>
@@ -242,13 +241,6 @@ public:
 
     /// Gets and resets core performance statistics
     [[nodiscard]] PerfStatsResults GetAndResetPerfStats();
-
-    /**
-     * Appends the end times of game frames presented since `next_frame` to `out` and advances
-     * `next_frame`. Does nothing while no game is running. See PerfStats::ReadGameFrameTimes.
-     */
-    void ReadGameFrameTimes(u64& next_frame,
-                            std::vector<std::chrono::steady_clock::time_point>& out) const;
 
     /// Gets the physical core for the CPU core that is currently running
     [[nodiscard]] Kernel::PhysicalCore& CurrentPhysicalCore();
