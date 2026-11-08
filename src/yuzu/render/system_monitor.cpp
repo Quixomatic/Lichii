@@ -198,7 +198,7 @@ private:
         DWORD size = 0;
         DWORD count = 0;
         if (PdhGetFormattedCounterArrayW(counter, format, &size, &count, nullptr) !=
-            PDH_MORE_DATA) {
+            static_cast<PDH_STATUS>(PDH_MORE_DATA)) {
             return;
         }
         buffer.resize(size);
