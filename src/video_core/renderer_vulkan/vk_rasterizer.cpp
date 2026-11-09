@@ -5296,6 +5296,9 @@ void RasterizerVulkan::UpdateVertexInput(Tegra::Engines::Maxwell3D::Regs& regs) 
     if (!vertex_input_dirty && !vertex_buffers_dirty) {
         return;
     }
+    if (vertex_input_dirty) {
+        dirty[Dirty::VertexInputKey] = true; // The pipeline key's copy of the change
+    }
     dirty[Dirty::VertexInput] = false;
 
     boost::container::static_vector<VkVertexInputBindingDescription2EXT, 32> bindings;

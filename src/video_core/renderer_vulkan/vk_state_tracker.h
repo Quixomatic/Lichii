@@ -70,6 +70,10 @@ enum : u8 {
     BlendEquations,
     ColorMask,
     ViewportSwizzles,
+    /// With dynamic vertex input, the command buffer update (UpdateVertexInput) consumes
+    /// VertexInput on every draw, including fast-path draws that never refresh the pipeline key:
+    /// it sets this so the key's attribute types follow the change at the next refresh.
+    VertexInputKey,
 
     Last,
 };

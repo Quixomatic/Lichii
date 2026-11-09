@@ -109,7 +109,8 @@ void FixedPipelineState::Refresh(Tegra::Engines::Maxwell3D& maxwell3d, DynamicFe
     const auto topology_ = maxwell3d.draw_manager.draw_state.topology;
 
     RefreshCore(maxwell3d, features);
-    if (maxwell3d.dirty.flags[Dirty::VertexInput]) {
+    if (maxwell3d.dirty.flags[Dirty::VertexInput] ||
+        maxwell3d.dirty.flags[Dirty::VertexInputKey]) {
         RefreshVertexInput(maxwell3d, features, true);
     }
     if (maxwell3d.dirty.flags[Dirty::ViewportSwizzles]) {
@@ -233,8 +234,11 @@ void FixedPipelineState::RefreshCore(const Maxwell& regs, Maxwell::PrimitiveTopo
 
 void FixedPipelineState::RefreshVertexInput(Tegra::Engines::Maxwell3D& maxwell3d,
                                             const DynamicFeatures& features, bool touch_flags) {
-    if (!features.has_dynamic_vertex_input && touch_flags) {
-        maxwell3d.dirty.flags[Dirty::VertexInput] = false;
+    if (touch_flags) {
+        if (!features.has_dynamic_vertex_input) {
+            maxwell3d.dirty.flags[Dirty::VertexInput] = false;
+        }
+        maxwell3d.dirty.flags[Dirty::VertexInputKey] = false;
     }
     RefreshVertexInput(maxwell3d.regs, features);
 }
@@ -342,12 +346,16 @@ u32 FixedPipelineState::RefreshIncremental(Tegra::Engines::Maxwell3D& maxwell3d,
                                            const DynamicFeatures& features, u32 groups,
                                            const KeyInputs& previous, bool force,
                                            bool touch_flags) {
-    const bool vertex_input = force || maxwell3d.dirty.flags[Dirty::VertexInput];
+    const bool vertex_input = force || maxwell3d.dirty.flags[Dirty::VertexInput] ||
+                              maxwell3d.dirty.flags[Dirty::VertexInputKey];
     const bool swizzles = force || maxwell3d.dirty.flags[Dirty::ViewportSwizzles];
     if (touch_flags) {
         // What the blocks below consume (as Refresh clears them).
         if (vertex_input && !features.has_dynamic_vertex_input) {
             maxwell3d.dirty.flags[Dirty::VertexInput] = false;
+        }
+        if (vertex_input) {
+            maxwell3d.dirty.flags[Dirty::VertexInputKey] = false;
         }
         if (swizzles) {
             maxwell3d.dirty.flags[Dirty::ViewportSwizzles] = false;

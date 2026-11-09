@@ -1938,6 +1938,7 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineV2() {
         if (!dynamic_features.has_dynamic_vertex_input) {
             flags[Dirty::VertexInput] = false;
         }
+        flags[Dirty::VertexInputKey] = false;
         flags[Dirty::ViewportSwizzles] = false;
         if (!graphics_key.state.extended_dynamic_state_3_blend) {
             flags[Dirty::Blending] = false;
