@@ -1203,12 +1203,30 @@ bool BufferCache<P>::ReplayGraphicsBuffers(const VideoCommon::V2::DrawCache::Buf
         const Versions::Generations& gens = Versions::Gens();
         // F2-07: one check of the recipe's merged ranges, not one memo query per binding.
         replay_all_unchanged = recipe.AllUnchanged(memo, Versions::Pages());
+        // ...and one liveness check per buffer deletion, not one per binding per draw.
+        const auto alive = [&](const DC::BufferBind& bind) {
+            return gens.Get(Versions::Kind::Buffer, bind.buffer_id) == bind.generation &&
+                   slot_buffers.contains(BufferId{bind.buffer_id});
+        };
+        bool all_alive = recipe.alive_deletions == buffer_deletions;
+        if (!all_alive) {
+            all_alive = !recipe.has_index || alive(recipe.index);
+            for (const auto* list : {&recipe.vertex, &recipe.uniform, &recipe.storage,
+                                     &recipe.texture}) {
+                for (const DC::BufferBind& bind : *list) {
+                    all_alive &= alive(bind);
+                }
+            }
+            if (all_alive) {
+                recipe.alive_deletions = buffer_deletions;
+            }
+        }
+        replay_all_alive = all_alive;
         // A recorded buffer still bindable for [address, address + size): alive, the range within
         // the recorded one and unchanged since the recipe's stamp.
         const auto usable = [&](const DC::BufferBind* bind, DAddr address, u64 size) {
             return bind != nullptr && bind->Contains(address, size) &&
-                   gens.Get(Versions::Kind::Buffer, bind->buffer_id) == bind->generation &&
-                   slot_buffers.contains(BufferId{bind->buffer_id}) &&
+                   (all_alive || alive(*bind)) &&
                    (replay_all_unchanged || memo.Unchanged(address, size, recipe.stamp));
         };
         auto& flags = maxwell3d->dirty.flags;
@@ -1451,8 +1469,9 @@ void BufferCache<P>::ReplayHostStageBuffers(size_t stage,
         // range within the recorded one, unchanged since the recipe's stamp.
         const auto replayable = [&](const DC::BufferBind* kept, const Binding& binding, u32 size) {
             return kept != nullptr && binding.buffer_id.index == kept->buffer_id &&
-                   VideoCommon::V2::Versions::Gens().Get(VideoCommon::V2::Versions::Kind::Buffer,
-                                                         kept->buffer_id) == kept->generation &&
+                   (replay_all_alive ||
+                    VideoCommon::V2::Versions::Gens().Get(VideoCommon::V2::Versions::Kind::Buffer,
+                                                          kept->buffer_id) == kept->generation) &&
                    kept->Contains(binding.device_addr, size) &&
                    unchanged(binding.device_addr, size);
         };

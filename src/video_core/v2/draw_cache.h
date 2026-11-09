@@ -315,6 +315,8 @@ struct BufferRecipe {
     std::vector<std::pair<DAddr, DAddr>> merged;
     mutable u64 checked_sequence{};
     mutable bool checked{};
+    /// The buffer cache's deletion count when every recorded buffer was last found alive.
+    mutable u64 alive_deletions{~0ULL};
 
     void Clear() {
         valid = false;
@@ -328,6 +330,7 @@ struct BufferRecipe {
         merged.clear();
         checked = false;
         checked_sequence = 0;
+        alive_deletions = ~0ULL;
     }
     /// Builds `merged` from the bindings (after recording them).
     void MergeRanges() {
