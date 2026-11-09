@@ -38,6 +38,10 @@ public:
 
     void DeclareChannel(std::shared_ptr<ChannelState> new_channel);
 
+    /// Binds the rasterizer to a channel under the scheduling lock (with the split, on its back:
+    /// a Channel IR record or a deferred call).
+    void BindChannelOnBack(GPU& gpu, s32 bind_id);
+
 private:
     void BindChannel(GPU& gpu, s32 bind_id);
 

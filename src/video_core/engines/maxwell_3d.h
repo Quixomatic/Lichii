@@ -3297,6 +3297,12 @@ public:
 
     void ProcessInlineIndexMultiData(u32 method, const u32* start_base, u32 amount);
 
+    /// The back's work at the end of a front macro: consume the sink, issue a deferred draw
+    /// (a MacroEnd Draw IR record or a deferred call).
+    void FinishFrontMacro(Core::System& system);
+    /// EDEN_NX2_V2_MACROHLE (back): a host indirect draw replacing an identified NVN2 macro.
+    void RunMacroHleDraw(Core::System& system, const VideoCommon::V2::MacroHle::Draw& draw);
+
 private:
     void InitializeRegisterDefaults();
 
@@ -3443,6 +3449,11 @@ private:
     bool FrontRegSemEffect(VideoCommon::V2::RegSem::Effect effect, u32 a, u32 b);
 
     void FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split, FrontState& state);
+    /// Sends the end of a front macro that may leave a deferred draw (a MacroEnd Draw record).
+    void FrontEmitMacroEnd(Core::System& system, VideoCommon::GpuSplit& split, FrontState& state);
+    /// Sends a macro HLE host indirect draw (a HostIndirect Draw record).
+    void FrontEmitHostIndirect(Core::System& system, VideoCommon::GpuSplit& split,
+                               FrontState& state, const VideoCommon::V2::MacroHle::Draw& draw);
     void FrontTrackInstanceLoop(FrontState& state, u32 method, u32 value);
     bool FrontSkipsLoopWrite(FrontState& state, u32 method, u32 value, bool shadow_kept);
     void FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& state, u32 macro, u32 method,
@@ -3458,9 +3469,6 @@ private:
     /// Returns false when the old path must read.
     bool FrontDmaReadHazard(VideoCommon::GpuSplit& split, GPUVAddr source, size_t bytes,
                             std::span<u32> out);
-    void FinishFrontMacro(Core::System& system);
-    /// EDEN_NX2_V2_MACROHLE (back): a host indirect draw replacing an identified NVN2 macro.
-    void RunMacroHleDraw(Core::System& system, const VideoCommon::V2::MacroHle::Draw& draw);
     std::unique_ptr<FrontState> front;
     bool front_macros{};
     // EDEN_NX2_SPLIT_VERIFY: the last SET_SHADOW_RAM_CONTROL writes each side saw (argument,

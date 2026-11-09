@@ -930,15 +930,16 @@ TEST_CASE("V2 typed IR runs the same engine calls as the word stream",
             } else if (choice < 15) {
                 const u32 value = static_cast<u32>(rng());
                 words.Defer([&words_calls, value] { words_calls.push_back(value); });
-                typed.Defer([&typed_calls, value] { typed_calls.push_back(value); },
-                            VideoCommon::GpuSplit::Hint(VideoCommon::V2::Ir::Kind::Barrier));
+                typed.Defer([&typed_calls, value] { typed_calls.push_back(value); });
             } else {
+                // A typed record the back only reads, between the others.
                 const u32 value = static_cast<u32>(rng());
-                const VideoCommon::V2::Ir::ReleaseBody body{.address = value, .payload = value};
-                words.DeferTyped(VideoCommon::V2::Ir::Kind::Release, body,
-                                 [&words_calls, value] { words_calls.push_back(~value); });
-                typed.DeferTyped(VideoCommon::V2::Ir::Kind::Release, body,
-                                 [&typed_calls, value] { typed_calls.push_back(~value); });
+                const VideoCommon::V2::Ir::CopyBody body{.source = value, .destination = value};
+                typed.Note(VideoCommon::V2::Ir::Kind::Copy, body);
+                words.Defer([&words_calls, value] { words_calls.push_back(~value); },
+                            VideoCommon::GpuSplit::FastDrawNeutral);
+                typed.Defer([&typed_calls, value] { typed_calls.push_back(~value); },
+                            VideoCommon::GpuSplit::FastDrawNeutral);
             }
         }
         // Execute what both sent, as the back would (a publish closes the open StateRun).

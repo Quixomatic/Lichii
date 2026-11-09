@@ -271,23 +271,16 @@ public:
     /// Defer flag: the call doesn't end fast draw reuse (nx2_fast_draw.h).
     static constexpr u64 FastDrawNeutral = 1 << 7;
 
-    /// Defer flag: with the typed IR, the record kind that describes the deferred call (it
-    /// still travels as a callback, without a body). The word stream ignores it.
-    static constexpr u64 Hint(V2::Ir::Kind kind) {
-        return u64{static_cast<u8>(kind)} << 32;
-    }
-
     /// Runs `func` on the back after everything sent before it. Must be trivially copyable.
-    /// `flags`: FastDrawNeutral when `func` can't change what a draw resolves to, and a Hint.
+    /// `flags`: FastDrawNeutral when `func` can't change what a draw resolves to. With the typed
+    /// IR this is a Callback record: only debug hooks use it there (typed records: Emit).
     template <typename Func>
     void Defer(const Func& func, u64 flags = 0) {
         static_assert(std::is_trivially_copyable_v<Func> && alignof(Func) <= alignof(u64));
         constexpr size_t payload = (sizeof(Func) + sizeof(u64) - 1) / sizeof(u64);
         if (ir) {
-            const auto hint = static_cast<V2::Ir::Kind>((flags >> 32) & 0xff);
-            u64* const span = IrPayloadBegin(
-                hint != V2::Ir::Kind::Invalid ? hint : V2::Ir::Kind::Callback, nullptr, 0,
-                1 + payload, V2::Ir::HasThunk | (flags & FastDrawNeutral));
+            u64* const span = IrPayloadBegin(V2::Ir::Kind::Callback, nullptr, 0, 1 + payload,
+                                             V2::Ir::HasThunk | (flags & FastDrawNeutral));
             span[0] = reinterpret_cast<u64>(&CallThunk<Func>);
             std::memcpy(span + 1, &func, sizeof(Func));
             IrPayloadCommit();
@@ -299,22 +292,77 @@ public:
         std::memcpy(entry + 2, &func, sizeof(Func));
         Commit(2 + payload);
     }
-    /// As Defer; with the typed IR the record is of `kind` and carries `body` (ir.h), which
-    /// later stages can inspect without running `func`.
-    template <typename Body, typename Func>
-    void DeferTyped(V2::Ir::Kind kind, const Body& body, const Func& func, u64 flags = 0) {
-        if (!ir) {
-            Defer(func, flags);
+    /// IR: the object table index of `object` for a record body (NoObject without the IR).
+    [[nodiscard]] V2::Ir::ObjectRef Ref(const void* object) {
+        return ir && !on_back_thread ? IrRef(object) : V2::Ir::NoObject;
+    }
+    /// A typed record the back executes itself (V2::IrExec), objects named with Ref. With the
+    /// word stream, or when a Ref found the object table full, `legacy` (what the record does,
+    /// as a trivially copyable callable) runs on the back as a Defer instead.
+    template <typename Body, typename Legacy>
+    void Emit(V2::Ir::Kind kind, const Body& body, const Legacy& legacy, u64 flags = 0) {
+        static_assert(V2::Ir::IsBody<Body>);
+        if (!ir || ir_ref_failed) {
+            ir_ref_failed = false;
+            Defer(legacy, flags);
             return;
         }
+        constexpr size_t words = V2::Ir::HeaderWords + V2::Ir::BodyWordsOf<Body>;
+        u64* const record =
+            IrBegin(kind, V2::Ir::BodyWordsOf<Body>, words, flags & FastDrawNeutral);
+        std::memcpy(record + V2::Ir::HeaderWords, &body, sizeof(Body));
+        Commit(words);
+    }
+    /// As Emit, with `payload_words` of variable data (to the payload arena).
+    template <typename Body, typename Legacy>
+    void EmitPayload(V2::Ir::Kind kind, const Body& body, const u64* payload,
+                     size_t payload_words, const Legacy& legacy, u64 flags = 0) {
         static_assert(V2::Ir::IsBody<Body>);
-        static_assert(std::is_trivially_copyable_v<Func> && alignof(Func) <= alignof(u64));
-        constexpr size_t payload = (sizeof(Func) + sizeof(u64) - 1) / sizeof(u64);
-        u64* const span = IrPayloadBegin(kind, &body, V2::Ir::BodyWordsOf<Body>, 1 + payload,
-                                         V2::Ir::HasThunk | (flags & FastDrawNeutral));
-        span[0] = reinterpret_cast<u64>(&CallThunk<Func>);
-        std::memcpy(span + 1, &func, sizeof(Func));
+        if (!ir || ir_ref_failed || payload_words == 0) {
+            ir_ref_failed = false;
+            Defer(legacy, flags);
+            return;
+        }
+        u64* const span = IrPayloadBegin(kind, &body, V2::Ir::BodyWordsOf<Body>, payload_words,
+                                         flags & FastDrawNeutral);
+        std::memcpy(span, payload, payload_words * sizeof(u64));
         IrPayloadCommit();
+    }
+    /// IR only: a record that later stages and checks read; the back runs nothing for it and
+    /// it doesn't end fast draw reuse.
+    template <typename Body>
+    void Note(V2::Ir::Kind kind, const Body& body) {
+        static_assert(V2::Ir::IsBody<Body>);
+        if (!ir) {
+            return;
+        }
+        ir_ref_failed = false;
+        constexpr size_t words = V2::Ir::HeaderWords + V2::Ir::BodyWordsOf<Body>;
+        u64* const record = IrBegin(kind, V2::Ir::BodyWordsOf<Body>, words, FastDrawNeutral);
+        std::memcpy(record + V2::Ir::HeaderWords, &body, sizeof(Body));
+        Commit(words);
+    }
+    /// Run for typed records: Emit, then wait for the back to run it.
+    template <typename Body, typename Legacy>
+    void RunTyped(V2::Ir::Kind kind, const Body& body, const Legacy& legacy,
+                  DrainSite site = DrainSite::Other) {
+        if (on_back_thread || !active) {
+            legacy();
+            return;
+        }
+        Emit(kind, body, legacy);
+        Drain(site);
+    }
+    /// RunTyped with a payload.
+    template <typename Body, typename Legacy>
+    void RunTypedPayload(V2::Ir::Kind kind, const Body& body, const u64* payload,
+                         size_t payload_words, const Legacy& legacy, DrainSite site) {
+        if (on_back_thread || !active) {
+            legacy();
+            return;
+        }
+        EmitPayload(kind, body, payload, payload_words, legacy);
+        Drain(site);
     }
     void DeferFunction(std::function<void()>&& func);
     /// Runs `func` on the back and waits for it: for work on back-owned state, such as a buffer

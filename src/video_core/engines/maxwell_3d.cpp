@@ -36,6 +36,7 @@
 #include "video_core/texture_cache/image_info.h"
 #include "video_core/texture_cache/util.h"
 #include "video_core/v2/front_writes.h"
+#include "video_core/v2/ir_exec.h"
 #include "video_core/v2/regsem_3d.h"
 #include "video_core/v2/shader_writes.h"
 #ifdef ARCHITECTURE_x86_64
@@ -1732,9 +1733,7 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
             if (hle == VideoCommon::V2::Mode::On) {
                 // The back draws from the GPU buffer; the front reads nothing.
                 fs.parameters.clear();
-                split.Defer([this, system_ptr = &system, draw] {
-                    RunMacroHleDraw(*system_ptr, draw);
-                });
+                FrontEmitHostIndirect(system, split, fs, draw);
                 return;
             }
             static std::atomic<u32> logged{};
@@ -1800,8 +1799,7 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
     }
     if (fs.draw_pending) {
         fs.draw_pending = false;
-        split.Defer([this, system_ptr = &system] { FinishFrontMacro(*system_ptr); },
-                    VideoCommon::GpuSplit::FastDrawNeutral);
+        FrontEmitMacroEnd(system, split, fs);
     }
     if (FrontVerifyEnabled() && (++fs.calls & 4095) == 0) [[unlikely]] {
         FrontVerify(split, fs);
@@ -1845,6 +1843,40 @@ void Maxwell3D::RunMacroHleDraw(Core::System& system, const VideoCommon::V2::Mac
         engine_state = EngineHint::None;
         replace_table.clear();
     }
+}
+
+void Maxwell3D::FrontEmitMacroEnd(Core::System& system, VideoCommon::GpuSplit& split,
+                                  FrontState& fs) {
+    // The back consumes its sink and issues the deferred instanced draw (FinishFrontMacro).
+    VideoCommon::V2::Ir::DrawBody body{};
+    body.op = VideoCommon::V2::Ir::DrawOp::MacroEnd;
+    body.engine = split.Ref(this);
+    split.Emit(VideoCommon::V2::Ir::Kind::Draw, body,
+               [this, system_ptr = &system] { FinishFrontMacro(*system_ptr); },
+               VideoCommon::GpuSplit::FastDrawNeutral);
+    (void)fs;
+}
+
+void Maxwell3D::FrontEmitHostIndirect(Core::System& system, VideoCommon::GpuSplit& split,
+                                      FrontState& fs, const VideoCommon::V2::MacroHle::Draw& draw) {
+    // NVN2 macro HLE (EDEN_NX2_V2_MACROHLE): the back draws from the GPU buffer.
+    VideoCommon::V2::Ir::DrawBody body{};
+    body.op = VideoCommon::V2::Ir::DrawOp::HostIndirect;
+    body.engine = split.Ref(this);
+    body.hle = {
+        .kind = static_cast<u32>(draw.kind),
+        .topology = draw.topology,
+        .address = draw.address,
+        .count_address = draw.count_address,
+        .max_draws = draw.max_draws,
+        .stride = draw.stride,
+        .base_vertex_attribute = draw.base_vertex_attribute ? 1U : 0U,
+        .reserved = 0,
+    };
+    split.Emit(VideoCommon::V2::Ir::Kind::Draw, body, [this, system_ptr = &system, draw] {
+        RunMacroHleDraw(*system_ptr, draw);
+    });
+    (void)fs;
 }
 
 void Maxwell3D::FrontTrackInstanceLoop(FrontState& fs, u32 method, u32 value) {
@@ -1922,14 +1954,18 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
             if (!hazard_read) {
                 // One wait instead of up to three: the flushes run on the back after
                 // everything queued, then the front reads.
-                split.Defer([this, memory = &memory_manager, source, read_bytes] {
-                    if (memory->IsMemoryDirty(source, read_bytes,
-                                              VideoCommon::CacheType::BufferCache)) {
-                        memory->FlushRegion(source, read_bytes,
-                                            VideoCommon::CacheType::BufferCache);
-                    }
-                    VideoCommon::QueryDma::FlushPending(*memory, *rasterizer, source,
-                                                        read_bytes);
+                const VideoCommon::V2::Ir::ReadbackBody body{
+                    .op = VideoCommon::V2::Ir::ReadbackOp::MacroDmaFlush,
+                    .object = split.Ref(&memory_manager),
+                    .object2 = split.Ref(rasterizer),
+                    .cache = 0,
+                    .address = source,
+                    .bytes = read_bytes,
+                };
+                split.Emit(VideoCommon::V2::Ir::Kind::Readback, body,
+                           [this, memory = &memory_manager, source, read_bytes] {
+                    VideoCommon::V2::IrExec::MacroDmaFlush(*memory, *rasterizer, source,
+                                                           read_bytes);
                 });
                 split.Drain(VideoCommon::DrainSite::MacroDmaRead);
                 for (u32 i = 0; i < words; ++i) {
@@ -1962,14 +1998,30 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
         VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::DmaReadBytes, read_bytes);
     }
     if (memory_manager.IsMemoryDirty(source, read_bytes, VideoCommon::CacheType::BufferCache)) {
-        split.Run(
+        const VideoCommon::V2::Ir::ReadbackBody body{
+            .op = VideoCommon::V2::Ir::ReadbackOp::MemoryFlush,
+            .object = split.Ref(&memory_manager),
+            .address = source,
+            .bytes = read_bytes,
+        };
+        split.RunTyped(
+            VideoCommon::V2::Ir::Kind::Readback, body,
             [memory = &memory_manager, source, read_bytes] {
                 memory->FlushRegion(source, read_bytes, VideoCommon::CacheType::BufferCache);
             },
             VideoCommon::DrainSite::MacroDmaFlush);
     }
     // Write out the reports held in the query cache, or the read returns stale occlusion counts.
-    split.Run(
+    const VideoCommon::V2::Ir::ReadbackBody query_body{
+        .op = VideoCommon::V2::Ir::ReadbackOp::QueryFlush,
+        .object = split.Ref(&memory_manager),
+        .object2 = split.Ref(rasterizer),
+        .cache = 0,
+        .address = source,
+        .bytes = read_bytes,
+    };
+    split.RunTyped(
+        VideoCommon::V2::Ir::Kind::Readback, query_body,
         [this, source, read_bytes] {
             VideoCommon::QueryDma::FlushPending(memory_manager, *rasterizer, source, read_bytes);
         },

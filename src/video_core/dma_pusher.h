@@ -187,6 +187,10 @@ public:
 
     void BindRasterizer(VideoCore::RasterizerInterface* rasterizer);
 
+    /// A GP entry's sync bit: the rasterizer signals a fence whose completion lets the next
+    /// entry run (the back runs it: a SyncFence Barrier record or a deferred call).
+    void SignalSyncFence();
+
 private:
     friend struct DmaPusherTestAccess;
 

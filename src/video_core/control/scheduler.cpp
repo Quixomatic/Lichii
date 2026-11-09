@@ -21,12 +21,20 @@ void Scheduler::BindChannel(GPU& gpu, s32 bind_id) {
     // With the GPU thread split the rasterizer's channel switches with the methods around it, on
     // the back thread (deferred outside the lock: the back takes it to bind).
     if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
-        split.Defer([this, gpu_ptr = &gpu, bind_id] {
-            std::scoped_lock lk{scheduling_guard};
-            gpu_ptr->BindChannel(bind_id);
-        });
+        const VideoCommon::V2::Ir::ChannelBody body{
+            .scheduler = split.Ref(this),
+            .gpu = split.Ref(&gpu),
+            .bind_id = bind_id,
+            .reserved = 0,
+        };
+        split.Emit(VideoCommon::V2::Ir::Kind::Channel, body,
+                   [this, gpu_ptr = &gpu, bind_id] { BindChannelOnBack(*gpu_ptr, bind_id); });
         return;
     }
+    BindChannelOnBack(gpu, bind_id);
+}
+
+void Scheduler::BindChannelOnBack(GPU& gpu, s32 bind_id) {
     std::scoped_lock lk{scheduling_guard};
     gpu.BindChannel(bind_id);
 }

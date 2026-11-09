@@ -32,10 +32,7 @@
 
 namespace VideoCommon::GPUThread {
 
-namespace {
-
-// Tells a CPU thread waiting in PushCommand that its command ran.
-void SignalCommand(SynchState& state, u64 fence, bool block) {
+void SignalCommandFence(SynchState& state, u64 fence, bool block) {
     state.signaled_fence.store(fence);
     if (block) {
         // We have to lock the write_lock to ensure that the condition_variable wait not get a
@@ -44,8 +41,6 @@ void SignalCommand(SynchState& state, u64 fence, bool block) {
         state.cv.notify_all();
     }
 }
-
-} // Anonymous namespace
 
 ThreadManager::ThreadManager(Core::System& system_)
     : system{system_}
@@ -136,9 +131,13 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                     scheduler.Push(system.GPU(), submit_list->channel, std::move(submit_list->entries));
                 } else if (std::holds_alternative<GPUTickCommand>(next.data)) {
                     // TickWork ends fast draw reuse itself when it runs a request.
-                    split.Defer([gpu = &system.GPU()] { gpu->TickWork(); },
-                                VideoCommon::GpuSplit::FastDrawNeutral |
-                                    VideoCommon::GpuSplit::Hint(VideoCommon::V2::Ir::Kind::Barrier));
+                    const V2::Ir::BarrierBody body{.op = V2::Ir::BarrierOp::TickWork,
+                                                   .object = split.Ref(&system.GPU()),
+                                                   .a = 0,
+                                                   .b = 0};
+                    split.Emit(V2::Ir::Kind::Barrier, body,
+                               [gpu = &system.GPU()] { gpu->TickWork(); },
+                               VideoCommon::GpuSplit::FastDrawNeutral);
                 } else if (auto* run = std::get_if<RunCommand>(&next.data)) {
                     if (run->before_later_reads) {
                         // GPU memory maps unmap caches (UnmapMemory downloads): the back's state.
@@ -148,24 +147,36 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                         split.DeferFunction(std::move(run->func));
                     }
                 } else if (const auto* flush = std::get_if<FlushRegionCommand>(&next.data)) {
-                    split.DeferTyped(VideoCommon::V2::Ir::Kind::Readback,
-                                     VideoCommon::V2::Ir::ReadbackBody{.op = VideoCommon::V2::Ir::ReadbackOp::Flush,
-                                                                       .address = flush->addr,
-                                                                       .bytes = flush->size},
-                                     [rasterizer_ptr, addr = flush->addr, size = flush->size] {
+                    const V2::Ir::ReadbackBody body{.op = V2::Ir::ReadbackOp::Flush,
+                                                    .object = split.Ref(rasterizer_ptr),
+                                                    .address = flush->addr,
+                                                    .bytes = flush->size};
+                    split.Emit(V2::Ir::Kind::Readback, body,
+                               [rasterizer_ptr, addr = flush->addr, size = flush->size] {
                         rasterizer_ptr->FlushRegion(addr, size);
                     });
                 } else if (const auto* invalidate = std::get_if<InvalidateRegionCommand>(&next.data)) {
-                    split.Defer([rasterizer_ptr, addr = invalidate->addr, size = invalidate->size] {
+                    const V2::Ir::BarrierBody body{.op = V2::Ir::BarrierOp::Invalidate,
+                                                   .object = split.Ref(rasterizer_ptr),
+                                                   .a = invalidate->addr,
+                                                   .b = invalidate->size};
+                    split.Emit(V2::Ir::Kind::Barrier, body,
+                               [rasterizer_ptr, addr = invalidate->addr, size = invalidate->size] {
                         rasterizer_ptr->OnCacheInvalidation(addr, size);
-                    }, VideoCommon::GpuSplit::Hint(VideoCommon::V2::Ir::Kind::Barrier));
+                    });
                 } else {
                     ASSERT(false);
                 }
-                split.Defer([state_ptr = &state, fence = next.fence, block = next.block] {
-                    SignalCommand(*state_ptr, fence, block);
-                }, VideoCommon::GpuSplit::FastDrawNeutral |
-                       VideoCommon::GpuSplit::Hint(VideoCommon::V2::Ir::Kind::SyncPoint));
+                const V2::Ir::SyncPointBody signal{.id = 0,
+                                                   .value = 0,
+                                                   .op = V2::Ir::SyncPointOp::CommandSignal,
+                                                   .object = split.Ref(&state),
+                                                   .a = next.fence,
+                                                   .b = next.block ? 1U : 0U};
+                split.Emit(V2::Ir::Kind::SyncPoint, signal,
+                           [state_ptr = &state, fence = next.fence, block = next.block] {
+                    SignalCommandFence(*state_ptr, fence, block);
+                }, VideoCommon::GpuSplit::FastDrawNeutral);
 
                 split.Publish();
                 last_progress = std::chrono::steady_clock::now();
@@ -189,7 +200,7 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
             } else {
                 ASSERT(false);
             }
-            SignalCommand(state, next.fence, next.block);
+            SignalCommandFence(state, next.fence, next.block);
             last_progress = std::chrono::steady_clock::now();
         }
     });

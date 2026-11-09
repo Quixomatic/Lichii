@@ -110,6 +110,10 @@ struct SynchState final {
     std::condition_variable_any cv;
 };
 
+/// Tells a CPU thread waiting in PushCommand that the command with `fence` ran (on the split's
+/// back: a CommandSignal SyncPoint IR record or a deferred call).
+void SignalCommandFence(SynchState& state, u64 fence, bool block);
+
 /// Class used to manage the GPU thread
 class ThreadManager final {
 public:

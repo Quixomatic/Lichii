@@ -63,6 +63,14 @@ bool DmaPusher::CanResumeAcquire() {
     return puller.CanResumeAcquire(*this);
 }
 
+void DmaPusher::SignalSyncFence() {
+    rasterizer->SignalFence([this]() {
+        std::scoped_lock lk(sync_mutex);
+        synced = true;
+        sync_cv.notify_all();
+    });
+}
+
 void DmaPusher::DispatchCalls() {
     // The sub-index is kept: a channel suspended on a semaphore resumes inside its command list.
     dma_state.is_last_call = true;
@@ -72,7 +80,13 @@ void DmaPusher::DispatchCalls() {
         }
     }
     if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
-        split.Defer([gpu = &system.GPU()] {
+        const VideoCommon::V2::Ir::BarrierBody body{
+            .op = VideoCommon::V2::Ir::BarrierOp::CommandListEnd,
+            .object = split.Ref(&system.GPU()),
+            .a = 0,
+            .b = 0,
+        };
+        split.Emit(VideoCommon::V2::Ir::Kind::Barrier, body, [gpu = &system.GPU()] {
             gpu->FlushCommands();
             gpu->OnCommandListEnd();
         });
@@ -175,8 +189,17 @@ bool DmaPusher::Step() {
                 auto* const engine_state = subchannels[dma_state.subchannel];
                 if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
                     // The caches behind IsMemoryDirty belong to the split's back thread.
-                    split.Defer([engine_state, memory = &memory_manager, address = GPUVAddr{dma_state.dma_get},
-                                 bytes = words * sizeof(u32)] {
+                    const VideoCommon::V2::Ir::ReadbackBody body{
+                        .op = VideoCommon::V2::Ir::ReadbackOp::SegmentDirty,
+                        .object = split.Ref(engine_state),
+                        .object2 = split.Ref(&memory_manager),
+                        .cache = 0,
+                        .address = dma_state.dma_get,
+                        .bytes = words * sizeof(u32),
+                    };
+                    split.Emit(VideoCommon::V2::Ir::Kind::Readback, body,
+                               [engine_state, memory = &memory_manager,
+                                address = GPUVAddr{dma_state.dma_get}, bytes = words * sizeof(u32)] {
                         engine_state->current_dirty = memory->IsMemoryDirty(address, bytes);
                     }, VideoCommon::GpuSplit::FastDrawNeutral);
                 } else {
@@ -303,22 +326,23 @@ bool DmaPusher::Step() {
     }
 
     if (signal_sync) {
-        const auto signal = [this] {
-            rasterizer->SignalFence([this]() {
-                std::scoped_lock lk(sync_mutex);
-                synced = true;
-                sync_cv.notify_all();
-            });
+        const auto signal = [this] { SignalSyncFence(); };
+        auto& split = VideoCommon::GpuSplit::Get();
+        const VideoCommon::V2::Ir::BarrierBody body{
+            .op = VideoCommon::V2::Ir::BarrierOp::SyncFence,
+            .object = split.Ref(this),
+            .a = 0,
+            .b = 0,
         };
-        if (auto& split = VideoCommon::GpuSplit::Get();
-            split.Active() && split.HazardMode() == VideoCommon::V2::Mode::On) [[unlikely]] {
+        if (split.Active() && split.HazardMode() == VideoCommon::V2::Mode::On) [[unlikely]] {
             // EDEN_NX2_V2_HAZARD: the next entry waits for the fence itself (sync_cv), which
             // signals only once the back ran this and the GPU passed it: no drain needed.
-            split.Defer(signal);
+            split.Emit(VideoCommon::V2::Ir::Kind::Barrier, body, signal);
             VideoCommon::V2::Stats::NoteDecision(VideoCommon::DrainSite::GpSyncFence,
                                                  VideoCommon::V2::Stats::Decision::Avoided);
         } else {
-            VideoCommon::GpuSplit::Get().Run(signal, VideoCommon::DrainSite::GpSyncFence);
+            split.RunTyped(VideoCommon::V2::Ir::Kind::Barrier, body, signal,
+                           VideoCommon::DrainSite::GpSyncFence);
         }
     }
 
@@ -889,7 +913,13 @@ bool DmaPusher::FlushGpuWrittenCommands(GPUVAddr address, size_t size) {
             }
         }
         // `pages` outlives the call: the drain below waits for it.
-        split.Defer([rasterizer = rasterizer, pages = std::span<const DAddr>{pages}] {
+        const VideoCommon::V2::Ir::ReadbackBody body{
+            .op = VideoCommon::V2::Ir::ReadbackOp::ListPages,
+            .object = split.Ref(rasterizer),
+        };
+        split.EmitPayload(VideoCommon::V2::Ir::Kind::Readback, body,
+                          reinterpret_cast<const u64*>(pages.data()), pages.size(),
+                          [rasterizer = rasterizer, pages = std::span<const DAddr>{pages}] {
             rasterizer->FlushGpuWrittenCommandListPages(pages);
         });
         split.Drain(VideoCommon::DrainSite::ListFlush);
@@ -913,13 +943,26 @@ bool DmaPusher::FlushGpuWrittenCommands(GPUVAddr address, size_t size) {
                 pages.push_back(*device);
             }
         }
-        VideoCommon::GpuSplit::Get().Run(
+        const VideoCommon::V2::Ir::ReadbackBody body{
+            .op = VideoCommon::V2::Ir::ReadbackOp::ListPages,
+            .object = split.Ref(rasterizer),
+        };
+        split.RunTypedPayload(
+            VideoCommon::V2::Ir::Kind::Readback, body, reinterpret_cast<const u64*>(pages.data()),
+            pages.size(),
             [rasterizer = rasterizer, pages = std::span<const DAddr>{pages}] {
                 rasterizer->FlushGpuWrittenCommandListPages(pages);
             },
             VideoCommon::DrainSite::ListFlush);
     } else if (dirty) {
-        VideoCommon::GpuSplit::Get().Run(
+        const VideoCommon::V2::Ir::ReadbackBody body{
+            .op = VideoCommon::V2::Ir::ReadbackOp::MemoryFlush,
+            .object = split.Ref(&memory_manager),
+            .address = first_page,
+            .bytes = end_page - first_page,
+        };
+        split.RunTyped(
+            VideoCommon::V2::Ir::Kind::Readback, body,
             [memory = &memory_manager, first_page, size = end_page - first_page] {
                 memory->FlushRegion(first_page, size, VideoCommon::CacheType::BufferCache);
             },

@@ -44,7 +44,16 @@ u32 ReadSemaphoreWord(DmaPusher& dma_pusher, GPUVAddr address) {
     if (const auto device = dma_pusher.memory_manager.GpuToCpuAddress(address);
         device && dma_pusher.rasterizer->MustFlushRegion(*device, sizeof(u32),
                                                           VideoCommon::CacheType::BufferCache)) {
-        VideoCommon::GpuSplit::Get().Run(
+        auto& split = VideoCommon::GpuSplit::Get();
+        const VideoCommon::V2::Ir::ReadbackBody body{
+            .op = VideoCommon::V2::Ir::ReadbackOp::FlushCache,
+            .object = split.Ref(dma_pusher.rasterizer),
+            .cache = static_cast<u32>(VideoCommon::CacheType::BufferCache),
+            .address = *device,
+            .bytes = sizeof(u32),
+        };
+        split.RunTyped(
+            VideoCommon::V2::Ir::Kind::Readback, body,
             [rasterizer = dma_pusher.rasterizer, device = *device] {
                 rasterizer->FlushRegion(device, sizeof(u32), VideoCommon::CacheType::BufferCache);
             },
@@ -54,12 +63,14 @@ u32 ReadSemaphoreWord(DmaPusher& dma_pusher, GPUVAddr address) {
 }
 
 // With the GPU thread split (gpu_split.h) the rasterizer belongs to the back thread: work that
-// only feeds it runs there in order; reads of what it wrote first wait for it (DrainBack).
-// `hint`: the IR record kind of the call (EDEN_NX2_V2_IR).
+// only feeds it runs there in order; reads of what it wrote first wait for it (DrainBack). With
+// the typed IR it is a Barrier record (EDEN_NX2_V2_IR).
 template <typename Func>
-void OnBack(const Func& func, VideoCommon::V2::Ir::Kind hint = VideoCommon::V2::Ir::Kind::Callback) {
+void OnBackBarrier(DmaPusher& dma_pusher, VideoCommon::V2::Ir::BarrierOp op, const Func& func) {
     if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
-        split.Defer(func, VideoCommon::GpuSplit::Hint(hint));
+        const VideoCommon::V2::Ir::BarrierBody body{
+            .op = op, .object = split.Ref(dma_pusher.rasterizer), .a = 0, .b = 0};
+        split.Emit(VideoCommon::V2::Ir::Kind::Barrier, body, func);
     } else {
         func();
     }
@@ -77,8 +88,9 @@ void OnBackRelease(DmaPusher& dma_pusher, GPUVAddr address, u32 payload, u32 byt
             .bytes = bytes,
             .op = VideoCommon::V2::Ir::ReleaseOp::Payload,
             .address_space = static_cast<u32>(dma_pusher.memory_manager.GetID()),
+            .rasterizer = split.Ref(dma_pusher.rasterizer),
         };
-        split.DeferTyped(VideoCommon::V2::Ir::Kind::Release, body, func);
+        split.Emit(VideoCommon::V2::Ir::Kind::Release, body, func);
         if (split.TracksWrites()) [[unlikely]] {
             // 4-byte releases are fence-flagged (IsAFence); the 16-byte WriteLong is not.
             VideoCommon::V2::NoteReleaseWrite(split, dma_pusher.memory_manager, address, payload,
@@ -97,9 +109,16 @@ void DrainBack() {
 // The fence manager records into the scheduler and downloads the CPU's writes over GPU data:
 // the back's state, which a drained back still uses from its idle hook (it submits).
 void ReleaseFences(DmaPusher& dma_pusher) {
-    VideoCommon::GpuSplit::Get().Run(
-        [rasterizer = dma_pusher.rasterizer] { rasterizer->ReleaseFences(); },
-        VideoCommon::DrainSite::FenceRelease);
+    auto& split = VideoCommon::GpuSplit::Get();
+    const VideoCommon::V2::Ir::BarrierBody body{
+        .op = VideoCommon::V2::Ir::BarrierOp::ReleaseFences,
+        .object = split.Ref(dma_pusher.rasterizer),
+        .a = 0,
+        .b = 0,
+    };
+    split.RunTyped(VideoCommon::V2::Ir::Kind::Barrier, body,
+                   [rasterizer = dma_pusher.rasterizer] { rasterizer->ReleaseFences(); },
+                   VideoCommon::DrainSite::FenceRelease);
 }
 
 namespace V2Stats = VideoCommon::V2::Stats;
@@ -457,14 +476,27 @@ void Puller::ProcessFenceActionMethod(DmaPusher& dma_pusher) {
     case Puller::FenceOperation::Acquire:
         // UNIMPLEMENTED_MSG("Channel Scheduling pending.");
         // WaitFence(regs.fence_action.syncpoint_id, regs.fence_value);
-        OnBack([rasterizer = dma_pusher.rasterizer] { rasterizer->ReleaseFences(); },
-               VideoCommon::V2::Ir::Kind::Barrier);
+        OnBackBarrier(dma_pusher, VideoCommon::V2::Ir::BarrierOp::ReleaseFences,
+                      [rasterizer = dma_pusher.rasterizer] { rasterizer->ReleaseFences(); });
         VideoCommon::GpuSplit::Get().NoteSync();
         break;
     case Puller::FenceOperation::Increment:
-        OnBack([rasterizer = dma_pusher.rasterizer, id = static_cast<u32>(regs.fence_action.syncpoint_id.Value())] {
-            rasterizer->SignalSyncPoint(id);
-        }, VideoCommon::V2::Ir::Kind::SyncPoint);
+        if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
+            const u32 id = static_cast<u32>(regs.fence_action.syncpoint_id.Value());
+            const VideoCommon::V2::Ir::SyncPointBody body{
+                .id = id,
+                .value = 0,
+                .op = VideoCommon::V2::Ir::SyncPointOp::Increment,
+                .object = split.Ref(dma_pusher.rasterizer),
+                .a = 0,
+                .b = 0,
+            };
+            split.Emit(VideoCommon::V2::Ir::Kind::SyncPoint, body,
+                       [rasterizer = dma_pusher.rasterizer, id] { rasterizer->SignalSyncPoint(id); });
+        } else {
+            dma_pusher.rasterizer->SignalSyncPoint(
+                static_cast<u32>(regs.fence_action.syncpoint_id.Value()));
+        }
         break;
     default:
         UNIMPLEMENTED_MSG("Unimplemented operation {}", regs.fence_action.op.Value());
@@ -545,8 +577,8 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
                 if (const auto device = dma_pusher.memory_manager.GpuToCpuAddress(acquire.address)) {
                     waiters.Add(this, *device, acquire.value, acquire.operation);
                 }
-                OnBack([rasterizer = dma_pusher.rasterizer] { rasterizer->ReleaseFences(); },
-                       VideoCommon::V2::Ir::Kind::Barrier);
+                OnBackBarrier(dma_pusher, VideoCommon::V2::Ir::BarrierOp::ReleaseFences,
+                              [rasterizer = dma_pusher.rasterizer] { rasterizer->ReleaseFences(); });
                 pending_acquire = acquire;
                 dma_pusher.suspensions.fetch_add(1, std::memory_order_release);
                 VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AcquireWaits, 1);
@@ -767,15 +799,15 @@ void Puller::CallPullerMethod(DmaPusher& dma_pusher, const MethodCall& method_ca
     case BufferMethods::WrcacheFlush:
         break;
     case BufferMethods::RefCnt:
-        OnBack([rasterizer = dma_pusher.rasterizer] { rasterizer->SignalReference(); },
-               VideoCommon::V2::Ir::Kind::Barrier);
+        OnBackBarrier(dma_pusher, VideoCommon::V2::Ir::BarrierOp::SignalReference,
+                      [rasterizer = dma_pusher.rasterizer] { rasterizer->SignalReference(); });
         break;
     case BufferMethods::SyncpointOperation:
         ProcessFenceActionMethod(dma_pusher);
         break;
     case BufferMethods::WaitForIdle:
-        OnBack([rasterizer = dma_pusher.rasterizer] { rasterizer->WaitForIdle(); },
-               VideoCommon::V2::Ir::Kind::Barrier);
+        OnBackBarrier(dma_pusher, VideoCommon::V2::Ir::BarrierOp::WaitForIdle,
+                      [rasterizer = dma_pusher.rasterizer] { rasterizer->WaitForIdle(); });
         VideoCommon::GpuSplit::Get().NoteSync();
         break;
     case BufferMethods::SemaphoreOperation: {
@@ -792,8 +824,8 @@ void Puller::CallPullerMethod(DmaPusher& dma_pusher, const MethodCall& method_ca
     }
     case BufferMethods::MemOpB: {
         // Implement this better.
-        OnBack([rasterizer = dma_pusher.rasterizer] { rasterizer->InvalidateGPUCache(); },
-               VideoCommon::V2::Ir::Kind::Barrier);
+        OnBackBarrier(dma_pusher, VideoCommon::V2::Ir::BarrierOp::InvalidateCaches,
+                      [rasterizer = dma_pusher.rasterizer] { rasterizer->InvalidateGPUCache(); });
 
         break;
     }

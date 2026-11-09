@@ -30,6 +30,7 @@
 #include "video_core/nx2.h"
 #include "video_core/nx2_fast_draw.h"
 #include "video_core/nx2_profile.h"
+#include "video_core/v2/ir_exec.h"
 #include "video_core/v2/v2_stats.h"
 
 namespace VideoCommon {
@@ -647,16 +648,20 @@ size_t GpuSplit::ExecuteIr(const u64* entry) {
                                 data.amount, data.methods_pending);
         break;
     }
-    default:
-        // Callback and the typed kinds that still carry the function that runs them.
+    default: {
+        if ((head & FastDrawNeutral) == 0) {
+            Nx2FastDraw::Break(Nx2FastDraw::Reason::Call);
+        }
         if ((head & V2::Ir::HasThunk) != 0) {
-            if ((head & FastDrawNeutral) == 0) {
-                Nx2FastDraw::Break(Nx2FastDraw::Reason::Call);
-            }
+            // Callback: debug hooks only.
             const u64* const thunk = arena.At(payload.index);
             reinterpret_cast<void (*)(const u64*)>(thunk[0])(thunk + 1);
+            break;
         }
+        const V2::IrExec::Context context{*system, *objects, arena};
+        V2::IrExec::Execute(V2::Ir::Decode(entry), context);
         break;
+    }
     }
     return size;
 }

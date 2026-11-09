@@ -128,6 +128,8 @@ add_library(video_core STATIC
     v2/hazard.h
     v2/ir.h
     v2/ir_arena.h
+    v2/ir_exec.cpp
+    v2/ir_exec.h
     v2/landing.h
     v2/macro_hle.cpp
     v2/macro_hle.h
