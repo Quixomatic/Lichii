@@ -451,6 +451,9 @@ private:
     const bool worker_only_build;
     bool uses_push_descriptor{false};
     bool uses_descriptor_buffer{false};
+    /// EDEN_NX2_V2_BINDLESS: some sampled textures read the heap (set 1, pushed words).
+    bool heap_pipeline{false};
+    HeapPushConstant heap_push{};
 
     // Mesh emulation (MeshEmulationSetup).
     std::optional<MeshEmulationSetup> mesh_emulation;

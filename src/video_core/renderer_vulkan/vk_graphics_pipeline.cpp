@@ -444,11 +444,22 @@ GraphicsPipeline::GraphicsPipeline(
         }
     }
 
+    // EDEN_NX2_V2_BINDLESS: the pipeline cache marked heap textures before emission.
+    BindlessHeap* const heap = BindlessHeap::Active();
+    heap_pipeline = heap != nullptr && !mesh_emulation &&
+                    std::ranges::any_of(stage_infos, [](const Shader::Info& info) {
+                        return info.heap_texture_mask != 0;
+                    });
+    if (heap_pipeline) {
+        heap_push.heap = heap;
+        heap_push.verify = VideoCommon::V2::Verify(VideoCommon::V2::Switch::Bindless);
+    }
     DescriptorLayoutBuilder builder{MakeBuilder(device, stage_infos, mesh_emulation)};
     // Mesh emulation binds one descriptor set to both the compute dispatch and the draw.
     uses_push_descriptor = !mesh_emulation && builder.CanUsePushDescriptor();
-    uses_descriptor_buffer = !mesh_emulation && builder.CanUseDescriptorBuffer() &&
-                             descriptor_buffer_ring.IsValid();
+    // A layout with descriptor buffer sets can't take the heap's update-after-bind set.
+    uses_descriptor_buffer = !mesh_emulation && !heap_pipeline &&
+                             builder.CanUseDescriptorBuffer() && descriptor_buffer_ring.IsValid();
     // After every stage's descriptors: the output buffer, then with a task program its payload,
     // offset and map buffers.
     const u32 emulation_buffers{mesh_emulation ? (mesh_emulation->has_task ? 4U : 1U) : 0U};
@@ -469,7 +480,7 @@ GraphicsPipeline::GraphicsPipeline(
     }
 
     const VkDescriptorSetLayout set_layout{*descriptor_set_layout};
-    pipeline_layout = builder.CreatePipelineLayout(set_layout);
+    pipeline_layout = builder.CreatePipelineLayout(set_layout, heap_pipeline ? heap : nullptr);
     if (!uses_descriptor_buffer) {
         descriptor_update_template =
             builder.CreateTemplate(set_layout, *pipeline_layout, uses_push_descriptor);
@@ -972,7 +983,8 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         {
             Profile::Scope scope{Profile::Zone::PushDescriptors};
             PushImageDescriptors(texture_cache, guest_descriptor_queue, stage_infos[stage],
-                                 rescaling, samplers_it, views_it);
+                                 rescaling, samplers_it, views_it,
+                                 heap_pipeline ? &heap_push : nullptr);
         }
         const auto& info{stage_infos[stage]};
         if (info.uses_render_area) {
@@ -1087,7 +1099,8 @@ bool GraphicsPipeline::ConfigureDelta(bool is_indexed) {
         {
             Profile::Scope scope{Profile::Zone::PushDescriptors};
             PushImageDescriptors(texture_cache, guest_descriptor_queue, stage_infos[stage],
-                                 rescaling, samplers_it, views_it);
+                                 rescaling, samplers_it, views_it,
+                                 heap_pipeline ? &heap_push : nullptr);
         }
         if (stage_infos[stage].uses_render_area) {
             render_area.uses_render_area = true;
@@ -1490,6 +1503,31 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
                                       descriptor_set, nullptr);
         }
     });
+    if (heap_pipeline) {
+        // EDEN_NX2_V2_BINDLESS: the heap set (bound again with the pipeline; binds of set 0
+        // with this layout leave it bound) and this draw's heap words.
+        if (V2::P3Stats::Enabled()) {
+            auto& data = V2::P3Stats::Get();
+            ++data.heap_draws;
+            for (const Shader::Info& info : stage_infos) {
+                data.heap_textures += static_cast<u64>(std::popcount(info.heap_texture_mask));
+            }
+        }
+        scheduler.Record([this, bind_heap = bind_pipeline,
+                          words = heap_push.words](vk::CommandBuffer cmdbuf) {
+            if (bind_heap) {
+                const VkDescriptorSet heap_set{heap_push.heap->Set()};
+                cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS, *pipeline_layout,
+                                          Shader::Backend::SPIRV::HEAP_SET, heap_set, nullptr);
+            }
+            cmdbuf.PushConstants(*pipeline_layout, VK_SHADER_STAGE_ALL_GRAPHICS,
+                                 Shader::Backend::SPIRV::HEAP_PUSH_OFFSET,
+                                 static_cast<u32>(sizeof(words)), words.data());
+        });
+    } else if (V2::P3Stats::Enabled() && num_textures != 0 &&
+               BindlessHeap::Active() != nullptr) {
+        ++V2::P3Stats::Get().heap_fallback_draws;
+    }
     return true;
 }
 

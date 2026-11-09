@@ -827,6 +827,12 @@ private:
 class Sampler {
 public:
     explicit Sampler(TextureCacheRuntime&, const Tegra::Texture::TSCEntry&);
+    ~Sampler();
+
+    Sampler(const Sampler&) = delete;
+    Sampler& operator=(const Sampler&) = delete;
+    Sampler(Sampler&&) noexcept = default;
+    Sampler& operator=(Sampler&&) noexcept = default;
 
     [[nodiscard]] VkSampler Handle() const noexcept {
         return *variants.front().sampler;

@@ -8,10 +8,13 @@
 
 #include <array>
 #include <optional>
+#include <utility>
+#include <vector>
 
 #include <sirit/sirit.h>
 #include "common/container/unordered_set.h"
 
+#include "shader_recompiler/backend/spirv/bindless_heap.h"
 #include "shader_recompiler/backend/bindings.h"
 #include "shader_recompiler/frontend/ir/program.h"
 #include "shader_recompiler/profile.h"
@@ -42,6 +45,10 @@ struct TextureDefinition {
     u32 count;
     bool is_multisample;
     bool is_integer;
+    /// EDEN_NX2_V2_BINDLESS: `id` is the heap image array of the descriptor's class and
+    /// `pointer_type` points to one of its images; `heap_word` is its push word.
+    bool heap{};
+    u32 heap_word{};
 };
 
 struct TextureBufferDefinition {
@@ -325,6 +332,16 @@ public:
     Id render_area_push_constant{};
     u32 render_are_member_index{};
 
+    // EDEN_NX2_V2_BINDLESS (bindless_heap.h): the heap's sampler array and image arrays, and the
+    // push constant member with the draw's heap words.
+    Id heap_sampler_type{};
+    Id heap_sampler_pointer{};
+    Id heap_samplers{};
+    std::vector<std::pair<u32, Id>> heap_image_variables; ///< (image type id, array variable)
+    Id heap_words_type{};
+    u32 heap_words_member_index{};
+    bool uses_heap{};
+
     Id local_memory{};
 
     bool uses_explicit_workgroup_layout{};
@@ -458,6 +475,7 @@ private:
     void DefineTextureBuffers(const Info& info, u32& binding);
     void DefineImageBuffers(const Info& info, u32& binding);
     void DefineTextures(const Info& info, u32& binding, u32& scaling_index);
+    void DefineHeapTexture(const Info& info, const TextureDescriptor& desc, size_t index);
     void DefineImages(const Info& info, u32& binding, u32& scaling_index);
     void DefineAttributeMemAccess(const Info& info);
     void DefineWriteStorageCasLoopFunction(const Info& info);

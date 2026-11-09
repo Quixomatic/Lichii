@@ -1012,6 +1012,13 @@ FN_MAX_LIMIT_LIST
         return features.descriptor_indexing.descriptorBindingPartiallyBound;
     }
 
+    /// Pipeline v2 (EDEN_NX2_V2_BINDLESS): sampled image bindings can be written after they are
+    /// bound and while pending work uses other elements (enabled only with the switch).
+    bool IsSampledImageUpdateAfterBindSupported() const {
+        return features.descriptor_indexing.descriptorBindingSampledImageUpdateAfterBind &&
+               features.descriptor_indexing.descriptorBindingUpdateUnusedWhilePending;
+    }
+
     bool HasTimelineSemaphore() const;
 
     /// Returns true if the device supports VK_KHR_synchronization2.

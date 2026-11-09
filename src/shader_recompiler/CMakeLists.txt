@@ -7,6 +7,7 @@
 add_library(shader_recompiler STATIC
     backend/bindings.h
     backend/spirv/emit_spirv.cpp
+    backend/spirv/bindless_heap.h
     backend/spirv/emit_spirv.h
     backend/spirv/emit_spirv_atomic.cpp
     backend/spirv/emit_spirv_barriers.cpp

@@ -1259,10 +1259,11 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
 }
 
 void EmitContext::DefineRescalingInput(const Info& info) {
-    if (!info.uses_rescaling_uniform) {
+    if (!info.uses_rescaling_uniform && !uses_heap) {
         return;
     }
-    if (profile.unified_descriptor_binding) {
+    // The heap words share the one push constant block a stage may use (bindless_heap.h).
+    if (profile.unified_descriptor_binding || uses_heap) {
         DefineRescalingInputPushConstant();
     } else {
         DefineRescalingInputUniformConstant();
@@ -1270,7 +1271,7 @@ void EmitContext::DefineRescalingInput(const Info& info) {
 }
 
 void EmitContext::DefineRescalingInputPushConstant() {
-    boost::container::static_vector<Id, 3> members{};
+    boost::container::static_vector<Id, 4> members{};
     u32 member_index{0};
 
     rescaling_textures_type = TypeArray(U32[1], Const(4u));
@@ -1287,9 +1288,20 @@ void EmitContext::DefineRescalingInputPushConstant() {
         members.push_back(F32[1]);
         rescaling_downfactor_member_index = member_index++;
     }
+    if (uses_heap) {
+        heap_words_type = TypeArray(U32[1], Const(MAX_HEAP_TEXTURES));
+        Decorate(heap_words_type, spv::Decoration::ArrayStride, 4u);
+        members.push_back(heap_words_type);
+        heap_words_member_index = member_index++;
+    }
     const Id push_constant_struct{TypeStruct(std::span(members.data(), members.size()))};
     Decorate(push_constant_struct, spv::Decoration::Block);
     Name(push_constant_struct, "ResolutionInfo");
+    if (uses_heap) {
+        MemberDecorate(push_constant_struct, heap_words_member_index, spv::Decoration::Offset,
+                       HEAP_PUSH_OFFSET);
+        MemberName(push_constant_struct, heap_words_member_index, "heap_words");
+    }
 
     MemberDecorate(push_constant_struct, rescaling_textures_member_index, spv::Decoration::Offset,
                    static_cast<u32>(offsetof(RescalingLayout, rescaling_textures)));
@@ -1616,7 +1628,15 @@ void EmitContext::DefineImageBuffers(const Info& info, u32& binding) {
 
 void EmitContext::DefineTextures(const Info& info, u32& binding, u32& scaling_index) {
     textures.reserve(info.texture_descriptors.size());
-    for (const TextureDescriptor& desc : info.texture_descriptors) {
+    for (size_t index = 0; index < info.texture_descriptors.size(); ++index) {
+        const TextureDescriptor& desc{info.texture_descriptors[index]};
+        if (UsesHeap(info, index)) [[unlikely]] {
+            // EDEN_NX2_V2_BINDLESS: an element of the heap's image array of its class; no
+            // binding of its own (the host skips it too), its rescaling bit as before.
+            DefineHeapTexture(info, desc, index);
+            ++scaling_index;
+            continue;
+        }
         const Id image_type{ImageType(*this, desc)};
         const Id sampled_type{TypeSampledImage(image_type)};
         const Id pointer_type{TypePointer(spv::StorageClass::UniformConstant, sampled_type)};
@@ -1643,6 +1663,61 @@ void EmitContext::DefineTextures(const Info& info, u32& binding, u32& scaling_in
     if (info.uses_atomic_image_u32) {
         image_u32 = TypePointer(spv::StorageClass::Image, U32[1]);
     }
+}
+
+void EmitContext::DefineHeapTexture(const Info& info, const TextureDescriptor& desc,
+                                    size_t index) {
+    uses_heap = true;
+    const Id image_type{ImageType(*this, desc)};
+    const Id sampled_type{TypeSampledImage(image_type)};
+    const u32 heap_binding{HeapImageBinding(desc.type, desc.is_multisample, desc.is_integer)};
+    // One variable per image type: depth and colour views of a class alias one binding, which
+    // Vulkan allows for compatible descriptor types.
+    const Id image_pointer{TypePointer(spv::StorageClass::UniformConstant, image_type)};
+    const Id array_type{TypeArray(image_type, Const(MAX_HEAP_ARRAY_LENGTH))};
+    const Id array_pointer{TypePointer(spv::StorageClass::UniformConstant, array_type)};
+    Id array{};
+    for (const auto& [type, variable] : heap_image_variables) {
+        if (type == image_type.value) {
+            array = variable;
+            break;
+        }
+    }
+    if (!Sirit::ValidId(array)) {
+        array = AddGlobalVariable(array_pointer, spv::StorageClass::UniformConstant);
+        Decorate(array, spv::Decoration::Binding, heap_binding);
+        Decorate(array, spv::Decoration::DescriptorSet, HEAP_SET);
+        Name(array, fmt::format("heap_images_{}", heap_binding));
+        heap_image_variables.emplace_back(image_type.value, array);
+        if (profile.supported_spirv >= 0x00010400) {
+            interfaces.push_back(array);
+        }
+    }
+    if (!Sirit::ValidId(heap_samplers)) {
+        heap_sampler_type = TypeSampler();
+        heap_sampler_pointer = TypePointer(spv::StorageClass::UniformConstant, heap_sampler_type);
+        const Id sampler_array{TypeArray(heap_sampler_type, Const(MAX_HEAP_ARRAY_LENGTH))};
+        heap_samplers = AddGlobalVariable(
+            TypePointer(spv::StorageClass::UniformConstant, sampler_array),
+            spv::StorageClass::UniformConstant);
+        Decorate(heap_samplers, spv::Decoration::Binding, HEAP_SAMPLER_BINDING);
+        Decorate(heap_samplers, spv::Decoration::DescriptorSet, HEAP_SET);
+        Name(heap_samplers, "heap_samplers");
+        if (profile.supported_spirv >= 0x00010400) {
+            interfaces.push_back(heap_samplers);
+        }
+    }
+    textures.push_back({
+        .id = array,
+        .sampled_type = sampled_type,
+        .pointer_type = image_pointer,
+        .image_type = image_type,
+        .count = desc.count,
+        .is_multisample = desc.is_multisample,
+        .is_integer = desc.is_integer,
+        .heap = true,
+        .heap_word = HeapPushIndex(info, index),
+    });
 }
 
 void EmitContext::DefineImages(const Info& info, u32& binding, u32& scaling_index) {

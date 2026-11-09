@@ -21,6 +21,7 @@
 #include "video_core/oot_network.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/renderer_vulkan/blit_image.h"
+#include "video_core/renderer_vulkan/vk_bindless_heap.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
 #include "video_core/renderer_vulkan/vk_descriptor_buffer.h"
 #include "video_core/renderer_vulkan/vk_descriptor_pool.h"
@@ -204,6 +205,8 @@ private:
     bool NoMeshDebug();
     /// EDEN_NX2_V2_LEANDRAW: whether the program is Ocarina's (-1: not known yet).
     s8 oot_title{-1};
+    /// EDEN_NX2_V2_BINDLESS: the texture heap (vk_bindless_heap.h), null when off or unsupported.
+    std::unique_ptr<BindlessHeap> bindless_heap;
     /// Pipeline v2: the program addresses whose write summaries were last recorded.
     std::array<VAddr, 6> shader_write_addresses{};
     const GraphicsPipeline* shader_write_pipeline{};

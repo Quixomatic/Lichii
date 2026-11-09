@@ -239,8 +239,38 @@ private:
     spv::ImageOperandsMask mask{};
 };
 
+/// EDEN_NX2_V2_BINDLESS: the heap word the draw pushed for a heap texture.
+Id HeapWord(EmitContext& ctx, const TextureDefinition& def) {
+    const Id pointer_type{ctx.TypePointer(spv::StorageClass::PushConstant, ctx.U32[1])};
+    const Id pointer{ctx.OpAccessChain(pointer_type, ctx.rescaling_push_constants,
+                                       ctx.Const(ctx.heap_words_member_index),
+                                       ctx.Const(def.heap_word))};
+    return ctx.OpLoad(ctx.U32[1], pointer);
+}
+
+/// The heap image of a heap texture (low 16 bits of its word).
+Id HeapImage(EmitContext& ctx, const TextureDefinition& def, Id word) {
+    const Id element{ctx.OpBitwiseAnd(ctx.U32[1], word, ctx.Const(0xffffu))};
+    const Id pointer{ctx.OpAccessChain(def.pointer_type, def.id, element)};
+    return ctx.OpLoad(def.image_type, pointer);
+}
+
+/// The sampled image of a heap texture: its image and the heap sampler of the word's high bits.
+Id HeapSampledImage(EmitContext& ctx, const TextureDefinition& def) {
+    const Id word{HeapWord(ctx, def)};
+    const Id image{HeapImage(ctx, def, word)};
+    const Id sampler_element{ctx.OpShiftRightLogical(ctx.U32[1], word, ctx.Const(16u))};
+    const Id sampler_pointer{
+        ctx.OpAccessChain(ctx.heap_sampler_pointer, ctx.heap_samplers, sampler_element)};
+    const Id sampler{ctx.OpLoad(ctx.heap_sampler_type, sampler_pointer)};
+    return ctx.OpSampledImage(def.sampled_type, image, sampler);
+}
+
 Id Texture(EmitContext& ctx, IR::TextureInstInfo info, [[maybe_unused]] const IR::Value& index) {
     const TextureDefinition& def{ctx.textures.at(info.descriptor_index)};
+    if (def.heap) [[unlikely]] {
+        return HeapSampledImage(ctx, def);
+    }
     if (def.count > 1) {
         auto const idx = index.IsImmediate() ? ctx.Const(index.U32()) : ctx.Def(index);
         const bool non_uniform{MarkNonUniform(ctx, idx, index, NonUniformKind::SampledImage)};
@@ -274,6 +304,9 @@ Id TextureImage(EmitContext& ctx, IR::TextureInstInfo info, const IR::Value& ind
         return ctx.OpLoad(ctx.image_buffer_type, def.id);
     } else {
         const TextureDefinition& def{ctx.textures.at(info.descriptor_index)};
+        if (def.heap) [[unlikely]] {
+            return HeapImage(ctx, def, HeapWord(ctx, def));
+        }
         if (def.count > 1) {
             auto const idx = index.IsImmediate() ? ctx.Const(index.U32()) : ctx.Def(index);
             const bool non_uniform{MarkNonUniform(ctx, idx, index, NonUniformKind::SampledImage)};

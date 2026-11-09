@@ -1,8 +1,12 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <memory>
 #include <random>
 #include <vector>
@@ -10,6 +14,9 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include "core/core.h"
+#include "shader_recompiler/backend/spirv/bindless_heap.h"
+#include "shader_recompiler/backend/spirv/emit_spirv.h"
+#include "shader_recompiler/frontend/ir/ir_emitter.h"
 #include "core/device_memory.h"
 #include "tests/core/system_test_context.h"
 #include "video_core/dirty_flags.h"
@@ -397,4 +404,129 @@ TEST_CASE("V2 P3 constant buffer versions", "[video_core][v2_p3]") {
     REQUIRE(table->Bytes(A, 4) == std::vector<u8>{1, 2, 3, 4});
     table->Clear();
     REQUIRE(table->Find(A, 4, 9) == nullptr);
+}
+
+namespace {
+struct HeapModule {
+    u32 set1_decorations{};
+    u32 set0_decorations{};
+    bool sampled_image{};
+    bool offset_48{};
+};
+
+HeapModule EmitTextureSample(u64 heap_mask) {
+    using namespace Shader;
+    ObjectPool<IR::Inst> pool;
+    IR::Block block{pool};
+    IR::Program program;
+    program.stage = Stage::Fragment;
+    program.blocks = {&block};
+    program.post_order_blocks = {&block};
+    program.syntax_list = {{{.block = &block}, IR::AbstractSyntaxNode::Type::Block},
+                           {{}, IR::AbstractSyntaxNode::Type::Return}};
+    IR::IREmitter ir{block};
+    IR::TextureInstInfo flags{};
+    flags.type.Assign(TextureType::Color2D);
+    flags.descriptor_index.Assign(0);
+    const auto coords = ir.CompositeConstruct(ir.Imm32(0.0f), ir.Imm32(0.0f));
+    const IR::Value sample{ir.ImageSampleExplicitLod(ir.Imm32(0), coords, ir.Imm32(0.0f), {}, flags)};
+    // What the texture pass makes of the bound sample once the descriptor is known.
+    sample.InstRecursive()->ReplaceOpcode(IR::Opcode::ImageSampleExplicitLod);
+    program.info.texture_descriptors.push_back(TextureDescriptor{
+        .type = TextureType::Color2D,
+        .is_depth = false,
+        .is_multisample = false,
+        .is_integer = false,
+        .has_secondary = false,
+        .cbuf_index = 2,
+        .cbuf_offset = 0x20,
+        .shift_left = 0,
+        .secondary_cbuf_index = 0,
+        .secondary_cbuf_offset = 0,
+        .secondary_shift_left = 0,
+        .count = 1,
+        .size_shift = 0,
+    });
+    program.info.heap_texture_mask = heap_mask;
+    program.info.heap_push_base = 3;
+    Profile profile;
+    profile.supported_spirv = 0x00010500;
+    profile.unified_descriptor_binding = true;
+    const std::vector<u32> code = Backend::SPIRV::EmitSPIRV(profile, program);
+    // EDEN_V2_HEAP_TEST_OUTPUT=<dir>: write the modules for spirv-val.
+    if (const char* directory = std::getenv("EDEN_V2_HEAP_TEST_OUTPUT")) {
+        std::filesystem::create_directories(directory);
+        std::ofstream file{std::filesystem::path{directory} /
+                               (heap_mask != 0 ? "heap.spv" : "plain.spv"),
+                           std::ios::binary};
+        file.write(reinterpret_cast<const char*>(code.data()),
+                   static_cast<std::streamsize>(code.size() * sizeof(u32)));
+    }
+    HeapModule module;
+    for (size_t i = 5; i < code.size();) {
+        const u32 opcode = code[i] & 0xffff;
+        const u32 words = code[i] >> 16;
+        REQUIRE(words != 0);
+        if (opcode == 71 && words >= 4 && code[i + 2] == 34) { // OpDecorate DescriptorSet
+            ++(code[i + 3] == 1 ? module.set1_decorations : module.set0_decorations);
+        }
+        if (opcode == 72 && words >= 5 && code[i + 3] == 35 && code[i + 4] == 48) {
+            module.offset_48 = true; // OpMemberDecorate Offset 48
+        }
+        if (opcode == 86) { // OpSampledImage
+            module.sampled_image = true;
+        }
+        i += words;
+    }
+    return module;
+}
+} // Anonymous namespace
+
+TEST_CASE("V2 P3 heap textures index the bindless heap through pushed words",
+          "[video_core][v2_p3]") {
+    namespace SPIRV = Shader::Backend::SPIRV;
+    // Bindings: one per image class and component type, after the sampler array, all distinct.
+    std::vector<u32> bindings;
+    for (const auto type : {Shader::TextureType::Color1D, Shader::TextureType::ColorArray1D,
+                            Shader::TextureType::Color2D, Shader::TextureType::ColorArray2D,
+                            Shader::TextureType::Color3D, Shader::TextureType::ColorCube,
+                            Shader::TextureType::ColorArrayCube}) {
+        for (const bool integer : {false, true}) {
+            bindings.push_back(SPIRV::HeapImageBinding(type, false, integer));
+        }
+    }
+    for (const bool integer : {false, true}) {
+        bindings.push_back(SPIRV::HeapImageBinding(Shader::TextureType::Color2D, true, integer));
+        bindings.push_back(
+            SPIRV::HeapImageBinding(Shader::TextureType::ColorArray2D, true, integer));
+    }
+    std::ranges::sort(bindings);
+    REQUIRE(std::ranges::adjacent_find(bindings) == bindings.end());
+    REQUIRE(bindings.front() == SPIRV::HEAP_SAMPLER_BINDING + 1);
+    REQUIRE(bindings.back() == SPIRV::NUM_HEAP_BINDINGS - 1);
+    REQUIRE(SPIRV::HeapImageBinding(Shader::TextureType::Color2DRect, false, false) ==
+            SPIRV::HeapImageBinding(Shader::TextureType::Color2D, false, false));
+    // Push words: the base plus the heap descriptors before it.
+    Shader::Info info;
+    info.heap_texture_mask = 0b10110;
+    info.heap_push_base = 5;
+    REQUIRE_FALSE(SPIRV::UsesHeap(info, 0));
+    REQUIRE(SPIRV::UsesHeap(info, 1));
+    REQUIRE(SPIRV::HeapPushIndex(info, 1) == 5);
+    REQUIRE(SPIRV::HeapPushIndex(info, 2) == 6);
+    REQUIRE(SPIRV::HeapPushIndex(info, 4) == 7);
+    REQUIRE_FALSE(SPIRV::UsesHeap(info, 64));
+    REQUIRE(SPIRV::HEAP_PUSH_OFFSET + SPIRV::HEAP_PUSH_SIZE <= 128);
+    // Emission: without the mask the texture is a set 0 binding as before; with it, the heap
+    // arrays of set 1, a sampled image made in the shader and the heap words at offset 48.
+    const HeapModule plain = EmitTextureSample(0);
+    REQUIRE(plain.set1_decorations == 0);
+    REQUIRE(plain.set0_decorations == 1);
+    REQUIRE_FALSE(plain.sampled_image);
+    REQUIRE_FALSE(plain.offset_48);
+    const HeapModule heap = EmitTextureSample(1);
+    REQUIRE(heap.set1_decorations == 2);
+    REQUIRE(heap.set0_decorations == 0);
+    REQUIRE(heap.sampled_image);
+    REQUIRE(heap.offset_48);
 }

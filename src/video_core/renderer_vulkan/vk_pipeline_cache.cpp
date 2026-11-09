@@ -47,6 +47,7 @@
 #include "video_core/renderer_vulkan/pipeline_shader_emission.h"
 #include "video_core/renderer_vulkan/pipeline_statistics.h"
 #include "video_core/renderer_vulkan/vertex_repack.h"
+#include "video_core/renderer_vulkan/vk_bindless_heap.h"
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
 #include "video_core/renderer_vulkan/vk_cooperative_hmma_test.h"
 #include "video_core/renderer_vulkan/vk_descriptor_pool.h"
@@ -1647,6 +1648,48 @@ void ReportUnsupportedMeshPipeline(const GraphicsPipelineCacheKey& key, const Pr
 }
 } // Anonymous namespace
 
+namespace {
+/// EDEN_NX2_V2_BINDLESS: marks the sampled textures that read the heap (bindless_heap.h): every
+/// single texture descriptor of every stage, up to MAX_HEAP_TEXTURES per pipeline, unless a stage
+/// is a task or mesh program or reads the render area (its push constant block would clash).
+void MarkHeapTextures(std::span<Shader::IR::Program> programs, const GraphicsPipelineCacheKey& key,
+                      size_t first, bool emulated_layer) {
+    namespace SPIRV = Shader::Backend::SPIRV;
+    const auto active = [&](size_t index) {
+        return key.unique_hashes[index] != 0 ||
+               (emulated_layer && index == static_cast<size_t>(Maxwell::ShaderType::Geometry));
+    };
+    for (size_t index = first; index < programs.size(); ++index) {
+        if (!active(index)) {
+            continue;
+        }
+        const Shader::IR::Program& program{programs[index]};
+        if (program.stage == Shader::Stage::Task || program.stage == Shader::Stage::Mesh ||
+            program.info.is_mesh || program.info.is_task || program.info.uses_render_area) {
+            return;
+        }
+    }
+    u32 next{};
+    for (size_t index = first; index < programs.size(); ++index) {
+        if (!active(index)) {
+            continue;
+        }
+        Shader::Info& info{programs[index].info};
+        info.heap_texture_mask = 0;
+        info.heap_push_base = next;
+        const size_t num{(std::min)(info.texture_descriptors.size(), size_t{64})};
+        for (size_t desc = 0; desc < num && next < SPIRV::MAX_HEAP_TEXTURES; ++desc) {
+            const Shader::TextureDescriptor& descriptor{info.texture_descriptors[desc]};
+            if (descriptor.count != 1 || descriptor.type == Shader::TextureType::Buffer) {
+                continue;
+            }
+            info.heap_texture_mask |= u64{1} << desc;
+            ++next;
+        }
+    }
+}
+} // Anonymous namespace
+
 GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineSlowPath() {
     GraphicsPipeline* const pipeline = FindOrCreateGraphicsPipeline();
     if (!pipeline) {
@@ -2206,6 +2249,12 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                 "Binding {} storage buffers ({} for mesh fallback) to a descriptor set limited to {}",
                 storage_buffers + auxiliary_buffers, auxiliary_buffers, set_limit);
         }
+    }
+    // EDEN_NX2_V2_BINDLESS: which sampled textures read the heap, before emission (the shaders
+    // and the pipeline's descriptor layout both follow Info::heap_texture_mask).
+    if (BindlessHeap::Active() != nullptr && !mesh_emulation) {
+        MarkHeapTextures(programs, key, uses_vertex_a && uses_vertex_b ? 1 : 0,
+                         layer_source_program != nullptr);
     }
     std::array<const Shader::Info*, Maxwell::MaxShaderStage> infos{};
     std::array<vk::ShaderModule, Maxwell::MaxShaderStage> modules;

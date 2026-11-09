@@ -60,6 +60,7 @@
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_query_cache.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
+#include "video_core/renderer_vulkan/vk_bindless_heap.h"
 #include "video_core/v2/cbuf_version.h"
 #include "video_core/v2/continued_draw.h"
 #include "video_core/v2/p3_stats.h"
@@ -433,6 +434,9 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
     VideoCommon::GpuSplit::Get().SetIdleHook(
         [](void* argument) { static_cast<Scheduler*>(argument)->FlushDeferred(); },
         &scheduler);
+    if (VideoCommon::V2::On(VideoCommon::V2::Switch::Bindless)) [[unlikely]] {
+        bindless_heap = BindlessHeap::Create(device, scheduler);
+    }
 }
 
 RasterizerVulkan::~RasterizerVulkan() {

@@ -29,6 +29,7 @@
 #include "common/settings_enums.h"
 #include "video_core/vulkan_common/nsight_aftermath_tracker.h"
 #include "video_core/vulkan_common/vma.h"
+#include "video_core/v2/v2_switches.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 #include "video_core/gpu_logging/gpu_logging.h"
@@ -734,12 +735,16 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
         descriptor_indexing.shaderStorageBufferArrayNonUniformIndexing = false;
         descriptor_indexing.shaderInputAttachmentArrayNonUniformIndexing = false;
         descriptor_indexing.descriptorBindingUniformBufferUpdateAfterBind = false;
-        descriptor_indexing.descriptorBindingSampledImageUpdateAfterBind = false;
+        // EDEN_NX2_V2_BINDLESS keeps what its heap needs (vk_bindless_heap.h); off, as before.
+        const bool bindless_heap = VideoCommon::V2::On(VideoCommon::V2::Switch::Bindless);
+        descriptor_indexing.descriptorBindingSampledImageUpdateAfterBind =
+            bindless_heap && descriptor_indexing.descriptorBindingSampledImageUpdateAfterBind;
         descriptor_indexing.descriptorBindingStorageImageUpdateAfterBind = false;
         descriptor_indexing.descriptorBindingStorageBufferUpdateAfterBind = false;
         descriptor_indexing.descriptorBindingUniformTexelBufferUpdateAfterBind = false;
         descriptor_indexing.descriptorBindingStorageTexelBufferUpdateAfterBind = false;
-        descriptor_indexing.descriptorBindingUpdateUnusedWhilePending = false;
+        descriptor_indexing.descriptorBindingUpdateUnusedWhilePending =
+            bindless_heap && descriptor_indexing.descriptorBindingUpdateUnusedWhilePending;
         descriptor_indexing.descriptorBindingVariableDescriptorCount = false;
         descriptor_indexing.runtimeDescriptorArray = false;
     }

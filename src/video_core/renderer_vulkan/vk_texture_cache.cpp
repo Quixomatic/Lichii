@@ -31,6 +31,7 @@
 #include "video_core/gpu_logging/gpu_logging.h"
 #include "video_core/nx2.h"
 #include "video_core/render_trace.h"
+#include "video_core/renderer_vulkan/vk_bindless_heap.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
 #include "video_core/texture_cache/host_mip_limits.h"
 
@@ -4484,7 +4485,26 @@ ImageView::ImageView(TextureCacheRuntime& runtime, const VideoCommon::NullImageV
     }
 }
 
-ImageView::~ImageView() = default;
+ImageView::~ImageView() {
+    // EDEN_NX2_V2_BINDLESS: the heap slots of these views are free (moved-from views hold none).
+    if (BindlessHeap* const heap = BindlessHeap::Active()) [[unlikely]] {
+        for (const vk::ImageView& view : image_views) {
+            if (view) {
+                heap->ForgetImageView(*view);
+            }
+        }
+    }
+}
+
+Sampler::~Sampler() {
+    if (BindlessHeap* const heap = BindlessHeap::Active()) [[unlikely]] {
+        for (const Variant& variant : variants) {
+            if (variant.sampler) {
+                heap->ForgetSampler(*variant.sampler);
+            }
+        }
+    }
+}
 
 VkImageView ImageView::DepthView() {
     if (!image_handle) {

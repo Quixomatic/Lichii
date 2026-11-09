@@ -12,11 +12,14 @@
 #include <boost/container/small_vector.hpp>
 
 #include "common/common_types.h"
+#include "shader_recompiler/backend/spirv/bindless_heap.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/shader_info.h"
+#include "video_core/renderer_vulkan/vk_bindless_heap.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
 #include "video_core/surface.h"
+#include "video_core/v2/p3_stats.h"
 #include "video_core/texture_cache/types.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 
@@ -135,13 +138,22 @@ inline void WriteDescriptorBuffer(const Device& device, const DescriptorBufferLa
 }
 
 [[nodiscard]] inline u32 NumDescriptorEntries(const Shader::Info& info) {
+    // Heap textures (EDEN_NX2_V2_BINDLESS, count 1 each) have no entry of their own.
     return Shader::NumDescriptors(info.constant_buffer_descriptors) +
            Shader::NumDescriptors(info.storage_buffers_descriptors) +
            Shader::NumDescriptors(info.texture_buffer_descriptors) +
            Shader::NumDescriptors(info.image_buffer_descriptors) +
-           Shader::NumDescriptors(info.texture_descriptors) +
+           Shader::NumDescriptors(info.texture_descriptors) -
+           static_cast<u32>(std::popcount(info.heap_texture_mask)) +
            Shader::NumDescriptors(info.image_descriptors);
 }
+
+/// EDEN_NX2_V2_BINDLESS: the heap words a draw pushes for its heap textures.
+struct HeapPushConstant {
+    std::array<u32, Shader::Backend::SPIRV::MAX_HEAP_TEXTURES> words{};
+    BindlessHeap* heap{};
+    bool verify{};
+};
 
 class DescriptorLayoutBuilder {
 public:
@@ -242,9 +254,32 @@ public:
         });
     }
 
-    vk::PipelineLayout CreatePipelineLayout(VkDescriptorSetLayout descriptor_set_layout) const {
+    /// With `heap` (EDEN_NX2_V2_BINDLESS), set 1 is the heap (set 0 an empty layout when the
+    /// pipeline has no other descriptor) and the push constants hold the heap words too.
+    vk::PipelineLayout CreatePipelineLayout(VkDescriptorSetLayout descriptor_set_layout,
+                                            const BindlessHeap* heap = nullptr) const {
         using Shader::Backend::SPIRV::RenderAreaLayout;
         using Shader::Backend::SPIRV::RescalingLayout;
+        if (heap != nullptr) [[unlikely]] {
+            const std::array set_layouts{descriptor_set_layout ? descriptor_set_layout
+                                                               : heap->EmptyLayout(),
+                                         heap->Layout()};
+            const VkPushConstantRange heap_range{
+                .stageFlags = VK_SHADER_STAGE_ALL_GRAPHICS,
+                .offset = 0,
+                .size = Shader::Backend::SPIRV::HEAP_PUSH_OFFSET +
+                        Shader::Backend::SPIRV::HEAP_PUSH_SIZE,
+            };
+            return device->GetLogical().CreatePipelineLayout({
+                .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+                .pNext = nullptr,
+                .flags = 0,
+                .setLayoutCount = static_cast<u32>(set_layouts.size()),
+                .pSetLayouts = set_layouts.data(),
+                .pushConstantRangeCount = 1,
+                .pPushConstantRanges = &heap_range,
+            });
+        }
         const u32 size_offset = is_compute ? sizeof(RescalingLayout::down_factor) : 0u;
         const VkPushConstantRange range{
             .stageFlags = static_cast<VkShaderStageFlags>(
@@ -306,15 +341,21 @@ public:
         Add(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, stage, info.storage_buffers_descriptors);
         Add(VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, stage, info.texture_buffer_descriptors);
         Add(VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER, stage, info.image_buffer_descriptors);
-        Add(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, stage, info.texture_descriptors);
+        Add(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, stage, info.texture_descriptors,
+            info.heap_texture_mask);
         Add(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, stage, info.image_descriptors);
     }
 
 private:
+    /// `skip`: descriptors (by index) that read the heap instead (EDEN_NX2_V2_BINDLESS).
     template <typename Descriptors>
-    void Add(VkDescriptorType type, VkShaderStageFlags stage, const Descriptors& descriptors) {
+    void Add(VkDescriptorType type, VkShaderStageFlags stage, const Descriptors& descriptors,
+             u64 skip = 0) {
         const size_t num{descriptors.size()};
         for (size_t i = 0; i < num; ++i) {
+            if (i < 64 && ((skip >> i) & 1) != 0) [[unlikely]] {
+                continue;
+            }
             bindings.push_back({
                 .binding = binding,
                 .descriptorType = type,
@@ -391,12 +432,15 @@ inline void PushImageDescriptors(TextureCache& texture_cache,
                                  GuestDescriptorQueue& guest_descriptor_queue,
                                  const Shader::Info& info, RescalingPushConstant& rescaling,
                                  const VideoCommon::SamplerId*& samplers,
-                                 const VideoCommon::ImageViewInOut*& views) {
+                                 const VideoCommon::ImageViewInOut*& views,
+                                 HeapPushConstant* heap = nullptr) {
     const u32 num_texture_buffers = Shader::NumDescriptors(info.texture_buffer_descriptors);
     const u32 num_image_buffers = Shader::NumDescriptors(info.image_buffer_descriptors);
     views += num_texture_buffers;
     views += num_image_buffers;
-    for (const auto& desc : info.texture_descriptors) {
+    for (size_t desc_index = 0; desc_index < info.texture_descriptors.size(); ++desc_index) {
+        const auto& desc{info.texture_descriptors[desc_index]};
+        const bool in_heap{heap != nullptr && Shader::Backend::SPIRV::UsesHeap(info, desc_index)};
         bool is_rescaled{};
         for (u32 index = 0; index < desc.count; ++index) {
             const VideoCommon::ImageViewId image_view_id{(views++)->id};
@@ -408,8 +452,29 @@ inline void PushImageDescriptors(TextureCache& texture_cache,
                 if (null_image_view != VK_NULL_HANDLE) vk_image_view = null_image_view;
             }
             Sampler& sampler{texture_cache.GetSampler(sampler_id)};
-            guest_descriptor_queue.AddSampledImage(vk_image_view,
-                                                   sampler.HandleFor(image_view, desc.is_depth));
+            const VkSampler vk_sampler{sampler.HandleFor(image_view, desc.is_depth)};
+            if (in_heap) [[unlikely]] {
+                // EDEN_NX2_V2_BINDLESS: the heap elements of this view and sampler (written when
+                // first seen), pushed as the descriptor's word instead of a descriptor.
+                namespace SPIRV = Shader::Backend::SPIRV;
+                const u32 binding{
+                    SPIRV::HeapImageBinding(desc.type, desc.is_multisample, desc.is_integer)};
+                const u32 image_slot{heap->heap->ImageSlot(binding, vk_image_view)};
+                const u32 sampler_slot{heap->heap->SamplerSlot(vk_sampler)};
+                heap->words[SPIRV::HeapPushIndex(info, desc_index)] =
+                    image_slot | (sampler_slot << 16);
+                if (heap->verify) {
+                    // What the old path would bind against what the heap holds there.
+                    auto& data = VideoCommon::V2::P3Stats::Get();
+                    ++data.heap_verify;
+                    if (heap->heap->ImageAt(binding, image_slot) != vk_image_view ||
+                        heap->heap->SamplerAt(sampler_slot) != vk_sampler) {
+                        ++data.heap_mismatches;
+                    }
+                }
+            } else {
+                guest_descriptor_queue.AddSampledImage(vk_image_view, vk_sampler);
+            }
             const bool element_rescaled{texture_cache.IsRescaling(image_view)};
             is_rescaled |= element_rescaled;
         }

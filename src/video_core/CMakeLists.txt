@@ -215,6 +215,8 @@ add_library(video_core STATIC
     renderer_vulkan/vk_blit_screen.cpp
     renderer_vulkan/vk_blit_screen.h
     renderer_vulkan/vk_buffer_cache_base.cpp
+    renderer_vulkan/vk_bindless_heap.cpp
+    renderer_vulkan/vk_bindless_heap.h
     renderer_vulkan/vk_buffer_cache.cpp
     renderer_vulkan/vk_buffer_cache.h
     renderer_vulkan/vk_command_pool.cpp
