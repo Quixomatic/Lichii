@@ -195,6 +195,15 @@ private:
     /// Remembers render target 0 of a draw with one of Ocarina of Time's tonemap shaders.
     void TrackOotTonemappedImage(const GraphicsPipeline& pipeline);
     bool TryNx2IndirectReset(bool is_indexed, u32 instance_count);
+    /// The env-gated per-draw debug hooks of Draw; true when the draw must be skipped
+    /// (EDEN_NX2_SKIP_VS).
+    bool DrawDebugHooks(bool is_indexed, u32 instance_count);
+    /// EDEN_NX2_V2_LEANDRAW: whether DrawDebugHooks can do anything (one cached gate).
+    [[nodiscard]] bool DrawHooksActive() const;
+    /// EDEN_NX2_NO_MESH / EDEN_NX2_NO_MESH_FILE: whether task/mesh draws are skipped.
+    bool NoMeshDebug();
+    /// EDEN_NX2_V2_LEANDRAW: whether the program is Ocarina's (-1: not known yet).
+    s8 oot_title{-1};
     /// Pipeline v2: the program addresses whose write summaries were last recorded.
     std::array<VAddr, 6> shader_write_addresses{};
     const GraphicsPipeline* shader_write_pipeline{};

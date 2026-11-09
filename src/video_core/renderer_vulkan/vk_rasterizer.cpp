@@ -883,6 +883,47 @@ bool RasterizerVulkan::TryNx2IndirectReset(bool is_indexed, u32 instance_count) 
     return true;
 }
 
+namespace {
+/// The environment variables the per-draw debug hooks read, read once (EDEN_NX2_V2_LEANDRAW). A
+/// hook may still do nothing with its variable set (a value it doesn't accept); never the other
+/// way round.
+struct DebugHookVariables {
+    bool draw{};           ///< Any hook of RasterizerVulkan::DrawDebugHooks
+    bool no_mesh{};        ///< EDEN_NX2_NO_MESH or EDEN_NX2_NO_MESH_FILE
+    bool pending_writes{}; ///< EDEN_NX2_PENDING_WRITE_TRACE
+    bool native_capture{}; ///< EDEN_NATIVE_DRAW_CAPTURE
+};
+
+const DebugHookVariables& DebugHooks() {
+    static const DebugHookVariables variables = [] {
+        const auto set = [](const char* name) { return std::getenv(name) != nullptr; };
+        return DebugHookVariables{
+            .draw = set("EDEN_NX2_WINDOW_TRACE") || set("EDEN_NX2_CB24_TRACE") ||
+                    set("EDEN_NX2_TRACE_VS") || set("EDEN_NX2_SKIP_VS") ||
+                    set("EDEN_NX2_RT_TRACE"),
+            .no_mesh = set("EDEN_NX2_NO_MESH") || set("EDEN_NX2_NO_MESH_FILE"),
+            .pending_writes = set("EDEN_NX2_PENDING_WRITE_TRACE"),
+            .native_capture = set("EDEN_NATIVE_DRAW_CAPTURE"),
+        };
+    }();
+    return variables;
+}
+} // Anonymous namespace
+
+bool RasterizerVulkan::NoMeshDebug() {
+    // EDEN_NX2_NO_MESH=1: skip task/mesh draws as before they were supported (A/B comparisons).
+    // EDEN_NX2_NO_MESH_FILE=<path>: skip them while that file exists (checked every 1024 draws),
+    // to compare the same scene with and without them in one run.
+    static const bool no_mesh_always{std::getenv("EDEN_NX2_NO_MESH") != nullptr};
+    static const char* const no_mesh_file{std::getenv("EDEN_NX2_NO_MESH_FILE")};
+    static bool no_mesh{no_mesh_always};
+    static u32 no_mesh_check{};
+    if (no_mesh_file && (no_mesh_check++ % 1024) == 0) {
+        no_mesh = std::filesystem::exists(no_mesh_file);
+    }
+    return no_mesh;
+}
+
 template <typename Func>
 void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_indirect) {
 
@@ -1024,21 +1065,24 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         }
         return;
     }
-    if (VideoCommon::OotNetwork::BypassEnabled(Settings::GetCurrentProgramID())) {
+    const bool lean = VideoCommon::V2::On(VideoCommon::V2::Switch::LeanDraw);
+    if (lean) {
+        // EDEN_NX2_V2_LEANDRAW: the program id is fixed for the rasterizer's life.
+        if (oot_title < 0) [[unlikely]] {
+            oot_title =
+                Settings::GetCurrentProgramID() == VideoCommon::OotNetwork::ProgramId ? 1 : 0;
+        }
+        if (oot_title != 0 &&
+            VideoCommon::OotNetwork::BypassEnabled(Settings::GetCurrentProgramID())) {
+            TrackOotTonemappedImage(*pipeline);
+        }
+    } else if (VideoCommon::OotNetwork::BypassEnabled(Settings::GetCurrentProgramID())) {
         TrackOotTonemappedImage(*pipeline);
     }
     // Task/mesh pipelines: the draw's vertex count is the number of task workgroups.
     mesh_draw = pipeline->IsMeshPipeline();
-    // EDEN_NX2_NO_MESH=1: skip task/mesh draws as before they were supported (A/B comparisons).
-    // EDEN_NX2_NO_MESH_FILE=<path>: skip them while that file exists (checked every 1024 draws),
-    // to compare the same scene with and without them in one run.
-    static const bool no_mesh_always{std::getenv("EDEN_NX2_NO_MESH") != nullptr};
-    static const char* const no_mesh_file{std::getenv("EDEN_NX2_NO_MESH_FILE")};
-    static bool no_mesh{no_mesh_always};
-    static u32 no_mesh_check{};
-    if (no_mesh_file && (no_mesh_check++ % 1024) == 0) {
-        no_mesh = std::filesystem::exists(no_mesh_file);
-    }
+    // EDEN_NX2_NO_MESH / EDEN_NX2_NO_MESH_FILE (NoMeshDebug).
+    const bool no_mesh = (!lean || DebugHooks().no_mesh) ? NoMeshDebug() : false;
     const bool emulated_mesh{mesh_draw && pipeline->IsEmulatedMesh()};
     if (mesh_draw &&
         (no_mesh || (!device.IsExtMeshShaderSupported() && !emulated_mesh) ||
@@ -1246,8 +1290,12 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     TrackOcarinaCamera();
     TrackOcarinaActor(pipeline->ShaderHashes()[1], is_indexed, is_indirect);
 #endif
-    TracePendingCpuWrites(false, pipeline->ShaderHashes());
-    TraceRenderState(is_indexed, "configured", texture_cache.GetFramebuffer());
+    if (!lean || DebugHooks().pending_writes) {
+        TracePendingCpuWrites(false, pipeline->ShaderHashes());
+    }
+    if (!lean || VideoCommon::RenderTrace::Enabled()) {
+        TraceRenderState(is_indexed, "configured", texture_cache.GetFramebuffer());
+    }
     if (frame_dump.Capturing()) {
         FrameDumpPass(texture_cache.GetFramebuffer());
         frame_dump.NoteDraw(pipeline->ShaderHashes());
@@ -1339,8 +1387,8 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
             maxwell3d->v2_groups.TakeSink(VideoCommon::V2::GroupSink::ContinuedDraw));
     }
     static u32 native_capture_count{};
-    if (maxwell3d->GetNativeMacroEngine().native_turing &&
-        native_capture_count < 16 && [] {
+    if ((!lean || DebugHooks().native_capture) &&
+        maxwell3d->GetNativeMacroEngine().native_turing && native_capture_count < 16 && [] {
             static const bool capture = std::getenv("EDEN_NATIVE_DRAW_CAPTURE") != nullptr;
             return capture;
         }()) {
@@ -1463,29 +1511,11 @@ void TraceWindowTarget(const Tegra::Engines::Maxwell3D& maxwell3d, Tegra::Memory
 }
 } // Anonymous namespace
 
-void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
-    VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Draw};
-    {
-        // A draw's first and count can come from memory a skipped (rejected) compute program
-        // should have written. Past 16M vertices they are garbage: building the quad index
-        // buffer for one threw out of the GPU thread and ended the process (Hyrule Warriors:
-        // Age of Imprisonment, entering a new area), and indexed ones read far out of bounds.
-        const auto& state = maxwell3d->draw_manager.draw_state;
-        const u64 first = is_indexed ? state.index_buffer.first : state.vertex_buffer.first;
-        const u64 count = is_indexed ? state.index_buffer.count : state.vertex_buffer.count;
-        constexpr u64 MaxVertices = u64{1} << 24;
-        if (first + count > MaxVertices) {
-            static std::atomic<u32> skipped{};
-            if (skipped.fetch_add(1, std::memory_order_relaxed) < 16) {
-                LOG_WARNING(HW_GPU, "Draw skipped: {} {} from {} (vertex/index count past {})",
-                            count, is_indexed ? "indices" : "vertices", first, MaxVertices);
-            }
-            return;
-        }
-    }
-    if (TryNx2IndirectReset(is_indexed, instance_count)) {
-        return;
-    }
+bool RasterizerVulkan::DrawHooksActive() const {
+    return DebugHooks().draw || Tegra::Engines::g_nx2_trace_draws_after_upscale > 0;
+}
+
+bool RasterizerVulkan::DrawDebugHooks(bool is_indexed, u32 instance_count) {
     TraceWindowTarget(*maxwell3d, *gpu_memory, is_indexed ? "draw-indexed" : "draw",
                       is_indexed ? maxwell3d->draw_manager.draw_state.index_buffer.count
                                  : maxwell3d->draw_manager.draw_state.vertex_buffer.count);
@@ -1579,7 +1609,9 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
     if (!skip_list.empty()) {
         const auto& regs = maxwell3d->regs;
         const u64 vs = (u64{regs.pipelines[1].reserved[0] & 0xff} << 32) | regs.pipelines[1].reserved[1];
-        if (std::find(skip_list.begin(), skip_list.end(), vs) != skip_list.end()) return;
+        if (std::find(skip_list.begin(), skip_list.end(), vs) != skip_list.end()) {
+            return true;
+        }
     }
     // EDEN_NX2_RT_TRACE: log the first draw to every distinct colour target (debug aid).
     if (static const bool trace = std::getenv("EDEN_NX2_RT_TRACE") != nullptr; trace) {
@@ -1594,6 +1626,46 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
                      rt.Address(), rt.width, rt.height, static_cast<u32>(rt.format), vs, ps,
                      regs.blend.enable[0], seen.size());
         }
+    }
+    return false;
+}
+
+void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
+    VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Draw};
+    {
+        // A draw's first and count can come from memory a skipped (rejected) compute program
+        // should have written. Past 16M vertices they are garbage: building the quad index
+        // buffer for one threw out of the GPU thread and ended the process (Hyrule Warriors:
+        // Age of Imprisonment, entering a new area), and indexed ones read far out of bounds.
+        const auto& state = maxwell3d->draw_manager.draw_state;
+        const u64 first = is_indexed ? state.index_buffer.first : state.vertex_buffer.first;
+        const u64 count = is_indexed ? state.index_buffer.count : state.vertex_buffer.count;
+        constexpr u64 MaxVertices = u64{1} << 24;
+        if (first + count > MaxVertices) {
+            static std::atomic<u32> skipped{};
+            if (skipped.fetch_add(1, std::memory_order_relaxed) < 16) {
+                LOG_WARNING(HW_GPU, "Draw skipped: {} {} from {} (vertex/index count past {})",
+                            count, is_indexed ? "indices" : "vertices", first, MaxVertices);
+            }
+            return;
+        }
+    }
+    if (TryNx2IndirectReset(is_indexed, instance_count)) {
+        return;
+    }
+    // Debug hooks (env-gated traces, EDEN_NX2_SKIP_VS). EDEN_NX2_V2_LEANDRAW tests one cached
+    // gate before calling them: with none of their variables set they do nothing.
+    const bool lean = VideoCommon::V2::On(VideoCommon::V2::Switch::LeanDraw);
+    if (!lean || DrawHooksActive()) {
+        if (lean && VideoCommon::V2::P3Stats::Enabled()) [[unlikely]] {
+            ++VideoCommon::V2::P3Stats::Get().lean_cold;
+        }
+        if (DrawDebugHooks(is_indexed, instance_count)) {
+            return;
+        }
+    }
+    if (lean && VideoCommon::V2::P3Stats::Enabled()) [[unlikely]] {
+        ++VideoCommon::V2::P3Stats::Get().lean_draws;
     }
     // A direct draw with no vertices, or no instances outside task/mesh pipelines, records
     // nothing. Skip it before the pipeline, buffer and descriptor work: dirty state, deferred
