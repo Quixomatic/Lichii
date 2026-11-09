@@ -129,6 +129,12 @@ public:
     [[nodiscard]] bool DrawRecords() const {
         return draw_records;
     }
+    /// Whether Draw/Dispatch records carry their full bodies (group hashes, predicted draws):
+    /// only when something reads them, EDEN_NX2_V2_PARALLEL or IR_DRAWS=verify. Otherwise they
+    /// are V2::Ir::CompactBody records.
+    [[nodiscard]] bool FullDrawRecords() const {
+        return full_draw_records;
+    }
 
     // Pipeline v2 P2 (fixed at each start): EDEN_NX2_V2_ACQUIRE, EDEN_NX2_V2_HAZARD.
     /// Whether the front records the guest memory writes it sends (either switch on).
@@ -666,6 +672,7 @@ private:
     bool ir_verify{}; ///< EDEN_NX2_V2_IR=verify: the back checks every record header
     bool draw_records{}; ///< EDEN_NX2_V2_IR_DRAWS (DrawRecords)
     bool draw_verify{};  ///< EDEN_NX2_V2_IR_DRAWS=verify: the back checks draws (V2::IrCheck)
+    bool full_draw_records{}; ///< FullDrawRecords
     std::unique_ptr<u64[]> ring;
     V2::Resolve::SplitResolve* parallel{}; ///< EDEN_NX2_V2_PARALLEL (owned; deleted at Stop)
 

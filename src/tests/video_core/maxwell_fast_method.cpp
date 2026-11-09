@@ -80,9 +80,14 @@ struct GpuSplitTestAccess {
         split.front_macros = true;
         split.draw_records = true;
         split.draw_verify = verify;
+        split.full_draw_records = verify;
         if (verify) {
             V2::IrCheck::Start();
         }
+    }
+
+    static void SetFullDrawRecords(GpuSplit& split, bool full) {
+        split.full_draw_records = full;
     }
 
     static void SetBackThread(bool back) {
@@ -1676,4 +1681,53 @@ TEST_CASE("GpuSplit: a CPU lane request runs the lane hook, not the idle hook (n
     Access::ServeHookRequests(split);
     CHECK(lane == 2);
     CHECK(idle == 2);
+}
+
+TEST_CASE("V2 IR: without a consumer, draw records are compact and run the same",
+          "[video_core][gpu_split_dispatch][v2_ir]") {
+    using Access = VideoCommon::GpuSplitTestAccess;
+    struct Result {
+        u64 words;
+        u32 first;
+        u32 count;
+        u64 bad;
+    };
+    const auto run = [](bool full) {
+        Fixture f;
+        f.system.Initialize();
+        VideoCommon::GpuSplit split;
+        Access::Initialize(split, f.system);
+        Access::SetIr(split, true);
+        Access::SetDrawRecords(split, false);
+        Access::SetFullDrawRecords(split, full);
+        auto& engine = f.fast;
+        engine.SetNativeTuringMacroMode(true);
+        for (u32 i = 0; i < 64; ++i) {
+            engine.FrontCallMethod(f.system, split, MAXWELL3D_REG_INDEX(vertex_buffer.first), i,
+                                   true);
+            engine.FrontCallMethod(f.system, split, MAXWELL3D_REG_INDEX(vertex_buffer.count),
+                                   3 + i, true);
+            engine.FrontCallMethod(f.system, split, DrawBegin, 4, true);
+            engine.FrontCallMethod(f.system, split, DrawEnd, 0, true);
+        }
+        split.Publish();
+        Access::SetBackThread(true);
+        u64 read = 0;
+        while (read != Access::End(split)) {
+            read = Access::Execute(split, read, Access::End(split));
+        }
+        engine.ConsumeSink(f.system);
+        Access::SetBackThread(false);
+        return Result{Access::End(split), engine.regs.vertex_buffer.first,
+                      engine.regs.vertex_buffer.count, Access::IrBadRecords(split)};
+    };
+    const Result full = run(true);
+    const Result compact = run(false);
+    CHECK(full.bad == 0);
+    CHECK(compact.bad == 0);
+    CHECK(compact.first == full.first);
+    CHECK(compact.count == full.count);
+    CHECK(compact.first == 63);
+    // 5 ring words per compact record instead of 27.
+    CHECK(compact.words + 64 * 20 <= full.words);
 }

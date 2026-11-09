@@ -160,6 +160,7 @@ void GpuSplit::MaybeStart(Core::System& system_) {
     }
     draw_records = ir && front_macros && V2::On(V2::Switch::IrDraws);
     draw_verify = draw_records && V2::Verify(V2::Switch::IrDraws);
+    full_draw_records = draw_records && (draw_verify || V2::On(V2::Switch::Parallel));
     if (draw_verify) {
         V2::IrCheck::Start();
     }
@@ -230,6 +231,7 @@ void GpuSplit::Stop() {
     ir_verify = false;
     draw_records = false;
     draw_verify = false;
+    full_draw_records = false;
     V2::IrCheck::Stop();
     ir_sequence = 0;
     ir_run = nullptr;

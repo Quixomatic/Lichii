@@ -1923,6 +1923,20 @@ void KeplerCompute::FrontDispatchRecord(VideoCommon::GpuSplit& split, FrontState
         fs.v2_mode == VideoCommon::V2::Mode::On
             ? &fs.v2_groups
             : (fs.v2_mirror ? &fs.v2_mirror->v2_groups : nullptr);
+    if (!split.FullDrawRecords()) {
+        // Nothing reads the full record (MASTER_PLAN §5.2's compact form).
+        Ir::CompactBody compact{};
+        compact.full_kind = Ir::Kind::Dispatch;
+        compact.count = static_cast<u16>(std::min<u32>(body.max_dispatches, 0xffff));
+        compact.engine = body.engine;
+        if (groups != nullptr && groups->valid) {
+            compact.dirty_groups = groups->dirty;
+            compact.fingerprint = groups->Fingerprint(VideoCommon::V2::HashedComputeGroups);
+            groups->BeginDraw();
+        }
+        split.Note(Ir::Kind::Compact, compact);
+        return;
+    }
     if (groups != nullptr && groups->valid) {
         body.dirty_groups = groups->dirty;
         size_t slot = 0;

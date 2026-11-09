@@ -221,6 +221,16 @@ bool Execute(const Ir::RecordView& record, const Context& context) {
     case Ir::Kind::Draw:
         Draw(record, record.As<Ir::DrawBody>(), context);
         return true;
+    case Ir::Kind::Compact: {
+        // Only a macro end is executed; predicted draws and dispatches are informational.
+        const auto& body = record.As<Ir::CompactBody>();
+        if (body.full_kind == Ir::Kind::Draw &&
+            body.op == static_cast<u8>(Ir::DrawOp::MacroEnd)) {
+            context.objects.As<Tegra::Engines::Maxwell3D>(body.engine)
+                ->FinishFrontMacro(context.system);
+        }
+        return true;
+    }
     case Ir::Kind::Dispatch:
         // EDEN_NX2_V2_IR_DRAWS verify: the window the next records' dispatches count in (Fix
         // pass 1: only the never-called IsInformational noted it, so no window ever opened and

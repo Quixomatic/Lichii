@@ -3479,6 +3479,9 @@ private:
     void FrontParallelDraw(VideoCommon::GpuSplit& split, FrontState& state,
                            const VideoCommon::V2::DrawOutput& out, u32 pending_method,
                            bool may_cut);
+    VideoCommon::V2::Ir::CompactBody FrontCompactDraw(VideoCommon::GpuSplit& split,
+                                                      FrontState& state,
+                                                      VideoCommon::V2::Ir::DrawOp op, u32 count);
     void FrontFillDraw(FrontState& state, VideoCommon::V2::Ir::DrawBody& body, u32 method,
                        u32 value, const VideoCommon::V2::DrawOutput& out, u32 first,
                        const VideoCommon::V2::GroupTracker* hashes);

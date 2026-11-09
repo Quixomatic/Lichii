@@ -55,13 +55,14 @@ enum class Kind : u8 {
     SyncPoint,  ///< SyncPointBody: syncpoint increments, CPU queue fences, event signals
     Channel,    ///< ChannelBody: the rasterizer binds a channel
     Segment,    ///< SegmentBody: a P6 parallel resolve segment starts (EDEN_NX2_V2_PARALLEL)
+    Compact,    ///< CompactBody: a Draw or Dispatch record in the compact form (no consumer)
     Count,
 };
 
 inline constexpr const char* kind_names[] = {
     "invalid",  "engine",  "state run", "method data", "callback", "draw",
     "dispatch", "copy",    "release",   "acquire",     "barrier",  "readback",
-    "map",      "present", "sync point", "channel",   "segment",
+    "map",      "present", "sync point", "channel",   "segment", "compact",
 };
 static_assert(std::size(kind_names) == static_cast<size_t>(Kind::Count));
 
@@ -194,6 +195,20 @@ struct DrawBody {
     std::array<u64, 9> group_hashes; ///< Hashed groups, in RegGroup order (Pipeline..DrawParams)
     std::array<PredictedDraw, MaxPredictedDraws> draws;
     HostIndirectDraw hle; ///< HostIndirect only
+};
+
+/// MASTER_PLAN §5.2's compact Draw/Dispatch record (3 body words, 5 with the header), used
+/// when nothing reads the full one (no EDEN_NX2_V2_PARALLEL, IR_DRAWS not verify): the kind it
+/// stands for, the DrawOp (MacroEnd is executed), the predicted draw or dispatch count, the
+/// dirty register groups and the fingerprint of the group hashes (0 without groups).
+struct CompactBody {
+    Kind full_kind; ///< Draw or Dispatch
+    u8 op;          ///< DrawOp for draws
+    u16 count;      ///< Predicted draws, or the maximum dispatches (saturated)
+    ObjectRef engine;
+    u32 dirty_groups;
+    u32 reserved;
+    u64 fingerprint;
 };
 
 enum DrawFlags : u16 {
@@ -380,7 +395,9 @@ static_assert(IsBody<MethodDataBody> && IsBody<EngineBody> && IsBody<DrawBody> &
               IsBody<DispatchBody> && IsBody<CopyBody> && IsBody<ReleaseBody> &&
               IsBody<AcquireBody> && IsBody<BarrierBody> && IsBody<ReadbackBody> && IsBody<SegmentBody> &&
               IsBody<MapBody> && IsBody<PresentBody> && IsBody<SyncPointBody> &&
-              IsBody<ChannelBody> && IsBody<PredictedDraw> && IsBody<HostIndirectDraw>);
+              IsBody<ChannelBody> && IsBody<PredictedDraw> && IsBody<HostIndirectDraw> &&
+              IsBody<CompactBody>);
+static_assert(BodyWordsOf<CompactBody> == 3);
 
 /// A decoded record (for inspection, replay and verification).
 struct RecordView {

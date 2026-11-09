@@ -2200,9 +2200,36 @@ void Maxwell3D::FrontFillDraw(FrontState& fs, VideoCommon::V2::Ir::DrawBody& bod
     groups->BeginDraw();
 }
 
+VideoCommon::V2::Ir::CompactBody Maxwell3D::FrontCompactDraw(VideoCommon::GpuSplit& split,
+                                                              FrontState& fs,
+                                                              VideoCommon::V2::Ir::DrawOp op,
+                                                              u32 count) {
+    namespace V2 = VideoCommon::V2;
+    V2::Ir::CompactBody body{};
+    body.full_kind = V2::Ir::Kind::Draw;
+    body.op = static_cast<u8>(op);
+    body.count = static_cast<u16>(std::min<u32>(count, 0xffff));
+    body.engine = split.Ref(this);
+    if (V2::GroupTracker* const groups = FrontDrawGroups(fs); groups != nullptr && groups->valid) {
+        body.dirty_groups = groups->dirty;
+        body.fingerprint = groups->Fingerprint(V2::HashedGroups);
+        groups->BeginDraw();
+    }
+    return body;
+}
+
 void Maxwell3D::FrontEmitDraws(VideoCommon::GpuSplit& split, FrontState& fs, u32 method, u32 value,
                                const VideoCommon::V2::DrawOutput& out,
                                const VideoCommon::V2::GroupTracker* hashes) {
+    if (out.count == 0) {
+        return;
+    }
+    if (!split.FullDrawRecords()) {
+        // Nothing reads the predictions: one compact record per trigger (MASTER_PLAN §5.2).
+        split.Note(VideoCommon::V2::Ir::Kind::Compact,
+                   FrontCompactDraw(split, fs, VideoCommon::V2::Ir::DrawOp::Predicted, out.count));
+        return;
+    }
     // Draw records go before the method that makes the back draw (it consumes them in order).
     for (u32 first = 0; first < out.count; first += VideoCommon::V2::Ir::MaxPredictedDraws) {
         VideoCommon::V2::Ir::DrawBody body{};
@@ -2351,6 +2378,22 @@ void Maxwell3D::FrontDrawMulti(VideoCommon::GpuSplit& split, FrontState& fs, u32
 void Maxwell3D::FrontEmitMacroEnd(Core::System& system, VideoCommon::GpuSplit& split,
                                   FrontState& fs) {
     // The back consumes its sink and issues the deferred instanced draw (FinishFrontMacro).
+    if (!split.FullDrawRecords()) [[likely]] {
+        VideoCommon::V2::Ir::CompactBody compact{};
+        if (split.DrawRecords()) {
+            VideoCommon::V2::DrawOutput out;
+            fs.v2_draw_model.OnMacroEnd(fs.regs.data(), out);
+            compact = FrontCompactDraw(split, fs, VideoCommon::V2::Ir::DrawOp::MacroEnd, out.count);
+        } else {
+            compact.full_kind = VideoCommon::V2::Ir::Kind::Draw;
+            compact.op = static_cast<u8>(VideoCommon::V2::Ir::DrawOp::MacroEnd);
+            compact.engine = split.Ref(this);
+        }
+        split.Emit(VideoCommon::V2::Ir::Kind::Compact, compact,
+                   [this, system_ptr = &system] { FinishFrontMacro(*system_ptr); },
+                   VideoCommon::GpuSplit::FastDrawNeutral);
+        return;
+    }
     VideoCommon::V2::Ir::DrawBody body{};
     body.op = VideoCommon::V2::Ir::DrawOp::MacroEnd;
     if (split.DrawRecords()) [[unlikely]] {
