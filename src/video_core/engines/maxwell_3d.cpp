@@ -1730,6 +1730,42 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
         memory_manager.ReadBlockUnsafe(source, diag_before.data(), read_bytes);
     }
     VideoCommon::Nx2Profile::CountDmaRead(macro);
+    const VideoCommon::V2::Mode hazard_mode = split.HazardMode();
+    std::vector<u32> hazard_words;
+    bool hazard_read = false;
+    if (hazard_mode != VideoCommon::V2::Mode::Off && !Tegra::Nx2CmdPageDiag::g_enabled &&
+        !VideoCommon::QueryDma::TraceEnabled()) [[unlikely]] {
+        // EDEN_NX2_V2_HAZARD: wait only for the queued writes the words depend on.
+        hazard_words.resize(words);
+        hazard_read = FrontDmaReadHazard(split, source, read_bytes, hazard_words);
+        if (hazard_mode == VideoCommon::V2::Mode::On) {
+            if (!hazard_read) {
+                // One wait instead of up to three: the flushes run on the back after
+                // everything queued, then the front reads.
+                split.Defer([this, memory = &memory_manager, source, read_bytes] {
+                    if (memory->IsMemoryDirty(source, read_bytes,
+                                              VideoCommon::CacheType::BufferCache)) {
+                        memory->FlushRegion(source, read_bytes,
+                                            VideoCommon::CacheType::BufferCache);
+                    }
+                    VideoCommon::QueryDma::FlushPending(*memory, *rasterizer, source,
+                                                        read_bytes);
+                });
+                split.Drain(VideoCommon::DrainSite::MacroDmaRead);
+                for (u32 i = 0; i < words; ++i) {
+                    hazard_words[i] = memory_manager.Read<u32>(source + u64{i} * sizeof(u32));
+                }
+            }
+            for (u32 i = 0; i < words; ++i) {
+                if (method == 0x158) {
+                    fs.parameters.push_back(hazard_words[i]);
+                } else if (ram + i < native_data_ram.size()) {
+                    native_data_ram[ram + i] = hazard_words[i];
+                }
+            }
+            return;
+        }
+    }
     split.Drain(VideoCommon::DrainSite::MacroDmaRead);
     if (VideoCommon::QueryDma::TraceEnabled()) {
         split.Run(
@@ -1769,6 +1805,18 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
         if (!diag_before.empty() && diag_before[i] != word) {
             ++changed;
         }
+        if (hazard_read && hazard_words[i] != word) [[unlikely]] {
+            // EDEN_NX2_V2_HAZARD=verify: the read without the drain disagrees.
+            VideoCommon::V2::Stats::NoteMismatch(VideoCommon::DrainSite::MacroDmaRead);
+            static std::atomic<u32> logged{};
+            if (logged.fetch_add(1) < 32) {
+                LOG_WARNING(HW_GPU,
+                            "V2 hazard verify: macro {:#x} DMA read {:#x} word {} read {:#x} "
+                            "without the drain, {:#x} after it",
+                            macro, source, i, hazard_words[i], word);
+            }
+            hazard_read = false;
+        }
     }
     if (Tegra::Nx2CmdPageDiag::g_enabled) {
         bool gpu_written = false;
@@ -1778,6 +1826,71 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
         }
         Tegra::Nx2CmdPageDiag::RecordDmaRead(source, words, changed, gpu_written);
     }
+}
+
+bool Maxwell3D::FrontDmaReadHazard(VideoCommon::GpuSplit& split, GPUVAddr source, size_t bytes,
+                                   std::span<u32> out) {
+    namespace V2 = VideoCommon::V2;
+    using V2::Stats::Decision;
+    using V2::Stats::Reason;
+    constexpr auto site = VideoCommon::DrainSite::MacroDmaRead;
+    const auto fall_back = [](Reason reason) {
+        V2::Stats::NoteDecision(site, Decision::Waited, reason);
+        return false;
+    };
+    // The words in device memory, in one piece.
+    const auto device = memory_manager.GpuToCpuAddress(source);
+    if (!device || bytes == 0) {
+        return fall_back(Reason::Unmapped);
+    }
+    for (GPUVAddr page = (source & ~GPUVAddr{0xfff}) + 0x1000; page < source + bytes;
+         page += 0x1000) {
+        const auto page_device = memory_manager.GpuToCpuAddress(page);
+        if (!page_device || *page_device != *device + (page - source)) {
+            return fall_back(Reason::Unmapped);
+        }
+    }
+    // Reports the query cache may still hold back, and words the buffer cache may hold newer
+    // than memory, need the back's flushes (the old path).
+    if (split.MayHoldReports(*device, bytes)) {
+        return fall_back(Reason::ReportPage);
+    }
+    // What can have written the words in command order (7429fba04e): methods that write memory
+    // (ranged, or unbounded: dispatches, copies, uploads) and the work before the last
+    // host-level wait. Draws after it are not visible to the 3D engine's reads before a wait.
+    V2::HazardFilter filter;
+    filter.unbounded = V2::ProducerBit(V2::Producer::Dispatch) |
+                       V2::ProducerBit(V2::Producer::Copy) |
+                       V2::ProducerBit(V2::Producer::Upload);
+    bool narrowed = false;
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        if (Nx2MayBeGpuWritten(*device, bytes)) {
+            return fall_back(Reason::GpuWritten);
+        }
+        for (size_t i = 0; i < out.size(); ++i) {
+            out[i] = memory_manager.Read<u32>(source + i * sizeof(u32));
+        }
+        const V2::HazardResult result =
+            split.FindWrites(*device, out.size() * sizeof(u32), filter,
+                             reinterpret_cast<u8*>(out.data()));
+        u64 wait = result.kind == V2::HazardResult::Kind::Wait ? result.position : 0;
+        if (const u64 sync = split.SyncPosition(); sync > split.ConsumedNow()) {
+            wait = std::max(wait, sync);
+        }
+        if (wait == 0) {
+            V2::Stats::NoteDecision(site, narrowed ? Decision::Narrowed
+                                          : result.kind == V2::HazardResult::Kind::Forward
+                                              ? Decision::Forwarded
+                                              : Decision::Avoided);
+            return true;
+        }
+        if (attempt == 2) {
+            break;
+        }
+        split.WaitForPosition(wait, site);
+        narrowed = true;
+    }
+    return fall_back(Reason::Overflow);
 }
 
 void Maxwell3D::FrontVerify(VideoCommon::GpuSplit& split, FrontState& fs) {

@@ -149,6 +149,17 @@ public:
     [[nodiscard]] u64 SyncedWriterPosition() const {
         return std::min(last_writer_position, last_sync_position);
     }
+    /// Front: the compute/copy work sent so far (WaitForWriters' target).
+    [[nodiscard]] u64 WriterPosition() const {
+        return std::min(last_writer_position, write_position);
+    }
+    /// Front: the last host-level sync sent (NoteSync).
+    [[nodiscard]] u64 SyncPosition() const {
+        return std::min(last_sync_position, write_position);
+    }
+    [[nodiscard]] bool MayHoldReports(u64 device_address, u64 size) const {
+        return hazards.MayHoldReports(device_address, size);
+    }
     /// Any thread, EDEN_NX2_V2_CPULANE: has the back run `hook` after its current entry (or at
     /// once if it waits for work).
     void SetCpuLaneHook(void (*hook)(void*), void* argument) {

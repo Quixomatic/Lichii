@@ -220,7 +220,7 @@ bool DmaPusher::Step() {
         const bool use_safe = !VideoCommon::GpuSplit::Get().Active() &&
                               (Settings::IsDMALevelDefault() ? Settings::IsGPULevelHigh() : Settings::IsDMALevelSafe());
         if (!gpu_written && VideoCommon::GpuSplit::Get().Active() &&
-            VideoCommon::GpuSplit::Get().WaitForWriters()) {
+            WaitForListWriters(dma_state.dma_get, size_t{header.size} * sizeof(u32))) {
             gpu_written =
                 IsGpuWrittenCommands(dma_state.dma_get, size_t{header.size} * sizeof(u32));
         }
@@ -303,13 +303,23 @@ bool DmaPusher::Step() {
     }
 
     if (signal_sync) {
-        VideoCommon::GpuSplit::Get().Run([this] {
+        const auto signal = [this] {
             rasterizer->SignalFence([this]() {
                 std::scoped_lock lk(sync_mutex);
                 synced = true;
                 sync_cv.notify_all();
             });
-        }, VideoCommon::DrainSite::GpSyncFence);
+        };
+        if (auto& split = VideoCommon::GpuSplit::Get();
+            split.Active() && split.HazardMode() == VideoCommon::V2::Mode::On) [[unlikely]] {
+            // EDEN_NX2_V2_HAZARD: the next entry waits for the fence itself (sync_cv), which
+            // signals only once the back ran this and the GPU passed it: no drain needed.
+            split.Defer(signal);
+            VideoCommon::V2::Stats::NoteDecision(VideoCommon::DrainSite::GpSyncFence,
+                                                 VideoCommon::V2::Stats::Decision::Avoided);
+        } else {
+            VideoCommon::GpuSplit::Get().Run(signal, VideoCommon::DrainSite::GpSyncFence);
+        }
     }
 
     return true;
@@ -593,6 +603,70 @@ void DmaPusher::CallMultiMethod(const u32* base_start, u32 num_methods) {
     }
 }
 
+bool DmaPusher::WaitForListWriters(GPUVAddr address, size_t size) {
+    namespace V2 = VideoCommon::V2;
+    using V2::Stats::Decision;
+    auto& split = VideoCommon::GpuSplit::Get();
+    const V2::Mode mode = split.HazardMode();
+    if (mode == V2::Mode::Off) [[likely]] {
+        return split.WaitForWriters();
+    }
+    constexpr auto site = VideoCommon::DrainSite::ListWriters;
+    const u64 consumed = split.ConsumedNow();
+    const u64 old_target = split.WriterPosition();
+    if (old_target <= consumed) {
+        return false; // Nothing queued writes it either way
+    }
+    // The fetch of a GP entry is ordered after earlier engine work only by a host-level wait in
+    // between (83d6c8d78b): compute and copy work sent before the last one, plus queued copies
+    // whose destination overlaps the list.
+    u64 target = split.SyncedWriterPosition();
+    V2::HazardFilter filter;
+    filter.ranged = V2::ProducerBit(V2::Producer::Copy);
+    for (GPUVAddr chunk = address; chunk < address + size;) {
+        const GPUVAddr chunk_end =
+            std::min<GPUVAddr>(address + size, (chunk & ~GPUVAddr{0xfff}) + 0x1000);
+        const auto device = memory_manager.GpuToCpuAddress(chunk);
+        if (!device) {
+            target = old_target; // As before
+            break;
+        }
+        const V2::HazardResult result = split.FindWrites(*device, chunk_end - chunk, filter);
+        if (result.kind == V2::HazardResult::Kind::Wait) {
+            target = std::max(target, result.position);
+        }
+        chunk = chunk_end;
+    }
+    target = std::min(target, old_target);
+    V2::Stats::NoteDecision(site, target <= consumed  ? Decision::Avoided
+                                  : target < old_target ? Decision::Narrowed
+                                                        : Decision::Waited);
+    if (mode == V2::Mode::On) {
+        return target > consumed && split.WaitForPosition(target, site);
+    }
+    // Verify: read the words after the narrow wait, then wait as before and compare.
+    const bool waited = target > consumed && split.WaitForPosition(target, site);
+    std::vector<u32> narrow(size / sizeof(u32));
+    memory_manager.ReadBlockUnsafe(address, narrow.data(), narrow.size() * sizeof(u32));
+    const bool narrow_written = IsGpuWrittenCommands(address, size);
+    const bool waited_old = split.WaitForWriters();
+    std::vector<u32> full(narrow.size());
+    memory_manager.ReadBlockUnsafe(address, full.data(), full.size() * sizeof(u32));
+    const bool full_written = IsGpuWrittenCommands(address, size);
+    if (narrow != full || narrow_written != full_written) {
+        V2::Stats::NoteMismatch(site);
+        static std::atomic<u32> logged{};
+        if (logged.fetch_add(1) < 32) {
+            LOG_WARNING(HW_GPU,
+                        "V2 hazard verify: command list {:#x} ({} words) read after a wait for "
+                        "{} differs from the read after the writers {} (GPU-written {} / {})",
+                        address, narrow.size(), target, old_target, narrow_written,
+                        full_written);
+        }
+    }
+    return waited || waited_old;
+}
+
 void DmaPusher::NoteTrackedWrite(Engines::EngineInterface& engine, Engines::EngineTypes type,
                                  u32 method, u32 argument, bool writer) {
     // The 3D engine (FrontNoteWrites), the compute engine's reports and the puller's releases
@@ -788,9 +862,36 @@ bool DmaPusher::FlushGpuWrittenCommands(GPUVAddr address, size_t size) {
         diag_before.resize(size / sizeof(u32));
         memory_manager.ReadBlockUnsafe(address, diag_before.data(), diag_before.size() * sizeof(u32));
     }
-    VideoCommon::GpuSplit::Get().Drain(VideoCommon::DrainSite::ListFlush);
     const GPUVAddr first_page = address & ~GPUVAddr{0xfff};
     const GPUVAddr end_page = (address + size + 0xfff) & ~GPUVAddr{0xfff};
+    if (auto& split = VideoCommon::GpuSplit::Get(); split.Active() && rasterizer != nullptr &&
+                                                    !diag &&
+                                                    split.HazardMode() != VideoCommon::V2::Mode::Off)
+        [[unlikely]] {
+        // EDEN_NX2_V2_HAZARD: one wait instead of two; the flush runs on the back after
+        // everything queued (the writers among it), then the front reads.
+        std::vector<DAddr> pages;
+        for (GPUVAddr page = first_page; page < end_page; page += 0x1000) {
+            if (const auto device = memory_manager.GpuToCpuAddress(page)) {
+                pages.push_back(*device);
+            }
+        }
+        // `pages` outlives the call: the drain below waits for it.
+        split.Defer([rasterizer = rasterizer, pages = std::span<const DAddr>{pages}] {
+            rasterizer->FlushGpuWrittenCommandListPages(pages);
+        });
+        split.Drain(VideoCommon::DrainSite::ListFlush);
+        VideoCommon::V2::Stats::NoteDecision(VideoCommon::DrainSite::ListFlush,
+                                             VideoCommon::V2::Stats::Decision::Narrowed);
+        for (GPUVAddr page = first_page; page < end_page; page += 0x1000) {
+            if (const auto device = memory_manager.GpuToCpuAddress(page);
+                device && Tegra::Nx2IsCommandListPage(*device)) {
+                rasterizer->NoteGpuWrittenCommandListSynced(*device);
+            }
+        }
+        return true;
+    }
+    VideoCommon::GpuSplit::Get().Drain(VideoCommon::DrainSite::ListFlush);
     const bool dirty = memory_manager.IsMemoryDirty(first_page, end_page - first_page,
                                                     VideoCommon::CacheType::BufferCache);
     if (rasterizer != nullptr) {

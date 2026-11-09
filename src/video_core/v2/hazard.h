@@ -103,6 +103,11 @@ public:
     [[nodiscard]] HazardResult Find(u64 address, u64 size, u64 consumed, const HazardFilter& filter,
                                     u8* out = nullptr);
 
+    /// Whether a release or report was ever sent to a page of the range (sticky, hashed): the
+    /// query cache may hold its value back past the back running it (fence-flagged releases,
+    /// counter reports), so a read there must flush the reports first.
+    [[nodiscard]] bool MayHoldReports(u64 address, u64 size) const;
+
     /// The newest unbounded write of `producer` still queued, or 0.
     [[nodiscard]] u64 PendingUnbounded(Producer producer, u64 consumed) const {
         const u64 position = unbounded[static_cast<size_t>(producer)];
@@ -154,6 +159,9 @@ private:
     std::array<u64, static_cast<size_t>(Producer::Count)> wide{};
     std::array<u64, static_cast<size_t>(Producer::Count)> unbounded{};
     std::array<u64, static_cast<size_t>(Producer::Count)> unbounded_synced{};
+    static constexpr size_t ReportPageBits = size_t{1} << 16;
+    static size_t ReportBit(u64 page);
+    std::unique_ptr<std::array<u64, ReportPageBits / 64>> report_pages;
     u64 overflow_position = 0; ///< Pending entries that no longer fit
     u64 overflows = 0;
 };
