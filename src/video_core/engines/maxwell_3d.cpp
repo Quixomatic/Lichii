@@ -1065,6 +1065,11 @@ struct Maxwell3D::S1CheckState {
     u64 mismatches{};
 };
 
+std::pair<u64, u64> Maxwell3D::S1CheckCounts() const {
+    return s1_check ? std::pair<u64, u64>{s1_check->entries, s1_check->mismatches}
+                    : std::pair<u64, u64>{0, 0};
+}
+
 size_t Maxwell3D::S1CheckEntry(const u64* entry) {
     namespace S1 = VideoCommon::V2::S1;
     if (!s1_check) {
@@ -2038,10 +2043,7 @@ void Maxwell3D::FrontMultiS1(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
         const u64 buffer = (u64{fs.regs[MAXWELL3D_REG_INDEX(const_buffer.address_high)]} << 32) |
                            fs.regs[MAXWELL3D_REG_INDEX(const_buffer.address_low)];
         RegSem::WriteMulti3D(fs, table, method, base_start, amount, effects);
-        for (u32 i = 0; i < amount; ++i) {
-            split.S1Cbuf(this, false, 0, buffer, offset + i * static_cast<u32>(sizeof(u32)),
-                         base_start[i]);
-        }
+        split.S1CbufBlock(this, buffer, offset, base_start, amount);
     } else if ((flags & RegSem::InlineData) != 0) {
         // Upload data only: the back's CallMultiMethod reads no register for it.
         RegSem::WriteMulti3D(fs, table, method, base_start, amount, effects);
@@ -2087,10 +2089,9 @@ void Maxwell3D::FrontCheckMultiS1(VideoCommon::GpuSplit& split, const u32* table
         const u64 buffer =
             (u64{table_regs[MAXWELL3D_REG_INDEX(const_buffer.address_high)]} << 32) |
             table_regs[MAXWELL3D_REG_INDEX(const_buffer.address_low)];
-        for (u32 i = 0; i < amount; ++i) {
-            split.S1Cbuf(this, false, 0, buffer, old_offset + i * static_cast<u32>(sizeof(u32)),
-                         base_start[i]);
-        }
+        // One entry for the whole run: the check compares after each entry, and the back
+        // executed the run's MethodData records whole before it.
+        split.S1CbufBlock(this, buffer, old_offset, base_start, amount);
         return;
     }
     if ((flags & V2::RegSem::InlineData) != 0) {

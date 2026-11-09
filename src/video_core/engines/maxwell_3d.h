@@ -3190,6 +3190,8 @@ public:
     /// GpuSplit::S1Check: a classified entry sent beside the method words this engine executes;
     /// applies it to a register copy and compares. Returns its size in words.
     size_t S1CheckEntry(const u64* entry);
+    /// GpuSplit::S1Check: the entries checked and the mismatches found so far (tests, logs).
+    [[nodiscard]] std::pair<u64, u64> S1CheckCounts() const;
 
     /// Reads a register value located at the input method address
     u32 GetRegisterValue(u32 method) const;

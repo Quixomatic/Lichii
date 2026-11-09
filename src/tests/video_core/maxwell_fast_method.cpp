@@ -1884,6 +1884,55 @@ public:
 
 } // Anonymous namespace
 
+TEST_CASE("V2 S1 check: constant buffer runs of any length check exactly against the executor",
+          "[video_core][gpu_split_dispatch][v2_s1]") {
+    // F1-12 (in game: every mismatch on const_buffer.offset): S1Check compares after each
+    // entry, while the back already ran a whole multi-word CB run. Runs longer than one Cbuf
+    // entry (256 words) or cut by a publish made the check see part of the run's offset.
+    using Access = VideoCommon::GpuSplitTestAccess;
+    using M3Access = Tegra::Engines::Maxwell3DTestAccess;
+    using VideoCommon::V2::Mode;
+    using VideoCommon::V2::Switch;
+    Fixture f;
+    f.system.Initialize();
+    auto& engine = f.fast;
+    RecordingRasterizer draws{f.gpu};
+    draws.engine = &engine;
+    engine.BindRasterizer(&draws);
+    const V2SwitchScope regsem{Switch::RegSem, Mode::On};
+    VideoCommon::GpuSplit split;
+    Access::Initialize(split, f.system);
+    Access::SetIr(split, true);
+    Access::SetDrawRecords(split, false);
+    Access::SetS1(split, false, true);
+    std::mt19937 rng{17};
+    for (u32 step = 0; step < 3000; ++step) {
+        CAPTURE(step);
+        const u32 kind = rng() % 10;
+        if (kind < 4) {
+            std::vector<u32> words(1 + (rng() % 4 == 0 ? rng() % 1200 : rng() % 40));
+            for (u32& word : words) {
+                word = rng();
+            }
+            const u32 amount = static_cast<u32>(words.size());
+            engine.FrontCallMultiMethod(f.system, split, CbData + rng() % 16, words.data(),
+                                        amount, amount);
+        } else if (kind < 6) {
+            engine.FrontCallMethod(f.system, split, CbData + rng() % 16, rng(), true);
+        } else if (kind < 7) {
+            M3Access::MacroWrite(engine, f.system, split, CbData + rng() % 16, rng());
+        } else if (kind < 9) {
+            engine.FrontCallMethod(f.system, split, CbOffset, (rng() % 0x800) * 4, true);
+        } else {
+            Access::RunBack(split);
+        }
+    }
+    Access::RunBack(split);
+    const auto [entries, mismatches] = engine.S1CheckCounts();
+    CHECK(entries > 1000);
+    REQUIRE(mismatches == 0);
+}
+
 TEST_CASE("V2 S1 deltas applied on the back match the method executor on random streams",
           "[video_core][gpu_split_dispatch][v2_s1]") {
     // Fix F1: the front runs the register semantics and sends classified entries; the back

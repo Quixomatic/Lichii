@@ -193,6 +193,11 @@ public:
     /// the word (with `store`).
     void S1Cbuf(Tegra::Engines::EngineInterface* engine, bool store, u32 slot, u64 buffer,
                 u32 offset, u32 word);
+    /// Front, S1: a multi-word constant buffer upload (no register store) as one Cbuf entry,
+    /// written whole: the back (and S1Check, which compares after each entry with the
+    /// executed MethodData run) never sees part of it.
+    void S1CbufBlock(Tegra::Engines::EngineInterface* engine, u64 buffer, u32 offset,
+                     const u32* words, u32 count);
     /// Front, S1: inline index words for `method` (V2::S1 Inline entries).
     void S1Inline(Tegra::Engines::EngineInterface* engine, u32 method, const u32* words,
                   u32 count);

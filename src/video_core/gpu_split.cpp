@@ -683,6 +683,22 @@ void GpuSplit::S1Cbuf(Tegra::Engines::EngineInterface* engine, bool store, u32 s
     S1Commit(3);
 }
 
+void GpuSplit::S1CbufBlock(Tegra::Engines::EngineInterface* engine, u64 buffer, u32 offset,
+                           const u32* words, u32 count) {
+    namespace S1 = V2::S1;
+    if (count == 0) {
+        return;
+    }
+    const size_t size = 2 + (size_t{count} + 1) / 2;
+    u64* const entry = S1Begin(engine, size);
+    entry[0] = S1::MakeCbuf(false, false, 0, count, offset);
+    entry[1] = buffer;
+    entry[size - 1] = 0;
+    std::memcpy(entry + 2, words, size_t{count} * sizeof(u32));
+    S1Commit(size);
+    s1_cbuf = nullptr;
+}
+
 void GpuSplit::S1Inline(Tegra::Engines::EngineInterface* engine, u32 method, const u32* words,
                         u32 count) {
     namespace S1 = V2::S1;
