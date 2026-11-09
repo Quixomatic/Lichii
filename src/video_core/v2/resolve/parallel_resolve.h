@@ -73,6 +73,8 @@ struct Stats {
     std::atomic<u64> refused{};       ///< submissions refused by back pressure
     std::atomic<u64> stolen_unsubmitted{}; ///< the commit reached a segment not submitted yet
     std::atomic<u64> stolen_queued{};      ///< the commit took a submitted segment no shard began
+    std::atomic<u64> early_submits{};   ///< segments submitted before their end was published
+    std::atomic<u64> early_abandoned{}; ///< ...whose shard the commit stopped waiting for
     std::atomic<u64> verify_segments{};
     std::atomic<u64> verify_mismatches{};
     std::atomic<u64> verify_dependent{}; ///< request differences an earlier commit explains
@@ -341,6 +343,16 @@ public:
             case State::Running: {
                 const u64 start = NowNs();
                 while (StateOf(slot.word.load(std::memory_order_acquire)) == State::Running) {
+                    if constexpr (requires { slot.input.progress->abandon; }) {
+                        // An early-submitted segment whose shard waits for the front to publish
+                        // more: the commit is here, so it resolves the segment itself.
+                        const auto& progress = slot.input.progress;
+                        if (progress != nullptr &&
+                            progress->waiting.load(std::memory_order_acquire) &&
+                            !progress->abandon.exchange(true, std::memory_order_acq_rel)) {
+                            Count(GetStats().early_abandoned);
+                        }
+                    }
                     if (++spins < 4096) {
                         CpuRelax();
                     } else {

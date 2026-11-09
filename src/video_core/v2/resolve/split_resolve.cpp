@@ -1,9 +1,12 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <algorithm>
 #include <bit>
 #include <cstddef>
 #include <cstring>
+#include <optional>
+#include <thread>
 
 #include "common/logging.h"
 #include "video_core/gpu_split.h"
@@ -143,6 +146,32 @@ void LoadMirror(RegSem::Mirror3D& mirror, const FrontSnapshot& snapshot) {
     mirror.v2_cbufs = snapshot.cbufs != nullptr ? *snapshot.cbufs : CbufTable{};
 }
 
+/// An early-submitted segment: the position the shard may read up to, waiting for the front to
+/// publish more; `position` itself once it is the segment's end; nothing when abandoned.
+std::optional<u64> WaitPublished(const SegmentInput& input, u64 position) {
+    SegmentProgress& progress = *input.progress;
+    for (u32 spins = 0;; ++spins) {
+        const u64 end = progress.end.load(std::memory_order_acquire);
+        const u64 published = input.published->load(std::memory_order_acquire);
+        const u64 limit = (std::min)(end, published);
+        if (limit > position || position >= end) {
+            progress.waiting.store(false, std::memory_order_relaxed);
+            return limit;
+        }
+        if (progress.abandon.load(std::memory_order_acquire)) {
+            return std::nullopt;
+        }
+        if (spins == 64) {
+            progress.waiting.store(true, std::memory_order_release);
+        }
+        if (spins < 1024) {
+            CpuRelax();
+        } else {
+            std::this_thread::yield();
+        }
+    }
+}
+
 } // Anonymous namespace
 
 SerialReason SplitTraits::Resolve(Shard& shard, const Input& input, std::vector<Record>& records,
@@ -255,7 +284,23 @@ SerialReason SplitTraits::Resolve(Shard& shard, const Input& input, std::vector<
         }
         return S1::EntryWords(entry);
     };
-    for (u64 position = input.begin; position < input.end;) {
+    u64 limit = input.progress != nullptr ? input.begin : input.end;
+    for (u64 position = input.begin;;) {
+        if (position >= limit) {
+            if (input.progress == nullptr) {
+                break;
+            }
+            const std::optional<u64> available = WaitPublished(input, position);
+            if (!available) {
+                return SerialReason::Stolen;
+            }
+            limit = *available;
+            if (position >= limit) {
+                // The segment's end: a reason the front found after submitting it decides.
+                return static_cast<SerialReason>(
+                    input.progress->serial.load(std::memory_order_acquire));
+            }
+        }
         const size_t index = static_cast<size_t>(position & (RingWords - 1));
         const u64 head = input.ring[index];
         const u64 ring_kind = head & RingKindMask;
@@ -420,6 +465,9 @@ SplitResolve::SplitResolve(GpuSplit& split_, const u64* ring_, const Ir::Payload
 }
 
 SplitResolve::~SplitResolve() {
+    if (last_early != nullptr) {
+        last_early->abandon.store(true, std::memory_order_release); // its end may never publish
+    }
     resolver.reset(); // joins the shards before the ring goes away
 }
 
@@ -503,9 +551,17 @@ void SplitResolve::FrontDraw(const FrontView& view, const EngineInfo& engine,
         split.Note(Ir::Kind::Segment, body);
         const u64 position = split.WritePosition();
         if (open) {
-            open_input.end = position;
-            open_input.serial = closing_reason;
-            closed.push_back(std::move(open_input));
+            if (open_progress != nullptr) {
+                // Submitted early: its shard reads on up to here once it is published.
+                open_progress->serial.store(static_cast<u8>(closing_reason),
+                                            std::memory_order_relaxed);
+                open_progress->end.store(position, std::memory_order_release);
+                open_progress = nullptr;
+            } else {
+                open_input.end = position;
+                open_input.serial = closing_reason;
+                closed.push_back(std::move(open_input));
+            }
         }
         open = true;
         open_input = SegmentInput{};
@@ -538,6 +594,35 @@ void SplitResolve::OnPublish(u64 position) {
         }
         closed.pop_front();
     }
+    // The open segment goes once its start is published and it holds a few draws, so the back
+    // does not reach it before a shard could start (AP6 §1.3(a)). Ids stay in order: only when
+    // every closed segment went.
+    if (!open || open_progress != nullptr || !closed.empty() || open_input.begin > position ||
+        open_input.draws < EarlySubmitDraws || segmenter.OpenReason() != SerialReason::None ||
+        open_input.snapshot == nullptr) {
+        return;
+    }
+    const u32 draws = open_input.draws;
+    const u32 in_flight = in_flight_draws.load(std::memory_order_acquire);
+    if (in_flight != 0 && in_flight + draws > InFlightDraws) {
+        return;
+    }
+    auto progress = std::make_shared<SegmentProgress>();
+    open_input.progress = progress;
+    open_input.published = &split.published;
+    bool retry = false;
+    in_flight_draws.fetch_add(draws, std::memory_order_acq_rel);
+    if (resolver->Submit(open_input.id, std::move(open_input), SerialReason::None, &retry)) {
+        open_progress = progress;
+        last_early = std::move(progress);
+        if (stats) {
+            Count(GetStats().early_submits);
+        }
+        return;
+    }
+    in_flight_draws.fetch_sub(draws, std::memory_order_acq_rel);
+    open_input.progress = nullptr;
+    open_input.published = nullptr;
 }
 
 void SplitResolve::OnSegment(const Ir::SegmentBody& body, const u32* back_regs,
