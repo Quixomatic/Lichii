@@ -614,6 +614,12 @@ size_t GpuSplit::ExecuteIr(const u64* entry) {
     if (draw_verify) [[unlikely]] {
         V2::IrCheck::OnRecord(V2::Ir::KindOf(head));
     }
+    if (V2::Stats::Enabled()) [[unlikely]] {
+        V2::Stats::NoteIrRecord(static_cast<u32>(V2::Ir::KindOf(head)), size,
+                                (head & V2::Ir::HasPayload) != 0
+                                    ? V2::Ir::UnpackRef(entry[V2::Ir::HeaderWords]).words
+                                    : 0);
+    }
     back_sequence = entry[1];
     const V2::Ir::PayloadRef payload = (head & V2::Ir::HasPayload) != 0
                                            ? V2::Ir::UnpackRef(entry[V2::Ir::HeaderWords])

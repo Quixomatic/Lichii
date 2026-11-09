@@ -1541,3 +1541,39 @@ TEST_CASE("V2 back table path cost per write", "[.][v2_regsem_bench]") {
     WARN("V2 back register path: engine " << legacy << " / " << legacy2 << " ns per write, table "
                                           << table << " / " << table2 << " ns per write");
 }
+
+TEST_CASE("V2 IR: a write noted for the hazard table ends its StateRun at the noted position",
+          "[video_core][gpu_split_dispatch][v2_ir]") {
+    using Access = VideoCommon::GpuSplitTestAccess;
+    Fixture f;
+    f.system.Initialize();
+    VideoCommon::GpuSplit split;
+    Access::Initialize(split, f.system);
+    Access::SetIr(split, true);
+    constexpr u32 first = MAXWELL3D_REG_INDEX(vertex_buffer.first);
+    constexpr u32 count = MAXWELL3D_REG_INDEX(vertex_buffer.count);
+    split.Method(&f.fast, first, 11, true, nullptr);
+    split.Method(&f.fast, count, 12, true, nullptr);
+    // P2 notes a write at the position after the method that made it.
+    const u32 payload = 7;
+    split.NoteKnownWrite(0x1000, &payload, sizeof(payload), VideoCommon::V2::Producer::Release);
+    const u64 noted = split.WritePosition();
+    split.Method(&f.fast, first, 21, true, nullptr);
+    split.Method(&f.fast, count, 22, true, nullptr);
+    split.Publish();
+    REQUIRE(Access::End(split) > noted);
+    // The back runs up to the noted position: the methods before it, none after.
+    u64 read = 0;
+    while (read < noted) {
+        read = Access::Execute(split, read, Access::End(split));
+    }
+    REQUIRE(read == noted);
+    CHECK(f.fast.regs.vertex_buffer.first == 11);
+    CHECK(f.fast.regs.vertex_buffer.count == 12);
+    while (read != Access::End(split)) {
+        read = Access::Execute(split, read, Access::End(split));
+    }
+    CHECK(f.fast.regs.vertex_buffer.first == 21);
+    CHECK(f.fast.regs.vertex_buffer.count == 22);
+    CHECK(Access::IrBadRecords(split) == 0);
+}

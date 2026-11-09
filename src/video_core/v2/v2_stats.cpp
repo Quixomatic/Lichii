@@ -13,6 +13,7 @@
 #include "video_core/gpu_split.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/v2/regsem.h"
+#include "video_core/v2/ir.h"
 #include "video_core/v2/v2_stats.h"
 
 #define OFF(field_name) MAXWELL3D_REG_INDEX(field_name)
@@ -219,6 +220,14 @@ DrawData& Draws() {
     return *t_draw_data;
 }
 thread_local bool t_in_draw{};
+
+/// IR records the back ran (EDEN_NX2_V2_IR), by kind.
+struct IrData {
+    std::array<u64, 32> records{};
+    std::array<u64, 32> payload{};
+    u64 ring_words{};
+};
+thread_local std::unique_ptr<IrData> t_ir_data;
 
 void Rehash(const Maxwell3D& maxwell3d, u64& state_hash, u64& stream_hash) {
     const GroupTable& groups = Groups();
@@ -449,7 +458,7 @@ void NoteRelease(size_t address_space, GPUVAddr address, u32 payload, ReleaseKin
     }
     entry = {
         .address = address,
-        .position = GpuSplit::Get().WritePosition(),
+        .position = GpuSplit::Get().CutPosition(),
         .payload = payload,
         .address_space = static_cast<u32>(address_space),
         .kind = kind,
@@ -571,6 +580,17 @@ void NoteWrite(DrawTracker& tracker, u32 method, u32 old_value, u32 value) {
     } else if ((bit & StreamGroups) != 0) {
         tracker.stream_hash ^= delta;
     }
+}
+
+void NoteIrRecord(u32 kind, size_t words, size_t payload_words) {
+    if (!t_ir_data) [[unlikely]] {
+        t_ir_data = std::make_unique<IrData>();
+    }
+    IrData& data = *t_ir_data;
+    const size_t index = std::min<size_t>(kind, data.records.size() - 1);
+    ++data.records[index];
+    data.payload[index] += payload_words;
+    data.ring_words += words;
 }
 
 void NoteHashDrift() {
@@ -716,6 +736,33 @@ void ReportSlow(const char* thread_name) {
         draws.state_4096.hits = 0;
         draws.full_256.hits = 0;
         draws.full_4096.hits = 0;
+    }
+    if (t_ir_data) {
+        IrData& ir = *t_ir_data;
+        std::string kinds;
+        u64 payload = 0;
+        for (size_t kind = 1; kind < static_cast<size_t>(Ir::Kind::Count); ++kind) {
+            payload += ir.payload[kind];
+            if (ir.records[kind] == 0) {
+                continue;
+            }
+            kinds += fmt::format(" {} {:.0f}", Ir::kind_names[kind],
+                                 PerSecond(ir.records[kind], window_ns));
+            if (ir.payload[kind] != 0) {
+                kinds += fmt::format(" ({:.0f} payload words)",
+                                     PerSecond(ir.payload[kind], window_ns));
+            }
+            kinds += ',';
+        }
+        if (!kinds.empty()) {
+            kinds.pop_back();
+            LOG_INFO(HW_GPU,
+                     "V2 stats {} IR records (per s):{} | ring words {:.0f}/s, payload arena "
+                     "words {:.0f}/s",
+                     thread_name, kinds, PerSecond(ir.ring_words, window_ns),
+                     PerSecond(payload, window_ns));
+        }
+        ir = {};
     }
     window.start_ns = now;
     window.start_ticks = now_ticks;

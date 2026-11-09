@@ -84,6 +84,12 @@ public:
     [[nodiscard]] u64 ConsumedPosition() const {
         return consumed.load(std::memory_order_relaxed);
     }
+    /// Front thread: ends the open IR StateRun (the next method starts a record) and returns
+    /// the write position, which then follows the last method sent (the v2 stats' releases).
+    [[nodiscard]] u64 CutPosition() {
+        IrCut();
+        return write_position;
+    }
     /// Front thread: ring and payload words sent so far (grows with every method sent; the
     /// write position does not when a method joins an open IR StateRun).
     [[nodiscard]] u64 SentWords() const {
