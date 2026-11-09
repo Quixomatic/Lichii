@@ -180,6 +180,8 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
             const auto copies = FullDownloadCopies(image.info);
             image.DownloadMemory(map, copies);
             runtime.Finish();
+            V2::Versions::HookWrite(image.cpu_addr, image.guest_size_bytes,
+                                    V2::Versions::Source::Gpu);
             SwizzleImage(*gpu_memory, image.gpu_addr, image.info, copies, map.mapped_span, swizzle_data_buffer);
             ++gc_download_deletes;
             ClearStaleImage(image);
@@ -1302,6 +1304,8 @@ void TextureCache<P>::DownloadMemory(DAddr cpu_addr, size_t size) {
         runtime.Finish();
         for (Pending& entry : pending) {
             Image& image = slot_images[entry.image_id];
+            V2::Versions::HookWrite(image.cpu_addr, image.guest_size_bytes,
+                                    V2::Versions::Source::Gpu);
             SwizzleImage(*gpu_memory, image.gpu_addr, image.info, entry.copies,
                          entry.map.mapped_span, swizzle_data_buffer);
             ClearStaleImage(image);
@@ -1850,6 +1854,8 @@ void TextureCache<P>::PopAsyncFlushes() {
                 download_buffer.offset -= Common::AlignUp(image.unswizzled_size_bytes, 64);
                 std::span<u8> download_span =
                     download_buffer.mapped_span.subspan(download_buffer.offset);
+                V2::Versions::HookWrite(image.cpu_addr, image.guest_size_bytes,
+                                        V2::Versions::Source::Gpu);
                 SwizzleImage(*gpu_memory, image.gpu_addr, image.info, copies, download_span, swizzle_data_buffer);
                 ClearStaleImage(image);
             } else {
@@ -1900,6 +1906,8 @@ void TextureCache<P>::PopAsyncFlushes() {
             }
             const ImageBase& image = download_info.GetImage(slot_images);
             const auto copies = FullDownloadCopies(image.info);
+            V2::Versions::HookWrite(image.cpu_addr, image.guest_size_bytes,
+                                    V2::Versions::Source::Gpu);
             SwizzleImage(*gpu_memory, image.gpu_addr, image.info, copies, download_span, swizzle_data_buffer);
             ClearStaleImage(image);
             download_map.offset += image.unswizzled_size_bytes;

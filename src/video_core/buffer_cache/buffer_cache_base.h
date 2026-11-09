@@ -47,6 +47,7 @@
 #include "video_core/nx2_download_trace.h"
 #include "video_core/surface.h"
 #include "video_core/texture_cache/types.h"
+#include "video_core/v2/draw_cache.h"
 
 namespace VideoCommon {
 
@@ -338,6 +339,34 @@ public:
                                      GPUVAddr gpu_addr, u32 size, u32 segment_first,
                                      u32 segment_count, bool is_written);
 
+    /// EDEN_NX2_V2_DRAWCACHE buffer replay. Records the graphics buffer bindings the last
+    /// UpdateGraphicsBuffers/BindHost* resolved and bound (with `stamp`, taken before them).
+    void RecordGraphicsBuffers(VideoCommon::V2::DrawCache::BufferRecipe& recipe, bool is_indexed,
+                               u64 stamp);
+    /// Replaces UpdateGraphicsBuffers + BindHostGeometryBuffers for a recipe replay. A binding
+    /// whose buffer generation matches and whose guest range is unchanged since the recipe's stamp
+    /// (and lies within the recorded one) is bound from the recipe: no FindBuffer, no
+    /// SynchronizeBuffer. Any other binding takes the existing lookup and sync. False when the
+    /// replay can't run (the caller takes the existing calls; nothing was bound).
+    [[nodiscard]] bool ReplayGraphicsBuffers(const VideoCommon::V2::DrawCache::BufferRecipe& recipe,
+                                             bool is_indexed,
+                                             VideoCommon::V2::Versions::EpochMemo& memo);
+    /// Replaces BindHostStageBuffers(stage) after ReplayGraphicsBuffers returned true: uniform
+    /// versions of this tick are referenced and cached uniform, storage and texture buffers bound
+    /// without SynchronizeBuffer when unchanged; anything else is bound as always.
+    void ReplayHostStageBuffers(size_t stage,
+                                const VideoCommon::V2::DrawCache::BufferRecipe& recipe,
+                                VideoCommon::V2::Versions::EpochMemo& memo);
+    /// Bindings ReplayGraphicsBuffers/ReplayHostStageBuffers bound from the recipe and through
+    /// the sync path since the last call (stats; any synced one means the recipe is recorded again).
+    [[nodiscard]] std::pair<u32, u32> TakeReplayCounts() noexcept {
+        return {std::exchange(replay_binds_replayed, 0), std::exchange(replay_binds_synced, 0)};
+    }
+    /// Verify: recipe bindings the versions vouch for whose ranges the tracker still holds
+    /// CPU-modified (a skipped upload would have been needed).
+    [[nodiscard]] u32 CountStaleRecipeRanges(const VideoCommon::V2::DrawCache::BufferRecipe& recipe,
+                                             VideoCommon::V2::Versions::EpochMemo& memo);
+
     /// EDEN_NX2_V2_DRAWCACHE: visits the graphics storage buffer bindings of `stage` as
     /// func(index, is_written, binding).
     template <typename Func>
@@ -521,6 +550,12 @@ public:
 
     Common::SpinRecursiveMutex mutex;
     Runtime& runtime;
+    // EDEN_NX2_V2_DRAWCACHE buffer replay (ReplayGraphicsBuffers): bindings bound from the recipe
+    // or synced, and the vertex buffers that skip their synchronization in this replay.
+    u32 replay_binds_replayed{};
+    u32 replay_binds_synced{};
+    u32 replay_skip_vertex_mask{};
+    bool replay_skip_index{};
     bool any_buffer_uploaded = false;
     /// Indirectly read banks of native programs already uploaded this frame.
     std::unordered_set<DAddr> native_indirect_uniforms_this_frame;

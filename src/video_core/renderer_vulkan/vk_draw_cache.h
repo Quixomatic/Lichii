@@ -59,6 +59,15 @@ public:
     void NoteReplayRebuilt(Recipe& recipe);
     /// Prepare time per path (EDEN_NX2_V2_STATS).
     void NoteDrawTime(bool replay, u64 ns);
+    /// What a replay did with the buffers (stats).
+    void NoteBufferReplay(bool replayed, u32 binds_replayed, u32 binds_synced);
+    /// Verify sample, before its full resolve: counts the hit's buffer ranges the versions vouch
+    /// for that the buffer cache still holds CPU-modified (a mismatch: a skipped upload).
+    void VerifyBufferBytes(const Decision& decision, BufferCache& buffer_cache);
+    /// The resolver's epoch memo (buffer replay validates its ranges through it).
+    [[nodiscard]] VideoCommon::V2::Versions::EpochMemo& Memo() {
+        return memo;
+    }
 
     // --- Dispatches ----------------------------------------------------------------------------
     [[nodiscard]] Decision DecideDispatch(const Tegra::Engines::KeplerCompute& kepler,

@@ -6,6 +6,8 @@
 #include <cstring>
 #include <vector>
 
+#include <fmt/format.h>
+
 #include "common/scope_exit.h"
 
 #include "core/memory.h"
@@ -394,7 +396,9 @@ void DrawCacheGlue::Store(DC::RecipeTable& table, u64 key, Recipe& recipe,
             ++counters.verify_deferred;
         } else {
             std::string reasons;
-            if (!DC::CompareRecipes(*decision.recipe, recipe, reasons)) {
+            const bool buffers_equal =
+                DC::CompareBufferRecipes(decision.recipe->buffers, recipe.buffers, reasons);
+            if (!DC::CompareRecipes(*decision.recipe, recipe, reasons) || !buffers_equal) {
                 ++counters.verify_mismatches;
                 DC::LogMismatch(compute, key, reasons);
             }
@@ -417,7 +421,6 @@ void DrawCacheGlue::FinishDrawCapture(GraphicsPipeline& pipeline, const Decision
         return;
     }
     pending_draw.capturing = false;
-    static_cast<void>(is_indexed);
     const Versions::Generations& gens = Versions::Gens();
     Recipe& recipe = built;
     recipe.pipeline = &pipeline;
@@ -449,6 +452,8 @@ void DrawCacheGlue::FinishDrawCapture(GraphicsPipeline& pipeline, const Decision
                 recipe.inputs.content.push_back({binding.device_addr, binding.size, false});
             });
     }
+    // The buffers the resolve bound, against the stamp taken before it synchronized them.
+    buffer_cache.RecordGraphicsBuffers(recipe.buffers, is_indexed, recipe.inputs.stamp);
     const auto& targets = texture_cache.GetRenderTargets();
     for (size_t rt = 0; rt < DC::NumRecipeTargets - 1; ++rt) {
         const u32 id = targets.color_buffer_ids[rt].index;
@@ -482,6 +487,35 @@ void DrawCacheGlue::NoteReplayed(Recipe& recipe) {
 void DrawCacheGlue::NoteReplayRebuilt(Recipe& recipe) {
     static_cast<void>(recipe);
     ++GraphicsCounters().replays_failed;
+}
+
+void DrawCacheGlue::NoteBufferReplay(bool replayed, u32 binds_replayed, u32 binds_synced) {
+    DC::Counters& counters = GraphicsCounters();
+    if (!replayed) {
+        ++counters.buffer_normal;
+    } else if (binds_synced != 0) {
+        ++counters.buffer_partial;
+    } else {
+        ++counters.buffer_replays;
+    }
+    counters.buffer_binds_replayed += binds_replayed;
+    counters.buffer_binds_synced += binds_synced;
+}
+
+void DrawCacheGlue::VerifyBufferBytes(const Decision& decision, BufferCache& buffer_cache) {
+    if (decision.recipe == nullptr) {
+        return;
+    }
+    const u32 stale = buffer_cache.CountStaleRecipeRanges(decision.recipe->buffers, memo);
+    if (stale == 0) {
+        return;
+    }
+    DC::Counters& counters = GraphicsCounters();
+    counters.buffer_stale += stale;
+    ++counters.verify_mismatches;
+    DC::LogMismatch(false, decision.recipe->key,
+                    fmt::format("buffer bytes: {} ranges CPU-modified behind unchanged versions",
+                                stale));
 }
 
 void DrawCacheGlue::NoteDrawTime(bool replay, u64 ns) {

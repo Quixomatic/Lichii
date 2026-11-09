@@ -244,6 +244,78 @@ struct RecipeCapture {
 
 inline constexpr size_t NumRecipeTargets = 9; ///< 8 colour + depth
 
+/// One buffer binding of a draw as the buffer cache bound it: the host buffer (weak: slot id +
+/// generation), the guest range it covers, and for uniform buffers the path it took.
+struct BufferBind {
+    enum class Kind : u8 {
+        Cached,  ///< bound from the host buffer (the buffer cache's cached path)
+        Version, ///< a P3 constant buffer version in the stream buffer (`ref`, made in `tick`)
+        Normal,  ///< a path the replay doesn't take (stream copy without versions, root table,
+                 ///< native 64 KiB bank): bound by the buffer cache as always
+    };
+    u8 stage{};
+    u8 index{};
+    Kind kind{Kind::Cached};
+    u8 flags{}; ///< bit 0: image texture buffer
+    u32 buffer_id{};
+    u32 generation{};
+    DAddr device_addr{};
+    u32 size{};
+    u32 format{};
+    std::array<u64, 3> ref{}; ///< the runtime's stream uniform reference (Version)
+    u64 tick{};
+
+    /// Whether [address, address + size) lies within this binding's range.
+    [[nodiscard]] bool Contains(DAddr address, u64 bytes) const {
+        return address >= device_addr && address + bytes <= device_addr + size;
+    }
+    [[nodiscard]] bool SameBinding(const BufferBind& other) const {
+        return stage == other.stage && index == other.index && buffer_id == other.buffer_id &&
+               device_addr == other.device_addr && size == other.size && kind == other.kind;
+    }
+};
+
+/// The buffer bindings of a draw recipe (EDEN_NX2_V2_DRAWCACHE buffer replay). `stamp` is taken
+/// before the resolve that synchronized them and never restamped with the words: a binding is
+/// replayed (no FindBuffer, no SynchronizeBuffer, no uniform copy) only while its guest range is
+/// unchanged since then and its buffer's generation is the one recorded.
+struct BufferRecipe {
+    bool valid{};
+    u64 stamp{};
+    bool has_index{};
+    BufferBind index;
+    std::vector<BufferBind> vertex;  ///< index = vertex buffer slot
+    std::vector<BufferBind> uniform; ///< stage, index = constant buffer slot
+    std::vector<BufferBind> storage; ///< stage, index = storage buffer slot
+    std::vector<BufferBind> texture; ///< stage, index = texture buffer slot
+
+    void Clear() {
+        valid = false;
+        stamp = 0;
+        has_index = false;
+        index = {};
+        vertex.clear();
+        uniform.clear();
+        storage.clear();
+        texture.clear();
+    }
+    [[nodiscard]] static const BufferBind* Find(const std::vector<BufferBind>& binds, u32 stage,
+                                                u32 index) {
+        for (const BufferBind& bind : binds) {
+            if (bind.stage == stage && bind.index == index) {
+                return &bind;
+            }
+        }
+        return nullptr;
+    }
+};
+
+/// Compares the buffer bindings a replay of `hit` would bind with the ones a full resolve bound
+/// (`fresh`): a binding the replay takes from the recipe (its range holds the fresh one) must have
+/// the same buffer. Appends "buffers (...)" to `reasons` on a difference.
+[[nodiscard]] bool CompareBufferRecipes(const BufferRecipe& hit, const BufferRecipe& fresh,
+                                        std::string& reasons);
+
 /// Everything a hit needs to record the draw (or dispatch) without resolving it again.
 struct Recipe {
     u64 key{};
@@ -266,6 +338,7 @@ struct Recipe {
     u32 push_words{};
     std::vector<u32> heap_words; ///< bindless heap words (verify)
     CapturedInputs inputs;
+    BufferRecipe buffers;
     u64 uses{};
 
     void Clear() {
@@ -275,6 +348,7 @@ struct Recipe {
         storage.clear();
         heap_words.clear();
         inputs.Clear();
+        buffers.Clear();
         pipeline = nullptr;
         engine = nullptr;
         memory = nullptr;
@@ -498,6 +572,12 @@ struct Counters {
     u64 resolve_draws{};
     u64 restamped{};
     u64 buffers_written{}; ///< hits whose storage buffer pages were written (synced on replay)
+    u64 buffer_replays{};  ///< replays that bound every buffer from the recipe
+    u64 buffer_partial{};  ///< replays where some bindings took the sync path
+    u64 buffer_normal{};   ///< replays whose buffers all took the existing path
+    u64 buffer_binds_replayed{};
+    u64 buffer_binds_synced{};
+    u64 buffer_stale{};    ///< verify: a range the versions vouched for was CPU-modified
     u64 watched_pages{};
 };
 

@@ -1279,10 +1279,14 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     bool replayed = false;
     if (replay_pipeline != nullptr) [[unlikely]] {
         Profile::Scope scope{Profile::Zone::Configure};
-        switch (pipeline->ConfigureRecipe(is_indexed, *cache_decision.recipe, nullptr)) {
+        GraphicsPipeline::BufferReplay buffers{};
+        switch (pipeline->ConfigureRecipe(is_indexed, *cache_decision.recipe, nullptr,
+                                          &DrawCache().Memo(), &buffers)) {
         case GraphicsPipeline::RecipeResult::Recorded:
             replayed = true;
             DrawCache().NoteReplayed(*cache_decision.recipe);
+            DrawCache().NoteBufferReplay(buffers.replayed, buffers.binds_replayed,
+                                         buffers.binds_synced);
             break;
         case GraphicsPipeline::RecipeResult::Rebuild:
             DrawCache().NoteReplayRebuilt(*cache_decision.recipe);
@@ -1316,6 +1320,11 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
                       : nullptr;
         if (recipe_capture != nullptr) [[unlikely]] {
             pipeline->SetRecipeCapture(recipe_capture);
+            if (cache_decision.verify) {
+                // The hit's buffer ranges the versions vouch for must not be CPU-modified (the
+                // sync the replay would skip had nothing to upload). Before this resolve syncs.
+                DrawCache().VerifyBufferBytes(cache_decision, buffer_cache);
+            }
         }
         bool configured;
         {

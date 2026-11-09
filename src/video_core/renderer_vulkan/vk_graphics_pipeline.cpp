@@ -1243,8 +1243,9 @@ void GraphicsPipeline::CaptureStorageDescriptor(size_t stage, u32 cbuf_index, u3
 }
 
 GraphicsPipeline::RecipeResult GraphicsPipeline::ConfigureRecipe(
-    bool is_indexed, const VideoCommon::V2::DrawCache::Recipe& recipe,
-    VideoCommon::V2::DrawCache::RecipeCapture* push_out) {
+    bool is_indexed, VideoCommon::V2::DrawCache::Recipe& recipe,
+    VideoCommon::V2::DrawCache::RecipeCapture* push_out,
+    VideoCommon::V2::Versions::EpochMemo* memo, BufferReplay* buffers) {
     namespace Profile = VideoCommon::Nx2Profile;
     if (recipe.views.size() != num_image_elements || recipe.samplers.size() != num_textures) {
         return RecipeResult::Rebuild;
@@ -1328,10 +1329,19 @@ GraphicsPipeline::RecipeResult GraphicsPipeline::ConfigureRecipe(
     if (regs.transform_feedback_enabled != 0) {
         scheduler.RequestOutsideRenderPassOperationContext();
     }
+    // Buffers: replayed from the recipe where it still holds (stamp first: a write after it is
+    // newer than a recipe recorded again below).
+    const u64 buffer_stamp = memo != nullptr ? VideoCommon::V2::Versions::Pages().Stamp() : 0;
+    bool buffers_replayed = false;
     {
         Profile::Scope scope{Profile::Zone::UpdateBuffers};
-        buffer_cache.UpdateGraphicsBuffers(is_indexed);
-        buffer_cache.BindHostGeometryBuffers(is_indexed);
+        if (memo != nullptr) {
+            buffers_replayed = buffer_cache.ReplayGraphicsBuffers(recipe.buffers, is_indexed, *memo);
+        }
+        if (!buffers_replayed) {
+            buffer_cache.UpdateGraphicsBuffers(is_indexed);
+            buffer_cache.BindHostGeometryBuffers(is_indexed);
+        }
     }
     {
         Profile::Scope scope{Profile::Zone::DescriptorAcquire};
@@ -1347,7 +1357,11 @@ GraphicsPipeline::RecipeResult GraphicsPipeline::ConfigureRecipe(
         }
         {
             Profile::Scope scope{Profile::Zone::BindStageBuffers};
-            buffer_cache.BindHostStageBuffers(stage);
+            if (buffers_replayed) {
+                buffer_cache.ReplayHostStageBuffers(stage, recipe.buffers, *memo);
+            } else {
+                buffer_cache.BindHostStageBuffers(stage);
+            }
         }
         {
             Profile::Scope scope{Profile::Zone::PushDescriptors};
@@ -1394,6 +1408,20 @@ GraphicsPipeline::RecipeResult GraphicsPipeline::ConfigureRecipe(
     }
     if (IsBuilt() && (!pipeline || build->Failed())) {
         return RecipeResult::Failed;
+    }
+    if (memo != nullptr) {
+        const auto [replayed, synced] = buffer_cache.TakeReplayCounts();
+        if (buffers != nullptr) {
+            *buffers = BufferReplay{
+                .replayed = buffers_replayed,
+                .binds_replayed = replayed,
+                .binds_synced = synced,
+            };
+        }
+        if (!buffers_replayed || synced != 0) {
+            // Some binding took the sync path: the recipe holds what was bound now.
+            buffer_cache.RecordGraphicsBuffers(recipe.buffers, is_indexed, buffer_stamp);
+        }
     }
     if (push_out != nullptr) {
         NoteRecipePush(*push_out, rescaling, render_area, heap_push.words);

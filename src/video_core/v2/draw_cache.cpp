@@ -156,6 +156,45 @@ bool CompareRecipes(const Recipe& hit, const Recipe& fresh, std::string& reasons
     return reasons.size() == before;
 }
 
+bool CompareBufferRecipes(const BufferRecipe& hit, const BufferRecipe& fresh,
+                          std::string& reasons) {
+    if (!hit.valid || !fresh.valid) {
+        return true;
+    }
+    std::string differ;
+    const auto check = [&](const char* what, const std::vector<BufferBind>& hits,
+                           const std::vector<BufferBind>& fresh_binds) {
+        for (const BufferBind& bind : fresh_binds) {
+            const BufferBind* const kept = BufferRecipe::Find(hits, bind.stage, bind.index);
+            if (kept == nullptr || !kept->Contains(bind.device_addr, bind.size)) {
+                continue; // the replay takes the sync path for it
+            }
+            if (kept->buffer_id != bind.buffer_id ||
+                (kept->kind == BufferBind::Kind::Cached) != (bind.kind == BufferBind::Kind::Cached)) {
+                differ += fmt::format("{}{} {}:{}", differ.empty() ? "" : " ", what, bind.stage,
+                                      bind.index);
+            }
+        }
+    };
+    if (hit.has_index && fresh.has_index && hit.index.Contains(fresh.index.device_addr,
+                                                               fresh.index.size) &&
+        hit.index.buffer_id != fresh.index.buffer_id) {
+        differ += "index";
+    }
+    check("vertex", hit.vertex, fresh.vertex);
+    check("uniform", hit.uniform, fresh.uniform);
+    check("storage", hit.storage, fresh.storage);
+    check("texture", hit.texture, fresh.texture);
+    if (differ.empty()) {
+        return true;
+    }
+    if (!reasons.empty()) {
+        reasons += ", ";
+    }
+    reasons += "buffers (" + differ + ")";
+    return false;
+}
+
 Recipe* RecipeTable::Find(u64 key) {
     Entry* const set = &entries[SetOf(key) * Ways];
     for (size_t way = 0; way < Ways; ++way) {
@@ -214,7 +253,9 @@ std::string FormatCounters(const char* name, const char* unit, const Counters& c
     return fmt::format(
         "{}: {:.0f}/s, continued {:.1f}%, hit {:.1f}%, invalidated {:.1f}% | misses:{} | replay "
         "{:.2f} us vs resolve {:.2f} us per {} | replays sent back to resolve {:.0f}/s, restamped "
-        "{:.0f}/s, hits with storage pages written (synchronized) {:.0f}/s | table {}/{} "
+        "{:.0f}/s, hits with storage pages written (synchronized) {:.0f}/s | buffer replay: all "
+        "{:.0f}/s, partial {:.0f}/s, existing path {:.0f}/s, bindings from the recipe {:.0f}/s, "
+        "synced {:.0f}/s, verify stale ranges {} | table {}/{} "
         "({:.1f}%), inserts {:.0f}/s, evictions {:.0f}/s | verify {} samples, {} mismatches, {} "
         "deferred by the epoch",
         name, static_cast<double>(decided) / seconds, pct(c.continued), pct(c.hits),
@@ -222,7 +263,12 @@ std::string FormatCounters(const char* name, const char* unit, const Counters& c
         micros(c.replay_ns, c.replay_draws), micros(c.resolve_ns, c.resolve_draws),
         unit, static_cast<double>(c.replays_failed) / seconds,
         static_cast<double>(c.restamped) / seconds,
-        static_cast<double>(c.buffers_written) / seconds, occupied, capacity,
+        static_cast<double>(c.buffers_written) / seconds,
+        static_cast<double>(c.buffer_replays) / seconds,
+        static_cast<double>(c.buffer_partial) / seconds,
+        static_cast<double>(c.buffer_normal) / seconds,
+        static_cast<double>(c.buffer_binds_replayed) / seconds,
+        static_cast<double>(c.buffer_binds_synced) / seconds, c.buffer_stale, occupied, capacity,
         capacity == 0 ? 0.0 : 100.0 * static_cast<double>(occupied) / static_cast<double>(capacity),
         static_cast<double>(c.inserts) / seconds, static_cast<double>(c.evictions) / seconds,
         c.verify_samples, c.verify_mismatches, c.verify_deferred);

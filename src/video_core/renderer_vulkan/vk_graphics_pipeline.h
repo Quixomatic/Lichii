@@ -377,8 +377,19 @@ public:
     /// texture buffers, with no handle, TIC/TSC or storage descriptor read and no view lookup.
     /// Vertex, index and uniform buffers are resolved and synchronized by the buffer cache as
     /// always. `push_out` (verify) receives the push data and heap words recorded.
-    RecipeResult ConfigureRecipe(bool is_indexed, const VideoCommon::V2::DrawCache::Recipe& recipe,
-                                 VideoCommon::V2::DrawCache::RecipeCapture* push_out);
+    /// With `memo`, buffers are replayed too (BufferCache::ReplayGraphicsBuffers): bindings whose
+    /// buffer and guest range are unchanged since the recipe's buffer stamp are bound from it, the
+    /// rest through the lookup and sync; the recipe's buffers are recorded again when any binding
+    /// took the sync path. `buffers` (stats) receives what happened.
+    struct BufferReplay {
+        bool replayed{}; ///< the buffer replay ran (else the existing calls)
+        u32 binds_replayed{};
+        u32 binds_synced{};
+    };
+    RecipeResult ConfigureRecipe(bool is_indexed, VideoCommon::V2::DrawCache::Recipe& recipe,
+                                 VideoCommon::V2::DrawCache::RecipeCapture* push_out,
+                                 VideoCommon::V2::Versions::EpochMemo* memo,
+                                 BufferReplay* buffers);
     /// Constant buffer slots per stage holding the storage buffer descriptors the pipeline reads.
     [[nodiscard]] const std::array<u32, NUM_STAGES>& StorageConstantBuffers() const noexcept {
         return storage_constant_buffers;

@@ -209,6 +209,9 @@ void BufferCache<P>::UnmapGPUMemory(size_t as_id, GPUVAddr gpu_addr, size_t size
 
 template <class P>
 void BufferCache<P>::WriteMemory(DAddr device_addr, u64 size, bool keep_page_gpu_data) {
+    // EDEN_NX2_V2_DRAWCACHE: every path that marks memory CPU-modified moves its version (a
+    // recipe's skipped SynchronizeBuffer relies on it), whoever called.
+    V2::Versions::HookWrite(device_addr, size, V2::Versions::Source::Host);
     Nx2NoteListHostWrite(device_addr, size);
     // The written range lies within its pages: when they hold no GPU-written data, both lookups
     // below find nothing, so one lookup answers them.
@@ -264,6 +267,7 @@ void BufferCache<P>::WriteMemory(DAddr device_addr, u64 size, bool keep_page_gpu
 
 template <class P>
 void BufferCache<P>::CachedWriteMemory(DAddr device_addr, u64 size) {
+    V2::Versions::HookWrite(device_addr, size, V2::Versions::Source::Host);
     const bool is_dirty = IsRegionRegistered(device_addr, size);
     if (!is_dirty) {
         return;
@@ -502,6 +506,7 @@ bool BufferCache<P>::DownloadMemoryAsync(DAddr device_addr, u64 size,
                     continue;
                 }
                 // As WriteDownloadedMemory: CPU writes since the download keep their bytes.
+                V2::Versions::HookWrite(copy.device_addr, copy.size, V2::Versions::Source::Gpu);
                 if (!state->cpu_written.Intersects(copy.device_addr, copy.size)) {
                     memory->WriteBlockUnsafe(copy.device_addr, data, copy.size);
                     continue;
@@ -1021,6 +1026,523 @@ bool BufferCache<P>::BindGraphicsStorageBuffer(size_t stage, size_t ssbo_index, 
     return (channel_state->storage_buffers[stage][ssbo_index].buffer_id != NULL_BUFFER_ID);
 }
 
+
+template <class P>
+void BufferCache<P>::RecordGraphicsBuffers(VideoCommon::V2::DrawCache::BufferRecipe& recipe,
+                                           bool is_indexed, u64 stamp) {
+    namespace DC = VideoCommon::V2::DrawCache;
+    namespace Versions = VideoCommon::V2::Versions;
+    recipe.Clear();
+    if constexpr (!IS_OPENGL && !HAS_FULL_INDEX_AND_PRIMITIVE_SUPPORT &&
+                  VideoCommon::StreamUniformReusable<Runtime>) {
+        const Versions::Generations& gens = Versions::Gens();
+        const auto make = [&](u32 stage, u32 index, const Binding& binding) {
+            return DC::BufferBind{
+                .stage = static_cast<u8>(stage),
+                .index = static_cast<u8>(index),
+                .buffer_id = binding.buffer_id.index,
+                .generation = gens.Get(Versions::Kind::Buffer, binding.buffer_id.index),
+                .device_addr = binding.device_addr,
+                .size = binding.size,
+            };
+        };
+        if (current_draw_indirect || runtime.AnyVertexRepacked()) {
+            return;
+        }
+        const auto& draw_state = maxwell3d->draw_manager.draw_state;
+        if (is_indexed) {
+            if (!draw_state.inline_index_draw_indexes.empty() ||
+                (draw_state.index_buffer.format == Maxwell::IndexFormat::UnsignedByte &&
+                 runtime.WidensUint8IndicesOnHost())) {
+                // Widened on the host from guest memory every draw: no recipe.
+                return;
+            }
+            recipe.has_index = true;
+            recipe.index = make(0, 0, channel_state->index_buffer);
+        }
+        for (u32 mask = enabled_vertex_buffers_mask; mask != 0; mask &= mask - 1) {
+            const u32 index = static_cast<u32>(std::countr_zero(mask));
+            recipe.vertex.push_back(make(0, index, VertexBufferSlot(index)));
+        }
+        const u64 tick = runtime.CurrentTick();
+        for (u32 stage = 0; stage < NUM_STAGES; ++stage) {
+            ForEachEnabledBit(channel_state->enabled_uniform_buffer_masks[stage], [&](u32 index) {
+                const Binding& binding = channel_state->uniform_buffers[stage][index];
+                DC::BufferBind bind = make(stage, index, binding);
+                const u32 size = (std::min)(binding.size,
+                                            (*channel_state->uniform_buffer_sizes)[stage][index]);
+                bind.size = size;
+                const bool has_host_buffer = binding.buffer_id != NULL_BUFFER_ID;
+                const u32 offset =
+                    has_host_buffer ? slot_buffers[binding.buffer_id].Offset(binding.device_addr)
+                                    : 0;
+                const u32 alignment = runtime.GetUniformBufferAlignment();
+                const bool needs_alignment_stream =
+                    has_host_buffer && alignment > 1 && (offset % alignment) != 0;
+                const bool native_bank =
+                    has_host_buffer &&
+                    (*channel_state->uniform_buffer_sizes)[stage][index] == 0x10000 &&
+                    gpu_memory != nullptr && gpu_memory->UsesNativeTiling();
+                const bool use_fast_buffer =
+                    needs_alignment_stream ||
+                    (has_host_buffer && size <= channel_state->uniform_buffer_skip_cache_size &&
+                     !memory_tracker.IsRegionGpuModified(binding.device_addr, size));
+                if ((index == 17 && maxwell3d->root_tables.loaded && binding.size == 0) ||
+                    native_bank || !has_host_buffer) {
+                    bind.kind = DC::BufferBind::Kind::Normal;
+                } else if (use_fast_buffer) {
+                    using Ref = typename Runtime::StreamUniformRef;
+                    static_assert(sizeof(Ref) <= sizeof(bind.ref));
+                    const Ref* const version =
+                        VideoCommon::V2::On(VideoCommon::V2::Switch::CbufVer)
+                            ? VideoCommon::V2::CbufVer::Table<Ref>().Find(binding.device_addr, size,
+                                                                          tick)
+                            : nullptr;
+                    if (version != nullptr) {
+                        bind.kind = DC::BufferBind::Kind::Version;
+                        std::memcpy(bind.ref.data(), version, sizeof(Ref));
+                        bind.tick = tick;
+                    } else {
+                        bind.kind = DC::BufferBind::Kind::Normal;
+                    }
+                } else {
+                    bind.kind = DC::BufferBind::Kind::Cached;
+                }
+                recipe.uniform.push_back(bind);
+            });
+            bool multi_range = false;
+            ForEachEnabledBit(channel_state->enabled_storage_buffers[stage], [&](u32 index) {
+                const Binding& binding = channel_state->storage_buffers[stage][index];
+                multi_range |= binding.segment_count != 0;
+                recipe.storage.push_back(make(stage, index, binding));
+            });
+            if (multi_range) {
+                recipe.Clear();
+                return;
+            }
+            ForEachEnabledBit(channel_state->enabled_texture_buffers[stage], [&](u32 index) {
+                const TextureBufferBinding& binding = channel_state->texture_buffers[stage][index];
+                DC::BufferBind bind = make(stage, index, binding);
+                bind.format = static_cast<u32>(binding.format);
+                if constexpr (SEPARATE_IMAGE_BUFFERS_BINDINGS) {
+                    bind.flags = static_cast<u8>(
+                        (channel_state->image_texture_buffers[stage] >> index) & 1);
+                }
+                recipe.texture.push_back(bind);
+            });
+        }
+        recipe.stamp = stamp;
+        recipe.valid = true;
+    } else {
+        static_cast<void>(is_indexed);
+        static_cast<void>(stamp);
+    }
+}
+
+template <class P>
+bool BufferCache<P>::ReplayGraphicsBuffers(const VideoCommon::V2::DrawCache::BufferRecipe& recipe,
+                                           bool is_indexed,
+                                           VideoCommon::V2::Versions::EpochMemo& memo) {
+    namespace DC = VideoCommon::V2::DrawCache;
+    namespace Versions = VideoCommon::V2::Versions;
+    if constexpr (!IS_OPENGL && !HAS_FULL_INDEX_AND_PRIMITIVE_SUPPORT &&
+                  VideoCommon::StreamUniformReusable<Runtime>) {
+        if (!recipe.valid || recipe.has_index != is_indexed || current_draw_indirect ||
+            runtime.AnyVertexRepacked() || maxwell3d->regs.transform_feedback_enabled != 0) {
+            return false;
+        }
+        const auto& draw_state = maxwell3d->draw_manager.draw_state;
+        if (!draw_state.inline_index_draw_indexes.empty() ||
+            (is_indexed && draw_state.index_buffer.format == Maxwell::IndexFormat::UnsignedByte &&
+             runtime.WidensUint8IndicesOnHost())) {
+            // The index format is not in the key: 8-bit indices widened on the host from guest
+            // memory every draw take the existing path.
+            return false;
+        }
+        const Versions::Generations& gens = Versions::Gens();
+        // A recorded buffer still bindable for [address, address + size): alive, the range within
+        // the recorded one and unchanged since the recipe's stamp.
+        const auto usable = [&](const DC::BufferBind* bind, DAddr address, u64 size) {
+            return bind != nullptr && bind->Contains(address, size) &&
+                   gens.Get(Versions::Kind::Buffer, bind->buffer_id) == bind->generation &&
+                   slot_buffers.contains(BufferId{bind->buffer_id}) &&
+                   memo.Unchanged(address, size, recipe.stamp);
+        };
+        auto& flags = maxwell3d->dirty.flags;
+        graphics_segments.clear();
+        channel_state->has_deleted_buffers = false;
+        replay_skip_index = false;
+        replay_skip_vertex_mask = 0;
+
+        // Index buffer (UpdateIndexBuffer without the lookup when the recipe holds it).
+        if (is_indexed) {
+            if (flags[Dirty::IndexBuffer]) {
+                flags[Dirty::IndexBuffer] = false;
+                const auto& index_buffer_ref = draw_state.index_buffer;
+                const GPUVAddr gpu_addr_begin = index_buffer_ref.StartAddress();
+                const GPUVAddr gpu_addr_end = index_buffer_ref.EndAddress();
+                const std::optional<DAddr> device_addr = gpu_memory->GpuToCpuAddress(gpu_addr_begin);
+                const u32 address_size = static_cast<u32>(gpu_addr_end - gpu_addr_begin);
+                const u32 draw_size = (index_buffer_ref.count + index_buffer_ref.first) *
+                                      u32(index_buffer_ref.FormatSizeInBytes());
+                const u32 size = (std::min)(address_size, draw_size);
+                if (size == 0 || !device_addr) {
+                    channel_state->index_buffer = NULL_BINDING;
+                } else if (usable(&recipe.index, *device_addr, size)) {
+                    channel_state->index_buffer = Binding{
+                        .device_addr = *device_addr,
+                        .size = size,
+                        .buffer_id = BufferId{recipe.index.buffer_id},
+                    };
+                    replay_skip_index = true;
+                } else {
+                    channel_state->index_buffer = Binding{
+                        .device_addr = *device_addr,
+                        .size = size,
+                        .buffer_id = FindBuffer(*device_addr, size, false),
+                    };
+                }
+            } else {
+                const Binding& current = channel_state->index_buffer;
+                replay_skip_index = current.buffer_id.index == recipe.index.buffer_id &&
+                                    usable(&recipe.index, current.device_addr, current.size);
+            }
+        }
+        // Vertex buffers (UpdateVertexBuffer without the lookup when the recipe holds it).
+        if (flags[Dirty::VertexBuffers]) {
+            flags[Dirty::VertexBuffers] = false;
+            for (u32 index = 0; index < NUM_VERTEX_BUFFERS; ++index) {
+                if (!flags[Dirty::VertexBuffer0 + index]) {
+                    continue;
+                }
+                const auto& array = maxwell3d->regs.vertex_streams[index];
+                const auto& limit = maxwell3d->regs.vertex_stream_limits[index];
+                const GPUVAddr gpu_addr_begin = array.Address();
+                const bool native = maxwell3d->GetNativeMacroEngine().native_turing;
+                const u64 native_size = native ? maxwell3d->regs.NativeVertexStreamSize(index) : 0;
+                if (native && array.enable != 0 &&
+                    native_size > (std::numeric_limits<u32>::max)()) {
+                    throw std::runtime_error(
+                        "Native vertex stream exceeds supported 32-bit buffer size");
+                }
+                const GPUVAddr gpu_addr_end =
+                    native ? gpu_addr_begin + native_size : limit.Address() + 1;
+                const std::optional<DAddr> device_addr = gpu_memory->GpuToCpuAddress(gpu_addr_begin);
+                u32 size = static_cast<u32>(gpu_addr_end - gpu_addr_begin);
+                if (array.enable == 0 || size == 0 || !device_addr) {
+                    channel_state->vertex_buffers[index] = NULL_BINDING;
+                    UpdateVertexBufferSlot(index, NULL_BINDING);
+                    continue;
+                }
+                if (!gpu_memory->IsWithinGPUAddressRange(gpu_addr_end) || size >= 64_MiB) {
+                    size = static_cast<u32>(gpu_memory->MaxContinuousRange(gpu_addr_begin, size));
+                }
+                const DC::BufferBind* const kept = DC::BufferRecipe::Find(recipe.vertex, 0, index);
+                const BufferId buffer_id = usable(kept, *device_addr, size)
+                                               ? BufferId{kept->buffer_id}
+                                               : FindBuffer(*device_addr, size, false);
+                const Binding binding{
+                    .device_addr = *device_addr,
+                    .size = size,
+                    .buffer_id = buffer_id,
+                };
+                channel_state->vertex_buffers[index] = binding;
+                UpdateVertexBufferSlot(index, binding);
+            }
+        }
+        for (u32 mask = enabled_vertex_buffers_mask; mask != 0; mask &= mask - 1) {
+            const u32 index = static_cast<u32>(std::countr_zero(mask));
+            const Binding& binding = VertexBufferSlot(index);
+            const DC::BufferBind* const kept = DC::BufferRecipe::Find(recipe.vertex, 0, index);
+            if (kept != nullptr && binding.buffer_id.index == kept->buffer_id &&
+                usable(kept, binding.device_addr, binding.size)) {
+                replay_skip_vertex_mask |= 1U << index;
+            }
+        }
+        // Uniform, storage and texture buffers (Update*Buffers).
+        for (u32 stage = 0; stage < NUM_STAGES; ++stage) {
+            ForEachEnabledBit(channel_state->enabled_uniform_buffer_masks[stage], [&](u32 index) {
+                Binding& binding = channel_state->uniform_buffers[stage][index];
+                if (binding.buffer_id) {
+                    return;
+                }
+                const DC::BufferBind* const kept = DC::BufferRecipe::Find(recipe.uniform, stage, index);
+                const u32 size = (std::min)(binding.size,
+                                            (*channel_state->uniform_buffer_sizes)[stage][index]);
+                // FindBuffer would return a buffer holding the whole binding: the recorded one
+                // still does when it covers it.
+                const bool covers =
+                    kept != nullptr && kept->kind != DC::BufferBind::Kind::Normal &&
+                    usable(kept, binding.device_addr, size) && [&] {
+                        const Buffer& buffer = slot_buffers[BufferId{kept->buffer_id}];
+                        return buffer.CpuAddr() <= binding.device_addr &&
+                               binding.device_addr + binding.size <=
+                                   buffer.CpuAddr() + buffer.SizeBytes();
+                    }();
+                binding.buffer_id = covers ? BufferId{kept->buffer_id}
+                                           : FindBuffer(binding.device_addr, binding.size, false);
+            });
+            ForEachEnabledBit(channel_state->enabled_storage_buffers[stage], [&](u32 index) {
+                Binding& binding = channel_state->storage_buffers[stage][index];
+                const DC::BufferBind* const kept = DC::BufferRecipe::Find(recipe.storage, stage, index);
+                if (kept != nullptr && kept->device_addr == binding.device_addr &&
+                    kept->size == binding.size && usable(kept, binding.device_addr, binding.size)) {
+                    binding.buffer_id = BufferId{kept->buffer_id};
+                } else {
+                    binding.buffer_id = FindBuffer(binding.device_addr, binding.size, false);
+                    const bool is_written =
+                        ((channel_state->written_storage_buffers[stage] >> index) & 1) != 0;
+                    ResolveMultiRangeStorage(binding, is_written, graphics_segments);
+                }
+            });
+            ForEachEnabledBit(channel_state->enabled_texture_buffers[stage], [&](u32 index) {
+                Binding& binding = channel_state->texture_buffers[stage][index];
+                const DC::BufferBind* const kept = DC::BufferRecipe::Find(recipe.texture, stage, index);
+                binding.buffer_id = kept != nullptr && kept->device_addr == binding.device_addr &&
+                                            kept->size == binding.size &&
+                                            usable(kept, binding.device_addr, binding.size)
+                                        ? BufferId{kept->buffer_id}
+                                        : FindBuffer(binding.device_addr, binding.size, false);
+            });
+        }
+        if (channel_state->has_deleted_buffers) {
+            // A lookup joined or recreated buffers: the existing loop resolves everything again.
+            UpdateGraphicsBuffers(is_indexed);
+            replay_skip_index = false;
+            replay_skip_vertex_mask = 0;
+        }
+        RefreshMultiRangeSegments(graphics_segments);
+
+        // BindHostGeometryBuffers.
+        if (is_indexed) {
+            Buffer& buffer = slot_buffers[channel_state->index_buffer.buffer_id];
+            TouchBuffer(buffer, channel_state->index_buffer.buffer_id);
+            const u32 offset = buffer.Offset(channel_state->index_buffer.device_addr);
+            const u32 size = channel_state->index_buffer.size;
+            if (replay_skip_index) {
+                ++replay_binds_replayed;
+            } else {
+                ++replay_binds_synced;
+                SynchronizeGeometryBuffer(NUM_VERTEX_BUFFERS, channel_state->index_buffer.buffer_id,
+                                          channel_state->index_buffer.device_addr, size);
+            }
+            buffer.MarkUsage(offset, size);
+            runtime.BindIndexBuffer(draw_state.topology, draw_state.index_buffer.format,
+                                    draw_state.index_buffer.first, draw_state.index_buffer.count,
+                                    buffer, offset, size);
+        } else if (draw_state.topology == Maxwell::PrimitiveTopology::Quads ||
+                   draw_state.topology == Maxwell::PrimitiveTopology::QuadStrip) {
+            runtime.BindQuadIndexBuffer(draw_state.topology, draw_state.vertex_buffer.first,
+                                        draw_state.vertex_buffer.count);
+        }
+        RefreshRepackedVertexBuffers();
+        u32 enabled_mask = enabled_vertex_buffers_mask;
+        HostBindings<Buffer> bindings{};
+        u32 last_index = (std::numeric_limits<u32>::max)();
+        const auto flush_bindings = [&]() {
+            if (bindings.buffers.empty()) {
+                return;
+            }
+            bindings.max_index = bindings.min_index + static_cast<u32>(bindings.buffers.size());
+            runtime.BindVertexBuffers(bindings);
+            bindings = HostBindings<Buffer>{};
+            last_index = (std::numeric_limits<u32>::max)();
+        };
+        while (enabled_mask != 0) {
+            const u32 index = static_cast<u32>(std::countr_zero(enabled_mask));
+            enabled_mask &= (enabled_mask - 1);
+            const Binding& binding = VertexBufferSlot(index);
+            Buffer& buffer = slot_buffers[binding.buffer_id];
+            TouchBuffer(buffer, binding.buffer_id);
+            if (((replay_skip_vertex_mask >> index) & 1) != 0) {
+                ++replay_binds_replayed;
+            } else {
+                ++replay_binds_synced;
+                SynchronizeGeometryBuffer(index, binding.buffer_id, binding.device_addr,
+                                          binding.size);
+            }
+            if (!flags[Dirty::VertexBuffer0 + index]) {
+                flush_bindings();
+                continue;
+            }
+            flags[Dirty::VertexBuffer0 + index] = false;
+            const u32 stride = maxwell3d->regs.vertex_streams[index].stride;
+            const u32 offset = buffer.Offset(binding.device_addr);
+            buffer.MarkUsage(offset, binding.size);
+            if (!bindings.buffers.empty() && index != last_index + 1) {
+                flush_bindings();
+            }
+            if (bindings.buffers.empty()) {
+                bindings.min_index = index;
+            }
+            bindings.buffers.push_back(&buffer);
+            bindings.offsets.push_back(offset);
+            bindings.sizes.push_back(binding.size);
+            bindings.strides.push_back(stride);
+            last_index = index;
+        }
+        flush_bindings();
+        return true;
+    } else {
+        static_cast<void>(recipe);
+        static_cast<void>(is_indexed);
+        static_cast<void>(memo);
+        return false;
+    }
+}
+
+template <class P>
+void BufferCache<P>::ReplayHostStageBuffers(size_t stage,
+                                            const VideoCommon::V2::DrawCache::BufferRecipe& recipe,
+                                            VideoCommon::V2::Versions::EpochMemo& memo) {
+    namespace DC = VideoCommon::V2::DrawCache;
+    if constexpr (!IS_OPENGL && !HAS_FULL_INDEX_AND_PRIMITIVE_SUPPORT &&
+                  !NEEDS_BIND_UNIFORM_INDEX && !NEEDS_BIND_STORAGE_INDEX &&
+                  !HAS_PERSISTENT_UNIFORM_BUFFER_BINDINGS &&
+                  VideoCommon::StreamUniformReusable<Runtime>) {
+        const u32 stage_index = static_cast<u32>(stage);
+        const auto unchanged = [&](DAddr address, u64 size) {
+            return memo.Unchanged(address, size, recipe.stamp);
+        };
+        // The binding still uses the recorded buffer object (same slot and generation) for a
+        // range within the recorded one, unchanged since the recipe's stamp.
+        const auto replayable = [&](const DC::BufferBind* kept, const Binding& binding, u32 size) {
+            return kept != nullptr && binding.buffer_id.index == kept->buffer_id &&
+                   VideoCommon::V2::Versions::Gens().Get(VideoCommon::V2::Versions::Kind::Buffer,
+                                                         kept->buffer_id) == kept->generation &&
+                   kept->Contains(binding.device_addr, size) &&
+                   unchanged(binding.device_addr, size);
+        };
+        // Uniform buffers (BindHostGraphicsUniformBuffers).
+        ForEachEnabledBit(channel_state->enabled_uniform_buffer_masks[stage], [&](u32 index) {
+            const Binding& binding = channel_state->uniform_buffers[stage][index];
+            const DC::BufferBind* const kept = DC::BufferRecipe::Find(recipe.uniform, stage_index,
+                                                                      index);
+            const u32 size =
+                (std::min)(binding.size, (*channel_state->uniform_buffer_sizes)[stage][index]);
+            if (kept != nullptr && kept->kind == DC::BufferBind::Kind::Version &&
+                kept->tick == runtime.CurrentTick() && kept->device_addr == binding.device_addr &&
+                kept->size == size && replayable(kept, binding, size)) {
+                // The version made in this command buffer still holds the bytes: no copy.
+                using Ref = typename Runtime::StreamUniformRef;
+                Ref ref{};
+                std::memcpy(&ref, kept->ref.data(), sizeof(Ref));
+                channel_state->fast_bound_uniform_buffers[stage] |= 1u << index;
+                channel_state->uniform_buffer_binding_sizes[stage][index] = size;
+                runtime.RebindStreamUniform(ref, size);
+                ++replay_binds_replayed;
+                return;
+            }
+            if (kept != nullptr && kept->kind == DC::BufferBind::Kind::Cached &&
+                replayable(kept, binding, size)) {
+                Buffer& buffer = slot_buffers[binding.buffer_id];
+                TouchBuffer(buffer, binding.buffer_id);
+                const u32 offset = buffer.Offset(binding.device_addr);
+                buffer.MarkUsage(offset, size);
+                runtime.BindUniformBuffer(buffer, offset, size);
+                channel_state->fast_bound_uniform_buffers[stage] &= ~(1u << index);
+                ++replay_binds_replayed;
+                return;
+            }
+            ++replay_binds_synced;
+            BindHostGraphicsUniformBuffer(stage, index, 0, true);
+        });
+        // Storage buffers (BindHostGraphicsStorageBuffers).
+        if (channel_state->enabled_storage_buffers[stage] != 0) {
+            ForEachEnabledBit(channel_state->enabled_storage_buffers[stage], [&](u32 index) {
+                const Binding& binding = channel_state->storage_buffers[stage][index];
+                const bool is_written =
+                    ((channel_state->written_storage_buffers[stage] >> index) & 1) != 0;
+                if (BindMultiRangeStorage(binding, is_written, graphics_segments)) {
+                    ++replay_binds_synced;
+                    return;
+                }
+                Buffer& buffer = slot_buffers[binding.buffer_id];
+                TouchBuffer(buffer, binding.buffer_id);
+                const u32 size = binding.size;
+                const DC::BufferBind* const kept = DC::BufferRecipe::Find(recipe.storage,
+                                                                          stage_index, index);
+                if (!is_written && replayable(kept, binding, size)) {
+                    ++replay_binds_replayed;
+                } else {
+                    ++replay_binds_synced;
+                    SynchronizeBuffer(buffer, binding.device_addr, size);
+                }
+                const u32 offset = buffer.Offset(binding.device_addr);
+                buffer.MarkUsage(offset, size);
+                if (is_written) {
+                    MarkWrittenBuffer(binding.buffer_id, binding.device_addr, size);
+                }
+                runtime.BindStorageBuffer(buffer, offset, size, is_written);
+            });
+        }
+        // Texture buffers (BindHostGraphicsTextureBuffers).
+        if (channel_state->enabled_texture_buffers[stage] != 0) {
+            ForEachEnabledBit(channel_state->enabled_texture_buffers[stage], [&](u32 index) {
+                const TextureBufferBinding& binding = channel_state->texture_buffers[stage][index];
+                Buffer& buffer = slot_buffers[binding.buffer_id];
+                const u32 size = binding.size;
+                const bool is_written =
+                    ((channel_state->written_texture_buffers[stage] >> index) & 1) != 0;
+                const DC::BufferBind* const kept = DC::BufferRecipe::Find(recipe.texture,
+                                                                          stage_index, index);
+                if (!is_written && replayable(kept, binding, size)) {
+                    ++replay_binds_replayed;
+                } else {
+                    ++replay_binds_synced;
+                    SynchronizeBuffer(buffer, binding.device_addr, size);
+                }
+                if (is_written) {
+                    MarkWrittenBuffer(binding.buffer_id, binding.device_addr, size);
+                }
+                const u32 offset = buffer.Offset(binding.device_addr);
+                buffer.MarkUsage(offset, size);
+                if constexpr (SEPARATE_IMAGE_BUFFERS_BINDINGS) {
+                    if (((channel_state->image_texture_buffers[stage] >> index) & 1) != 0) {
+                        runtime.BindImageBuffer(buffer, offset, size, binding.format);
+                    } else {
+                        runtime.BindTextureBuffer(buffer, offset, size, binding.format);
+                    }
+                } else {
+                    runtime.BindTextureBuffer(buffer, offset, size, binding.format);
+                }
+            });
+        }
+    } else {
+        static_cast<void>(recipe);
+        static_cast<void>(memo);
+        BindHostStageBuffers(stage);
+    }
+}
+
+template <class P>
+u32 BufferCache<P>::CountStaleRecipeRanges(const VideoCommon::V2::DrawCache::BufferRecipe& recipe,
+                                           VideoCommon::V2::Versions::EpochMemo& memo) {
+    if (!recipe.valid) {
+        return 0;
+    }
+    u32 stale = 0;
+    const auto check = [&](const VideoCommon::V2::DrawCache::BufferBind& bind) {
+        if (bind.kind == VideoCommon::V2::DrawCache::BufferBind::Kind::Normal || bind.size == 0 ||
+            !slot_buffers.contains(BufferId{bind.buffer_id})) {
+            return;
+        }
+        if (memo.Unchanged(bind.device_addr, bind.size, recipe.stamp) &&
+            memory_tracker.IsRegionCpuModified(bind.device_addr, bind.size)) {
+            ++stale;
+        }
+    };
+    if (recipe.has_index) {
+        check(recipe.index);
+    }
+    for (const auto* binds : {&recipe.vertex, &recipe.uniform, &recipe.storage, &recipe.texture}) {
+        for (const auto& bind : *binds) {
+            check(bind);
+        }
+    }
+    return stale;
+}
+
 template <class P>
 void BufferCache<P>::ReplayGraphicsStorageBuffer(size_t stage, size_t ssbo_index,
                                                  DAddr device_addr, GPUVAddr gpu_addr, u32 size,
@@ -1367,6 +1889,8 @@ Common::RangeSet<DAddr> BufferCache<P>::PendingCpuWriteRanges() {
 template <class P>
 void BufferCache<P>::WriteDownloadedMemory(const Common::RangeSet<DAddr>& cpu_written,
                                            DAddr device_addr, const u8* data, u64 size) {
+    // A download changes guest memory (handle words, stream-copied uniforms read it).
+    V2::Versions::HookWrite(device_addr, size, V2::Versions::Source::Gpu);
     if (!cpu_written.Intersects(device_addr, size)) {
         device_memory.WriteBlockUnsafe(device_addr, data, size);
         return;
@@ -3145,6 +3669,7 @@ bool BufferCache<P>::InlineMemory(DAddr dest_address, size_t copy_size,
 template <class P>
 void BufferCache<P>::InlineMemoryImplementation(DAddr dest_address, size_t copy_size,
                                                 std::span<const u8> inlined_buffer) {
+    V2::Versions::HookWrite(dest_address, copy_size, V2::Versions::Source::Inline);
     ClearDownload(dest_address, copy_size);
     gpu_modified_ranges.Subtract(dest_address, copy_size);
     MarkVertexBuffersStale(dest_address, copy_size);
