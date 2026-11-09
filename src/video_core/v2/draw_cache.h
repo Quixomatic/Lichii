@@ -427,11 +427,17 @@ struct Recipe {
     CapturedInputs inputs;
     BufferRecipe buffers;
     ResidencyStamp residency; ///< F2-09: the views were prepared under this stamp
+    /// F2-04: the bindless heap's release count when a hit last found `heap_words` (~0: not
+    /// yet), and the submission that last marked their slots used.
+    u64 heap_releases{~0ULL};
+    u64 heap_tick{};
     u64 uses{};
 
     void Clear() {
         const u64 kept_key = key;
         residency = {};
+        heap_releases = ~0ULL;
+        heap_tick = 0;
         views.clear();
         samplers.clear();
         storage.clear();

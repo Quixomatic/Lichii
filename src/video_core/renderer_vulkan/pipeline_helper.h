@@ -569,6 +569,10 @@ public:
     const std::array<u32, NUM_TEXTURE_AND_IMAGE_SCALING_WORDS>& Data() const noexcept {
         return words;
     }
+    /// F2-04: the words a recipe recorded (its Push* calls are not replayed).
+    void Assign(std::span<const u32> recorded) noexcept {
+        std::copy_n(recorded.begin(), (std::min)(recorded.size(), words.size()), words.begin());
+    }
 
 private:
     std::array<u32, NUM_TEXTURE_AND_IMAGE_SCALING_WORDS> words{};

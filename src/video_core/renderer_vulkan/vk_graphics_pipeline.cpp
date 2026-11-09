@@ -1397,6 +1397,14 @@ GraphicsPipeline::RecipeResult GraphicsPipeline::ConfigureRecipe(
     RenderAreaPushConstant render_area;
     const VideoCommon::SamplerId* samplers_it{samplers.data()};
     const VideoCommon::ImageViewInOut* views_it{views.data()};
+    // F2-04 (§7 descriptor row): the recipe's heap words and rescaling words replayed while no
+    // heap slot was recycled or freed since a hit found them equal (the views and samplers are
+    // the recipe's, validated by generation, and the rescale epoch is validated): no slot
+    // lookup per descriptor; the slots are marked used once per submission.
+    const bool heap_replay = HeapWordsReplayable(recipe);
+    const u64 heap_releases = heap_pipeline && heap_push.heap != nullptr
+                                  ? heap_push.heap->Releases()
+                                  : 0;
     for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
         if (!recipe_stages[stage]) {
             continue;
@@ -1411,7 +1419,7 @@ GraphicsPipeline::RecipeResult GraphicsPipeline::ConfigureRecipe(
                 WithHeapTexels(stage, [&] { buffer_cache.BindHostStageBuffers(stage); });
             }
         }
-        {
+        if (!heap_replay) {
             Profile::Scope scope{Profile::Zone::PushDescriptors};
             PushImageDescriptors(texture_cache, guest_descriptor_queue, stage_infos[stage],
                                  rescaling, samplers_it, views_it,
@@ -1424,6 +1432,20 @@ GraphicsPipeline::RecipeResult GraphicsPipeline::ConfigureRecipe(
             render_area.words = {static_cast<float>(clip_set ? clip_width : u32{regs.rt[0].width}),
                                  static_cast<float>(clip_set ? clip_height : u32{regs.rt[0].height})};
         }
+    }
+    if (heap_replay) {
+        heap_push.words.assign(recipe.heap_words.begin(), recipe.heap_words.end());
+        rescaling.Assign(std::span<const u32>(recipe.push.data(), rescaling.Data().size()));
+        if (const u64 tick = scheduler.CurrentTick(); recipe.heap_tick != tick) {
+            recipe.heap_tick = tick;
+            TouchHeapWords(recipe.heap_words);
+        }
+    } else if (HeapWordsLearnable(recipe) && heap_push.words == recipe.heap_words &&
+               std::equal(rescaling.Data().begin(), rescaling.Data().end(),
+                          recipe.push.begin())) {
+        // This hit found the recipe's words: later hits replay them while no slot moves.
+        recipe.heap_releases = heap_releases;
+        recipe.heap_tick = scheduler.CurrentTick();
     }
     if (heap_pipeline) {
         AddHeapWords();
@@ -1923,6 +1945,63 @@ void GraphicsPipeline::AddHeapWords() {
         });
     heap_push_data.count = 1;
     guest_descriptor_queue.AddBuffer(heap_table.buffer, heap_table.offset, heap_table.size);
+}
+
+bool GraphicsPipeline::HeapImagesOnly() {
+    if (heap_images_only >= 0) [[likely]] {
+        return heap_images_only != 0;
+    }
+    namespace SPIRV = Shader::Backend::SPIRV;
+    bool only = heap_pipeline;
+    for (size_t stage = 0; stage < NUM_STAGES && only; ++stage) {
+        const Shader::Info& info = stage_infos[stage];
+        only &= heap_texels[stage].heap == 0;
+        for (size_t index = 0; index < info.texture_descriptors.size() && only; ++index) {
+            only &= SPIRV::UsesHeap(info, index);
+        }
+        for (size_t index = 0; index < info.image_descriptors.size() && only; ++index) {
+            only &= SPIRV::UsesHeapImage(info, index) && !info.image_descriptors[index].is_written;
+        }
+    }
+    heap_images_only = only ? 1 : 0;
+    return only;
+}
+
+bool GraphicsPipeline::HeapWordsLearnable(const VideoCommon::V2::DrawCache::Recipe& recipe) {
+    return heap_push.heap != nullptr && !heap_push.verify && HeapImagesOnly() &&
+           recipe.push_words >= RescalingPushConstant{}.Data().size();
+}
+
+bool GraphicsPipeline::HeapWordsReplayable(const VideoCommon::V2::DrawCache::Recipe& recipe) {
+    return recipe.heap_releases != ~0ULL && HeapWordsLearnable(recipe) &&
+           recipe.heap_releases == heap_push.heap->Releases();
+}
+
+void GraphicsPipeline::TouchHeapWords(std::span<const u32> words) {
+    // The words in the order PushImageDescriptors pushes them: per stage, the sampled textures
+    // (image | sampler << 16), then the storage images.
+    namespace SPIRV = Shader::Backend::SPIRV;
+    size_t word = 0;
+    for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
+        if (!recipe_stages[stage]) {
+            continue;
+        }
+        const Shader::Info& info = stage_infos[stage];
+        for (const auto& desc : info.texture_descriptors) {
+            const u32 binding = SPIRV::HeapImageBinding(desc.type, desc.is_multisample,
+                                                        desc.is_integer);
+            for (u32 index = 0; index < desc.count && word < words.size(); ++index, ++word) {
+                heap_push.heap->Touch(binding, words[word] & 0xffff);
+                heap_push.heap->Touch(SPIRV::HEAP_SAMPLER_BINDING, words[word] >> 16);
+            }
+        }
+        for (const auto& desc : info.image_descriptors) {
+            const u32 binding = SPIRV::HeapStorageBinding(desc.type, desc.is_integer);
+            for (u32 index = 0; index < desc.count && word < words.size(); ++index, ++word) {
+                heap_push.heap->Touch(binding, words[word]);
+            }
+        }
+    }
 }
 
 void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {

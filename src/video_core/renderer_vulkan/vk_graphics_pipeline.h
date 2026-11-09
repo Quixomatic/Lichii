@@ -535,6 +535,15 @@ private:
     }
     u32 heap_reasons{}; ///< HeapReason bits of descriptors left out
     u32 heap_words{};
+    /// F2-04: every sampled texture and storage image of the pipeline reads the heap and no
+    /// texel buffer does (its heap words are its image words only). -1: not computed yet.
+    s8 heap_images_only{-1};
+    [[nodiscard]] bool HeapImagesOnly();
+    /// Whether a recipe hit can replay the recipe's heap and rescaling words / learn them now.
+    [[nodiscard]] bool HeapWordsReplayable(const VideoCommon::V2::DrawCache::Recipe& recipe);
+    [[nodiscard]] bool HeapWordsLearnable(const VideoCommon::V2::DrawCache::Recipe& recipe);
+    /// Marks the heap slots of `words` used by the current submission.
+    void TouchHeapWords(std::span<const u32> words);
     /// The heap words are push constants (they fit HEAP_PUSH_WORDS); else the word table.
     bool heap_words_pushed{false};
     HeapWordTable heap_table;

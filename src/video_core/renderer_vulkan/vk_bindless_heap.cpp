@@ -280,6 +280,12 @@ u32 BindlessHeap::Slot(u32 binding, u64 handle) {
     return slot;
 }
 
+void BindlessHeap::Touch(u32 binding, u32 slot) {
+    if (binding < spaces.size() && slot < Capacity) {
+        spaces[binding].last_use[slot].store(scheduler.CurrentTick(), std::memory_order_relaxed);
+    }
+}
+
 u32 BindlessHeap::Recycle(Space& space) {
     std::scoped_lock lock{mutex};
     const u64 tick = scheduler.CurrentTick();
@@ -300,6 +306,7 @@ u32 BindlessHeap::Recycle(Space& space) {
         }
         return 0;
     }
+    releases.fetch_add(1, std::memory_order_acq_rel);
     const u64 old = space.handles[slot].exchange(0, std::memory_order_acq_rel);
     if (old != 0) {
         if (space.slots->Find(old, HandleHash(old)) == slot) {
@@ -407,6 +414,7 @@ VkSampler BindlessHeap::SamplerAt(u32 slot) const {
 }
 
 void BindlessHeap::Forget(Space& space, u64 handle) {
+    releases.fetch_add(1, std::memory_order_acq_rel);
     const u32 slot = space.slots->Find(handle, HandleHash(handle));
     if (slot != VideoCommon::V2::PublishedMap<u64>::Missing) {
         space.slots->Erase(handle, HandleHash(handle));

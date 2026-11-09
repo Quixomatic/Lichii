@@ -114,6 +114,14 @@ public:
     /// Slot writes since the last call.
     [[nodiscard]] u64 TakeWrites() noexcept;
 
+    /// F2-04: moves whenever a slot may stop holding what it held (recycled or freed): while it
+    /// stays, heap words taken before still name the same descriptors.
+    [[nodiscard]] u64 Releases() const noexcept {
+        return releases.load(std::memory_order_acquire);
+    }
+    /// F2-04: marks `slot` of `binding` used by the current tick (what Slot does on a lookup).
+    void Touch(u32 binding, u32 slot);
+
     /// P5a: writes the descriptors of slots reserved since the last call (lookups reserve slot
     /// indices lock-free and only queue the write). Called before the draw or dispatch that uses
     /// them is recorded, on the caches' owner.
@@ -153,6 +161,7 @@ private:
     std::mutex mutex; ///< owner-side changes (commit, forget, recycle); lookups take none
     VideoCommon::V2::Commit::ExternalQueue pending; ///< reserved slots to write (address = handle)
     std::atomic<u64> generation{1};                 ///< moves at each Commit
+    std::atomic<u64> releases{0};                   ///< see Releases
     u64 writes{};
     bool storage_images{};
     bool texel_buffers{};
