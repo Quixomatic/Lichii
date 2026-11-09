@@ -178,7 +178,7 @@ V2::Resolve::ShardKey ShardKeyOf(const V2::Resolve::ShardKeyInputs& in) {
 
 void NoteParallelMismatch(const char* what, u64 shard, u64 serial) {
     V2::Resolve::Count(V2::Resolve::GetStats().verify_draw_mismatches);
-    if (V2::Resolve::ShouldLogMismatch()) {
+    if (V2::Resolve::ShouldLogMismatch(V2::Resolve::MismatchLog::Draw)) {
         LOG_WARNING(HW_GPU,
                     "V2 parallel verify: a draw's {} from the shard is {:#x}, the serial "
                     "resolve has {:#x}",

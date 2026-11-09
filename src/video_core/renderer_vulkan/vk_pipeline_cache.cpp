@@ -1966,7 +1966,7 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineV2() {
                 }
                 if (offset != size || shard_key->hash != graphics_key.state.Hash()) {
                     V2::Resolve::Count(V2::Resolve::GetStats().verify_draw_mismatches);
-                    if (V2::Resolve::ShouldLogMismatch()) {
+                    if (V2::Resolve::ShouldLogMismatch(V2::Resolve::MismatchLog::Draw)) {
                         LOG_WARNING(Render_Vulkan,
                                     "V2 parallel verify: a draw's pipeline key from the shard "
                                     "differs from the serial key at byte {:#x} of {:#x} ({})",

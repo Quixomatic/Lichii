@@ -284,8 +284,16 @@ const char* SplitTraits::Compare(const Record& a, const Record& b) {
     if (a.has_shape != b.has_shape || a.shape != b.shape) {
         return "shape";
     }
-    if (a.has_key != b.has_key || a.partial != b.partial || a.relevant != b.relevant) {
-        return "key";
+    // Which part of the key (Fix pass 1: "key" alone didn't tell the register-derived part from
+    // the shape table's relevance mask the shard read).
+    if (a.has_key != b.has_key) {
+        return "key presence";
+    }
+    if (a.relevant != b.relevant) {
+        return "key relevant groups (the published shape info)";
+    }
+    if (a.partial != b.partial) {
+        return "key (texture pools, vertex layout or handle constant buffers)";
     }
     if (a.has_full != b.has_full || a.full != b.full || a.cbuf_masks != b.cbuf_masks) {
         return "full key (constant buffer bindings)";
@@ -462,7 +470,7 @@ void SplitResolve::OnSegment(const Ir::SegmentBody& body, const u32* back_regs,
                 const u32 snapshot_value = input.snapshot->regs.Read(index);
                 if (snapshot_value != back_regs[index]) {
                     Count(GetStats().snapshot_mismatches);
-                    if (ShouldLogMismatch()) {
+                    if (ShouldLogMismatch(MismatchLog::Snapshot)) {
                         LOG_WARNING(HW_GPU,
                                     "V2 parallel verify: segment {} snapshot register {:#x} is "
                                     "{:#x}, the back has {:#x}",
@@ -484,7 +492,7 @@ void SplitResolve::OnSegment(const Ir::SegmentBody& body, const u32* back_regs,
                             continue;
                         }
                         Count(GetStats().snapshot_mismatches);
-                        if (ShouldLogMismatch()) {
+                        if (ShouldLogMismatch(MismatchLog::Snapshot)) {
                             LOG_WARNING(HW_GPU,
                                         "V2 parallel verify: segment {} snapshot constant buffer "
                                         "stage {} slot {} is {:#x}+{:#x} enabled {}, the back has "

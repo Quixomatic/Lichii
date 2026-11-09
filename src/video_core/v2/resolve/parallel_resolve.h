@@ -114,8 +114,11 @@ u32 DepthFromEnv();
 /// Logs the P6 line and resets the window (EDEN_NX2_V2_STATS; the commit thread).
 void ReportStats(const char* thread_name, u64 window_ns);
 
-/// Rate-limited verify log (first 32 mismatches).
-bool ShouldLogMismatch();
+/// What a verify log line is about: each kind has its own budget (Fix pass 1: the segment lines
+/// took all 32 and no snapshot or draw detail was ever logged).
+enum class MismatchLog : u8 { Segment, Snapshot, Draw, Count };
+/// Rate-limited verify log (first 32 mismatches of each kind).
+bool ShouldLogMismatch(MismatchLog kind = MismatchLog::Segment);
 
 [[nodiscard]] inline u64 NowNs() {
     return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -385,9 +388,12 @@ public:
         if (config.stats) {
             Count(GetStats().determinism_checks);
         }
-        if (id != next_commit) {
+        // Fix pass 1: the first segment sets the order. next_commit began at 0 while the
+        // segmenter's ids start at 1, which counted one out-of-order commit per run.
+        if (committed_any && id != next_commit) {
             Count(GetStats().determinism_failures);
         }
+        committed_any = true;
         next_commit = id + 1;
     }
     void NoteCommitted(const Result& result, u64 start_ns) {
@@ -587,6 +593,7 @@ private:
     std::vector<std::jthread> threads;
     Commit::Stage stage;
     u64 next_commit = 0;
+    bool committed_any = false; ///< The first commit starts the order (segment ids start at 1)
     std::vector<Record> verify_records;
     Commit::RequestList verify_requests;
 };

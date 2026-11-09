@@ -44,9 +44,9 @@ u32 DepthFromEnv() {
     return std::bit_ceil(static_cast<u32>(parsed));
 }
 
-bool ShouldLogMismatch() {
-    static std::atomic<u32> logged{};
-    return logged.fetch_add(1, std::memory_order_relaxed) < 32;
+bool ShouldLogMismatch(MismatchLog kind) {
+    static std::array<std::atomic<u32>, static_cast<size_t>(MismatchLog::Count)> logged{};
+    return logged[static_cast<size_t>(kind)].fetch_add(1, std::memory_order_relaxed) < 32;
 }
 
 void LogSegmentMismatch(u64 segment, size_t record, const char* field) {
