@@ -52,13 +52,13 @@ std::unique_ptr<BindlessHeap> BindlessHeap::Create(const Device& device, Schedul
     properties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
     properties.pNext = &indexing;
     device.GetPhysical().GetProperties2(properties);
-    const u64 images = u64{Capacity} * (NumBindings - 1);
+    const u64 images = u64{Capacity} * SampledBindings;
+    const u64 storage = u64{Capacity} * StorageBindings;
     if (indexing.maxPerStageDescriptorUpdateAfterBindSampledImages < images ||
         indexing.maxDescriptorSetUpdateAfterBindSampledImages < images ||
         indexing.maxPerStageDescriptorUpdateAfterBindSamplers < Capacity ||
         indexing.maxDescriptorSetUpdateAfterBindSamplers < Capacity ||
-        indexing.maxUpdateAfterBindDescriptorsInAllPools < images + Capacity ||
-        device.GetMaxPushConstantsSize() < SPIRV::HEAP_PUSH_OFFSET + SPIRV::HEAP_PUSH_SIZE) {
+        indexing.maxUpdateAfterBindDescriptorsInAllPools < images + Capacity) {
         LOG_WARNING(Render_Vulkan,
                     "EDEN_NX2_V2_BINDLESS: descriptor limits too small for the heap ({} images "
                     "per stage, {} samplers); heap off",
@@ -66,13 +66,23 @@ std::unique_ptr<BindlessHeap> BindlessHeap::Create(const Device& device, Schedul
                     indexing.maxPerStageDescriptorUpdateAfterBindSamplers);
         return nullptr;
     }
-    std::unique_ptr<BindlessHeap> heap{new BindlessHeap(device, scheduler)};
+    // Storage images need their own update-after-bind feature and limits; without them the
+    // storage arrays are empty bindings and storage images keep descriptors.
+    const bool storage_images =
+        device.IsStorageImageUpdateAfterBindSupported() &&
+        indexing.maxPerStageDescriptorUpdateAfterBindStorageImages >= storage &&
+        indexing.maxDescriptorSetUpdateAfterBindStorageImages >= storage &&
+        indexing.maxUpdateAfterBindDescriptorsInAllPools >= images + storage + Capacity;
+    std::unique_ptr<BindlessHeap> heap{new BindlessHeap(device, scheduler, storage_images)};
     if (heap->set == VK_NULL_HANDLE) {
         return nullptr;
     }
     g_active.store(heap.get(), std::memory_order_release);
-    LOG_INFO(Render_Vulkan, "EDEN_NX2_V2_BINDLESS: heap of {} images x {} bindings, {} samplers",
-             Capacity, NumBindings - 1, Capacity);
+    LOG_INFO(Render_Vulkan,
+             "EDEN_NX2_V2_BINDLESS: heap of {} elements x {} sampled image arrays, {} storage "
+             "image arrays{}, samplers",
+             Capacity, SampledBindings, StorageBindings,
+             storage_images ? "" : " (storage images unsupported: kept as descriptors)");
     return heap;
 }
 
@@ -80,24 +90,29 @@ BindlessHeap* BindlessHeap::Active() noexcept {
     return g_active.load(std::memory_order_acquire);
 }
 
-BindlessHeap::BindlessHeap(const Device& device_, Scheduler& scheduler_)
-    : device{device_}, scheduler{scheduler_} {
-    constexpr VkShaderStageFlags stages = VK_SHADER_STAGE_ALL_GRAPHICS;
+BindlessHeap::BindlessHeap(const Device& device_, Scheduler& scheduler_, bool storage_images_)
+    : device{device_}, scheduler{scheduler_}, storage_images{storage_images_} {
+    VkShaderStageFlags stages = VK_SHADER_STAGE_ALL_GRAPHICS | VK_SHADER_STAGE_COMPUTE_BIT;
+    if (device.IsExtMeshShaderSupported()) {
+        stages |= VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT;
+    }
     std::array<VkDescriptorSetLayoutBinding, NumBindings> bindings{};
     std::array<VkDescriptorBindingFlags, NumBindings> flags{};
     for (u32 binding = 0; binding < NumBindings; ++binding) {
+        const bool is_storage = binding >= SPIRV::HEAP_FIRST_STORAGE_BINDING;
         bindings[binding] = VkDescriptorSetLayoutBinding{
             .binding = binding,
-            .descriptorType = binding == SPIRV::HEAP_SAMPLER_BINDING
-                                  ? VK_DESCRIPTOR_TYPE_SAMPLER
-                                  : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
-            .descriptorCount = Capacity,
+            .descriptorType = DescriptorType(binding),
+            .descriptorCount = is_storage && !storage_images ? 0 : Capacity,
             .stageFlags = stages,
             .pImmutableSamplers = nullptr,
         };
-        flags[binding] = VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT |
-                         VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT |
-                         VK_DESCRIPTOR_BINDING_UPDATE_UNUSED_WHILE_PENDING_BIT;
+        flags[binding] = is_storage && !storage_images
+                             ? VkDescriptorBindingFlags{}
+                             : VkDescriptorBindingFlags{
+                                   VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT |
+                                   VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT |
+                                   VK_DESCRIPTOR_BINDING_UPDATE_UNUSED_WHILE_PENDING_BIT};
     }
     const VkDescriptorSetLayoutBindingFlagsCreateInfo flags_ci{
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO,
@@ -122,14 +137,15 @@ BindlessHeap::BindlessHeap(const Device& device_, Scheduler& scheduler_)
     });
     const std::array sizes{
         VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_SAMPLER, Capacity},
-        VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, Capacity * (NumBindings - 1)},
+        VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, Capacity * SampledBindings},
+        VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, Capacity * StorageBindings},
     };
     pool = dev.CreateDescriptorPool({
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
         .pNext = nullptr,
         .flags = VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT,
         .maxSets = 1,
-        .poolSizeCount = static_cast<u32>(sizes.size()),
+        .poolSizeCount = static_cast<u32>(storage_images ? sizes.size() : 2),
         .pPoolSizes = sizes.data(),
     });
     const VkDescriptorSetLayout set_layout = *layout;
@@ -153,7 +169,8 @@ BindlessHeap::BindlessHeap(const Device& device_, Scheduler& scheduler_)
         if (binding != SPIRV::HEAP_SAMPLER_BINDING) {
             // A null view (devices with null descriptors) is element 0 of every image array.
             space.next = 1;
-            if (device.HasNullDescriptor()) {
+            const bool written = binding < SPIRV::HEAP_FIRST_STORAGE_BINDING || storage_images;
+            if (written && device.HasNullDescriptor()) {
                 Write(binding, 0, 0);
             }
         }
@@ -216,6 +233,7 @@ void BindlessHeap::Write(u32 binding, u32 slot, u64 handle) {
     } else {
         image_info.imageView = FromHandle<VkImageView>(handle);
     }
+    const VkDescriptorType type = DescriptorType(binding);
     const VkWriteDescriptorSet write{
         .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
         .pNext = nullptr,
@@ -223,7 +241,7 @@ void BindlessHeap::Write(u32 binding, u32 slot, u64 handle) {
         .dstBinding = binding,
         .dstArrayElement = slot,
         .descriptorCount = 1,
-        .descriptorType = is_sampler ? VK_DESCRIPTOR_TYPE_SAMPLER : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+        .descriptorType = type,
         .pImageInfo = &image_info,
         .pBufferInfo = nullptr,
         .pTexelBufferView = nullptr,

@@ -126,6 +126,15 @@ private:
     vk::DescriptorUpdateTemplate descriptor_update_template;
     vk::Pipeline pipeline;
 
+    /// EDEN_NX2_V2_BINDLESS: textures or storage images read the heap (set 1, word table).
+    bool heap_pipeline{false};
+    HeapPushConstant heap_push{};
+    u32 heap_reasons{};
+    std::vector<u32> last_heap_words;
+    VkBuffer last_heap_buffer{};
+    VkDeviceSize last_heap_offset{};
+    u64 last_heap_tick{~u64{}};
+
     std::function<void()> build_task;
     std::atomic_bool build_claimed{false};
     std::atomic_bool build_task_done{true};

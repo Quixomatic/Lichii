@@ -390,11 +390,15 @@ struct Info {
     TextureBufferDescriptors texture_buffer_descriptors;
     ImageBufferDescriptors image_buffer_descriptors;
     TextureDescriptors texture_descriptors;
-    /// Pipeline v2 (EDEN_NX2_V2_BINDLESS, backend/spirv/bindless_heap.h): texture descriptors
-    /// read from the host descriptor heap, by index, and the push word of the first of them.
-    /// Set by the host before emission; zero emits the program exactly as before.
+    /// Pipeline v2 (EDEN_NX2_V2_BINDLESS, backend/spirv/bindless_heap.h): texture and storage
+    /// image descriptors (by index) read from the host descriptor heap, and the stage's first word
+    /// in the draw's heap word table. Set by the host before emission; zero masks emit the program
+    /// exactly as before.
     u64 heap_texture_mask{};
-    u32 heap_push_base{};
+    u64 heap_image_mask{};
+    u32 heap_word_base{};
+    /// Why descriptors of this stage were left out of the heap (host bits, for the stats).
+    u32 heap_block_reasons{};
     /// Texture handles the shader reads from storage buffers, as programs over constant buffer
     /// and storage buffer words (see EvaluateHandleProgram), evaluated for each draw.
     std::vector<std::vector<u32>> handle_programs;

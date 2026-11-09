@@ -451,9 +451,16 @@ private:
     const bool worker_only_build;
     bool uses_push_descriptor{false};
     bool uses_descriptor_buffer{false};
-    /// EDEN_NX2_V2_BINDLESS: some sampled textures read the heap (set 1, pushed words).
+    /// EDEN_NX2_V2_BINDLESS: some textures or storage images read the heap (set 1, word table).
     bool heap_pipeline{false};
     HeapPushConstant heap_push{};
+    u32 heap_reasons{}; ///< HeapReason bits of descriptors left out
+    u32 heap_words{};
+    std::vector<u32> last_heap_words;
+    VkBuffer last_heap_buffer{};
+    VkDeviceSize last_heap_offset{};
+    u64 last_heap_tick{~u64{}};
+    void AddHeapWords();
 
     // Mesh emulation (MeshEmulationSetup).
     std::optional<MeshEmulationSetup> mesh_emulation;

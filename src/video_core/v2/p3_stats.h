@@ -59,11 +59,15 @@ struct Data {
     u64 cbuf_verify{};
     u64 cbuf_mismatches{};
     // EDEN_NX2_V2_BINDLESS
-    u64 heap_draws{};
-    u64 heap_fallback_draws{};
+    u64 heap_draws{};          ///< every image descriptor in the heap
+    u64 heap_partial_draws{};  ///< some left out (heap_reasons)
+    u64 heap_fallback_draws{}; ///< none in the heap
+    u64 heap_dispatches{};
+    u64 heap_partial_dispatches{};
+    u64 heap_fallback_dispatches{};
+    std::array<u64, 8> heap_reasons{}; ///< partial and fallback work by HeapReason bit
     u64 heap_slot_writes{};
-    u64 heap_versions{};
-    u64 heap_textures{};
+    u64 heap_words{};
     u64 heap_verify{};
     u64 heap_mismatches{};
     // EDEN_NX2_V2_LEANDRAW

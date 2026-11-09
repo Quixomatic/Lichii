@@ -98,18 +98,40 @@ void Report(const char* thread_name, u64 window_ns) {
                  PerSecond(d.cbuf_bytes_saved, window_ns) / 1024.0, d.cbuf_verify,
                  d.cbuf_mismatches);
     }
-    if (d.heap_draws != 0 || d.heap_fallback_draws != 0) {
+    const u64 heap_work = d.heap_draws + d.heap_partial_draws + d.heap_fallback_draws +
+                          d.heap_dispatches + d.heap_partial_dispatches +
+                          d.heap_fallback_dispatches;
+    if (heap_work != 0) {
+        static constexpr std::array<const char*, 6> reason_names{
+            "mesh emulation",      "texel buffers",     "byte-addressed images",
+            "no storage image heap", "storage image type", "too many bindings",
+        };
+        std::string reasons;
+        for (size_t reason = 0; reason < reason_names.size(); ++reason) {
+            if (d.heap_reasons[reason] != 0) {
+                reasons += fmt::format(" {} {:.0f}/s,", reason_names[reason],
+                                       PerSecond(d.heap_reasons[reason], window_ns));
+            }
+        }
+        if (!reasons.empty()) {
+            reasons.pop_back();
+        }
         LOG_INFO(HW_GPU,
-                 "V2 stats {} P3 bindless heap: {:.0f} heap draws/s ({:.1f} textures each), "
-                 "{:.0f} fallback draws/s, {:.0f} slot writes/s, {:.0f} heap versions/s | verify "
-                 "{} checked, {} mismatches",
+                 "V2 stats {} P3 bindless heap (work with images): draws {:.0f}/s all in the heap, "
+                 "{:.0f}/s partly, {:.0f}/s none; dispatches {:.0f}/s all, {:.0f}/s partly, {:.0f}/s "
+                 "none | left out for:{} | {:.1f} words per heap draw, {:.0f} slot writes/s | "
+                 "verify {} checked, {} mismatches",
                  thread_name, PerSecond(d.heap_draws, window_ns),
-                 d.heap_draws == 0 ? 0.0
-                                   : static_cast<double>(d.heap_textures) /
-                                         static_cast<double>(d.heap_draws),
+                 PerSecond(d.heap_partial_draws, window_ns),
                  PerSecond(d.heap_fallback_draws, window_ns),
-                 PerSecond(d.heap_slot_writes, window_ns), PerSecond(d.heap_versions, window_ns),
-                 d.heap_verify, d.heap_mismatches);
+                 PerSecond(d.heap_dispatches, window_ns),
+                 PerSecond(d.heap_partial_dispatches, window_ns),
+                 PerSecond(d.heap_fallback_dispatches, window_ns),
+                 reasons.empty() ? std::string{" nothing"} : reasons,
+                 heap_work == 0 ? 0.0
+                                : static_cast<double>(d.heap_words) /
+                                      static_cast<double>(heap_work),
+                 PerSecond(d.heap_slot_writes, window_ns), d.heap_verify, d.heap_mismatches);
     }
     if (d.lean_draws != 0) {
         LOG_INFO(HW_GPU, "V2 stats {} P3 lean draws: {:.0f}/s, {:.1f}% took the debug hooks",

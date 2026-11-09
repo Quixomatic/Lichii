@@ -739,7 +739,8 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
         const bool bindless_heap = VideoCommon::V2::On(VideoCommon::V2::Switch::Bindless);
         descriptor_indexing.descriptorBindingSampledImageUpdateAfterBind =
             bindless_heap && descriptor_indexing.descriptorBindingSampledImageUpdateAfterBind;
-        descriptor_indexing.descriptorBindingStorageImageUpdateAfterBind = false;
+        descriptor_indexing.descriptorBindingStorageImageUpdateAfterBind =
+            bindless_heap && descriptor_indexing.descriptorBindingStorageImageUpdateAfterBind;
         descriptor_indexing.descriptorBindingStorageBufferUpdateAfterBind = false;
         descriptor_indexing.descriptorBindingUniformTexelBufferUpdateAfterBind = false;
         descriptor_indexing.descriptorBindingStorageTexelBufferUpdateAfterBind = false;

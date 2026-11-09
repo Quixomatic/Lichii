@@ -222,9 +222,21 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
 
     DescriptorLayoutBuilder builder{device};
     builder.Add(info, VK_SHADER_STAGE_COMPUTE_BIT);
+    // EDEN_NX2_V2_BINDLESS: the pipeline cache marked heap descriptors before emission.
+    BindlessHeap* const heap = BindlessHeap::Active();
+    heap_pipeline = heap != nullptr && (info.heap_texture_mask != 0 || info.heap_image_mask != 0);
+    heap_reasons = info.heap_block_reasons;
+    if (heap_pipeline) {
+        heap_push.heap = heap;
+        heap_push.verify = VideoCommon::V2::Verify(VideoCommon::V2::Switch::Bindless);
+        const bool added = builder.AddHeapWords();
+        ASSERT(added);
+        ++num_descriptor_entries;
+    }
 
     uses_push_descriptor = builder.CanUsePushDescriptor();
-    uses_descriptor_buffer = builder.CanUseDescriptorBuffer() && descriptor_buffer_ring.IsValid();
+    uses_descriptor_buffer = !heap_pipeline && builder.CanUseDescriptorBuffer() &&
+                             descriptor_buffer_ring.IsValid();
     descriptor_set_layout =
         builder.CreateDescriptorSetLayout(uses_push_descriptor, uses_descriptor_buffer);
     if (uses_descriptor_buffer) {
@@ -239,7 +251,8 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
             descriptor_set_layout = builder.CreateDescriptorSetLayout(false);
         }
     }
-    pipeline_layout = builder.CreatePipelineLayout(*descriptor_set_layout);
+    pipeline_layout =
+        builder.CreatePipelineLayout(*descriptor_set_layout, heap_pipeline ? heap : nullptr);
     if (!uses_descriptor_buffer) {
         descriptor_update_template =
             builder.CreateTemplate(*descriptor_set_layout, *pipeline_layout, uses_push_descriptor);
@@ -593,26 +606,61 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
     RescalingPushConstant rescaling;
     const VideoCommon::SamplerId* samplers_it{samplers.data()};
     const VideoCommon::ImageViewInOut* views_it{views.data()};
+    HeapPushConstant* const heap{heap_pipeline ? &heap_push : nullptr};
+    heap_push.words.clear();
     if (!shadow) {
         PushImageDescriptors(texture_cache, guest_descriptor_queue, info, rescaling, samplers_it,
-                             views_it);
+                             views_it, heap);
     } else {
         auto sampled_info{info};
         sampled_info.image_descriptors.clear();
         PushImageDescriptors(texture_cache, guest_descriptor_queue, sampled_info, rescaling,
-                             samplers_it, views_it);
-        for (const auto& desc : info.image_descriptors) {
+                             samplers_it, views_it, heap);
+        for (size_t desc_index = 0; desc_index < info.image_descriptors.size(); ++desc_index) {
+            const auto& desc{info.image_descriptors[desc_index]};
+            // The shadow copy is byte-addressed, which never reads the heap.
+            const bool in_heap{heap != nullptr &&
+                               Shader::Backend::SPIRV::UsesHeapImage(info, desc_index)};
             bool is_rescaled{};
             for (u32 i = 0; i < desc.count; ++i) {
                 const size_t view_index{static_cast<size_t>(views_it - views.data())};
                 auto& view{texture_cache.GetImageView((views_it++)->id)};
                 const VkImageView storage{view_index == *shadow_index ? shadow->view :
                     view.StorageView(desc.type, desc.format, desc.is_byte_addressed)};
-                guest_descriptor_queue.AddImage(storage);
+                if (in_heap) {
+                    heap_push.words.push_back(heap_push.heap->ImageSlot(
+                        Shader::Backend::SPIRV::HeapStorageBinding(desc.type, desc.is_integer),
+                        storage));
+                } else {
+                    guest_descriptor_queue.AddImage(storage);
+                }
                 is_rescaled |= texture_cache.IsRescaling(view);
             }
             rescaling.PushImage(is_rescaled);
         }
+    }
+    if (heap_pipeline) {
+        // EDEN_NX2_V2_BINDLESS: the dispatch's heap words, reused while unchanged in a tick.
+        std::vector<u32>& words = heap_push.words;
+        if (words.empty()) {
+            words.push_back(0);
+        }
+        const u64 tick = scheduler.CurrentTick();
+        const size_t bytes = words.size() * sizeof(u32);
+        if (last_heap_tick != tick || last_heap_words != words) {
+            const StagingBufferRef ref = buffer_cache.runtime.UploadStagingBuffer(bytes);
+            std::memcpy(ref.mapped_span.data(), words.data(), bytes);
+            last_heap_buffer = ref.buffer;
+            last_heap_offset = ref.offset;
+            last_heap_tick = tick;
+            last_heap_words = words;
+        }
+        guest_descriptor_queue.AddBuffer(last_heap_buffer, last_heap_offset, bytes);
+    }
+    if (VideoCommon::V2::P3Stats::Enabled() && !views.empty() &&
+        BindlessHeap::Active() != nullptr) {
+        CountHeapCoverage(heap_pipeline, heap_reasons,
+                          static_cast<u32>(heap_push.words.size()), true);
     }
 
     if (guest_descriptor_queue.UpdateCount() != num_descriptor_entries) {
@@ -673,6 +721,13 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
     auto bind = [this, descriptor_data, is_rescaling, descriptor_buffer_offset,
                       descriptor_buffer_chunk, bind_descriptor_buffer,
                       rescaling_data = rescaling.Data()](vk::CommandBuffer cmdbuf) {
+        if (heap_pipeline && pipeline) {
+            // EDEN_NX2_V2_BINDLESS: the heap set, with every dispatch (its pipeline is bound
+            // again below too).
+            const VkDescriptorSet heap_set{heap_push.heap->Set()};
+            cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, *pipeline_layout,
+                                      Shader::Backend::SPIRV::HEAP_SET, heap_set, nullptr);
+        }
         if (bind_descriptor_buffer) {
             const VkDescriptorBufferBindingInfoEXT binding_info{
                 descriptor_buffer_ring.BindingInfo(descriptor_buffer_chunk)};

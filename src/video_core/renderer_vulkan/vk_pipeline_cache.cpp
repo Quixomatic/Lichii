@@ -1649,42 +1649,89 @@ void ReportUnsupportedMeshPipeline(const GraphicsPipelineCacheKey& key, const Pr
 } // Anonymous namespace
 
 namespace {
-/// EDEN_NX2_V2_BINDLESS: marks the sampled textures that read the heap (bindless_heap.h): every
-/// single texture descriptor of every stage, up to MAX_HEAP_TEXTURES per pipeline, unless a stage
-/// is a task or mesh program or reads the render area (its push constant block would clash).
+/// EDEN_NX2_V2_BINDLESS: marks the textures and storage images of one stage that read the heap
+/// (bindless_heap.h), its first word `word_base`, and why the rest stay out. Returns its words.
+u32 MarkHeapStage(Shader::Info& info, u32 word_base, bool storage_images) {
+    namespace SPIRV = Shader::Backend::SPIRV;
+    info.heap_texture_mask = 0;
+    info.heap_image_mask = 0;
+    info.heap_word_base = word_base;
+    info.heap_block_reasons = 0;
+    for (size_t desc = 0; desc < info.texture_descriptors.size(); ++desc) {
+        if (desc >= 64) {
+            info.heap_block_reasons |= HeapReasonBindings;
+            break;
+        }
+        if (info.texture_descriptors[desc].type != Shader::TextureType::Buffer) {
+            info.heap_texture_mask |= u64{1} << desc;
+        }
+    }
+    for (size_t desc = 0; desc < info.image_descriptors.size(); ++desc) {
+        const Shader::ImageDescriptor& image{info.image_descriptors[desc]};
+        if (desc >= 64) {
+            info.heap_block_reasons |= HeapReasonBindings;
+            break;
+        }
+        if (!storage_images) {
+            info.heap_block_reasons |= HeapReasonNoStorage;
+        } else if (!SPIRV::HeapStorageType(image.type)) {
+            info.heap_block_reasons |= HeapReasonStorageType;
+        } else if (image.is_byte_addressed) {
+            info.heap_block_reasons |= HeapReasonByteAddressed;
+        } else {
+            info.heap_image_mask |= u64{1} << desc;
+        }
+    }
+    if (!info.texture_buffer_descriptors.empty() || !info.image_buffer_descriptors.empty()) {
+        info.heap_block_reasons |= HeapReasonTexelBuffers;
+    }
+    return SPIRV::HeapWordCount(info);
+}
+
+/// Clears a stage's heap marks, leaving `reason`.
+void UnmarkHeapStage(Shader::Info& info, u32 reason) {
+    info.heap_texture_mask = 0;
+    info.heap_image_mask = 0;
+    info.heap_word_base = 0;
+    info.heap_block_reasons = reason;
+}
+
+/// EDEN_NX2_V2_BINDLESS: the heap marks of a graphics pipeline's stages, words numbered across
+/// them in stage order (as ConfigureImpl pushes them). Mesh emulation keeps descriptors (its mesh
+/// program runs as a compute shader with the draw's set); so does a pipeline whose own set 0
+/// bindings would reach the heap word table's binding.
 void MarkHeapTextures(std::span<Shader::IR::Program> programs, const GraphicsPipelineCacheKey& key,
-                      size_t first, bool emulated_layer) {
+                      size_t first, bool emulated_layer, bool mesh_emulation,
+                      bool storage_images) {
     namespace SPIRV = Shader::Backend::SPIRV;
     const auto active = [&](size_t index) {
         return key.unique_hashes[index] != 0 ||
                (emulated_layer && index == static_cast<size_t>(Maxwell::ShaderType::Geometry));
     };
-    for (size_t index = first; index < programs.size(); ++index) {
-        if (!active(index)) {
-            continue;
-        }
-        const Shader::IR::Program& program{programs[index]};
-        if (program.stage == Shader::Stage::Task || program.stage == Shader::Stage::Mesh ||
-            program.info.is_mesh || program.info.is_task || program.info.uses_render_area) {
-            return;
-        }
-    }
-    u32 next{};
+    u32 words{};
+    u32 bindings{};
     for (size_t index = first; index < programs.size(); ++index) {
         if (!active(index)) {
             continue;
         }
         Shader::Info& info{programs[index].info};
-        info.heap_texture_mask = 0;
-        info.heap_push_base = next;
-        const size_t num{(std::min)(info.texture_descriptors.size(), size_t{64})};
-        for (size_t desc = 0; desc < num && next < SPIRV::MAX_HEAP_TEXTURES; ++desc) {
-            const Shader::TextureDescriptor& descriptor{info.texture_descriptors[desc]};
-            if (descriptor.count != 1 || descriptor.type == Shader::TextureType::Buffer) {
-                continue;
+        if (mesh_emulation) {
+            UnmarkHeapStage(info, HeapReasonMeshEmulation);
+            continue;
+        }
+        words += MarkHeapStage(info, words, storage_images);
+        bindings += static_cast<u32>(info.constant_buffer_descriptors.size() +
+                                     info.storage_buffers_descriptors.size() +
+                                     info.texture_buffer_descriptors.size() +
+                                     info.image_buffer_descriptors.size() +
+                                     info.texture_descriptors.size() +
+                                     info.image_descriptors.size());
+    }
+    if (!mesh_emulation && bindings >= SPIRV::HEAP_WORDS_BINDING) {
+        for (size_t index = first; index < programs.size(); ++index) {
+            if (active(index)) {
+                UnmarkHeapStage(programs[index].info, HeapReasonBindings);
             }
-            info.heap_texture_mask |= u64{1} << desc;
-            ++next;
         }
     }
 }
@@ -2250,11 +2297,12 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                 storage_buffers + auxiliary_buffers, auxiliary_buffers, set_limit);
         }
     }
-    // EDEN_NX2_V2_BINDLESS: which sampled textures read the heap, before emission (the shaders
-    // and the pipeline's descriptor layout both follow Info::heap_texture_mask).
-    if (BindlessHeap::Active() != nullptr && !mesh_emulation) {
+    // EDEN_NX2_V2_BINDLESS: which textures and storage images read the heap, before emission
+    // (the shaders and the pipeline's descriptor layout both follow the Info heap masks).
+    if (const BindlessHeap* const heap = BindlessHeap::Active()) {
         MarkHeapTextures(programs, key, uses_vertex_a && uses_vertex_b ? 1 : 0,
-                         layer_source_program != nullptr);
+                         layer_source_program != nullptr, mesh_emulation.has_value(),
+                         heap->StorageImages());
     }
     std::array<const Shader::Info*, Maxwell::MaxShaderStage> infos{};
     std::array<vk::ShaderModule, Maxwell::MaxShaderStage> modules;
@@ -2561,6 +2609,17 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
                     program.shared_memory_size / 1024,
                     max_shared_memory / 1024);
         program.shared_memory_size = max_shared_memory;
+    }
+    // EDEN_NX2_V2_BINDLESS: the textures and storage images that read the heap.
+    if (const BindlessHeap* const heap = BindlessHeap::Active()) {
+        MarkHeapStage(program.info, 0, heap->StorageImages());
+        const Shader::Info& info{program.info};
+        if (info.constant_buffer_descriptors.size() + info.storage_buffers_descriptors.size() +
+                info.texture_buffer_descriptors.size() + info.image_buffer_descriptors.size() +
+                info.texture_descriptors.size() + info.image_descriptors.size() >=
+            Shader::Backend::SPIRV::HEAP_WORDS_BINDING) {
+            UnmarkHeapStage(program.info, HeapReasonBindings);
+        }
     }
     std::vector<u32> code{EmitSPIRV(profile, program)};
     device.SaveShader(code);

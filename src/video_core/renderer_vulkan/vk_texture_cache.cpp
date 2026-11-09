@@ -4488,9 +4488,16 @@ ImageView::ImageView(TextureCacheRuntime& runtime, const VideoCommon::NullImageV
 ImageView::~ImageView() {
     // EDEN_NX2_V2_BINDLESS: the heap slots of these views are free (moved-from views hold none).
     if (BindlessHeap* const heap = BindlessHeap::Active()) [[unlikely]] {
-        for (const vk::ImageView& view : image_views) {
+        const auto forget = [heap](const vk::ImageView& view) {
             if (view) {
                 heap->ForgetImageView(*view);
+            }
+        };
+        std::ranges::for_each(image_views, forget);
+        forget(typeless_storage_view);
+        if (storage_views) {
+            for (const auto& views : storage_views->formats) {
+                std::ranges::for_each(views, forget);
             }
         }
     }

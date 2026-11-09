@@ -46,7 +46,7 @@ struct TextureDefinition {
     bool is_multisample;
     bool is_integer;
     /// EDEN_NX2_V2_BINDLESS: `id` is the heap image array of the descriptor's class and
-    /// `pointer_type` points to one of its images; `heap_word` is its push word.
+    /// `pointer_type` points to one of its images; `heap_word` is its first word in the table.
     bool heap{};
     u32 heap_word{};
 };
@@ -70,6 +70,9 @@ struct ImageDefinition {
     Id pointer_type;
     u32 count;
     bool is_integer;
+    /// EDEN_NX2_V2_BINDLESS: `id` is the heap storage image array; `heap_word` its first word.
+    bool heap{};
+    u32 heap_word{};
 };
 
 struct UniformDefinitions {
@@ -332,15 +335,19 @@ public:
     Id render_area_push_constant{};
     u32 render_are_member_index{};
 
-    // EDEN_NX2_V2_BINDLESS (bindless_heap.h): the heap's sampler array and image arrays, and the
-    // push constant member with the draw's heap words.
+    // EDEN_NX2_V2_BINDLESS (bindless_heap.h): the heap's sampler and image arrays and the draw's
+    // heap word table.
     Id heap_sampler_type{};
     Id heap_sampler_pointer{};
     Id heap_samplers{};
     std::vector<std::pair<u32, Id>> heap_image_variables; ///< (image type id, array variable)
-    Id heap_words_type{};
-    u32 heap_words_member_index{};
+    Id heap_words{};
+    Id heap_word_pointer{};
     bool uses_heap{};
+
+    /// The heap word of element `index` (when `arrayed`) of a heap descriptor whose first word is
+    /// `word`.
+    Id HeapWord(u32 word, const IR::Value& index, bool arrayed);
 
     Id local_memory{};
 
@@ -476,6 +483,9 @@ private:
     void DefineImageBuffers(const Info& info, u32& binding);
     void DefineTextures(const Info& info, u32& binding, u32& scaling_index);
     void DefineHeapTexture(const Info& info, const TextureDescriptor& desc, size_t index);
+    void DefineHeapImage(const Info& info, const ImageDescriptor& desc, size_t index);
+    void DefineHeapWords();
+    Id HeapArray(Id image_type, u32 heap_binding, bool coherent);
     void DefineImages(const Info& info, u32& binding, u32& scaling_index);
     void DefineAttributeMemAccess(const Info& info);
     void DefineWriteStorageCasLoopFunction(const Info& info);

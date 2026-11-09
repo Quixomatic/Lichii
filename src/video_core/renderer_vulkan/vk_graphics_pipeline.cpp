@@ -444,17 +444,27 @@ GraphicsPipeline::GraphicsPipeline(
         }
     }
 
-    // EDEN_NX2_V2_BINDLESS: the pipeline cache marked heap textures before emission.
+    // EDEN_NX2_V2_BINDLESS: the pipeline cache marked heap textures and images before emission.
     BindlessHeap* const heap = BindlessHeap::Active();
     heap_pipeline = heap != nullptr && !mesh_emulation &&
                     std::ranges::any_of(stage_infos, [](const Shader::Info& info) {
-                        return info.heap_texture_mask != 0;
+                        return info.heap_texture_mask != 0 || info.heap_image_mask != 0;
                     });
+    for (const Shader::Info& info : stage_infos) {
+        heap_reasons |= info.heap_block_reasons;
+        heap_words += Shader::Backend::SPIRV::HeapWordCount(info);
+    }
     if (heap_pipeline) {
         heap_push.heap = heap;
         heap_push.verify = VideoCommon::V2::Verify(VideoCommon::V2::Switch::Bindless);
     }
     DescriptorLayoutBuilder builder{MakeBuilder(device, stage_infos, mesh_emulation)};
+    if (heap_pipeline) {
+        // The heap word table, last in the payload (the cache kept set 0 below its binding).
+        const bool added = builder.AddHeapWords();
+        ASSERT(added);
+        ++num_descriptor_entries;
+    }
     // Mesh emulation binds one descriptor set to both the compute dispatch and the draw.
     uses_push_descriptor = !mesh_emulation && builder.CanUsePushDescriptor();
     // A layout with descriptor buffer sets can't take the heap's update-after-bind set.
@@ -616,6 +626,7 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     }
 
     buffer_cache.SetUniformBuffersState(enabled_uniform_buffer_masks, &uniform_buffer_sizes);
+    heap_push.words.clear();
 
     const auto& regs{maxwell3d->regs};
     const bool via_header_index{regs.sampler_binding == Maxwell::SamplerBinding::ViaHeaderBinding};
@@ -1011,6 +1022,9 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     if constexpr (Spec::enabled_stages[4]) {
         prepare_stage(4);
     }
+    if (heap_pipeline) {
+        AddHeapWords();
+    }
     if (mesh_emulation) {
         if (!mesh_output_buffer) {
             return false;
@@ -1057,6 +1071,7 @@ bool GraphicsPipeline::ConfigureDelta(bool is_indexed) {
     // ConfigureImpl without reading handles and resolving image views, samplers and texture
     // buffers: the buffers are resolved, synchronized and bound as it does.
     buffer_cache.SetUniformBuffersState(enabled_uniform_buffer_masks, &uniform_buffer_sizes);
+    heap_push.words.clear();
     {
         Profile::Scope scope{Profile::Zone::ReadHandles};
         for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
@@ -1109,6 +1124,9 @@ bool GraphicsPipeline::ConfigureDelta(bool is_indexed) {
             render_area.words = {static_cast<float>(clip_set ? clip_width : u32{regs.rt[0].width}),
                                  static_cast<float>(clip_set ? clip_height : u32{regs.rt[0].height})};
         }
+    }
+    if (heap_pipeline) {
+        AddHeapWords();
     }
     if (buffer_cache.any_buffer_uploaded) {
         buffer_cache.runtime.PostCopyBarrier();
@@ -1503,32 +1521,39 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
                                       descriptor_set, nullptr);
         }
     });
-    if (heap_pipeline) {
-        // EDEN_NX2_V2_BINDLESS: the heap set (bound again with the pipeline; binds of set 0
-        // with this layout leave it bound) and this draw's heap words.
-        if (V2::P3Stats::Enabled()) {
-            auto& data = V2::P3Stats::Get();
-            ++data.heap_draws;
-            for (const Shader::Info& info : stage_infos) {
-                data.heap_textures += static_cast<u64>(std::popcount(info.heap_texture_mask));
-            }
-        }
-        scheduler.Record([this, bind_heap = bind_pipeline,
-                          words = heap_push.words](vk::CommandBuffer cmdbuf) {
-            if (bind_heap) {
-                const VkDescriptorSet heap_set{heap_push.heap->Set()};
-                cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS, *pipeline_layout,
-                                          Shader::Backend::SPIRV::HEAP_SET, heap_set, nullptr);
-            }
-            cmdbuf.PushConstants(*pipeline_layout, VK_SHADER_STAGE_ALL_GRAPHICS,
-                                 Shader::Backend::SPIRV::HEAP_PUSH_OFFSET,
-                                 static_cast<u32>(sizeof(words)), words.data());
+    if (heap_pipeline && bind_pipeline) {
+        // EDEN_NX2_V2_BINDLESS: the heap set, bound again with the pipeline (binds of set 0 with
+        // this layout leave it bound).
+        scheduler.Record([this](vk::CommandBuffer cmdbuf) {
+            const VkDescriptorSet heap_set{heap_push.heap->Set()};
+            cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS, *pipeline_layout,
+                                      Shader::Backend::SPIRV::HEAP_SET, heap_set, nullptr);
         });
-    } else if (V2::P3Stats::Enabled() && num_textures != 0 &&
-               BindlessHeap::Active() != nullptr) {
-        ++V2::P3Stats::Get().heap_fallback_draws;
+    }
+    if (V2::P3Stats::Enabled() && num_image_elements != 0 && BindlessHeap::Active() != nullptr) {
+        CountHeapCoverage(heap_pipeline, heap_reasons, heap_words, false);
     }
     return true;
+}
+
+void GraphicsPipeline::AddHeapWords() {
+    // EDEN_NX2_V2_BINDLESS: the heap words of this draw, in a stream buffer allocation reused
+    // while the words and the command buffer stay the same (so the payload does too).
+    std::vector<u32>& words = heap_push.words;
+    if (words.empty()) {
+        words.push_back(0);
+    }
+    const u64 tick = scheduler.CurrentTick();
+    const size_t bytes = words.size() * sizeof(u32);
+    if (last_heap_tick != tick || last_heap_words != words) {
+        const StagingBufferRef ref = buffer_cache.runtime.UploadStagingBuffer(bytes);
+        std::memcpy(ref.mapped_span.data(), words.data(), bytes);
+        last_heap_buffer = ref.buffer;
+        last_heap_offset = ref.offset;
+        last_heap_tick = tick;
+        last_heap_words = words;
+    }
+    guest_descriptor_queue.AddBuffer(last_heap_buffer, last_heap_offset, bytes);
 }
 
 void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {

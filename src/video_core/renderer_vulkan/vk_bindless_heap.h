@@ -30,6 +30,22 @@ class BindlessHeap {
 public:
     static constexpr u32 Capacity = Shader::Backend::SPIRV::MAX_HEAP_ARRAY_LENGTH;
     static constexpr u32 NumBindings = Shader::Backend::SPIRV::NUM_HEAP_BINDINGS;
+    static constexpr u32 SampledBindings = Shader::Backend::SPIRV::NUM_HEAP_IMAGE_CLASSES * 2;
+    static constexpr u32 StorageBindings = Shader::Backend::SPIRV::NUM_HEAP_STORAGE_CLASSES * 2;
+
+    /// The descriptor type of a heap binding.
+    [[nodiscard]] static constexpr VkDescriptorType DescriptorType(u32 binding) {
+        return binding == Shader::Backend::SPIRV::HEAP_SAMPLER_BINDING
+                   ? VK_DESCRIPTOR_TYPE_SAMPLER
+               : binding >= Shader::Backend::SPIRV::HEAP_FIRST_STORAGE_BINDING
+                   ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE
+                   : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    }
+
+    /// Whether storage images can live in the heap on this device.
+    [[nodiscard]] bool StorageImages() const noexcept {
+        return storage_images;
+    }
 
     /// The heap, or null when the device lacks update-after-bind sampled images, partially bound
     /// and update-unused-while-pending bindings, or descriptor limits for the arrays.
@@ -71,7 +87,7 @@ public:
     [[nodiscard]] u64 TakeWrites() noexcept;
 
 private:
-    BindlessHeap(const Device& device, Scheduler& scheduler);
+    BindlessHeap(const Device& device, Scheduler& scheduler, bool storage_images);
 
     struct Space {
         std::unordered_map<u64, u32> slots; ///< handle -> slot
@@ -95,6 +111,7 @@ private:
     std::array<Space, NumBindings> spaces;
     std::mutex mutex;
     u64 writes{};
+    bool storage_images{};
 };
 
 } // namespace Vulkan

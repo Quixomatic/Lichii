@@ -1018,6 +1018,9 @@ FN_MAX_LIMIT_LIST
         return features.descriptor_indexing.descriptorBindingSampledImageUpdateAfterBind &&
                features.descriptor_indexing.descriptorBindingUpdateUnusedWhilePending;
     }
+    bool IsStorageImageUpdateAfterBindSupported() const {
+        return features.descriptor_indexing.descriptorBindingStorageImageUpdateAfterBind;
+    }
 
     bool HasTimelineSemaphore() const;
 
