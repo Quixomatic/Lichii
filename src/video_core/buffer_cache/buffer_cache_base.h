@@ -679,6 +679,20 @@ private:
     /// EDEN_NX2_V2_READBACK early downloads (Switch 2): a guest read of [begin, end); pages read
     /// back twice become Preflushable, so the fences download their later GPU writes.
     void LearnReadback(DAddr begin, DAddr end);
+
+public:
+    /// EDEN_NX2_V2_XREADBACK: records the queued fence downloads right behind their writers.
+    void RecordWriterDownloads();
+    bool v2_writer_downloads = false;
+
+private:
+    struct PreparedDownload {
+        Async_Buffer staging{};
+        boost::container::small_vector<BufferCopy, 4> copies;
+        Common::RangeSet<DAddr> ranges;
+    };
+    std::vector<PreparedDownload> writer_downloads_open;
+    std::deque<std::vector<PreparedDownload>> writer_downloads_fenced;
     /// ...and GPU writes to them: four writes nobody read in between drop a page again.
     void NoteLearnedWrite(DAddr device_addr, u64 size);
 

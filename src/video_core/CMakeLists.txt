@@ -281,6 +281,8 @@ add_library(video_core STATIC
     renderer_vulkan/vk_resource_pool.cpp
     renderer_vulkan/vk_resource_pool.h
     renderer_vulkan/vk_scheduler.cpp
+    renderer_vulkan/vk_background_readback.cpp
+    renderer_vulkan/vk_background_readback.h
     renderer_vulkan/vk_submit_engine.cpp
     renderer_vulkan/vk_submit_engine.h
     renderer_vulkan/vk_scheduler.h

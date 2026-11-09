@@ -130,6 +130,17 @@ class BufferCacheRuntime {
     /// EDEN_NX2_V2_XFERQ: CanReorderUpload's answer for the CopyBuffer that follows it.
     bool reorder_to_transfer = false;
 
+public:
+    /// EDEN_NX2_V2_XREADBACK: buffer readbacks copied on the transfer queue.
+    [[nodiscard]] bool TransferReadbacks() const noexcept;
+    void TransferReadbackCopy(VkBuffer staging, Buffer& src, const VideoCommon::BufferCopy& copy,
+                              bool mapped);
+    /// Flushes and submits the job: {semaphore, value}.
+    std::pair<u64, u64> SubmitTransferReadback();
+    void WaitTransferReadback(u64 semaphore, u64 value);
+
+private:
+
     using PrimitiveTopology = Tegra::Engines::Maxwell3D::Regs::PrimitiveTopology;
     using IndexFormat = Tegra::Engines::Maxwell3D::Regs::IndexFormat;
 

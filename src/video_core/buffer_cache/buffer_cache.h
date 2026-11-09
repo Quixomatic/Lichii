@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include "video_core/v2/p5b_stats.h"
 #include "video_core/buffer_cache/uniform_cache_history.h"
 
 #include <algorithm>
@@ -389,6 +390,8 @@ struct BufferCache<P>::ReadbackState {
     Common::RangeSet<DAddr> cpu_written;
     std::vector<u8> expected; ///< Verify: what the synchronous download wrote
     u64 tick{};
+    u64 job_semaphore{}; ///< EDEN_NX2_V2_XREADBACK: the transfer queue job, else 0
+    u64 job_value{};
     bool verify{};
     std::atomic<bool> landed{};
 };
@@ -418,15 +421,22 @@ bool BufferCache<P>::DownloadMemoryAsync(DAddr device_addr, u64 size,
         if (readbacks_in_flight.size() >= 64) {
             return false; // Readers that never landed theirs: don't pile up staging memory
         }
+        // EDEN_NX2_V2_XREADBACK: the copies run on the transfer queue (per-thread background
+        // resources); mapped buffers are snapshotted there too.
+        bool transfer = false;
+        if constexpr (requires { runtime.TransferReadbacks(); }) {
+            transfer = !verify && runtime.TransferReadbacks();
+        }
         // Buffers read in place (mapped) need no copy, but a later GPU write could reach them
-        // before the reader does: they keep the synchronous path.
+        // before the reader does: they keep the synchronous path (unless copied on the transfer
+        // queue).
         bool mapped = false;
         ForEachBufferInRange(device_addr, size, [&](BufferId, Buffer& buffer) {
             if constexpr (requires { buffer.Mapped(); }) {
                 mapped |= !buffer.Mapped().empty();
             }
         });
-        if (mapped) {
+        if (mapped && !transfer) {
             return false;
         }
         struct Download {
@@ -468,6 +478,13 @@ bool BufferCache<P>::DownloadMemoryAsync(DAddr device_addr, u64 size,
                                      download.copy.dst_offset, download.copy.size});
             download.copy.dst_offset += state->staging.offset;
             buffer.MarkUsage(download.copy.src_offset, download.copy.size);
+            if constexpr (requires { runtime.TransferReadbacks(); }) {
+                if (transfer) {
+                    runtime.TransferReadbackCopy(state->staging.buffer, buffer, download.copy,
+                                                 mapped);
+                    continue;
+                }
+            }
             runtime.CopyBuffer(state->staging.buffer, buffer, std::span{&download.copy, 1}, true);
         }
         state->cpu_written = PendingCpuWriteRanges();
@@ -480,12 +497,22 @@ bool BufferCache<P>::DownloadMemoryAsync(DAddr device_addr, u64 size,
                 state->expected.insert(state->expected.end(), data, data + copy.size);
                 WriteDownloadedMemory(state->cpu_written, copy.device_addr, data, copy.size);
             }
+        } else if (transfer) {
+            if constexpr (requires { runtime.TransferReadbacks(); }) {
+                const auto job = runtime.SubmitTransferReadback();
+                state->job_semaphore = job.first;
+                state->job_value = job.second;
+            }
         } else {
             state->tick = runtime.SubmitForHostRead();
         }
         readbacks_in_flight.push_back(state);
         land = [state, runtime_ptr = &runtime, memory = &device_memory] {
-            if (!state->verify) {
+            if (state->job_value != 0) {
+                if constexpr (requires { runtime_ptr->TransferReadbacks(); }) {
+                    runtime_ptr->WaitTransferReadback(state->job_semaphore, state->job_value);
+                }
+            } else if (!state->verify) {
                 runtime_ptr->WaitForHostRead(state->tick);
             }
             size_t expected_offset = 0;
@@ -1759,7 +1786,73 @@ bool BufferCache<P>::ShouldWaitAsyncFlushes() const noexcept {
 }
 
 template <class P>
+void BufferCache<P>::RecordWriterDownloads() {
+    // EDEN_NX2_V2_XREADBACK: the fence downloads queued so far (learned pages the guest reads
+    // back) are recorded now, right after the work that wrote them and in its submission, and
+    // land with the next fence's operations.
+    if constexpr (!USE_MEMORY_MAPS) {
+        return;
+    } else {
+        if (uncommitted_gpu_modified_ranges.Empty()) {
+            return;
+        }
+        Common::RangeSet<DAddr> ranges = std::move(uncommitted_gpu_modified_ranges);
+        uncommitted_gpu_modified_ranges.Clear();
+        boost::container::small_vector<std::pair<BufferCopy, BufferId>, 16> downloads;
+        u64 total_size_bytes = 0;
+        ranges.ForEach([&](DAddr lower, DAddr upper) {
+            ForEachBufferInRange(lower, upper - lower, [&](BufferId buffer_id, Buffer& buffer) {
+                const DAddr buffer_addr = buffer.CpuAddr();
+                const DAddr begin = (std::max)(buffer_addr, lower);
+                const DAddr end = (std::min)(buffer_addr + buffer.SizeBytes(), upper);
+                if (begin >= end) {
+                    return;
+                }
+                memory_tracker.ForEachDownloadRange(
+                    begin, end - begin, false, [&](u64 range_addr, u64 range_size) {
+                        gpu_modified_ranges.ForEachInRange(
+                            range_addr, range_size, [&](DAddr start, DAddr stop) {
+                                downloads.push_back({BufferCopy{
+                                                         .src_offset = start - buffer_addr,
+                                                         .dst_offset = total_size_bytes,
+                                                         .size = stop - start,
+                                                     },
+                                                     buffer_id});
+                                total_size_bytes += Common::AlignUp(stop - start, 64);
+                            });
+                    });
+            });
+        });
+        if (downloads.empty()) {
+            return;
+        }
+        PreparedDownload prepared;
+        prepared.staging = runtime.DownloadStagingBuffer(total_size_bytes, true);
+        runtime.PreCopyBarrier();
+        for (auto& [copy, buffer_id] : downloads) {
+            Buffer& buffer = slot_buffers[buffer_id];
+            copy.dst_offset += prepared.staging.offset;
+            BufferCopy normalized{copy};
+            normalized.src_offset = static_cast<size_t>(buffer.CpuAddr()) + copy.src_offset;
+            prepared.ranges.Add(normalized.src_offset, copy.size);
+            buffer.MarkUsage(copy.src_offset, copy.size);
+            runtime.CopyBuffer(prepared.staging.buffer, buffer, std::span{&copy, 1}, false);
+            prepared.copies.push_back(normalized);
+        }
+        runtime.PostCopyBarrier();
+        VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::EarlyDownloads,
+                                       prepared.copies.size());
+        writer_downloads_open.push_back(std::move(prepared));
+    }
+}
+
+template <class P>
 void BufferCache<P>::CommitAsyncFlushesHigh() {
+    if (v2_writer_downloads) [[unlikely]] {
+        // The downloads prepared behind their writers land with this fence.
+        writer_downloads_fenced.push_back(std::move(writer_downloads_open));
+        writer_downloads_open.clear();
+    }
     AccumulateFlushes();
 
     if (committed_gpu_modified_ranges.empty()) {
@@ -1916,6 +2009,27 @@ void BufferCache<P>::WriteDownloadedMemory(const Common::RangeSet<DAddr>& cpu_wr
 
 template <class P>
 void BufferCache<P>::PopAsyncBuffers() {
+    if (v2_writer_downloads && !writer_downloads_fenced.empty() && !async_buffers.empty())
+        [[unlikely]] {
+        if constexpr (USE_MEMORY_MAPS) {
+            const Common::RangeSet<DAddr> cpu_written = PendingCpuWriteRanges();
+            for (auto& prepared : writer_downloads_fenced.front()) {
+                u8* const base = prepared.staging.mapped_span.data();
+                for (const BufferCopy& copy : prepared.copies) {
+                    const DAddr device_addr = static_cast<DAddr>(copy.src_offset);
+                    const u8* const data = base + (copy.dst_offset - prepared.staging.offset);
+                    prepared.ranges.ForEachInRange(device_addr, copy.size,
+                                                   [&](DAddr start, DAddr end) {
+                        WriteDownloadedMemory(cpu_written, start, &data[start - device_addr],
+                                              end - start);
+                        gpu_modified_ranges.Subtract(start, end - start);
+                    });
+                }
+                async_buffers_death_ring.emplace_back(prepared.staging);
+            }
+        }
+        writer_downloads_fenced.pop_front();
+    }
     if (async_buffers.empty()) {
         return;
     }
@@ -3284,6 +3398,17 @@ void BufferCache<P>::MarkWrittenBuffer(BufferId buffer_id, DAddr device_addr, u3
     V2::Versions::HookWrite(device_addr, size, V2::Versions::Source::Gpu);
     if (learned_marked != 0) [[unlikely]] {
         NoteLearnedWrite(device_addr, size);
+    }
+    if (v2_writer_downloads) [[unlikely]] {
+        // A newer write: the prepared downloads hold older bytes for this range.
+        for (auto& prepared : writer_downloads_open) {
+            prepared.ranges.Subtract(device_addr, size);
+        }
+        for (auto& fence : writer_downloads_fenced) {
+            for (auto& prepared : fence) {
+                prepared.ranges.Subtract(device_addr, size);
+            }
+        }
     }
     QueueFenceDownload(device_addr, size);
     if (Tegra::g_nx2_ampere.load(std::memory_order_relaxed)) {

@@ -29,6 +29,7 @@
 
 #include <atomic>
 #include "video_core/v2/p5b_stats.h"
+#include "video_core/renderer_vulkan/vk_background_readback.h"
 #include "video_core/renderer_vulkan/vk_submit_engine.h"
 #include "video_core/gpu_logging/gpu_logging.h"
 #include "video_core/nx2.h"
@@ -1339,7 +1340,42 @@ TextureCacheRuntime::TextureCacheRuntime(const Device& device_, Scheduler& sched
 }
 
 void TextureCacheRuntime::Finish() {
+    BackgroundReadback* const readback = scheduler.GetBackgroundReadback();
+    if (readback != nullptr && !readback->Empty()) [[unlikely]] {
+        // The job waits for the graphics tick it flushes: its completion covers the copies the
+        // graphics path recorded in that tick too.
+        readback->Wait(readback->Submit());
+        return;
+    }
     scheduler.Finish();
+}
+
+bool TextureCacheRuntime::TryTransferDownload(Image& image, const StagingBufferRef& map,
+                                              std::span<const VideoCommon::BufferImageCopy> copies) {
+    BackgroundReadback* const readback = scheduler.GetBackgroundReadback();
+    if (readback == nullptr || !readback->Active() ||
+        image.AspectMask() != VK_IMAGE_ASPECT_COLOR_BIT || image.info.num_samples != 1 ||
+        image.HostMipLevels() != static_cast<u32>(image.info.resources.levels) ||
+        True(image.flags & (VideoCommon::ImageFlagBits::Rescaled |
+                            VideoCommon::ImageFlagBits::Converted |
+                            VideoCommon::ImageFlagBits::Sparse |
+                            VideoCommon::ImageFlagBits::SparseTiles |
+                            VideoCommon::ImageFlagBits::SparseLayers |
+                            VideoCommon::ImageFlagBits::Unbacked))) {
+        return false;
+    }
+    for (const auto& copy : copies) {
+        if (((map.offset + copy.buffer_offset) & 3) != 0) {
+            return false; // Transfer-only queues need 4-byte aligned buffer offsets
+        }
+    }
+    auto vk_copies = TransformBufferImageCopies(copies, map.offset, VK_IMAGE_ASPECT_COLOR_BIT);
+    readback->AddImageCopy(image.Handle(), VK_IMAGE_ASPECT_COLOR_BIT, map.buffer,
+                           {vk_copies.data(), vk_copies.size()});
+    // Owned by the transfer queue until the next submission takes it back: no transfer upload
+    // into it before then.
+    image.v2_track_id = (std::max)(image.v2_track_id, scheduler.CurrentTick() + 1);
+    return true;
 }
 
 StagingBufferRef TextureCacheRuntime::UploadStagingBuffer(size_t size, bool deferred) {

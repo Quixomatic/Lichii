@@ -87,6 +87,11 @@ public:
 
     void Finish();
 
+    /// EDEN_NX2_V2_XREADBACK: a synchronous image download on the transfer queue (Finish waits
+    /// for it). False when the image must take the graphics path.
+    bool TryTransferDownload(Image& image, const StagingBufferRef& map,
+                             std::span<const VideoCommon::BufferImageCopy> copies);
+
     StagingBufferRef UploadStagingBuffer(size_t size, bool deferred = false);
 
     StagingBufferRef DownloadStagingBuffer(size_t size, bool deferred = false);

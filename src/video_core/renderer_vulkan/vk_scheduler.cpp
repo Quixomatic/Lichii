@@ -31,6 +31,7 @@
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_state_tracker.h"
+#include "video_core/renderer_vulkan/vk_background_readback.h"
 #include "video_core/renderer_vulkan/vk_submit_engine.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
 #include "video_core/v2/p5b_stats.h"
@@ -165,6 +166,13 @@ Scheduler::Scheduler(const Device& device_, StateTracker& state_tracker_)
     if (submit_thread || transfer_queue) {
         submit_engine = std::make_unique<SubmitEngine>(device, *master_semaphore, submit_mutex,
                                                        submit_thread, transfer_queue.get());
+    }
+
+    if (transfer_queue && VideoCommon::V2::On(VideoCommon::V2::Switch::XReadback)) {
+        background_readback = std::make_unique<BackgroundReadback>(device, *this);
+    } else if (VideoCommon::V2::On(VideoCommon::V2::Switch::XReadback)) {
+        LOG_INFO(Render_Vulkan, "EDEN_NX2_V2_XREADBACK needs the transfer queue "
+                                "(EDEN_NX2_V2_XFERQ and a dedicated transfer family)");
     }
 
     AcquireNewChunk();

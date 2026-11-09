@@ -443,6 +443,8 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
         VideoCommon::GpuSplit::SetTransferJoinHook(
             [](void* self) { static_cast<Scheduler*>(self)->NoteAcquireJoin(); }, &scheduler);
     }
+    // EDEN_NX2_V2_XREADBACK: learned downloads recorded right behind their writers.
+    buffer_cache.v2_writer_downloads = VideoCommon::V2::On(VideoCommon::V2::Switch::XReadback);
     // EDEN_NX2_V2_ADAPTSUBMIT: adaptive submission for native titles (FlushWork).
     adapt_submit = VideoCommon::V2::On(VideoCommon::V2::Switch::AdaptSubmit);
     if (VideoCommon::V2::On(VideoCommon::V2::Switch::Bindless)) [[unlikely]] {
@@ -2718,6 +2720,9 @@ void RasterizerVulkan::DispatchCompute() {
     if (can_replace) {
         // The deferred native binding may follow DLSS's command buffer bindings.
         scheduler.InvalidateState();
+    }
+    if (buffer_cache.v2_writer_downloads) [[unlikely]] {
+        buffer_cache.RecordWriterDownloads(); // EDEN_NX2_V2_XREADBACK
     }
     SubmitNx2ListCopies();
     publish_collision_map();

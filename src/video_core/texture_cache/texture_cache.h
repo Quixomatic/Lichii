@@ -1478,7 +1478,13 @@ void TextureCache<P>::DownloadMemory(DAddr cpu_addr, size_t size) {
         }
         auto map = runtime.DownloadStagingBuffer(image.unswizzled_size_bytes);
         auto copies = FullDownloadCopies(image.info);
-        image.DownloadMemory(map, copies);
+        bool on_transfer = false;
+        if constexpr (requires { runtime.TryTransferDownload(image, map, copies); }) {
+            on_transfer = runtime.TryTransferDownload(image, map, copies);
+        }
+        if (!on_transfer) {
+            image.DownloadMemory(map, copies);
+        }
         pending_bytes += image.unswizzled_size_bytes;
         pending.push_back(Pending{image_id, map, std::move(copies)});
     }

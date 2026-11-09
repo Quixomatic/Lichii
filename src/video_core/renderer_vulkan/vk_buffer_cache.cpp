@@ -11,6 +11,7 @@
 #include <span>
 #include <vector>
 
+#include "video_core/renderer_vulkan/vk_background_readback.h"
 #include "video_core/v2/p5b_stats.h"
 #include "video_core/buffer_cache/buffer_cache_base.h"
 #include "video_core/nx2_perf.h"
@@ -565,6 +566,30 @@ u64 BufferCacheRuntime::SubmitForHostRead() {
 
 void BufferCacheRuntime::WaitForHostRead(u64 tick) {
     scheduler.GetMasterSemaphore().Wait(tick);
+}
+
+bool BufferCacheRuntime::TransferReadbacks() const noexcept {
+    const BackgroundReadback* const readback = scheduler.GetBackgroundReadback();
+    return readback != nullptr && readback->Active();
+}
+
+void BufferCacheRuntime::TransferReadbackCopy(VkBuffer staging, Buffer& src,
+                                              const VideoCommon::BufferCopy& copy, bool mapped) {
+    scheduler.GetBackgroundReadback()->AddBufferCopy(src.Handle(), staging,
+                                                     MakeBufferCopy(copy));
+    if (mapped) {
+        VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::MappedReadbacks);
+    }
+}
+
+std::pair<u64, u64> BufferCacheRuntime::SubmitTransferReadback() {
+    const auto job = scheduler.GetBackgroundReadback()->Submit();
+    return {reinterpret_cast<u64>(job.semaphore), job.value};
+}
+
+void BufferCacheRuntime::WaitTransferReadback(u64 semaphore, u64 value) {
+    scheduler.GetBackgroundReadback()->Wait(
+        {reinterpret_cast<VkSemaphore>(semaphore), value, std::chrono::steady_clock::now()});
 }
 
 bool BufferCacheRuntime::CanReorderUpload(const Buffer& buffer,

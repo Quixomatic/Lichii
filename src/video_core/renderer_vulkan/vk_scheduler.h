@@ -42,6 +42,7 @@ class Device;
 class Framebuffer;
 class GraphicsPipeline;
 class StateTracker;
+class BackgroundReadback;
 class SubmitEngine;
 class TransferQueue;
 struct SubmitContext;
@@ -257,6 +258,11 @@ public:
 
     [[nodiscard]] SubmitEngine* GetSubmitEngine() const noexcept {
         return submit_engine.get();
+    }
+
+    /// EDEN_NX2_V2_XREADBACK: readbacks on the transfer queue (null when off or unavailable).
+    [[nodiscard]] BackgroundReadback* GetBackgroundReadback() const noexcept {
+        return background_readback.get();
     }
 
     /// Whether the recording thread submitted `tick` within 20 ms.
@@ -579,6 +585,7 @@ private:
     /// (EDEN_NX2_V2_SUBMITTHREAD, or contexts for the transfer queue). Destroyed after the worker.
     std::unique_ptr<TransferQueue> transfer_queue;
     std::unique_ptr<SubmitEngine> submit_engine;
+    std::unique_ptr<BackgroundReadback> background_readback;
     SubmitContext* current_context{}; ///< worker thread
     VideoCommon::V2::TimelineJoin timeline_join; ///< recording thread
 
