@@ -1835,6 +1835,9 @@ private:
             frames_ahead = 1;
         }
         const auto entered = std::chrono::steady_clock::now();
+        // Perf fix C: the fencing thread counts the part of this wait spent on work that was not
+        // submitted yet (Ryujinx's AutoFlushCounter trigger), not the whole wait.
+        Core::g_nx2_guest_sync_waiters.fetch_add(1, std::memory_order_relaxed);
         if (frames_ahead == 1 || (frames_ahead == -1 && !WaitForFrame(~w[22], w[24], true))) {
             LOG_DEBUG(Service, "nx2:vi2 present #{} fence ({}, {:#x}), waiting for ({}, {:#x}); now {:#x}",
                       m_presents, ~w[22], w[24], m_previous_fence_id, m_previous_fence_value,
@@ -1858,11 +1861,8 @@ private:
         }
         m_previous_fence_id = ~w[22];
         m_previous_fence_value = w[24];
+        Core::g_nx2_guest_sync_waiters.fetch_sub(1, std::memory_order_relaxed);
         const auto waited = std::chrono::steady_clock::now();
-        Core::g_nx2_guest_sync_wait_us.fetch_add(
-            static_cast<u64>(
-                std::chrono::duration_cast<std::chrono::microseconds>(waited - entered).count()),
-            std::memory_order_relaxed);
         Core::g_nx2_frames_ahead.store(frames_ahead, std::memory_order_relaxed);
         Composite(w[5], ~w[22], w[24], w[7]);
         const auto composited = std::chrono::steady_clock::now();

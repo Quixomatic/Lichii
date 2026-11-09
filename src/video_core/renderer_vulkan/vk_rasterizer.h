@@ -254,6 +254,9 @@ private:
 
     /// A hint for the adaptive submission heuristic (no-op unless EDEN_NX2_V2_ADAPTSUBMIT).
     void FlushHint(VideoCommon::V2::FlushHint hint);
+    /// Resets the heuristic's counters when any submission happened since it last looked.
+    void SyncAdaptiveTick();
+    static u64 AdaptNowUs();
 
     void TraceRenderState(bool is_indexed, const char* outcome, const Framebuffer* framebuffer);
 

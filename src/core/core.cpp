@@ -83,6 +83,7 @@ static_assert(std::atomic<u64>::is_always_lock_free);
 std::array<std::atomic<u64>, 4096> g_nx2_present_times_ns{};
 std::atomic<u32> g_nx2_present_time_services{};
 std::atomic<u64> g_nx2_guest_sync_wait_us{};
+std::atomic<u32> g_nx2_guest_sync_waiters{};
 std::atomic<int> g_nx2_frames_ahead{-1};
 
 FileSys::VirtualFile GetGameFileFromPath(const FileSys::VirtualFilesystem& vfs,

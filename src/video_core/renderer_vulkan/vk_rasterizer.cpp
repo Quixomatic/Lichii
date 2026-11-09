@@ -2805,8 +2805,10 @@ void RasterizerVulkan::ResetCounter(VideoCommon::QueryType type) {
 void RasterizerVulkan::Query(GPUVAddr gpu_addr, VideoCommon::QueryType type,
                              VideoCommon::QueryPropertiesFlags flags, u32 payload, u32 subreport) {
     query_cache.CounterReport(gpu_addr, type, flags, payload, subreport);
-    if (adapt_submit) [[unlikely]] {
-        // A release or report: something the guest (or another channel) waits on.
+    if (adapt_submit && type != VideoCommon::QueryType::Payload) [[unlikely]] {
+        // Perf fix C (MASTER_PLAN §5.5, §6): only a GPU-result-valued report (class D: counters,
+        // query results) is work the guest reads back. A payload release is class A/B: S1 owns
+        // its value, and its fence submits by itself; a hint there only made small submits.
         FlushHint(VideoCommon::V2::FlushHint::Strong);
     }
 }
@@ -4258,23 +4260,33 @@ void RasterizerVulkan::FlushHint(VideoCommon::V2::FlushHint hint) {
     if (!adapt_submit) {
         return;
     }
+    SyncAdaptiveTick();
     flush_heuristic.Hint(hint);
-    if (hint >= VideoCommon::V2::FlushHint::Strong) {
-        // Work the guest reads back or waits on: submit now when enough is recorded or the GPU
-        // is about to go idle (DXVK's strong hint), instead of waiting for a chunk boundary.
-        auto& master = scheduler.GetMasterSemaphore();
-        const u64 current = master.CurrentTick();
-        const u64 done = master.KnownGpuTick();
-        const u32 pending = static_cast<u32>(current > done + 1 ? current - done - 1 : 0);
-        if (flush_heuristic.WantsFlushNow(pending)) {
-            scheduler.Flush();
-            pending_native_work = false;
-            flush_heuristic.NoteSubmit(static_cast<u64>(
-                std::chrono::duration_cast<std::chrono::microseconds>(
-                    std::chrono::steady_clock::now().time_since_epoch())
-                    .count()));
-            VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::FlushStrong);
-        }
+    if (hint >= VideoCommon::V2::FlushHint::Strong && flush_heuristic.WantsFlushNow()) {
+        // Work the guest reads back: submit now when enough is recorded (DXVK's strong hint),
+        // instead of waiting for a chunk boundary.
+        scheduler.Flush();
+        pending_native_work = false;
+        adapt_tick = scheduler.GetMasterSemaphore().CurrentTick();
+        flush_heuristic.NoteSubmit(AdaptNowUs());
+        VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::FlushStrong);
+    }
+}
+
+u64 RasterizerVulkan::AdaptNowUs() {
+    return static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                std::chrono::steady_clock::now().time_since_epoch())
+                                .count());
+}
+
+void RasterizerVulkan::SyncAdaptiveTick() {
+    // Fix pass 1 (B8): any submission resets the heuristic, not only its own. A fence, present or
+    // readback submit left the draws since the heuristic's last flush counted, so it flushed again
+    // soon after (OoT: 11 draws per submission).
+    if (const u64 tick = scheduler.GetMasterSemaphore().CurrentTick(); tick != adapt_tick)
+        [[unlikely]] {
+        adapt_tick = tick;
+        flush_heuristic.NoteSubmit(AdaptNowUs());
     }
 }
 
@@ -4283,35 +4295,24 @@ void RasterizerVulkan::AdaptiveFlushWork(u32 cost) {
     // The clock and the GPU progress are read only at chunk boundaries (and in fast-flush mode).
     namespace P5b = VideoCommon::V2::P5bStats;
     const auto& params = flush_heuristic.Params();
+    SyncAdaptiveTick();
     const u32 next = flush_heuristic.Draws() + 1;
-    const bool boundary = next % params.chunk_draws == 0 || next >= params.max_draws ||
-                          flush_heuristic.FastMode();
     u64 now_us = 0;
-    u32 pending = 1;
-    if (boundary) {
-        now_us = static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
-                                      std::chrono::steady_clock::now().time_since_epoch())
-                                      .count());
+    VideoCommon::V2::FlushState state{};
+    if (next % params.chunk_draws == 0) {
+        // Real GPU progress: the timeline's value against what was handed off. Pending 0 means
+        // the GPU finished every submission; the recorder being behind (more published work in
+        // the split's ring) means the GPU starves because of the CPU, not for lack of submits.
+        now_us = AdaptNowUs();
         auto& master = scheduler.GetMasterSemaphore();
         master.Refresh();
         const u64 current = master.CurrentTick();
         const u64 done = master.KnownGpuTick();
-        pending = static_cast<u32>(current > done + 1 ? current - done - 1 : 0);
+        state.pending = static_cast<u32>(current > done + 1 ? current - done - 1 : 0);
+        state.back_behind = VideoCommon::GpuSplit::OnBackThread() &&
+                            VideoCommon::GpuSplit::Get().BackBehind();
     }
-    // Fix pass 1 (B8): any submission resets the heuristic, not only its own. A fence, present or
-    // readback submit left the draws since the heuristic's last flush counted, so it flushed again
-    // soon after (OoT: 11 draws per submission).
-    if (const u64 tick = scheduler.GetMasterSemaphore().CurrentTick(); tick != adapt_tick)
-        [[unlikely]] {
-        adapt_tick = tick;
-        if (now_us == 0) {
-            now_us = static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
-                                          std::chrono::steady_clock::now().time_since_epoch())
-                                          .count());
-        }
-        flush_heuristic.NoteSubmit(now_us);
-    }
-    const auto decision = flush_heuristic.Advance(cost, pending, now_us);
+    const auto decision = flush_heuristic.Advance(cost, state, now_us);
     P5b::Add(P5b::Counter::SubmitDraws);
     switch (decision.action) {
     case VideoCommon::V2::FlushAction::None:

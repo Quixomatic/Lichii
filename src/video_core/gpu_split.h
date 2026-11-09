@@ -284,6 +284,12 @@ public:
     [[nodiscard]] static bool OnBackThread() {
         return on_back_thread;
     }
+    /// Back thread: whether the front published more work past the batch the back is running,
+    /// i.e. the back is the bottleneck right now (Perf fix C: the adaptive submission's idle
+    /// and fast-flush rules stay off then).
+    [[nodiscard]] bool BackBehind() const {
+        return published.load(std::memory_order_relaxed) != back_batch_end;
+    }
     /// Called on the back before it sleeps waiting for work (the rasterizer submits deferred work).
     void SetIdleHook(void (*hook)(void*), void* argument) {
         idle_hook = hook;
@@ -772,6 +778,7 @@ private:
     alignas(64) std::atomic<bool> hook_requested{};
     std::atomic<bool> idle_hook_requested{};
     std::atomic<bool> back_running{};
+    u64 back_batch_end{}; ///< Back thread: the published position of the batch it runs
 
     // 128 bytes: x86 spatial prefetchers pull 64-byte lines in pairs. back_waiting and wake are
     // always touched together by both threads, so they share a block.

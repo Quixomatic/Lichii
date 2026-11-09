@@ -25,6 +25,7 @@ using VideoCommon::V2::FlushAction;
 using VideoCommon::V2::FlushHeuristic;
 using VideoCommon::V2::FlushHint;
 using VideoCommon::V2::FlushParams;
+using VideoCommon::V2::FlushState;
 using VideoCommon::V2::RangeBarrierTracker;
 using VideoCommon::V2::TimelineJoin;
 
@@ -141,32 +142,54 @@ TEST_CASE("V2 P5b barrier tracker range math", "[video_core][v2_p5b]") {
 
 TEST_CASE("V2 P5b flush heuristic decisions", "[video_core][v2_p5b]") {
     FlushParams params;
-    SECTION("idle GPU is fed at the first chunk with enough draws") {
+    const FlushState idle{.pending = 0, .back_behind = false};
+    const FlushState idle_behind{.pending = 0, .back_behind = true};
+    SECTION("idle GPU is fed once enough draws are recorded") {
         FlushHeuristic heuristic{params};
         u64 now = 1000;
         FlushHeuristic::Decision decision{};
-        for (u32 i = 0; i < params.chunk_draws; ++i) {
-            decision = heuristic.Advance(1, /*pending*/ 0, now);
-            now += params.idle_min_interval_us / (params.chunk_draws - 1) + 1;
+        u32 at = 0;
+        for (u32 i = 1; i <= 1000 && at == 0; ++i) {
+            now += 20;
+            decision = heuristic.Advance(1, idle, now);
+            if (decision.action == FlushAction::Flush) {
+                at = i;
+            }
         }
-        REQUIRE(decision.action == FlushAction::Flush);
         REQUIRE(decision.reason == FlushHeuristic::ReasonIdle);
+        // Never before min_draws (Perf fix C: 16-draw submissions), at a chunk boundary.
+        REQUIRE(at == params.min_draws);
         REQUIRE(heuristic.Draws() == 0);
     }
-    // Fix pass 1 (B8, OoT: 23 to 44 submissions a frame): a light load keeps the GPU about to
-    // idle, which must not submit every chunk.
-    SECTION("idle GPU: no idle flush sooner than the minimum interval") {
+    // Perf fix C: a CPU-bound recorder always leaves the GPU idle; the idle rule must not turn
+    // that into "submit every millisecond".
+    SECTION("idle GPU with the recorder behind: no idle flush, only the interval") {
         FlushHeuristic heuristic{params};
         u32 flushes = 0;
-        // 10 draws per 100 us: 32-draw chunks every 320 us, all with the GPU idle.
-        for (u32 i = 0; i < 640; ++i) {
+        // 10 draws per 100 us for 20 ms, all with the GPU idle and more work queued.
+        for (u32 i = 0; i < 2000; ++i) {
             const u64 now = 1000 + u64{i} * 10;
-            if (heuristic.Advance(1, /*pending*/ 0, now).action == FlushAction::Flush) {
+            const auto decision = heuristic.Advance(1, idle_behind, now);
+            if (decision.action == FlushAction::Flush) {
+                REQUIRE(decision.reason == FlushHeuristic::ReasonInterval);
                 ++flushes;
             }
         }
-        // 6.4 ms of draws: at most one idle flush per millisecond, not one per chunk (20).
-        REQUIRE(flushes <= 7);
+        // 20 ms: one interval flush per max_interval_us (5), not one per ms or per chunk.
+        REQUIRE(flushes <= 20000 / params.max_interval_us + 1);
+        REQUIRE(flushes >= 1);
+    }
+    SECTION("idle GPU: no idle flush sooner than the minimum interval") {
+        FlushHeuristic heuristic{params};
+        u32 flushes = 0;
+        // 10 draws per 100 us: 128 draws every 1.28 ms.
+        for (u32 i = 0; i < 1280; ++i) {
+            const u64 now = 1000 + u64{i} * 10;
+            if (heuristic.Advance(1, idle, now).action == FlushAction::Flush) {
+                ++flushes;
+            }
+        }
+        REQUIRE(flushes <= 1280 / params.min_draws);
         REQUIRE(flushes >= 1);
     }
     SECTION("busy GPU: threshold grows with pending work, chunks dispatched meanwhile") {
@@ -187,6 +210,16 @@ TEST_CASE("V2 P5b flush heuristic decisions", "[video_core][v2_p5b]") {
         // min(20, 4 * 3) = 12 chunks of 32 draws.
         REQUIRE(flushed_at == 12 * params.chunk_draws);
         REQUIRE(dispatches == 11);
+    }
+    SECTION("one submission in flight: no pending flush, no idle flush") {
+        FlushHeuristic heuristic{params};
+        u32 flushed_at = 0;
+        for (u32 i = 1; i <= 2000 && flushed_at == 0; ++i) {
+            if (heuristic.Advance(1, /*pending*/ 1, 1000).action == FlushAction::Flush) {
+                flushed_at = i;
+            }
+        }
+        REQUIRE(flushed_at == params.max_draws);
     }
     SECTION("deep queue caps at max_draws") {
         FlushHeuristic heuristic{params};
@@ -238,14 +271,16 @@ TEST_CASE("V2 P5b flush heuristic decisions", "[video_core][v2_p5b]") {
         FlushHeuristic timed{params};
         u64 now = 1000;
         decision = {};
-        for (u32 d = 1; d <= params.chunk_draws; ++d) {
-            now += 100; // 3.2 ms over the chunk: past max_interval_us
-            decision = timed.Advance(1, 10, now);
+        u32 at = 0;
+        for (u32 d = 1; d <= 1000 && decision.action != FlushAction::Flush; ++d) {
+            now += 50; // past max_interval_us at draw 80, but below min_draws
+            decision = timed.Advance(1, 1, now);
+            at = d;
         }
-        REQUIRE(decision.action == FlushAction::Flush);
         REQUIRE(decision.reason == FlushHeuristic::ReasonInterval);
+        REQUIRE(at == params.min_draws);
     }
-    SECTION("fast-flush mode enters and leaves on the guest's sync waits") {
+    SECTION("fast-flush mode enters and leaves on the guest's unsubmitted waits") {
         FlushHeuristic heuristic{params};
         for (int frame = 0; frame < 40 && !heuristic.FastMode(); ++frame) {
             heuristic.NoteGuestSyncWait(5000);
@@ -255,24 +290,36 @@ TEST_CASE("V2 P5b flush heuristic decisions", "[video_core][v2_p5b]") {
         u64 now = 1000;
         FlushHeuristic::Decision decision{};
         heuristic.NoteSubmit(now);
-        for (u32 d = 1; d <= params.min_draws + 2 && decision.action != FlushAction::Flush; ++d) {
+        for (u32 d = 1; d <= params.chunk_draws; ++d) {
             now += 200;
-            decision = heuristic.Advance(1, 10, now);
+            decision = heuristic.Advance(1, FlushState{.pending = 10, .back_behind = true}, now);
         }
+        // A recorder that is behind makes the guest wait by itself: no fast flush then.
+        REQUIRE(decision.action == FlushAction::Dispatch);
+        for (u32 d = 1; d <= params.chunk_draws; ++d) {
+            now += 200;
+            decision = heuristic.Advance(1, FlushState{.pending = 10, .back_behind = false}, now);
+        }
+        REQUIRE(decision.action == FlushAction::Flush);
         REQUIRE(decision.reason == FlushHeuristic::ReasonFast);
         for (int frame = 0; frame < 200 && heuristic.FastMode(); ++frame) {
             heuristic.NoteFrame();
         }
         REQUIRE_FALSE(heuristic.FastMode());
     }
-    SECTION("immediate strong hint") {
+    SECTION("immediate strong hint needs 3 chunks, idle GPU or not") {
         FlushHeuristic heuristic{params};
-        for (u32 i = 0; i < params.min_draws; ++i) {
-            (void)heuristic.Advance(1, 10, 1000);
+        for (u32 i = 0; i < 16; ++i) {
+            (void)heuristic.Advance(1, idle, 1000);
         }
         heuristic.Hint(FlushHint::Strong);
-        REQUIRE(heuristic.WantsFlushNow(/*pending*/ 0));
-        REQUIRE_FALSE(heuristic.WantsFlushNow(/*pending*/ 10)); // < 3 chunks, GPU busy
+        REQUIRE_FALSE(heuristic.WantsFlushNow()); // Perf fix C: no idle shortcut
+        FlushHeuristic later{params};
+        for (u32 i = 0; i < params.strong_chunks * params.chunk_draws; ++i) {
+            (void)later.Advance(1, 10, 1000);
+        }
+        later.Hint(FlushHint::Strong);
+        REQUIRE(later.WantsFlushNow());
     }
 }
 
