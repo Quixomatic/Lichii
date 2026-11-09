@@ -257,6 +257,9 @@ void GpuSplit::Stop() {
     ir_run_classified = false;
     s1_open_words = 0;
     s1_cbuf = nullptr;
+    s1_cursor = nullptr;
+    s1_limit = nullptr;
+    s1_unadvanced = 0;
     V2::IrCheck::Stop();
     ir_sequence = 0;
     ir_run = nullptr;
@@ -587,6 +590,42 @@ u64* GpuSplit::S1OpenRun(size_t words) {
     return entries;
 }
 
+u64* GpuSplit::S1BeginSlow(Tegra::Engines::EngineInterface* engine, size_t words) {
+    SelectEngine(engine);
+    s1_cbuf = nullptr;
+    u64* entry = nullptr;
+    if (ir_run != nullptr && ir_run_classified == s1_exec && ir_run_words + words <= MaxRunWords) {
+        // The run's end is the arena's head, or the start of its reserved words: grow from there
+        // (the payload stays contiguous).
+        const size_t have = static_cast<size_t>(s1_limit - s1_cursor);
+        u64* const start = s1_cursor != nullptr ? s1_cursor : nullptr;
+        if (u64* const grown = arena.Extend(words - have)) {
+            entry = start != nullptr ? start : grown;
+            ir_run_words += words;
+            s1_cursor = nullptr;
+            s1_limit = nullptr;
+        }
+    }
+    if (entry == nullptr) {
+        entry = S1OpenRun(words);
+    }
+    if (s1_exec) {
+        S1Reserve();
+    }
+    return entry;
+}
+
+void GpuSplit::S1Reserve() {
+    if (ir_run == nullptr || !ir_run_classified ||
+        ir_run_words + S1ReserveWords > MaxRunWords) {
+        return;
+    }
+    if (u64* const reserved = arena.Extend(S1ReserveWords)) {
+        s1_cursor = reserved;
+        s1_limit = reserved + S1ReserveWords;
+    }
+}
+
 void GpuSplit::S1Cbuf(Tegra::Engines::EngineInterface* engine, bool store, u32 slot, u64 buffer,
                       u32 offset, u32 word) {
     namespace S1 = V2::S1;
@@ -608,9 +647,16 @@ void GpuSplit::S1Cbuf(Tegra::Engines::EngineInterface* engine, bool store, u32 s
         }
         if (joins && method_ok) {
             u32* data = nullptr;
+            // Odd: the high half of the data word at `next`; even: a new word at `next`, right
+            // after the entry (it is the run's last).
+            u64* const next = head + 2 + count / 2;
             if (count % 2 != 0) {
-                data = reinterpret_cast<u32*>(head + 2 + count / 2) + 1;
-            } else if (ir_run_words + 1 <= MaxRunWords) {
+                data = reinterpret_cast<u32*>(next) + 1;
+            } else if (s1_cursor == next && s1_cursor != s1_limit) {
+                *s1_cursor++ = 0;
+                ++ir_run_words;
+                data = reinterpret_cast<u32*>(next);
+            } else if (s1_cursor == nullptr && ir_run_words + 1 <= MaxRunWords) {
                 if (u64* const extra = arena.Extend(1)) {
                     ++ir_run_words;
                     *extra = 0;
@@ -621,7 +667,7 @@ void GpuSplit::S1Cbuf(Tegra::Engines::EngineInterface* engine, bool store, u32 s
                 *data = word;
                 head[0] = S1::MakeCbuf(store, inc, m0, count + 1, S1::ValueOf(h));
                 if (count % 2 == 0) {
-                    Advance(1); // A publish here closes the run with this word in it
+                    S1Commit(1); // A publish here closes the run with this word in it
                 }
                 return;
             }

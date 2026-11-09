@@ -150,23 +150,28 @@ public:
     /// Front, S1: room for `words` of classified entries for `engine` in the open StateRun (a
     /// Classified one with S1Exec), opening one when needed. Fill them, then S1Commit(words).
     u64* S1Begin(Tegra::Engines::EngineInterface* engine, size_t words) {
-        SelectEngine(engine);
         s1_cbuf = nullptr;
-        if (ir_run != nullptr && ir_run_classified == s1_exec &&
-            ir_run_words + words <= MaxRunWords) [[likely]] {
-            if (u64* const entry = arena.Extend(words)) [[likely]] {
-                ir_run_words += words;
-                return entry;
-            }
+        // The open classified run's reserved words (S1Reserve): a pointer bump.
+        if (engine == front_engine && static_cast<size_t>(s1_limit - s1_cursor) >= words)
+            [[likely]] {
+            u64* const entry = s1_cursor;
+            s1_cursor += words;
+            ir_run_words += words;
+            return entry;
         }
-        return S1OpenRun(words);
+        return S1BeginSlow(engine, words);
     }
     void S1Commit(size_t words) {
         if (s1_open_words != 0) [[unlikely]] {
             const size_t header = std::exchange(s1_open_words, size_t{0});
             Commit(header);
         }
-        Advance(words);
+        // The publish cadence counts payload words in batches (a publish closes the run, so
+        // nothing written is ever left out of it).
+        s1_unadvanced += words;
+        if (s1_unadvanced >= S1AdvanceWords) [[unlikely]] {
+            Advance(std::exchange(s1_unadvanced, size_t{0}));
+        }
     }
     /// Front, S1: a one-word entry (Delta, Exec).
     void S1Word(Tegra::Engines::EngineInterface* engine, u64 word) {
@@ -672,8 +677,15 @@ private:
         ir_run = nullptr;
         ir_run_classified = false;
         s1_cbuf = nullptr;
+        s1_cursor = nullptr;
+        s1_limit = nullptr;
     }
     u64* S1OpenRun(size_t words);
+    u64* S1BeginSlow(Tegra::Engines::EngineInterface* engine, size_t words);
+    /// S1Exec: reserves arena words after the open classified run for the next entries.
+    void S1Reserve();
+    static constexpr size_t S1ReserveWords = 64;
+    static constexpr size_t S1AdvanceWords = 16;
     /// Closes the open StateRun (P2 notes a write at the position after it: the next method
     /// starts a new record, so every noted write ends its record).
     void IrCut() {
@@ -807,6 +819,9 @@ private:
     bool ir_run_classified{}; ///< The open StateRun is an Ir::Classified one
     size_t s1_open_words{};   ///< S1OpenRun's record, committed by S1Commit
     u64* s1_cbuf{}; ///< The open run's last entry when it is a Cbuf entry S1Cbuf may extend
+    u64* s1_cursor{}; ///< S1Reserve's words still free after the open classified run
+    u64* s1_limit{};
+    size_t s1_unadvanced{}; ///< S1 payload words not yet counted by Advance
     size_t ir_pending_words{};   ///< IrPayloadBegin's record, until IrPayloadCommit
     size_t ir_pending_payload{};
     bool ir_ref_failed{};        ///< IrRef found the object table full
