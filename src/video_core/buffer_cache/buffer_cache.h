@@ -2579,8 +2579,8 @@ bool BufferCache<P>::BindUniformVersion(size_t stage, u32 index, u32 binding_ind
         // copy too, so the two can't differ when the CPU writes meanwhile (two copies, no
         // scratch).
         u8* const bytes = table.Prepare(device_addr, size, tick, page_sum);
-        if (const u8* const span = device_memory.GetSpan(device_addr, size)) {
-            std::memcpy(bytes, span, size);
+        if (const u8* const guest = device_memory.GetSpan(device_addr, size)) {
+            std::memcpy(bytes, guest, size);
         } else {
             device_memory.ReadBlockUnsafe(device_addr, bytes, size);
         }
