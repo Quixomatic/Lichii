@@ -332,6 +332,23 @@ public:
 
     void UnbindGraphicsStorageBuffers(size_t stage);
 
+    /// EDEN_NX2_V2_DRAWCACHE: binds a storage buffer as BindGraphicsStorageBuffer bound it for a
+    /// draw recipe, without reading its descriptor (the recipe proved it unchanged).
+    void ReplayGraphicsStorageBuffer(size_t stage, size_t ssbo_index, DAddr device_addr,
+                                     GPUVAddr gpu_addr, u32 size, u32 segment_first,
+                                     u32 segment_count, bool is_written);
+
+    /// EDEN_NX2_V2_DRAWCACHE: visits the graphics storage buffer bindings of `stage` as
+    /// func(index, is_written, binding).
+    template <typename Func>
+    void ForEachGraphicsStorageBinding(size_t stage, Func&& func) const {
+        ForEachEnabledBit(channel_state->enabled_storage_buffers[stage], [&](u32 index) {
+            const bool is_written =
+                ((channel_state->written_storage_buffers[stage] >> index) & 1) != 0;
+            func(index, is_written, channel_state->storage_buffers[stage][index]);
+        });
+    }
+
     bool BindGraphicsStorageBuffer(size_t stage, size_t ssbo_index, u32 cbuf_index, u32 cbuf_offset,
                                    bool is_written, u32 indirect_offset = ~0U);
 

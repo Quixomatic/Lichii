@@ -41,6 +41,7 @@ enum class Switch : u32 {
     CbufVer,   ///< EDEN_NX2_V2_CBUFVER: constant buffer versions instead of per-draw copies (P3)
     MarkDirty, ///< EDEN_NX2_V2_MARKDIRTY: a submit only marks command buffer state dirty (P3)
     LeanDraw,  ///< EDEN_NX2_V2_LEANDRAW: per-draw debug hooks behind one cached gate (P3)
+    DrawCache, ///< EDEN_NX2_V2_DRAWCACHE: fingerprint -> recipe draw/dispatch cache (P4)
     Count,
 };
 
@@ -63,6 +64,7 @@ inline constexpr std::array<const char*, static_cast<size_t>(Switch::Count)> swi
     "CBUFVER",
     "MARKDIRTY",
     "LEANDRAW",
+    "DRAWCACHE",
 };
 
 namespace Detail {
@@ -84,10 +86,11 @@ inline std::array<Mode, static_cast<size_t>(Switch::Count)> g_modes = Detail::Re
 }
 
 /// Whether the executing Maxwell3D keeps its register group tracker (V2::GroupTracker):
-/// EDEN_NX2_V2_REGSEM, or a P3 consumer of the dirty groups (PIPEKEY, CONTDRAW): three bytes of
-/// the cached modes, tested per register write.
+/// EDEN_NX2_V2_REGSEM, or a P3/P4 consumer of the dirty groups and fingerprints (PIPEKEY,
+/// CONTDRAW, DRAWCACHE): four bytes of the cached modes, tested per register write.
 [[nodiscard]] inline bool TrackGroups() {
-    return On(Switch::RegSem) || On(Switch::PipeKey) || On(Switch::ContDraw);
+    return On(Switch::RegSem) || On(Switch::PipeKey) || On(Switch::ContDraw) ||
+           On(Switch::DrawCache);
 }
 
 /// Reads every switch again and logs the ones set. Called by VideoCore::CreateGPU.

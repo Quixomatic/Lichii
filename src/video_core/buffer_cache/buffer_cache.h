@@ -31,6 +31,7 @@
 #include "video_core/v2/cbuf_version.h"
 #include "video_core/v2/p3_stats.h"
 #include "video_core/v2/v2_stats.h"
+#include "video_core/v2/versions.h"
 
 namespace VideoCommon {
 
@@ -683,6 +684,7 @@ bool BufferCache<P>::DMACopy(GPUVAddr src_address, GPUVAddr dest_address, u64 am
 
     ClearDownload(*cpu_dest_address, amount);
     MarkVertexBuffersStale(*cpu_dest_address, amount);
+    V2::Versions::HookWrite(*cpu_dest_address, amount, V2::Versions::Source::Dma);
 
     BufferId buffer_a;
     BufferId buffer_b;
@@ -751,6 +753,7 @@ bool BufferCache<P>::DMAClear(GPUVAddr dst_address, u64 amount, u32 value) {
 
     const size_t size = amount * sizeof(u32);
     ClearDownload(*cpu_dst_address, size);
+    V2::Versions::HookWrite(*cpu_dst_address, size, V2::Versions::Source::Dma);
     gpu_modified_ranges.Subtract(*cpu_dst_address, size);
 
     const BufferId buffer = FindBuffer(*cpu_dst_address, static_cast<u32>(size), false);
@@ -1016,6 +1019,38 @@ bool BufferCache<P>::BindGraphicsStorageBuffer(size_t stage, size_t ssbo_index, 
                           channel_state->storage_buffers[stage][ssbo_index]);
     }
     return (channel_state->storage_buffers[stage][ssbo_index].buffer_id != NULL_BUFFER_ID);
+}
+
+template <class P>
+void BufferCache<P>::ReplayGraphicsStorageBuffer(size_t stage, size_t ssbo_index,
+                                                 DAddr device_addr, GPUVAddr gpu_addr, u32 size,
+                                                 u32 segment_first, u32 segment_count,
+                                                 bool is_written) {
+    if (stage >= NUM_STAGES || ssbo_index >= NUM_STORAGE_BUFFERS) {
+        return;
+    }
+    const bool already_enabled =
+        ((channel_state->enabled_storage_buffers[stage] >> ssbo_index) & 1U) != 0;
+    if constexpr (requires { runtime.ShouldLimitDynamicStorageBuffers(); }) {
+        if (runtime.ShouldLimitDynamicStorageBuffers() && !already_enabled) {
+            if (channel_state->total_graphics_storage_buffers >=
+                runtime.GetMaxDynamicStorageBuffers()) {
+                return;
+            }
+            ++channel_state->total_graphics_storage_buffers;
+        }
+    }
+    channel_state->enabled_storage_buffers[stage] |= u64{1} << ssbo_index;
+    channel_state->written_storage_buffers[stage] |= u64{is_written ? 1U : 0U} << ssbo_index;
+    // The buffer is found again by UpdateGraphicsBuffers, as for any binding.
+    channel_state->storage_buffers[stage][ssbo_index] = Binding{
+        .device_addr = device_addr,
+        .gpu_addr = gpu_addr,
+        .size = size,
+        .buffer_id = NULL_BUFFER_ID,
+        .segment_first = segment_first,
+        .segment_count = segment_count,
+    };
 }
 
 template <class P>
@@ -2462,6 +2497,7 @@ void BufferCache<P>::MarkWrittenBuffer(BufferId buffer_id, DAddr device_addr, u3
     memory_tracker.MarkRegionAsGpuModified(device_addr, size);
     MarkVertexBuffersStale(device_addr, size);
     gpu_modified_ranges.Add(device_addr, size);
+    V2::Versions::HookWrite(device_addr, size, V2::Versions::Source::Gpu);
     if (learned_marked != 0) [[unlikely]] {
         NoteLearnedWrite(device_addr, size);
     }
@@ -3314,6 +3350,7 @@ void BufferCache<P>::DeleteBuffer(BufferId buffer_id, bool do_not_mark) {
         delayed_destruction_ring.Push(std::move(slot_buffers[buffer_id]));
 
     slot_buffers.erase(buffer_id);
+    V2::Versions::HookBump(V2::Versions::Kind::Buffer, buffer_id.Value());
 
     if constexpr (HAS_PERSISTENT_UNIFORM_BUFFER_BINDINGS) {
         channel_state->dirty_uniform_buffers.fill(~u32{0});

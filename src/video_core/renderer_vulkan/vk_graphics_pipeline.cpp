@@ -290,6 +290,12 @@ ConfigureFuncPtr ConfigureFunc(const std::array<bool, NUM_STAGES>& stages,
                     DefaultSpec>(stages, infos);
 }
 
+/// EDEN_NX2_V2_DRAWCACHE: the capturing Configure (DefaultSpec fits every pipeline; capturing
+/// draws are misses, which resolve in full anyway).
+bool ConfigureCapturing(GraphicsPipeline* pipeline, bool is_indexed) {
+    return GraphicsPipeline::MakeCapturingSpecFunc<DefaultSpec>()(pipeline, is_indexed);
+}
+
 std::atomic<std::chrono::nanoseconds::rep> hold_time_ns{};
 // EDEN_NX2_TEXTURE_MEMO_VERIFY=1, read once: draws resolved from a memo are also resolved in full
 // and compared.
@@ -331,6 +337,22 @@ void ReportTextureMemo() {
                  "mismatches in total",
                  hits, misses, g_memo_mismatches.load(std::memory_order_relaxed));
     }
+}
+
+/// EDEN_NX2_V2_DRAWCACHE: the push data and heap words a configure records (recipe verify).
+void NoteRecipePush(VideoCommon::V2::DrawCache::RecipeCapture& capture,
+                    const RescalingPushConstant& rescaling,
+                    const RenderAreaPushConstant& render_area, const std::vector<u32>& heap_words) {
+    const auto& words = rescaling.Data();
+    static_assert(std::tuple_size_v<std::decay_t<decltype(words)>> + 4 <= 32);
+    std::copy(words.begin(), words.end(), capture.push.begin());
+    capture.push_words = static_cast<u32>(words.size());
+    if (render_area.uses_render_area) {
+        std::memcpy(&capture.push[capture.push_words], render_area.words.data(),
+                    sizeof(render_area.words));
+        capture.push_words += static_cast<u32>(render_area.words.size());
+    }
+    capture.heap_words = heap_words;
 }
 } // Anonymous namespace
 
@@ -443,6 +465,18 @@ GraphicsPipeline::GraphicsPipeline(
             handles |= 1U << desc.cbuf_index;
         }
     }
+
+    // EDEN_NX2_V2_DRAWCACHE: what a draw recipe of this pipeline records and replays.
+    bool table_pointers = false;
+    for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
+        recipe_stages[stage] = infos[stage] != nullptr;
+        for (const auto& desc : stage_infos[stage].storage_buffers_descriptors) {
+            storage_constant_buffers[stage] |= 1U << desc.cbuf_index;
+            table_pointers |= desc.indirect_offset != ~0U;
+        }
+    }
+    recipe_eligible = delta_blocker == DeltaBlocker::None && !writes_storage && !mesh_emulation &&
+                      !table_pointers;
 
     // EDEN_NX2_V2_BINDLESS: the pipeline cache marked heap textures and images before emission.
     BindlessHeap* const heap = BindlessHeap::Active();
@@ -612,7 +646,7 @@ void GraphicsPipeline::AddTransition(GraphicsPipeline* transition) {
     transitions.push_back(transition);
 }
 
-template <typename Spec>
+template <typename Spec, bool Capture>
 bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     boost::container::small_vector<VideoCommon::ImageViewInOut, 160> views;
     boost::container::small_vector<VideoCommon::SamplerId, 96> samplers;
@@ -631,7 +665,8 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     const auto& regs{maxwell3d->regs};
     const bool via_header_index{regs.sampler_binding == Maxwell::SamplerBinding::ViaHeaderBinding};
 
-    const bool use_memo{texture_memo_eligible && !RecordingSampledTextures()};
+    // A recipe capture records every handle read: it resolves in full.
+    const bool use_memo{texture_memo_eligible && !RecordingSampledTextures() && !Capture};
     const bool verify_memo{use_memo && TextureMemoVerify()};
     boost::container::small_vector<GPUVAddr, 32> handle_addresses;
     boost::container::small_vector<VideoCommon::TextureHandleRead, 32> handle_reads;
@@ -696,6 +731,10 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
             size_t ssbo_index{};
             for (const auto& desc : info.storage_buffers_descriptors) {
                 ASSERT(desc.count == 1);
+                if constexpr (Capture) {
+                    CaptureStorageDescriptor(stage, desc.cbuf_index, desc.cbuf_offset,
+                                             desc.indirect_offset);
+                }
                 buffer_cache.BindGraphicsStorageBuffer(stage, ssbo_index, desc.cbuf_index,
                                                        desc.cbuf_offset, desc.is_written,
                                                        desc.indirect_offset);
@@ -705,6 +744,9 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         const auto& cbufs{maxwell3d->state.shader_stages[stage].const_buffers};
         const auto read_handle{[&](const auto& desc, u32 index) {
             if (desc.handle_program != ~0U) {
+                if constexpr (Capture) {
+                    recipe_capture->ineligible = true;
+                }
                 // Read by the shader from a storage buffer: computed for this draw.
                 return TexturePair(VideoCommon::EvaluateTextureHandle(
                                        info, desc.handle_program, *gpu_memory,
@@ -727,14 +769,23 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
                     const u32 second_offset{desc.secondary_cbuf_offset};
                     const GPUVAddr separate_addr{cbufs[desc.secondary_cbuf_index].address +
                                                  second_offset};
-                    const u32 lhs_raw{gpu_memory->Read<u32>(addr) << desc.shift_left};
-                    const u32 rhs_raw{gpu_memory->Read<u32>(separate_addr)
-                                      << desc.secondary_shift_left};
+                    const u32 lhs_word{gpu_memory->Read<u32>(addr)};
+                    const u32 rhs_word{gpu_memory->Read<u32>(separate_addr)};
+                    if constexpr (Capture) {
+                        recipe_capture->AddWord(addr, lhs_word);
+                        recipe_capture->AddWord(separate_addr, rhs_word);
+                    }
+                    const u32 lhs_raw{lhs_word << desc.shift_left};
+                    const u32 rhs_raw{rhs_word << desc.secondary_shift_left};
                     const u32 raw{lhs_raw | rhs_raw};
                     return TexturePair(raw, via_header_index);
                 }
             }
-            return TexturePair(gpu_memory->Read<u32>(addr), via_header_index);
+            const u32 word{gpu_memory->Read<u32>(addr)};
+            if constexpr (Capture) {
+                recipe_capture->AddWord(addr, word);
+            }
+            return TexturePair(word, via_header_index);
         }};
         const auto add_image{[&](const auto& desc, bool blacklist) LAMBDA_FORCEINLINE {
             for (u32 index = 0; index < desc.count; ++index) {
@@ -766,6 +817,9 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
 
                     VideoCommon::SamplerId sampler{texture_cache.GetSamplerId(handle.second, false)};
                     samplers.push_back(sampler);
+                    if constexpr (Capture) {
+                        recipe_capture->tsc_indices.push_back(handle.second);
+                    }
                     if (use_memo) {
                         handle_reads.push_back(
                             {handle_addresses[handle_reads.size()],
@@ -872,6 +926,19 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
             if constexpr (Spec::has_images) {
                 view_index += Shader::NumDescriptors(info.image_descriptors);
             }
+        }
+    }
+    if constexpr (Capture) {
+        for (const VideoCommon::ImageViewInOut& view : views) {
+            recipe_capture->views.push_back({
+                .index = view.index,
+                .id = view.id.index,
+                .generation = 0,
+                .blacklist = view.blacklist,
+            });
+        }
+        for (const VideoCommon::SamplerId sampler : samplers) {
+            recipe_capture->samplers.push_back(sampler.index);
         }
     }
     if (std::exchange(capture_delta, false) && delta_blocker == DeltaBlocker::None) {
@@ -1058,6 +1125,9 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     if (IsBuilt() && (!pipeline || build->Failed())) {
         return false;
     }
+    if constexpr (Capture) {
+        NoteRecipePush(*recipe_capture, rescaling, render_area, heap_push.words);
+    }
     Profile::Scope scope{Profile::Zone::ConfigureDraw};
     return ConfigureDraw(rescaling, render_area);
 }
@@ -1147,6 +1217,194 @@ bool GraphicsPipeline::ConfigureDelta(bool is_indexed) {
     }
     Profile::Scope scope{Profile::Zone::ConfigureDraw};
     return ConfigureDraw(rescaling, render_area);
+}
+
+bool GraphicsPipeline::ConfigureCapture(bool is_indexed) {
+    return ConfigureCapturing(this, is_indexed);
+}
+
+void GraphicsPipeline::CaptureStorageDescriptor(size_t stage, u32 cbuf_index, u32 cbuf_offset,
+                                                u32 indirect_offset) {
+    // The address and size words the buffer cache reads next (StorageBufferBinding). A table
+    // pointer reads through memory the capture can't follow (TakesRecipes is false for those).
+    const auto& cbuf = maxwell3d->state.shader_stages[stage].const_buffers[cbuf_index];
+    const GPUVAddr address = cbuf.address + cbuf_offset;
+    if (indirect_offset != ~0U || !gpu_memory->IsFullyMappedRange(address, 16)) {
+        recipe_capture->ineligible = true;
+        return;
+    }
+    VideoCommon::V2::DrawCache::InputRead read{
+        .address = address,
+        .size = 16,
+        .what = VideoCommon::V2::DrawCache::Capture::What::StorageDesc,
+    };
+    gpu_memory->ReadBlockUnsafe(address, read.bytes.data(), read.bytes.size());
+    recipe_capture->reads.push_back(read);
+}
+
+GraphicsPipeline::RecipeResult GraphicsPipeline::ConfigureRecipe(
+    bool is_indexed, const VideoCommon::V2::DrawCache::Recipe& recipe,
+    VideoCommon::V2::DrawCache::RecipeCapture* push_out) {
+    namespace Profile = VideoCommon::Nx2Profile;
+    if (recipe.views.size() != num_image_elements || recipe.samplers.size() != num_textures) {
+        return RecipeResult::Rebuild;
+    }
+    boost::container::small_vector<VideoCommon::ImageViewInOut, 160> views;
+    boost::container::small_vector<VideoCommon::SamplerId, 96> samplers;
+    for (const auto& view : recipe.views) {
+        views.push_back({
+            .index = view.index,
+            .blacklist = view.blacklist,
+            .id = VideoCommon::ImageViewId{view.id},
+        });
+    }
+    for (const auto& sampler : recipe.samplers) {
+        samplers.push_back(VideoCommon::SamplerId{sampler.id});
+    }
+    {
+        Profile::Scope scope{Profile::Zone::SyncDescriptors};
+        texture_cache.SynchronizeDescriptors(false);
+    }
+    {
+        // What FillImageViews does to the views it finds: uploads, alias copies, the LRU.
+        Profile::Scope scope{Profile::Zone::FillImageViews};
+        if (!texture_cache.PrepareRecipeViews(std::span(views.data(), views.size()))) {
+            return RecipeResult::Rebuild;
+        }
+    }
+    buffer_cache.SetUniformBuffersState(enabled_uniform_buffer_masks, &uniform_buffer_sizes);
+    heap_push.words.clear();
+    const auto& regs{maxwell3d->regs};
+    {
+        Profile::Scope scope{Profile::Zone::ReadHandles};
+        VideoCommon::ImageViewInOut* texture_buffer_it{views.data()};
+        for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
+            if (!recipe_stages[stage]) {
+                continue;
+            }
+            const Shader::Info& info{stage_infos[stage]};
+            buffer_cache.UnbindGraphicsStorageBuffers(stage);
+            for (const auto& storage : recipe.storage) {
+                if (storage.stage == stage) {
+                    buffer_cache.ReplayGraphicsStorageBuffer(
+                        stage, storage.index, storage.device_addr, storage.gpu_addr, storage.size,
+                        storage.segment_first, storage.segment_count, storage.written);
+                }
+            }
+            buffer_cache.UnbindGraphicsTextureBuffers(stage);
+            size_t index{};
+            const auto add_buffer{[&](const auto& desc) {
+                constexpr bool is_image =
+                    std::is_same_v<decltype(desc), const ImageBufferDescriptor&>;
+                for (u32 i = 0; i < desc.count; ++i) {
+                    bool is_written{false};
+                    if constexpr (is_image) {
+                        is_written = desc.is_written;
+                    }
+                    ImageView& image_view{texture_cache.GetImageView(texture_buffer_it->id)};
+                    PixelFormat format{image_view.format};
+                    if constexpr (is_image) {
+                        if (const auto explicit_format{PixelFormatFromImageFormat(desc.format)}) {
+                            format = *explicit_format;
+                        }
+                    }
+                    buffer_cache.BindGraphicsTextureBuffer(stage, index, image_view.GpuAddr(),
+                                                           image_view.BufferSize(), format,
+                                                           is_written, is_image);
+                    ++index;
+                    ++texture_buffer_it;
+                }
+            }};
+            for (const auto& desc : info.texture_buffer_descriptors) {
+                add_buffer(desc);
+            }
+            for (const auto& desc : info.image_buffer_descriptors) {
+                add_buffer(desc);
+            }
+            texture_buffer_it += Shader::NumDescriptors(info.texture_descriptors);
+            texture_buffer_it += Shader::NumDescriptors(info.image_descriptors);
+        }
+    }
+    if (regs.transform_feedback_enabled != 0) {
+        scheduler.RequestOutsideRenderPassOperationContext();
+    }
+    {
+        Profile::Scope scope{Profile::Zone::UpdateBuffers};
+        buffer_cache.UpdateGraphicsBuffers(is_indexed);
+        buffer_cache.BindHostGeometryBuffers(is_indexed);
+    }
+    {
+        Profile::Scope scope{Profile::Zone::DescriptorAcquire};
+        guest_descriptor_queue.Acquire(scheduler, num_descriptor_entries, uses_descriptor_buffer);
+    }
+    RescalingPushConstant rescaling;
+    RenderAreaPushConstant render_area;
+    const VideoCommon::SamplerId* samplers_it{samplers.data()};
+    const VideoCommon::ImageViewInOut* views_it{views.data()};
+    for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
+        if (!recipe_stages[stage]) {
+            continue;
+        }
+        {
+            Profile::Scope scope{Profile::Zone::BindStageBuffers};
+            buffer_cache.BindHostStageBuffers(stage);
+        }
+        {
+            Profile::Scope scope{Profile::Zone::PushDescriptors};
+            PushImageDescriptors(texture_cache, guest_descriptor_queue, stage_infos[stage],
+                                 rescaling, samplers_it, views_it,
+                                 heap_pipeline ? &heap_push : nullptr);
+        }
+        if (stage_infos[stage].uses_render_area) {
+            render_area.uses_render_area = true;
+            const u32 clip_width = regs.surface_clip.width, clip_height = regs.surface_clip.height;
+            const bool clip_set = clip_width != 0 && clip_height != 0;
+            render_area.words = {static_cast<float>(clip_set ? clip_width : u32{regs.rt[0].width}),
+                                 static_cast<float>(clip_set ? clip_height : u32{regs.rt[0].height})};
+        }
+    }
+    if (heap_pipeline) {
+        AddHeapWords();
+    }
+    if (buffer_cache.any_buffer_uploaded) {
+        buffer_cache.runtime.PostCopyBarrier();
+        buffer_cache.any_buffer_uploaded = false;
+    }
+    {
+        Profile::Scope scope{Profile::Zone::RenderTargets};
+        texture_cache.UpdateRenderTargets(false);
+        // The key holds the render target registers: other views mean the texture cache moved
+        // under them (resolved in full, which finds the same state again).
+        const auto& targets = texture_cache.GetRenderTargets();
+        for (size_t rt = 0; rt < VideoCommon::V2::DrawCache::NumRecipeTargets - 1; ++rt) {
+            if (targets.color_buffer_ids[rt].index != recipe.targets[rt].id) {
+                return RecipeResult::Rebuild;
+            }
+        }
+        if (targets.depth_buffer_id.index !=
+            recipe.targets[VideoCommon::V2::DrawCache::NumRecipeTargets - 1].id) {
+            return RecipeResult::Rebuild;
+        }
+        const std::span<const VideoCommon::ImageViewInOut> view_span{views.data(), views.size()};
+        texture_cache.CheckFeedbackLoop(view_span);
+        if (scheduler.HasFragmentBarrier() &&
+            (scheduler.RenderPassHasStores() || texture_cache.SamplesRenderTarget(view_span))) {
+            scheduler.RequestOutsideRenderPassOperationContext();
+        }
+    }
+    if (IsBuilt() && (!pipeline || build->Failed())) {
+        return RecipeResult::Failed;
+    }
+    if (push_out != nullptr) {
+        NoteRecipePush(*push_out, rescaling, render_area, heap_push.words);
+    }
+    // A delta draw after this one keeps what this draw bound (as after a captured Configure).
+    delta_views.assign(views.begin(), views.end());
+    delta_samplers.assign(samplers.begin(), samplers.end());
+    configured_stages = recipe_stages;
+    delta_views_valid = true;
+    Profile::Scope scope{Profile::Zone::ConfigureDraw};
+    return ConfigureDraw(rescaling, render_area) ? RecipeResult::Recorded : RecipeResult::Failed;
 }
 
 bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,

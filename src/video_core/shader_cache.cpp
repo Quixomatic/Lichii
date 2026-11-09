@@ -34,6 +34,7 @@
 #include "video_core/nx2_debug_control.h"
 #include "video_core/shader_cache.h"
 #include "video_core/v2/shader_writes.h"
+#include "video_core/v2/versions.h"
 #include "video_core/shader_environment.h"
 #include "video_core/texture_cache/util.h"
 
@@ -461,6 +462,8 @@ void ShaderCache::InvalidatePageEntries(std::vector<Entry*>& entries, VAddr addr
         UnmarkMemory(entry);
         RemoveEntryFromInvalidationCache(entry);
         marked_for_removal.push_back(entry);
+        // EDEN_NX2_V2_DRAWCACHE: a recipe skips the pipeline lookup that would remove it.
+        VideoCommon::V2::Versions::HookBumpEpoch(VideoCommon::V2::Versions::Epoch::Pipelines);
     }
 }
 

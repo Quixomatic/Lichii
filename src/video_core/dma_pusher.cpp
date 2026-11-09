@@ -29,6 +29,7 @@
 #include "video_core/nx2.h"
 #include "video_core/nx2_cmdpage_diag.h"
 #include "video_core/rasterizer_interface.h"
+#include "video_core/v2/versions.h"
 
 namespace Tegra {
 
@@ -159,6 +160,8 @@ bool DmaPusher::Step() {
 
     auto& current_command = command_list.command_lists[dma_pushbuffer_subindex];
     const CommandListHeader& header = current_command;
+    // EDEN_NX2_V2_DRAWCACHE: a GP entry boundary orders the guest's earlier CPU writes.
+    VideoCommon::V2::Versions::HookEpoch(VideoCommon::V2::Versions::EpochReason::Entry);
     dma_state.dma_get = header.addr;
 
     if (signal_sync && !synced) {

@@ -28,6 +28,7 @@
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
 #include "video_core/v2/desc_cache.h"
+#include "video_core/v2/draw_cache.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
 namespace VideoCore {
@@ -351,9 +352,47 @@ public:
     /// ConfigureDelta prepares none, Configure does.
     [[nodiscard]] bool DeltaImagesChange() const noexcept;
 
+    /// EDEN_NX2_V2_DRAWCACHE: the next Configure records into `capture` what a draw recipe needs
+    /// (the handle words, storage buffer descriptors, views, samplers and push data it resolves),
+    /// resolving in full (no texture memo). Null: none.
+    void SetRecipeCapture(VideoCommon::V2::DrawCache::RecipeCapture* capture) noexcept {
+        recipe_capture = capture;
+    }
+    /// Configure recording into the capture SetRecipeCapture set (the plain Configure has no
+    /// capture code at all).
+    bool ConfigureCapture(bool is_indexed);
+    /// Whether draws with this pipeline can be replayed from a recipe: no storage writes, no
+    /// handles computed at draw time, no storage buffers through table pointers, no mesh.
+    [[nodiscard]] bool TakesRecipes() const noexcept {
+        return recipe_eligible;
+    }
+    enum class RecipeResult : u8 {
+        Recorded, ///< the draw's state is recorded
+        Rebuild,  ///< the recipe no longer matches (images deleted, other render targets):
+                  ///< resolve in full
+        Failed,   ///< the draw can't be recorded (as Configure returning false)
+    };
+    /// Records the draw from a recipe: its image views and samplers (prepared as a texture memo
+    /// hit prepares them: uploads and alias copies still happen), its storage buffer bindings and
+    /// texture buffers, with no handle, TIC/TSC or storage descriptor read and no view lookup.
+    /// Vertex, index and uniform buffers are resolved and synchronized by the buffer cache as
+    /// always. `push_out` (verify) receives the push data and heap words recorded.
+    RecipeResult ConfigureRecipe(bool is_indexed, const VideoCommon::V2::DrawCache::Recipe& recipe,
+                                 VideoCommon::V2::DrawCache::RecipeCapture* push_out);
+    /// Constant buffer slots per stage holding the storage buffer descriptors the pipeline reads.
+    [[nodiscard]] const std::array<u32, NUM_STAGES>& StorageConstantBuffers() const noexcept {
+        return storage_constant_buffers;
+    }
+
     template <typename Spec>
     static auto MakeConfigureSpecFunc() {
         return [](GraphicsPipeline* pl, bool is_indexed) { return pl->ConfigureImpl<Spec>(is_indexed); };
+    }
+    template <typename Spec>
+    static auto MakeCapturingSpecFunc() {
+        return [](GraphicsPipeline* pl, bool is_indexed) {
+            return pl->ConfigureImpl<Spec, true>(is_indexed);
+        };
     }
 
     void SetEngine(Tegra::Engines::Maxwell3D* maxwell3d_, Tegra::MemoryManager* gpu_memory_) {
@@ -367,7 +406,7 @@ public:
     }
 
 private:
-    template <typename Spec>
+    template <typename Spec, bool Capture = false>
     bool ConfigureImpl(bool is_indexed);
 
     bool ConfigureDraw(const RescalingPushConstant& rescaling,
@@ -422,6 +461,15 @@ private:
     std::array<u32, NUM_STAGES> handle_constant_buffers{};
     std::vector<VideoCommon::ImageViewInOut> delta_views;
     std::vector<VideoCommon::SamplerId> delta_samplers;
+
+    // EDEN_NX2_V2_DRAWCACHE (v2/draw_cache.h).
+    VideoCommon::V2::DrawCache::RecipeCapture* recipe_capture{};
+    bool recipe_eligible{};
+    std::array<bool, NUM_STAGES> recipe_stages{};
+    std::array<u32, NUM_STAGES> storage_constant_buffers{};
+    /// Records a storage buffer descriptor read for the recipe capture (before the bind reads it).
+    void CaptureStorageDescriptor(size_t stage, u32 cbuf_index, u32 cbuf_offset,
+                                  u32 indirect_offset);
 
     vk::DescriptorSetLayout descriptor_set_layout;
     DescriptorAllocator descriptor_allocator;

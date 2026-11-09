@@ -305,6 +305,22 @@ public:
         return VideoCommon::SampledViewsChange(views, slot_image_views, slot_images);
     }
 
+    /// EDEN_NX2_V2_DRAWCACHE: prepares a recipe's views as FillImageViews prepares the views it
+    /// finds (uploads, alias copies, the LRU), as a texture memo hit does. False when preparing
+    /// deleted images: the draw resolves in full.
+    [[nodiscard]] bool PrepareRecipeViews(std::span<const ImageViewInOut> views);
+
+    /// EDEN_NX2_V2_DRAWCACHE: the image (sampler = false) or sampler descriptor `index` of a
+    /// handle, as the last resolve read it: its GPU address, its host pointer and its bytes. False
+    /// when it crosses a page or memory no longer holds those bytes; true with a null host
+    /// pointer when the index is past the table's limit (the resolve read nothing).
+    [[nodiscard]] bool CaptureDescriptor(bool compute, bool sampler, u32 index, GPUVAddr& address,
+                                         const u8*& host, std::span<u8, 32> bytes) const;
+
+    /// EDEN_NX2_V2_DRAWCACHE: the guest range of the image a view samples (none for null and
+    /// buffer views).
+    [[nodiscard]] std::optional<std::pair<DAddr, u64>> ViewImageRange(ImageViewId id) const;
+
     /// EDEN_NX2_TEXTURE_MEMO_VERIFY: PrepareImage adds the images it is asked to prepare to `log`
     /// (nullptr stops it) and, with `dry`, does nothing else.
     void LogPrepares(std::vector<ImageId>* log, bool dry) noexcept {

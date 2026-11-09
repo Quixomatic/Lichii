@@ -31,6 +31,7 @@
 #include "video_core/v2/front_writes.h"
 #include "video_core/v2/hazard.h"
 #include "video_core/v2/v2_stats.h"
+#include "video_core/v2/versions.h"
 
 namespace Tegra::Engines {
 
@@ -702,6 +703,7 @@ void Puller::ProcessSemaphoreAcquire(DmaPusher& dma_pusher) {
     DrainBack();
     // The CPU may rewrite what the next draws read once it sees the release this waits for.
     VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Fence);
+    VideoCommon::V2::Versions::HookEpoch(VideoCommon::V2::Versions::EpochReason::Acquire);
     u32 word = dma_pusher.memory_manager.Read<u32>(regs.semaphore_address.SemaphoreAddress());
     const auto value = regs.semaphore_acquire;
     while (word != value) {
@@ -765,6 +767,7 @@ void Puller::ProcessSemaphoreExecute(DmaPusher& dma_pusher, u32 argument) {
                 VideoCommon::GpuSplit::Get().NoteSync();
             }
             VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Fence);
+    VideoCommon::V2::Versions::HookEpoch(VideoCommon::V2::Versions::EpochReason::Acquire);
             if (sync_class != V2Stats::SyncClass::Count) [[unlikely]] {
                 V2Stats::NoteAcquire(sync_class, false, true);
             }
@@ -773,6 +776,7 @@ void Puller::ProcessSemaphoreExecute(DmaPusher& dma_pusher, u32 argument) {
     }
     DrainBack();
     VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Fence);
+    VideoCommon::V2::Versions::HookEpoch(VideoCommon::V2::Versions::EpochReason::Acquire);
     ReleaseFences(dma_pusher);
     const u32 word = dma_pusher.memory_manager.Read<u32>(address);
     const bool ready = operation == 0   ? word == payload

@@ -7,6 +7,7 @@
 #pragma once
 
 #include <array>
+#include <memory>
 #include <optional>
 #include <string_view>
 
@@ -25,6 +26,7 @@
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
 #include "video_core/renderer_vulkan/vk_descriptor_buffer.h"
 #include "video_core/renderer_vulkan/vk_descriptor_pool.h"
+#include "video_core/renderer_vulkan/vk_draw_cache.h"
 #include "video_core/renderer_vulkan/vk_fence_manager.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_query_cache.h"
@@ -475,6 +477,14 @@ private:
                Maxwell::MaxShaderStage>
         handle_spans;
     FastDrawStats fast_draw_stats;
+    /// EDEN_NX2_V2_DRAWCACHE (P4): the draw/dispatch recipe cache, made on first use.
+    std::unique_ptr<DrawCacheGlue> draw_cache;
+    [[nodiscard]] DrawCacheGlue& DrawCache() {
+        if (!draw_cache) [[unlikely]] {
+            draw_cache = std::make_unique<DrawCacheGlue>(device_memory);
+        }
+        return *draw_cache;
+    }
     /// Nx2FastDraw::Enabled and VerifyEnabled as the drawing thread last read them.
     bool fast_draw_on{};
     bool fast_draw_verify{};

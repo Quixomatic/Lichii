@@ -33,6 +33,7 @@
 #include "video_core/v2/ir_check.h"
 #include "video_core/v2/ir_exec.h"
 #include "video_core/v2/v2_stats.h"
+#include "video_core/v2/versions.h"
 
 namespace VideoCommon {
 
@@ -298,6 +299,7 @@ void GpuSplit::Drain(DrainSite site) {
             if (v2_stats) [[unlikely]] {
                 V2::Stats::NoteDrain(site, start);
             }
+            V2::Versions::HookEpoch(V2::Versions::EpochReason::Wait);
             return;
         }
         Backoff(spins, write_position);
@@ -330,6 +332,7 @@ bool GpuSplit::WaitFor(u64 target, DrainSite site) {
             if (v2_stats) [[unlikely]] {
                 V2::Stats::NoteDrain(site, start);
             }
+            V2::Versions::HookEpoch(V2::Versions::EpochReason::Wait);
             return true;
         }
         Backoff(spins, target);

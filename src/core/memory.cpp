@@ -40,6 +40,7 @@
 #include "video_core/rasterizer_download_area.h"
 #include "video_core/v2/cbuf_version.h"
 #include "video_core/v2/v2_switches.h"
+#include "video_core/v2/versions.h"
 
 namespace Core::Memory {
 
@@ -951,6 +952,8 @@ struct Memory::Impl {
                 // on this page must not outlive it (video_core/v2/cbuf_version.h).
                 VideoCommon::V2::CbufVer::Log().NoteCpuWrite(address, size);
             }
+            // EDEN_NX2_V2_DRAWCACHE: every trapped write moves its page's version.
+            VideoCommon::V2::Versions::HookCpuWrite(address, size);
             auto& current_area = rasterizer_write_areas[core];
             PAddr subaddress = address >> YUZU_PAGEBITS;
             // Performance note:

@@ -62,6 +62,7 @@
 #include "video_core/shader_warm/shader_warm_builder.h"
 #include "video_core/v2/p3_stats.h"
 #include "video_core/v2/v2_switches.h"
+#include "video_core/v2/versions.h"
 #include "video_core/surface.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
@@ -805,6 +806,7 @@ PipelineCache::~PipelineCache() {
                                      CACHE_VERSION);
     }
     ClearV2Lookup();
+    VideoCommon::V2::Versions::HookBumpEpoch(VideoCommon::V2::Versions::Epoch::Pipelines);
     graphics_cache.clear();
     evicted_pipelines.clear();
 }
@@ -942,6 +944,7 @@ bool PipelineCache::StaleNullPointerSlot(const ComputePipelineCacheEntry& entry)
 
 ComputePipeline* PipelineCache::CurrentComputePipeline(u64& native_key) {
 
+    last_compute_takes_recipes = false;
     const ShaderInfo* const shader{ComputeShader()};
     if (!shader) {
         return nullptr;
@@ -967,6 +970,8 @@ ComputePipeline* PipelineCache::CurrentComputePipeline(u64& native_key) {
             if (entry.pipeline) {
                 retired_compute_pipelines.emplace_back(scheduler.CurrentTick(),
                                                        std::move(entry.pipeline));
+                VideoCommon::V2::Versions::HookBumpEpoch(
+                    VideoCommon::V2::Versions::Epoch::Pipelines);
             }
             rebuilt.rebuilds = entry.rebuilds + 1;
             entry = std::move(rebuilt);
@@ -978,8 +983,14 @@ ComputePipeline* PipelineCache::CurrentComputePipeline(u64& native_key) {
             entry.rebuilds = MaxComputeRebuilds;
         }
     }
+    last_compute_takes_recipes =
+        entry.null_pointer_slots.empty() || entry.rebuilds >= MaxComputeRebuilds;
     return entry.Get(kepler_compute->IsNativeMode(),
                      kepler_compute->regs.code_loc.Address() + qmd.program_start, key);
+}
+
+void PipelineCache::NoteRecipeUse(GraphicsPipeline* pipeline) {
+    pipeline->MarkUsed(frame_count);
 }
 
 void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading,
@@ -1942,6 +1953,8 @@ void PipelineCache::EvictUnusedPipelines() {
     if (evicted == 0) {
         return;
     }
+    // EDEN_NX2_V2_DRAWCACHE: recipes hold pipelines weakly, by this epoch.
+    VideoCommon::V2::Versions::HookBumpEpoch(VideoCommon::V2::Versions::Epoch::Pipelines);
     for (auto& [key, pipeline] : graphics_cache) {
         if (pipeline) {
             pipeline->ClearTransitions();

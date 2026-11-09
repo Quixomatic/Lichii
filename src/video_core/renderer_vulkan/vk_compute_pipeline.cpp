@@ -225,6 +225,33 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
     // EDEN_NX2_V2_BINDLESS: the pipeline cache marked heap descriptors before emission.
     BindlessHeap* const heap = BindlessHeap::Active();
     heap_pipeline = heap != nullptr && (info.heap_texture_mask != 0 || info.heap_image_mask != 0);
+    // EDEN_NX2_V2_DRAWCACHE: what a dispatch recipe records and replays.
+    {
+        bool computed = false;
+        const auto note = [&](const auto& descriptors) {
+            for (const auto& desc : descriptors) {
+                computed |= desc.handle_program != ~0U;
+                handle_constant_buffers |= 1U << desc.cbuf_index;
+            }
+        };
+        note(info.texture_buffer_descriptors);
+        note(info.image_buffer_descriptors);
+        note(info.texture_descriptors);
+        note(info.image_descriptors);
+        for (const auto& desc : info.texture_descriptors) {
+            if (desc.has_secondary) {
+                handle_constant_buffers |= 1U << desc.secondary_cbuf_index;
+            }
+        }
+        for (const auto& desc : info.texture_buffer_descriptors) {
+            if (desc.has_secondary) {
+                handle_constant_buffers |= 1U << desc.secondary_cbuf_index;
+            }
+        }
+        const bool byte_addressed = std::ranges::any_of(
+            info.image_descriptors, [](const auto& desc) { return desc.is_byte_addressed; });
+        recipe_eligible = !computed && !byte_addressed;
+    }
     heap_reasons = info.heap_block_reasons;
     if (heap_pipeline) {
         heap_push.heap = heap;
@@ -388,6 +415,22 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
                                 TextureCacheRuntime& texture_runtime,
                                 std::optional<ByteAddressedShadow>& shadow,
                                 BindCommand* deferred_bind) {
+    // EDEN_NX2_V2_DRAWCACHE: one branch; the plain path has no recipe code.
+    if (recipe_capture != nullptr || recipe_replay != nullptr) [[unlikely]] {
+        return ConfigureImpl<true>(kepler_compute, gpu_memory, scheduler, buffer_cache,
+                                   texture_cache, texture_runtime, shadow, deferred_bind);
+    }
+    return ConfigureImpl<false>(kepler_compute, gpu_memory, scheduler, buffer_cache, texture_cache,
+                                texture_runtime, shadow, deferred_bind);
+}
+
+template <bool Recipes>
+bool ComputePipeline::ConfigureImpl(Tegra::Engines::KeplerCompute& kepler_compute,
+                                    Tegra::MemoryManager& gpu_memory, Scheduler& scheduler,
+                                    BufferCache& buffer_cache, TextureCache& texture_cache,
+                                    TextureCacheRuntime& texture_runtime,
+                                    std::optional<ByteAddressedShadow>& shadow,
+                                    BindCommand* deferred_bind) {
     shadow.reset();
     guest_descriptor_queue.Acquire(scheduler, num_descriptor_entries, uses_descriptor_buffer);
 
@@ -413,6 +456,9 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
     const bool via_header_index{qmd.linked_tsc != 0};
     const auto read_handle{[&](const auto& desc, u32 index) {
         if (desc.handle_program != ~0U) {
+            if (Recipes && recipe_capture != nullptr) {
+                recipe_capture->ineligible = true;
+            }
             // Read by the shader from a storage buffer: computed for this dispatch.
             return TexturePair(VideoCommon::EvaluateTextureHandle(
                                    info, desc.handle_program, gpu_memory,
@@ -437,12 +483,22 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
                 const u32 secondary_offset{desc.secondary_cbuf_offset};
                 const GPUVAddr separate_addr{cbufs[desc.secondary_cbuf_index].Address() +
                                              secondary_offset};
-                const u32 lhs_raw{gpu_memory.Read<u32>(addr) << desc.shift_left};
-                const u32 rhs_raw{gpu_memory.Read<u32>(separate_addr) << desc.secondary_shift_left};
+                const u32 lhs_word{gpu_memory.Read<u32>(addr)};
+                const u32 rhs_word{gpu_memory.Read<u32>(separate_addr)};
+                if (Recipes && recipe_capture != nullptr) {
+                    recipe_capture->AddWord(addr, lhs_word);
+                    recipe_capture->AddWord(separate_addr, rhs_word);
+                }
+                const u32 lhs_raw{lhs_word << desc.shift_left};
+                const u32 rhs_raw{rhs_word << desc.secondary_shift_left};
                 return TexturePair(lhs_raw | rhs_raw, via_header_index);
             }
         }
-        return TexturePair(gpu_memory.Read<u32>(addr), via_header_index);
+        const u32 word{gpu_memory.Read<u32>(addr)};
+        if (Recipes && recipe_capture != nullptr) {
+            recipe_capture->AddWord(addr, word);
+        }
+        return TexturePair(word, via_header_index);
     }};
     const auto add_image{[&](const auto& desc, bool blacklist) {
         for (u32 index = 0; index < desc.count; ++index) {
@@ -454,27 +510,66 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
             });
         }
     }};
-    for (const auto& desc : info.texture_buffer_descriptors) {
-        add_image(desc, false);
-    }
-    for (const auto& desc : info.image_buffer_descriptors) {
-        add_image(desc, false);
-    }
-    for (const auto& desc : info.texture_descriptors) {
-        for (u32 index = 0; index < desc.count; ++index) {
-            const auto handle{VideoCommon::HandleIsStoragePointer(info, desc, index)
-                                  ? VideoCommon::NULL_TEXTURE_HANDLE
-                                  : read_handle(desc, index)};
-            views.push_back({handle.first});
+    if (Recipes && recipe_replay != nullptr) {
+        // EDEN_NX2_V2_DRAWCACHE: the recipe proved the handles, descriptors and views current.
+        for (const auto& view : recipe_replay->views) {
+            views.push_back({
+                .index = view.index,
+                .blacklist = view.blacklist,
+                .id = VideoCommon::ImageViewId{view.id},
+            });
+        }
+        for (const auto& sampler : recipe_replay->samplers) {
+            samplers.push_back(VideoCommon::SamplerId{sampler.id});
+        }
+        if (views.size() != Shader::NumDescriptors(info.texture_buffer_descriptors) +
+                                Shader::NumDescriptors(info.image_buffer_descriptors) +
+                                Shader::NumDescriptors(info.texture_descriptors) +
+                                Shader::NumDescriptors(info.image_descriptors) ||
+            samplers.size() != Shader::NumDescriptors(info.texture_descriptors) ||
+            !texture_cache.PrepareRecipeViews(std::span(views.data(), views.size()))) {
+            recipe_replay_failed = true;
+            return false;
+        }
+    } else {
+        for (const auto& desc : info.texture_buffer_descriptors) {
+            add_image(desc, false);
+        }
+        for (const auto& desc : info.image_buffer_descriptors) {
+            add_image(desc, false);
+        }
+        for (const auto& desc : info.texture_descriptors) {
+            for (u32 index = 0; index < desc.count; ++index) {
+                const auto handle{VideoCommon::HandleIsStoragePointer(info, desc, index)
+                                      ? VideoCommon::NULL_TEXTURE_HANDLE
+                                      : read_handle(desc, index)};
+                views.push_back({handle.first});
 
-            VideoCommon::SamplerId sampler = texture_cache.GetSamplerId(handle.second, true);
-            samplers.push_back(sampler);
+                VideoCommon::SamplerId sampler = texture_cache.GetSamplerId(handle.second, true);
+                samplers.push_back(sampler);
+                if (Recipes && recipe_capture != nullptr) {
+                    recipe_capture->tsc_indices.push_back(handle.second);
+                }
+            }
+        }
+        for (const auto& desc : info.image_descriptors) {
+            add_image(desc, desc.is_written);
+        }
+        texture_cache.FillImageViews(std::span(views.data(), views.size()), true);
+        if (Recipes && recipe_capture != nullptr) {
+            for (const VideoCommon::ImageViewInOut& view : views) {
+                recipe_capture->views.push_back({
+                    .index = view.index,
+                    .id = view.id.index,
+                    .generation = 0,
+                    .blacklist = view.blacklist,
+                });
+            }
+            for (const VideoCommon::SamplerId sampler : samplers) {
+                recipe_capture->samplers.push_back(sampler.index);
+            }
         }
     }
-    for (const auto& desc : info.image_descriptors) {
-        add_image(desc, desc.is_written);
-    }
-    texture_cache.FillImageViews(std::span(views.data(), views.size()), true);
     if (auto& trace{GetUpscalerTrace()}; trace.enabled && kepler_compute.IsNativeMode()) {
         const u64 frame{trace.frame.load(std::memory_order_relaxed)};
         if (!trace.armed && frame >= trace.first_frame && info.uses_subgroup_shuffles) {

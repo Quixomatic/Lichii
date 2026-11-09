@@ -131,6 +131,8 @@ add_library(video_core STATIC
     v2/cbuf_version.h
     v2/continued_draw.h
     v2/desc_cache.h
+    v2/draw_cache.cpp
+    v2/draw_cache.h
     v2/draw_model.cpp
     v2/draw_model.h
     v2/ir_arena.h
@@ -153,6 +155,8 @@ add_library(video_core STATIC
     v2/v2_stats.h
     v2/v2_switches.cpp
     v2/v2_switches.h
+    v2/versions.cpp
+    v2/versions.h
     pending_maps.h
     present.h
     pte_kind.h
@@ -237,6 +241,8 @@ add_library(video_core STATIC
     renderer_vulkan/vk_descriptor_buffer.h
     renderer_vulkan/vk_descriptor_pool.cpp
     renderer_vulkan/vk_descriptor_pool.h
+    renderer_vulkan/vk_draw_cache.cpp
+    renderer_vulkan/vk_draw_cache.h
     renderer_vulkan/vk_fence_manager.cpp
     renderer_vulkan/vk_fence_manager.h
     renderer_vulkan/vk_frame_dump.cpp

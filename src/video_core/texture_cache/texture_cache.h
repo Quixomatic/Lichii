@@ -28,6 +28,7 @@
 #include "video_core/dirty_flags.h"
 #include "video_core/nx2_fast_draw.h"
 #include "video_core/v2/v2_stats.h"
+#include "video_core/v2/versions.h"
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/guest_memory.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
@@ -689,6 +690,65 @@ bool TextureCache<P>::ResolveMemoizedTextures(SampledTextureMemo& memo,
         return false;
     }
     return true;
+}
+
+template <class P>
+bool TextureCache<P>::PrepareRecipeViews(std::span<const ImageViewInOut> views) {
+    has_deleted_images = false;
+    for (const ImageViewInOut& view : views) {
+        if (!view.id) {
+            continue;
+        }
+        PrepareImageView(view.id, false, false);
+    }
+    return !has_deleted_images;
+}
+
+template <class P>
+bool TextureCache<P>::CaptureDescriptor(bool compute, bool sampler, u32 index, GPUVAddr& address,
+                                        const u8*& host, std::span<u8, 32> bytes) const {
+    static_assert(sizeof(TICEntry) == 32 && sizeof(TSCEntry) == 32);
+    const auto capture = [&](const auto& table, u32 table_index) {
+        if (table_index > table.current_limit) {
+            // The resolve read nothing (a null view or sampler): nothing to capture.
+            address = 0;
+            host = nullptr;
+            return true;
+        }
+        if (table_index >= table.descriptors.size()) {
+            return false;
+        }
+        address = table.current_gpu_addr + table_index * 32ULL;
+        if ((address & Core::Memory::YUZU_PAGEMASK) + 32 > Core::Memory::YUZU_PAGESIZE) {
+            return false;
+        }
+        host = gpu_memory->GetPointer(address);
+        // The table's copy is what the resolve used; memory must still hold it.
+        std::memcpy(bytes.data(), &table.descriptors[table_index], 32);
+        return host != nullptr && std::memcmp(host, bytes.data(), 32) == 0;
+    };
+    if (sampler) {
+        const auto& table =
+            compute ? channel_state->compute_sampler_table : channel_state->graphics_sampler_table;
+        return capture(table, index);
+    }
+    const auto& table =
+        compute ? channel_state->compute_image_table : channel_state->graphics_image_table;
+    return capture(table, Tegra::Texture::TextureHeaderIndex(index, table.current_limit,
+                                                             gpu_memory->UsesNativeTiling()));
+}
+
+template <class P>
+std::optional<std::pair<DAddr, u64>> TextureCache<P>::ViewImageRange(ImageViewId id) const {
+    if (!PreparesImage(slot_image_views, id)) {
+        return std::nullopt;
+    }
+    const ImageId image_id = slot_image_views[id].image_id;
+    if (!image_id) {
+        return std::nullopt;
+    }
+    const ImageBase& image = slot_images[image_id];
+    return std::make_pair(static_cast<DAddr>(image.cpu_addr), u64{image.guest_size_bytes});
 }
 
 template <class P>
@@ -2533,6 +2593,9 @@ template <class P>
 void TextureCache<P>::InvalidateScale(Image& image) {
     // Its views are deleted: a fast draw delta draw keeping one must not follow.
     VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Invalidation);
+    // EDEN_NX2_V2_DRAWCACHE: recipes sampling or rendering to it miss (its views' generations
+    // move below; the rescale changes how every view of it binds).
+    V2::Versions::HookBumpEpoch(V2::Versions::Epoch::Rescale);
     if (image.scale_tick <= frame_tick) {
         image.scale_tick = frame_tick + 1;
     }
@@ -2554,6 +2617,7 @@ void TextureCache<P>::InvalidateScale(Image& image) {
     for (const ImageViewId image_view_id : image_view_ids) {
         sentenced_image_view.Push(std::move(slot_image_views[image_view_id]));
         slot_image_views.erase(image_view_id);
+        V2::Versions::HookBump(V2::Versions::Kind::ImageView, image_view_id.Value());
     }
     image.image_view_ids.clear();
     image.image_view_infos.clear();
@@ -2975,6 +3039,7 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
             // Left out of the cache: lookups see no image (a null view) and make it again once
             // the collector has freed memory.
             slot_images.erase(new_image_id);
+            V2::Versions::HookBump(V2::Versions::Kind::Image, new_image_id.Value());
             static u32 logged{};
             if (logged++ < 32) {
                 LOG_ERROR(HW_GPU, "No memory for the {}x{}x{} image at {:#x} (format {}); skipping it",
@@ -3934,6 +3999,7 @@ void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
             sentenced_image_view.Push(std::move(slot_image_views[image_view_id]));
         }
         slot_image_views.erase(image_view_id);
+        V2::Versions::HookBump(V2::Versions::Kind::ImageView, image_view_id.Value());
     }
     const bool retained = RetainPendingImageDownloads(image_id, slot_images[image_id],
                                                        uncommitted_downloads, committed_downloads);
@@ -3950,6 +4016,7 @@ void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
         }
     }
     slot_images.erase(image_id);
+    V2::Versions::HookBump(V2::Versions::Kind::Image, image_id.Value());
 
     alloc_images.erase(alloc_image_it);
     if (alloc_images.empty()) {
@@ -4015,6 +4082,11 @@ void TextureCache<P>::RemoveFramebuffers(std::span<const ImageViewId> removed_vi
 
 template <class P>
 void TextureCache<P>::MarkModification(ImageBase& image) noexcept {
+    if (V2::Versions::Active() && False(image.flags & ImageFlagBits::GpuModified)) [[unlikely]] {
+        // EDEN_NX2_V2_DRAWCACHE: the image's first GPU write since its memory was in sync.
+        V2::Versions::NoteWrite(image.cpu_addr, image.guest_size_bytes,
+                                V2::Versions::Source::Gpu);
+    }
     image.flags |= ImageFlagBits::GpuModified;
     SetModificationTick(slot_images, image, ++modification_tick);
 }

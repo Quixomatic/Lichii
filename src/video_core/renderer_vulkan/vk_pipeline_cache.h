@@ -138,6 +138,14 @@ public:
 
     [[nodiscard]] ComputePipeline* CurrentComputePipeline(u64& native_key);
 
+    /// EDEN_NX2_V2_DRAWCACHE: a recipe replay used `pipeline` without a lookup (eviction age).
+    void NoteRecipeUse(GraphicsPipeline* pipeline);
+    /// EDEN_NX2_V2_DRAWCACHE: whether the last CurrentComputePipeline's entry can be replayed
+    /// (no null pointer slots a later dispatch may rebuild it for).
+    [[nodiscard]] bool LastComputeTakesRecipes() const noexcept {
+        return last_compute_takes_recipes;
+    }
+
     void LoadDiskResources(u64 title_id, std::stop_token stop_loading,
                            const VideoCore::DiskResourceLoadCallback& callback);
 
@@ -245,6 +253,7 @@ private:
     /// Destroys graphics pipelines unused for a while, once the GPU is done with them.
     void EvictUnusedPipelines();
     u64 frame_count{};
+    bool last_compute_takes_recipes{};
     /// Wait budget of native draws for unbuilt pipelines left in this frame, in microseconds
     /// (native_async_draws = Bounded). Only touched on the GPU thread; reset in TickFrame.
     s64 native_wait_budget_us{8000};

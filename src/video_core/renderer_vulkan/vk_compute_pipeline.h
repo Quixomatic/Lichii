@@ -23,6 +23,7 @@
 #include "video_core/renderer_vulkan/vk_descriptor_pool.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
+#include "video_core/v2/draw_cache.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
 namespace VideoCore {
@@ -100,7 +101,41 @@ public:
         return info;
     }
 
+    /// EDEN_NX2_V2_DRAWCACHE: the next Configure records what a dispatch recipe needs.
+    void SetRecipeCapture(VideoCommon::V2::DrawCache::RecipeCapture* capture) noexcept {
+        recipe_capture = capture;
+    }
+    /// EDEN_NX2_V2_DRAWCACHE: the next Configure takes its image views and samplers from
+    /// `recipe` (no handle or TIC/TSC read, no view lookup; the views are prepared as a texture
+    /// memo hit prepares them). Storage buffers are bound from their descriptors as always: their
+    /// GPU-written extent depends on each dispatch's grid. RecipeReplayFailed tells a false
+    /// Configure caused by the replay (resolve in full then).
+    void SetRecipeReplay(const VideoCommon::V2::DrawCache::Recipe* recipe) noexcept {
+        recipe_replay = recipe;
+        recipe_replay_failed = false;
+    }
+    [[nodiscard]] bool RecipeReplayFailed() const noexcept {
+        return recipe_replay_failed;
+    }
+    /// Whether dispatches of this pipeline can be replayed from a recipe (no handles computed at
+    /// dispatch time, no byte-addressed images).
+    [[nodiscard]] bool TakesRecipes() const noexcept {
+        return recipe_eligible;
+    }
+    /// Constant buffer slots the dispatch reads texture and image handles from.
+    [[nodiscard]] u32 HandleConstantBuffers() const noexcept {
+        return handle_constant_buffers;
+    }
+
 private:
+    template <bool Recipes>
+    [[nodiscard]] bool ConfigureImpl(Tegra::Engines::KeplerCompute& kepler_compute,
+                                     Tegra::MemoryManager& gpu_memory, Scheduler& scheduler,
+                                     BufferCache& buffer_cache, TextureCache& texture_cache,
+                                     TextureCacheRuntime& texture_runtime,
+                                     std::optional<ByteAddressedShadow>& shadow,
+                                     BindCommand* deferred_bind);
+
     /// Builds the pipeline once, on whichever thread gets here first.
     void RunBuild();
 
@@ -125,6 +160,13 @@ private:
     vk::PipelineLayout pipeline_layout;
     vk::DescriptorUpdateTemplate descriptor_update_template;
     vk::Pipeline pipeline;
+
+    // EDEN_NX2_V2_DRAWCACHE (v2/draw_cache.h).
+    VideoCommon::V2::DrawCache::RecipeCapture* recipe_capture{};
+    const VideoCommon::V2::DrawCache::Recipe* recipe_replay{};
+    bool recipe_replay_failed{};
+    bool recipe_eligible{};
+    u32 handle_constant_buffers{};
 
     /// EDEN_NX2_V2_BINDLESS: textures or storage images read the heap (set 1, word table).
     bool heap_pipeline{false};

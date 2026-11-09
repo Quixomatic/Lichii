@@ -33,6 +33,7 @@
 #include "video_core/renderer_vulkan/vk_state_tracker.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
 #include "video_core/vulkan_common/vulkan_device.h"
+#include "video_core/v2/versions.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
 namespace Vulkan {
@@ -165,6 +166,8 @@ Scheduler::~Scheduler() {
 
 u64 Scheduler::Flush(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
                      std::source_location location) {
+    // EDEN_NX2_V2_DRAWCACHE: a submit is an ordering point (collect epoch).
+    VideoCommon::V2::Versions::HookEpoch(VideoCommon::V2::Versions::EpochReason::Submit);
     if (state.renderpass) {
         CountRenderPassEnd(location.file_name(), location.line());
     }

@@ -66,7 +66,9 @@
 #include "video_core/v2/p3_stats.h"
 #include "video_core/v2/regsem.h"
 #include "video_core/v2/shader_writes.h"
+#include "video_core/v2/v2_stats.h"
 #include "video_core/v2/v2_switches.h"
+#include "video_core/v2/versions.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 #include "video_core/renderer_vulkan/vk_state_tracker.h"
@@ -443,6 +445,8 @@ RasterizerVulkan::~RasterizerVulkan() {
     VideoCommon::GpuSplit::Get().SetIdleHook(nullptr, nullptr);
     scheduler.WaitWorker();
     scheduler.Finish();
+    // Its watched pages leave the write tracking while the caches still exist.
+    draw_cache.reset();
 }
 
 GraphicsPipeline* RasterizerVulkan::TakeReusableDraw(bool is_indexed, bool is_indirect) {
@@ -966,6 +970,10 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         fast_draw_on && (FastDraw::VerifyEnabled() ||
                          VideoCommon::V2::Verify(VideoCommon::V2::Switch::ContDraw));
     const u64 fast_draw_start = fast_draw_on ? Profile::Now() : 0;
+    // EDEN_NX2_V2_DRAWCACHE (P4): one cached-flag branch when off.
+    const bool drawcache = VideoCommon::V2::On(VideoCommon::V2::Switch::DrawCache);
+    const u64 drawcache_start =
+        drawcache && VideoCommon::V2::Stats::Enabled() ? Profile::Now() : 0;
     {
         Profile::Scope scope{Profile::Zone::FlushWork};
         FlushWork();
@@ -988,9 +996,25 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     };
     GraphicsPipeline* const delta_pipeline =
         fast_draw_on ? TakeReusableDraw(is_indexed, is_indirect) : nullptr;
+    // EDEN_NX2_V2_DRAWCACHE: the fast-path ladder (MASTER_PLAN §5.3) in one decision: a continued
+    // draw (P3, above), else a validated recipe replay, else the dirty-group resolve.
+    VideoCommon::V2::DrawCache::Decision cache_decision{};
+    if (drawcache) [[unlikely]] {
+        cache_decision = DrawCache().DecideDraw(delta_pipeline != nullptr, is_indexed,
+                                                is_indirect, *maxwell3d, *gpu_memory);
+    }
+    GraphicsPipeline* const replay_pipeline =
+        cache_decision.path == VideoCommon::V2::DrawCache::Path::Replay && !cache_decision.verify
+            ? static_cast<GraphicsPipeline*>(cache_decision.recipe->pipeline)
+            : nullptr;
+    if (replay_pipeline != nullptr) [[unlikely]] {
+        pipeline_cache.NoteRecipeUse(replay_pipeline);
+    }
     // EDEN_NX2_FAST_DRAW_VERIFY: resolve in full and compare with what the delta path keeps.
     GraphicsPipeline* const verify_pipeline = fast_draw_verify ? delta_pipeline : nullptr;
-    GraphicsPipeline* const pipeline{delta_pipeline && !verify_pipeline ? delta_pipeline : [&] {
+    GraphicsPipeline* const pipeline{replay_pipeline != nullptr ? replay_pipeline
+                                     : delta_pipeline && !verify_pipeline ? delta_pipeline
+                                                                          : [&] {
         Profile::Scope scope{Profile::Zone::PipelineLookup};
         // A continued-draw check that looked the pipeline up already (nothing changed since).
         if (cont_lookup_valid) [[unlikely]] {
@@ -1000,8 +1024,10 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     }()};
     cont_lookup_valid = false;
     const bool verify_views = verify_pipeline != nullptr && verify_pipeline == pipeline;
-    if (pipeline != nullptr && VideoCommon::V2::ShaderWrites::Enabled()) [[unlikely]] {
-        // Pipeline v2: what the bound programs store, for the split front's write ranges.
+    if (pipeline != nullptr && replay_pipeline == nullptr &&
+        VideoCommon::V2::ShaderWrites::Enabled()) [[unlikely]] {
+        // Pipeline v2: what the bound programs store, for the split front's write ranges (a
+        // replay looked nothing up; its programs were recorded when its recipe was built).
         for (size_t index = 0; index < shader_write_addresses.size(); ++index) {
             const VAddr address = pipeline_cache.ProgramDeviceAddress(index);
             if (address != shader_write_addresses[index] || pipeline != shader_write_pipeline) {
@@ -1250,7 +1276,26 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     const bool delta_holds =
         delta_pipeline != nullptr && DeltaStillHolds(draw_serial, draw_map_serial);
     const DrawPath path = delta_holds && !verify_pipeline ? DrawPath::Delta : DrawPath::Full;
-    if (path == DrawPath::Delta) {
+    bool replayed = false;
+    if (replay_pipeline != nullptr) [[unlikely]] {
+        Profile::Scope scope{Profile::Zone::Configure};
+        switch (pipeline->ConfigureRecipe(is_indexed, *cache_decision.recipe, nullptr)) {
+        case GraphicsPipeline::RecipeResult::Recorded:
+            replayed = true;
+            DrawCache().NoteReplayed(*cache_decision.recipe);
+            break;
+        case GraphicsPipeline::RecipeResult::Rebuild:
+            DrawCache().NoteReplayRebuilt(*cache_decision.recipe);
+            break;
+        case GraphicsPipeline::RecipeResult::Failed:
+            report_failure("configure failed");
+            TraceRenderState(is_indexed, "configure-failed", nullptr);
+            return;
+        }
+    }
+    if (replayed) {
+        // Recorded from the recipe; the pipeline keeps its views for delta draws after it.
+    } else if (path == DrawPath::Delta) {
         if (Profile::Scope scope{Profile::Zone::Configure}; !pipeline->ConfigureDelta(is_indexed)) {
             report_failure("configure failed");
             TraceRenderState(is_indexed, "configure-failed", nullptr);
@@ -1264,10 +1309,31 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         if (fast_draw_on) {
             pipeline->CaptureNextDelta(verify_views);
         }
-        if (Profile::Scope scope{Profile::Zone::Configure}; !pipeline->Configure(is_indexed)) {
+        // EDEN_NX2_V2_DRAWCACHE: a cacheable draw records what its recipe needs while resolving.
+        VideoCommon::V2::DrawCache::RecipeCapture* const recipe_capture =
+            drawcache ? DrawCache().BeginDrawCapture(*pipeline, is_indexed, is_indirect, mesh_draw,
+                                                     frame_dump.Capturing(), *maxwell3d)
+                      : nullptr;
+        if (recipe_capture != nullptr) [[unlikely]] {
+            pipeline->SetRecipeCapture(recipe_capture);
+        }
+        bool configured;
+        {
+            Profile::Scope scope{Profile::Zone::Configure};
+            configured = recipe_capture != nullptr ? pipeline->ConfigureCapture(is_indexed)
+                                                   : pipeline->Configure(is_indexed);
+        }
+        if (recipe_capture != nullptr) [[unlikely]] {
+            pipeline->SetRecipeCapture(nullptr);
+        }
+        if (!configured) {
             report_failure("configure failed");
             TraceRenderState(is_indexed, "configure-failed", nullptr);
             return;
+        }
+        if (recipe_capture != nullptr) [[unlikely]] {
+            DrawCache().FinishDrawCapture(*pipeline, cache_decision, is_indexed, *maxwell3d,
+                                          *gpu_memory, texture_cache, buffer_cache);
         }
         const bool view_mismatch = verify_views && pipeline->DeltaMismatch();
         const bool binding_mismatch =
@@ -1389,6 +1455,12 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         // The continued-draw sink starts over at every recorded draw.
         static_cast<void>(
             maxwell3d->v2_groups.TakeSink(VideoCommon::V2::GroupSink::ContinuedDraw));
+    }
+    if (drawcache_start != 0) [[unlikely]] {
+        if (replayed || path == DrawPath::Full) {
+            DrawCache().NoteDrawTime(replayed, Profile::Now() - drawcache_start);
+        }
+        DrawCache().Report();
     }
     static u32 native_capture_count{};
     if ((!lean || DebugHooks().native_capture) &&
@@ -2335,12 +2407,30 @@ void RasterizerVulkan::DispatchCompute() {
     }
 
     u64 native_key{};
-    ComputePipeline* const pipeline{pipeline_cache.CurrentComputePipeline(native_key)};
+    // EDEN_NX2_V2_DRAWCACHE: a validated dispatch recipe skips the pipeline lookup and the
+    // texture resolve (one cached-flag branch when off).
+    const bool drawcache = VideoCommon::V2::On(VideoCommon::V2::Switch::DrawCache);
+    const u64 drawcache_start =
+        drawcache && VideoCommon::V2::Stats::Enabled() ? VideoCommon::Nx2Profile::Now() : 0;
+    VideoCommon::V2::DrawCache::Decision cache_decision{};
+    if (drawcache) [[unlikely]] {
+        cache_decision =
+            DrawCache().DecideDispatch(*kepler_compute, *gpu_memory, !frame_dump.Capturing());
+    }
+    const bool replay =
+        cache_decision.path == VideoCommon::V2::DrawCache::Path::Replay && !cache_decision.verify;
+    if (replay) [[unlikely]] {
+        native_key = cache_decision.recipe->native_key;
+    }
+    ComputePipeline* const pipeline{
+        replay ? static_cast<ComputePipeline*>(cache_decision.recipe->pipeline)
+               : pipeline_cache.CurrentComputePipeline(native_key)};
+    const bool recipe_lookup_ok = replay || pipeline_cache.LastComputeTakesRecipes();
     if (!pipeline) {
         if (kepler_compute->IsNativeMode()) throw Shader::RuntimeError("Native compute pipeline unavailable");
         return;
     }
-    if (VideoCommon::V2::ShaderWrites::Enabled()) [[unlikely]] {
+    if (!replay && VideoCommon::V2::ShaderWrites::Enabled()) [[unlikely]] {
         VideoCommon::V2::ShaderWrites::Record(pipeline_cache.ComputeDeviceAddress(),
                                               pipeline->ShaderInfo());
     }
@@ -2361,11 +2451,54 @@ void RasterizerVulkan::DispatchCompute() {
     constexpr bool can_replace = false;
 #endif
     ComputePipeline::BindCommand deferred_bind;
-    if (!pipeline->Configure(*kepler_compute, *gpu_memory, scheduler, buffer_cache,
-                             texture_cache, texture_cache_runtime, byte_addressed_shadow,
-                             can_replace ? &deferred_bind : nullptr)) {
+    const auto configure = [&] {
+        return pipeline->Configure(*kepler_compute, *gpu_memory, scheduler, buffer_cache,
+                                   texture_cache, texture_cache_runtime, byte_addressed_shadow,
+                                   can_replace ? &deferred_bind : nullptr);
+    };
+    bool configured = false;
+    bool replayed = false;
+    bool resolve = true;
+    if (replay && !can_replace) [[unlikely]] {
+        pipeline->SetRecipeReplay(cache_decision.recipe);
+        configured = configure();
+        const bool failed = pipeline->RecipeReplayFailed();
+        pipeline->SetRecipeReplay(nullptr);
+        if (configured) {
+            replayed = true;
+            resolve = false;
+            DrawCache().NoteDispatchReplayed(*cache_decision.recipe);
+        } else if (failed) {
+            DrawCache().NoteDispatchRebuilt(*cache_decision.recipe);
+        } else {
+            resolve = false;
+        }
+    }
+    VideoCommon::V2::DrawCache::RecipeCapture* recipe_capture = nullptr;
+    if (resolve) {
+        recipe_capture = drawcache ? DrawCache().BeginDispatchCapture(
+                                         *pipeline, recipe_lookup_ok && !can_replace)
+                                   : nullptr;
+        if (recipe_capture != nullptr) [[unlikely]] {
+            pipeline->SetRecipeCapture(recipe_capture);
+        }
+        configured = configure();
+        if (recipe_capture != nullptr) [[unlikely]] {
+            pipeline->SetRecipeCapture(nullptr);
+        }
+    }
+    if (!configured) {
         if (kepler_compute->IsNativeMode()) throw Shader::RuntimeError("Native compute resources unavailable");
         return;
+    }
+    if (recipe_capture != nullptr) [[unlikely]] {
+        DrawCache().FinishDispatchCapture(*pipeline, native_key, cache_decision, *kepler_compute,
+                                          *gpu_memory, texture_cache);
+    }
+    if (drawcache_start != 0) [[unlikely]] {
+        DrawCache().NoteDispatchTime(replayed,
+                                     VideoCommon::Nx2Profile::Now() - drawcache_start);
+        DrawCache().Report();
     }
     SCOPE_EXIT {
         if (!frame_dump.Capturing()) {
@@ -2721,6 +2854,7 @@ void RasterizerVulkan::InvalidateRegion(DAddr addr, u64 size, VideoCommon::Cache
     if (addr == 0 || size == 0) {
         return;
     }
+    VideoCommon::V2::Versions::HookWrite(addr, size, VideoCommon::V2::Versions::Source::Host);
     if (VideoCommon::V2::On(VideoCommon::V2::Switch::CbufVer)) [[unlikely]] {
         VideoCommon::V2::CbufVer::Log().NoteHost(addr, size);
     }
@@ -2741,6 +2875,11 @@ void RasterizerVulkan::InvalidateRegion(DAddr addr, u64 size, VideoCommon::Cache
 }
 
 void RasterizerVulkan::InnerInvalidation(std::span<const std::pair<DAddr, std::size_t>> sequences) {
+    if (VideoCommon::V2::Versions::Active()) [[unlikely]] {
+        for (const auto& [addr, size] : sequences) {
+            VideoCommon::V2::Versions::NoteWrite(addr, size, VideoCommon::V2::Versions::Source::Inline);
+        }
+    }
     if (VideoCommon::V2::On(VideoCommon::V2::Switch::CbufVer)) [[unlikely]] {
         // The GPU's own cached writes, flushed on the drawing thread before a draw resolves:
         // exact ranges for the constant buffer versions.
@@ -2787,6 +2926,7 @@ void RasterizerVulkan::InnerInvalidation(std::span<const std::pair<DAddr, std::s
 
 bool RasterizerVulkan::OnCPUWrite(DAddr addr, u64 size) {
     DEBUG_ASSERT(addr != 0 || size != 0);
+    VideoCommon::V2::Versions::HookWrite(addr, size, VideoCommon::V2::Versions::Source::Host);
     if (VideoCommon::V2::On(VideoCommon::V2::Switch::CbufVer)) [[unlikely]] {
         VideoCommon::V2::CbufVer::Log().NoteHost(addr, size);
     }
@@ -2820,6 +2960,7 @@ void RasterizerVulkan::OnCacheInvalidation(DAddr addr, u64 size) {
     if (addr == 0 || size == 0) {
         return;
     }
+    VideoCommon::V2::Versions::HookWrite(addr, size, VideoCommon::V2::Versions::Source::Host);
     if (VideoCommon::V2::On(VideoCommon::V2::Switch::CbufVer)) [[unlikely]] {
         VideoCommon::V2::CbufVer::Log().NoteHost(addr, size);
     }
@@ -2837,6 +2978,7 @@ void RasterizerVulkan::OnCacheInvalidation(DAddr addr, u64 size) {
 
 bool RasterizerVulkan::TryCacheInvalidation(DAddr addr, u64 size) {
     if (addr == 0 || size == 0) return true;
+    VideoCommon::V2::Versions::HookWrite(addr, size, VideoCommon::V2::Versions::Source::Host);
     if (VideoCommon::V2::On(VideoCommon::V2::Switch::CbufVer)) [[unlikely]] {
         VideoCommon::V2::CbufVer::Log().NoteHost(addr, size);
     }
@@ -2859,6 +3001,7 @@ void RasterizerVulkan::InvalidateGPUCache() {
 }
 
 void RasterizerVulkan::UnmapMemory(DAddr addr, u64 size) {
+    VideoCommon::V2::Versions::HookWrite(addr, size, VideoCommon::V2::Versions::Source::Host);
     {
         std::scoped_lock lock{texture_cache.mutex};
         texture_cache.UnmapMemory(addr, size);
@@ -3602,6 +3745,7 @@ void RasterizerVulkan::AccelerateInlineToMemory(GPUVAddr address, size_t copy_si
         return;
     }
     gpu_memory->WriteBlockUnsafe(address, memory.data(), copy_size);
+    VideoCommon::V2::Versions::HookWrite(*cpu_addr, copy_size, VideoCommon::V2::Versions::Source::Inline);
     // EDEN_NX2_INLINE_DEFER=0: invalidate every cache at once (for comparisons).
     static const bool defer = [] {
         const char* value = std::getenv("EDEN_NX2_INLINE_DEFER");
@@ -3790,6 +3934,7 @@ bool AccelerateDMA::DmaBufferImageCopy(const Tegra::DMA::ImageCopy& copy_info,
     if constexpr (IS_IMAGE_UPLOAD) {
         texture_cache.PrepareImage(image_id, true, false);
         image->UploadMemory(buffer->Handle(), offset, copy_span);
+        VideoCommon::V2::Versions::HookWrite(image->cpu_addr, image->guest_size_bytes, VideoCommon::V2::Versions::Source::Dma);
     } else {
         if (offset % BytesPerBlock(image->info.format)) {
             return false;
