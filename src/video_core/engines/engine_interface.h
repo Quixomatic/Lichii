@@ -47,6 +47,9 @@ public:
     /// A Maxwell3D whose CallMethod takes its fast path (Nx2Perf): GpuSplit's back calls it
     /// without the virtual call.
     bool fast_maxwell3d{};
+    /// The engine is a Maxwell3D, whatever path its CallMethod takes (GpuSplit's back picks the
+    /// classified-run executor by it: fast_maxwell3d is off under EDEN_NX2_GPU_PROFILE).
+    bool is_maxwell3d{};
     std::vector<std::pair<u32, u32>> method_sink{};
     GPUVAddr current_dma_segment;
     bool current_dirty{};

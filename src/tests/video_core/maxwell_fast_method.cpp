@@ -2134,6 +2134,29 @@ TEST_CASE("V2 S1 deltas applied on the back match the method executor on random 
         Access::RunBack(replay_split);
         REQUIRE(replay.regs.reg_array == s1.regs.reg_array);
         REQUIRE(replay_draws.draws == s1_draws.draws);
+
+        // F1-X1: the same classified runs on a Maxwell3D without its fast path (profile builds,
+        // EDEN_NX2_GPU_PROFILE) go to the 3D executor, not the compute class's.
+        Maxwell3D slow{f.memory};
+        RecordingRasterizer slow_draws{f.gpu};
+        slow_draws.engine = &slow;
+        slow.fast_maxwell3d = false;
+        slow.BindRasterizer(&slow_draws);
+        VideoCommon::Dirty::SetupDirtyFlags(slow.dirty.tables);
+        slow.CallMethod(f.system, CbAddressHigh, 0x1, true);
+        slow.CallMethod(f.system, CbAddressLow, 0x2000'0000, true);
+        slow.CallMethod(f.system, CbSize, 0x10000, true);
+        VideoCommon::GpuSplit slow_split;
+        Access::Initialize(slow_split, f.system);
+        Access::SetIr(slow_split, true);
+        Access::Intern(slow_split, &slow);
+        REQUIRE(VideoCommon::V2::IrTrace::ForEach(
+            trace.Words(), [&](const VideoCommon::V2::IrTrace::TraceRecord& record) {
+                slow_split.ReplayIrRecord(record.record, record.payload);
+            }));
+        Access::RunBack(slow_split);
+        REQUIRE(slow.regs.reg_array == s1.regs.reg_array);
+        REQUIRE(slow_draws.draws == s1_draws.draws);
     }
 }
 

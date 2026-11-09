@@ -66,6 +66,7 @@ Maxwell3D::Maxwell3D(MemoryManager& memory_manager_)
     dirty.flags.flip();
     InitializeRegisterDefaults();
     reports_fast_draw_breaks = true;
+    is_maxwell3d = true;
     execution_mask.reset();
     for (size_t i = 0; i < execution_mask.size(); i++)
         execution_mask[i] = IsMethodExecutable(u32(i));

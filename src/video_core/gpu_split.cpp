@@ -955,8 +955,9 @@ size_t GpuSplit::ExecuteIr(const u64* entry) {
         const u64* const end = it + payload.words;
         auto* const engine = back_engine;
         if ((head & V2::Ir::Classified) != 0) {
-            // S1 single owner: register deltas and typed entries, no method execution.
-            if (engine->fast_maxwell3d) [[likely]] {
+            // S1 single owner: register deltas and typed entries, no method execution. By engine
+            // class, not fast path: profile builds run 3D without fast_maxwell3d (F1-X1).
+            if (engine->is_maxwell3d) [[likely]] {
                 static_cast<Tegra::Engines::Maxwell3D*>(engine)->ExecuteS1Run(it, end);
             } else {
                 // Only the native compute class sends classified runs besides 3D (F1-05).
