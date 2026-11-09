@@ -83,6 +83,8 @@ template <typename Ref>
 class VersionTable {
 public:
     static constexpr size_t NumEntries = 1024;
+    /// Most inline writes MayHold compares with a range (Perf fix D).
+    static constexpr u64 MaxInlineScan = 16;
 
     explicit VersionTable(WriteLog& log_) : log{&log_} {}
 
@@ -111,7 +113,12 @@ public:
         }
         const u64 sequence = log->Sequence();
         if (entry.sequence != sequence) {
-            if (log->WrittenSince(entry.sequence, address, address + size)) {
+            // A few inline writes since the last lookup are checked against the range (one over
+            // it is a new version without a compare). Past that the scan would cost more than
+            // the compare, and the bytes decide: an inline write lands in guest memory before
+            // the draw resolves, so one that changed the range fails Matching.
+            if (sequence - entry.sequence <= MaxInlineScan &&
+                log->WrittenSince(entry.sequence, address, address + size)) {
                 entry.valid = false;
                 return false;
             }
@@ -135,9 +142,9 @@ public:
         return &entry.ref;
     }
 
-    /// The version of [address, address + size) made in `tick`, if nothing wrote it since:
-    /// no inline or host write logged over it, and `current` (what guest memory holds now, `size`
-    /// bytes) equal to its bytes.
+    /// The version of [address, address + size) made in `tick`, if nothing wrote it since: no
+    /// host write logged over it, none of the last few inline writes either, and `current`
+    /// (what guest memory holds now, `size` bytes) equal to its bytes.
     [[nodiscard]] const Ref* Find(DAddr address, u32 size, u64 tick, const u8* current) {
         if (!MayHold(address, size, tick, log->PageSum(address, size))) {
             return nullptr;

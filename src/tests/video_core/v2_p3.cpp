@@ -382,11 +382,22 @@ TEST_CASE("V2 P3 constant buffer versions", "[video_core][v2_p3]") {
         log->NoteInline(Far + i * 16, Far + i * 16 + 16);
         REQUIRE(table->Find(A, 0x100, 7, a.data()) != nullptr);
     }
-    // Past the log's size without a lookup: unknown, so the version ends.
+    // More inline writes than MaxInlineScan (or than the log holds) since the last lookup: the
+    // bytes decide. Unchanged bytes keep the version; changed ones end it.
     table->Insert(B, 0x200, 7, 3, table->Begin(B, 0x200), b.data());
     for (size_t i = 0; i < WriteLog::LogSize + 1; ++i) {
         log->NoteInline(Far, Far + 4);
     }
+    REQUIRE(*table->Find(B, 0x200, 7, b.data()) == 3);
+    for (u64 i = 0; i <= VersionTable<int>::MaxInlineScan; ++i) {
+        log->NoteInline(B, B + 4);
+    }
+    b[0] ^= 1;
+    REQUIRE(table->Find(B, 0x200, 7, b.data()) == nullptr);
+    b[0] ^= 1;
+    // A few inline writes over the range end the version without a compare.
+    table->Insert(B, 0x200, 7, 3, table->Begin(B, 0x200), b.data());
+    log->NoteInline(B + 0x10, B + 0x14);
     REQUIRE(table->Find(B, 0x200, 7, b.data()) == nullptr);
     // A host write to A's page ends it; one to another page doesn't.
     table->Insert(A, 0x100, 7, 4, table->Begin(A, 0x100), a.data());
