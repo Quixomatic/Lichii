@@ -1,7 +1,10 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <algorithm>
+#include <cstddef>
 #include <cstring>
+#include <vector>
 
 #include "common/scope_exit.h"
 
@@ -25,10 +28,49 @@ using V2::RegGroup;
 
 namespace {
 
-/// The register groups the shape holds: what makes the pipeline (P3's key blocks read only
-/// these, plus the vertex streams the key adds when the shaders read attributes).
-constexpr u32 ShapeGroups = GroupBit(RegGroup::Pipeline) | GroupBit(RegGroup::Viewport) |
-                            GroupBit(RegGroup::Shaders) | GroupBit(RegGroup::RenderTargets);
+/// The register groups the shape holds whole: pipeline-key state, the programs and the render
+/// targets. Of the viewport group only the registers the pipeline key reads (swizzles and the
+/// like, KeyViewportRegisters) are in it, so scissor and viewport changes (dynamic state) keep
+/// the recipe; of the vertex streams only their layout (GraphicsKey).
+constexpr u32 ShapeGroups = GroupBit(RegGroup::Pipeline) | GroupBit(RegGroup::Shaders) |
+                            GroupBit(RegGroup::RenderTargets);
+
+/// The viewport-group registers some pipeline key block reads (P3's KeyBlockRegisters through
+/// the register semantics table), built once.
+const std::vector<u32>& KeyViewportRegisters() {
+    static const std::vector<u32> registers = [] {
+        using Regs = Tegra::Engines::Maxwell3D::Regs;
+        // Of the viewport transforms the key reads only the swizzle word (RefreshSwizzles); the
+        // scale and translation are dynamic state.
+        constexpr u32 transforms =
+            static_cast<u32>(offsetof(Regs, viewport_transform) / sizeof(u32));
+        constexpr u32 transform_words = sizeof(Regs::ViewportTransform) / sizeof(u32);
+        constexpr u32 transforms_end =
+            transforms + static_cast<u32>(sizeof(Regs::viewport_transform) / sizeof(u32));
+        constexpr u32 swizzle_word =
+            static_cast<u32>(offsetof(Regs::ViewportTransform, swizzle) / sizeof(u32));
+        std::vector<u32> result;
+        const auto& groups = V2::RegSem::GetTable3D().groups;
+        for (size_t block = 0; block < NumKeyBlocks; ++block) {
+            for (const auto& [first, count] : KeyBlockRegisters(static_cast<KeyBlock>(block))) {
+                for (u32 index = first; index < first + count && index < groups.size(); ++index) {
+                    if (groups[index] != RegGroup::Viewport) {
+                        continue;
+                    }
+                    if (index >= transforms && index < transforms_end &&
+                        (index - transforms) % transform_words != swizzle_word) {
+                        continue;
+                    }
+                    result.push_back(index);
+                }
+            }
+        }
+        std::ranges::sort(result);
+        result.erase(std::unique(result.begin(), result.end()), result.end());
+        return result;
+    }();
+    return registers;
+}
 
 constexpr size_t GraphicsSets = 1024; ///< x4 ways: 4096 recipes
 constexpr size_t ComputeSets = 256;   ///< x4 ways: 1024 recipes
@@ -69,6 +111,9 @@ DrawCacheGlue::~DrawCacheGlue() {
 u64 DrawCacheGlue::GraphicsShape(bool is_indexed, const Tegra::Engines::Maxwell3D& maxwell3d,
                                  const Tegra::MemoryManager& memory) const {
     u64 shape = maxwell3d.v2_groups.Fingerprint(ShapeGroups);
+    for (const u32 index : KeyViewportRegisters()) {
+        shape = DC::Mix(shape, (u64{index} << 32) | maxwell3d.regs.reg_array[index]);
+    }
     const KeyInputs inputs = FixedPipelineState::CurrentInputs(maxwell3d);
     shape = DC::Mix(shape, static_cast<u64>(inputs.topology));
     shape = DC::Mix(shape, static_cast<u64>(inputs.engine_state));
