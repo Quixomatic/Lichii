@@ -32,6 +32,7 @@
 #include "video_core/query_dma.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/textures/texture.h"
+#include "video_core/v2/regsem_3d.h"
 #ifdef ARCHITECTURE_x86_64
 #include "video_core/macro_turing_jit.h"
 #endif
@@ -57,6 +58,7 @@ Maxwell3D::Maxwell3D(MemoryManager& memory_manager_)
     execution_mask.reset();
     for (size_t i = 0; i < execution_mask.size(); i++)
         execution_mask[i] = IsMethodExecutable(u32(i));
+    VideoCommon::V2::RegSem::InitTable3D(execution_mask);
     fast_maxwell3d = !record_write_history &&
                      !trace_first_method_writes && !VideoCommon::Nx2Profile::Enabled();
 }
@@ -365,6 +367,9 @@ void Maxwell3D::ProcessDirtyRegisters(u32 method, u32 argument) {
     if (VideoCommon::V2::Stats::Enabled()) [[unlikely]] {
         VideoCommon::V2::Stats::NoteWrite(v2_draw_tracker, method, regs.reg_array[method],
                                           argument);
+    }
+    if (VideoCommon::V2::On(VideoCommon::V2::Switch::RegSem)) [[unlikely]] {
+        VideoCommon::V2::RegSem::NoteWrite3D(v2_groups, method, regs.reg_array[method], argument);
     }
     regs.reg_array[method] = argument;
     for (auto const& table : dirty.tables)
@@ -1068,6 +1073,9 @@ void Maxwell3D::ProcessCBMultiData(const u32* start_base, u32 amount) {
     if (VideoCommon::V2::Stats::Enabled()) [[unlikely]] {
         VideoCommon::V2::Stats::NoteConstantData(v2_draw_tracker);
     }
+    if (VideoCommon::V2::On(VideoCommon::V2::Switch::RegSem)) [[unlikely]] {
+        v2_groups.Touch(VideoCommon::V2::RegGroup::CbufData);
+    }
     // Write the input value to the current const buffer at the current position.
     const GPUVAddr buffer_address = regs.const_buffer.Address();
     ASSERT(buffer_address != 0);
@@ -1163,6 +1171,10 @@ struct Maxwell3D::FrontState {
     bool skip_same{}; ///< SkipSameValueWrites() && FrontSkipSame(), read once
     /// The back's draw manager is in an instance loop (DrawMode::Instance): draw.end does nothing.
     bool instance_loop{};
+    /// EDEN_NX2_V2_REGSEM (null when off): groups and fingerprints of these registers (=1), or
+    /// the table-driven copy compared with them (verify).
+    VideoCommon::V2::GroupTracker v2_groups;
+    std::unique_ptr<VideoCommon::V2::RegSem::Front3D> v2;
 };
 
 namespace {
@@ -1243,6 +1255,11 @@ Maxwell3D::FrontState& Maxwell3D::Front(Core::System& system, VideoCommon::GpuSp
         macro_params.clear();
         executing_macro = 0;
         front_macros = true;
+        if (VideoCommon::V2::On(VideoCommon::V2::Switch::RegSem)) [[unlikely]] {
+            front->v2 = std::make_unique<VideoCommon::V2::RegSem::Front3D>();
+            front->v2->mode = VideoCommon::V2::Get(VideoCommon::V2::Switch::RegSem);
+            FrontRegSemResync(*front);
+        }
     }
     return *front;
 }
@@ -1262,6 +1279,109 @@ void Maxwell3D::ReleaseFront() {
 
 void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 method,
                            u32 argument, bool is_last_call, bool from_macro) {
+    if (fs.v2 != nullptr) [[unlikely]] {
+        return FrontWriteRegSem(split, fs, method, argument, is_last_call, from_macro);
+    }
+    FrontWriteV1(split, fs, method, argument, is_last_call, from_macro);
+}
+
+void Maxwell3D::FrontWriteRegSem(VideoCommon::GpuSplit& split, FrontState& fs, u32 method,
+                                 u32 argument, bool is_last_call, bool from_macro) {
+    namespace Profile = VideoCommon::Nx2Profile;
+    namespace RegSem = VideoCommon::V2::RegSem;
+    const RegSem::Table3D& table = RegSem::GetTable3D();
+    if (fs.v2->mode == VideoCommon::V2::Mode::Verify) {
+        // The hand-written mirror decides; the table-driven copy follows and is compared.
+        const u64 before = split.WritePosition();
+        FrontWriteV1(split, fs, method, argument, is_last_call, from_macro);
+        const bool sent = split.WritePosition() != before;
+        const bool table_sent =
+            RegSem::Write3D(*fs.v2->mirror, table, method, argument, from_macro,
+                            [](RegSem::Effect, u32, u32) { return true; });
+        RegSem::CompareWrite3D(*fs.v2, fs, table, method, argument, sent, table_sent);
+        return;
+    }
+    if (Profile::Enabled()) [[unlikely]] {
+        Profile::Add(Profile::Counter::MethodWrites, 1);
+    }
+    if (method == MAXWELL3D_REG_INDEX(shadow_ram_control) && FrontVerifyEnabled()) [[unlikely]] {
+        fs.control_writes[fs.control_count++ % fs.control_writes.size()] = {
+            argument, static_cast<u32>(fs.control), from_macro ? 2U : 1U};
+    }
+    if (!RegSem::Write3D(fs, table, method, argument, from_macro,
+                         [this](RegSem::Effect effect, u32 a, u32 b) {
+                             return FrontRegSemEffect(effect, a, b);
+                         })) {
+        if (Profile::Enabled()) [[unlikely]] {
+            Profile::Add(Profile::Counter::SameValueWrites, 1);
+        }
+        return;
+    }
+    if (from_macro) {
+        split.MacroWrite(this, method, argument);
+    } else {
+        split.Method(this, method, argument, is_last_call, nullptr);
+    }
+    if ((table.flags[method] & RegSem::ReportSemaphore) != 0 &&
+        VideoCommon::V2::Stats::Enabled()) [[unlikely]] {
+        VideoCommon::V2::Stats::NoteReportSemaphore(memory_manager.GetID(), fs.regs.data());
+    }
+}
+
+bool Maxwell3D::FrontRegSemEffect(VideoCommon::V2::RegSem::Effect effect, u32 a, u32 b) {
+    switch (effect) {
+    case VideoCommon::V2::RegSem::Effect::ClearCode:
+        GetNativeMacroEngine().ClearCode(a);
+        return true;
+    case VideoCommon::V2::RegSem::Effect::AddCode:
+        GetNativeMacroEngine().AddCode(a, b);
+        return true;
+    case VideoCommon::V2::RegSem::Effect::Bind: {
+        const auto positions = GetNativeMacroPositions();
+        if (a < positions.size()) {
+            positions[a] = b;
+            return true;
+        }
+        return false;
+    }
+    }
+    return true;
+}
+
+void Maxwell3D::FrontMultiRegSem(FrontState& fs, u32 method, const u32* base_start, u32 amount,
+                                 bool apply) {
+    namespace RegSem = VideoCommon::V2::RegSem;
+    const RegSem::Table3D& table = RegSem::GetTable3D();
+    if (apply) {
+        RegSem::WriteMulti3D(fs, table, method, base_start, amount,
+                             [this](RegSem::Effect effect, u32 a, u32 b) {
+                                 return FrontRegSemEffect(effect, a, b);
+                             });
+        return;
+    }
+    RegSem::WriteMulti3D(*fs.v2->mirror, table, method, base_start, amount,
+                         [](RegSem::Effect, u32, u32) { return true; });
+    RegSem::CompareWrite3D(*fs.v2, fs, table, method, amount != 0 ? base_start[amount - 1] : 0,
+                           true, true);
+}
+
+void Maxwell3D::FrontRegSemResync(FrontState& fs) {
+    // The front's registers were set without the write path (copied, or resynchronized with
+    // the back by EDEN_NX2_SPLIT_VERIFY).
+    if (fs.v2->mode == VideoCommon::V2::Mode::Verify) {
+        if (!fs.v2->mirror) {
+            fs.v2->mirror = std::make_unique<VideoCommon::V2::RegSem::Mirror3D>();
+        }
+        VideoCommon::V2::RegSem::CopyMirror3D(*fs.v2->mirror, fs);
+    } else {
+        fs.v2_groups.valid = false;
+        VideoCommon::V2::RegSem::Rehash3D(fs.v2_groups, fs.regs.data());
+        fs.v2_groups.dirty = VideoCommon::V2::AllGroups;
+    }
+}
+
+void Maxwell3D::FrontWriteV1(VideoCommon::GpuSplit& split, FrontState& fs, u32 method,
+                             u32 argument, bool is_last_call, bool from_macro) {
     namespace Profile = VideoCommon::Nx2Profile;
     // As ProcessShadowRam does on the back.
     u32 value = argument;
@@ -1377,6 +1497,11 @@ void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit
         }
         return;
     }
+    if (fs.v2 != nullptr && fs.v2->mode == VideoCommon::V2::Mode::On) [[unlikely]] {
+        FrontMultiRegSem(fs, method, base_start, amount, true);
+        split.MultiMethod(this, method, base_start, amount, methods_pending, nullptr);
+        return;
+    }
     // What CallMultiMethod does to the registers on the back, then one entry for all the words.
     constexpr u32 cb_data = MAXWELL3D_REG_INDEX(const_buffer.buffer);
     const auto tracked = [&fs] {
@@ -1451,8 +1576,11 @@ void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit
             }
         }
     }
-    split.MultiMethod(this, method, base_start, amount, methods_pending, nullptr);
     fs.sink_pending = false; // The back consumes the sink before a run.
+    if (fs.v2 != nullptr) [[unlikely]] {
+        FrontMultiRegSem(fs, method, base_start, amount, false); // Verify
+    }
+    split.MultiMethod(this, method, base_start, amount, methods_pending, nullptr);
 }
 
 void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split,
@@ -1499,6 +1627,9 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
         }
     }
     fs.parameters.clear();
+    if (fs.v2 != nullptr && fs.v2->mirror) [[unlikely]] {
+        fs.v2->mirror->draw_pending = false;
+    }
     if (fs.draw_pending) {
         fs.draw_pending = false;
         split.Defer([this, system_ptr = &system] { FinishFrontMacro(*system_ptr); },
@@ -1671,7 +1802,11 @@ void Maxwell3D::FrontVerify(VideoCommon::GpuSplit& split, FrontState& fs) {
     if ((checks & 63) == 1) {
         LOG_INFO(HW_GPU, "Split front register checks: {} done, {} differences", checks, differences);
     }
+    if (fs.v2 != nullptr) [[unlikely]] {
+        FrontRegSemResync(fs);
+    }
 }
+
 
 void Maxwell3D::FinishFrontMacro(Core::System& system) {
     // What ProcessMacro and CallMacroMethod do around the macro.

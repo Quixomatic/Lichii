@@ -38,6 +38,7 @@
 #endif
 #include "video_core/rasterizer_interface.h"
 #include "video_core/textures/decoders.h"
+#include "video_core/v2/regsem_3d.h"
 
 namespace Tegra::Engines {
 
@@ -1425,6 +1426,10 @@ struct KeplerCompute::FrontState {
     bool compute_uploaded{};
     u32 bind_pointer{};
     MacroEngine* macro{}; ///< Without a native context: the one macro engine
+    /// EDEN_NX2_V2_REGSEM: the table-driven mirror (=1), or a copy compared with this (verify).
+    VideoCommon::V2::Mode v2_mode{};
+    std::unique_ptr<VideoCommon::V2::RegSem::MirrorCompute> v2_mirror;
+    u64 v2_writes{};
 };
 
 KeplerCompute::FrontState& KeplerCompute::Front(VideoCommon::GpuSplit& split) {
@@ -1441,6 +1446,13 @@ KeplerCompute::FrontState& KeplerCompute::Front(VideoCommon::GpuSplit& split) {
         front->bind_pointer = native_bind_pointer;
         front->macro = native_macro;
         front_macros = true;
+        front->v2_mode = VideoCommon::V2::Get(VideoCommon::V2::Switch::RegSem);
+        if (front->v2_mode == VideoCommon::V2::Mode::Verify) [[unlikely]] {
+            front->v2_mirror = std::make_unique<VideoCommon::V2::RegSem::MirrorCompute>();
+            front->v2_mirror->registers = front->registers;
+            front->v2_mirror->compute_uploaded = front->compute_uploaded;
+            front->v2_mirror->bind_pointer = front->bind_pointer;
+        }
     }
     return *front;
 }
@@ -1458,7 +1470,73 @@ void KeplerCompute::ReleaseFront() {
 }
 
 void KeplerCompute::FrontApply(FrontState& fs, u32 method, u32 argument) {
+    if (fs.v2_mode != VideoCommon::V2::Mode::Off) [[unlikely]] {
+        return FrontApplyRegSem(fs, method, argument);
+    }
+    FrontApplyV1(fs, method, argument);
+}
+
+void KeplerCompute::FrontApplyRegSem(FrontState& fs, u32 method, u32 argument) {
+    namespace RegSem = VideoCommon::V2::RegSem;
+    if (fs.v2_mode == VideoCommon::V2::Mode::On) {
+        RegSem::ApplyCompute(fs, method, argument, [this, &fs](RegSem::Effect effect, u32 a, u32 b) {
+            switch (effect) {
+            case RegSem::Effect::ClearCode:
+                FrontMacroEngine(fs).ClearCode(a);
+                return true;
+            case RegSem::Effect::AddCode:
+                FrontMacroEngine(fs).AddCode(a, b);
+                return true;
+            case RegSem::Effect::Bind:
+                break;
+            }
+            const auto positions = FrontMacroPositions(fs);
+            if (a < positions.size()) {
+                positions[a] = b;
+                return true;
+            }
+            LOG_ERROR(HW_GPU, "Native compute macro bind out of bounds");
+            return false;
+        });
+        return;
+    }
+    // Verify: the hand-written mirror decides, the table-driven copy follows.
+    FrontApplyV1(fs, method, argument);
+    RegSem::MirrorCompute& copy = *fs.v2_mirror;
+    RegSem::ApplyCompute(copy, method, argument, [this, &copy](RegSem::Effect effect, u32 a, u32) {
+        if (effect != RegSem::Effect::Bind) {
+            return true;
+        }
+        const size_t size = native_context ? (copy.compute_uploaded
+                                                  ? native_context->compute_positions.size()
+                                                  : native_context->positions.size())
+                                           : native_macro_positions.size();
+        return a < size;
+    });
+    bool same = copy.registers[method] == fs.registers[method] &&
+                copy.compute_uploaded == fs.compute_uploaded &&
+                copy.bind_pointer == fs.bind_pointer;
+    if (same && (++fs.v2_writes & 4095) == 0) {
+        same = copy.registers == fs.registers;
+    }
+    if (!same) {
+        if (RegSem::ReportMismatch()) {
+            LOG_WARNING(HW_GPU,
+                        "V2 regsem compute write {:#x} = {:#x}: register table {:#x} hand {:#x}, "
+                        "uploaded {} / {}, bind pointer {} / {}",
+                        method, argument, copy.registers[method], fs.registers[method],
+                        copy.compute_uploaded, fs.compute_uploaded, copy.bind_pointer,
+                        fs.bind_pointer);
+        }
+        copy.registers = fs.registers;
+        copy.compute_uploaded = fs.compute_uploaded;
+        copy.bind_pointer = fs.bind_pointer;
+    }
+}
+
+void KeplerCompute::FrontApplyV1(FrontState& fs, u32 method, u32 argument) {
     // As ProcessNativeMethod does with the macro code and bindings.
+
     if (method == 0x45 || method == 0x47) {
         fs.compute_uploaded = true;
     }

@@ -97,6 +97,9 @@ struct DrawTracker {
 
 /// A 3D register write (ProcessDirtyRegisters), before the register takes `value`.
 void NoteWrite(DrawTracker& tracker, u32 method, u32 old_value, u32 value);
+/// A register group hash (V2::GroupTracker, EDEN_NX2_V2_REGSEM) drifted from its registers:
+/// counted with the P0 "hash drift".
+void NoteHashDrift();
 /// Constant buffer data written (any value: the shader sees new data).
 void NoteConstantData(DrawTracker& tracker);
 /// A draw about to be resolved.

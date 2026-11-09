@@ -349,6 +349,10 @@ void Maxwell3D::DrawManager::ProcessDraw(Maxwell3D& maxwell3d, bool draw_indexed
             VideoCommon::V2::Stats::NoteDraw(maxwell3d, static_cast<u32>(draw_state.topology),
                                              draw_indexed, false);
         }
+        if (VideoCommon::V2::On(VideoCommon::V2::Switch::RegSem)) [[unlikely]] {
+            VideoCommon::V2::RegSem::NoteDraw3D(maxwell3d.v2_groups,
+                                                maxwell3d.regs.reg_array.data());
+        }
         const VideoCommon::V2::Stats::DrawScope v2_scope{v2_stats};
         maxwell3d.rasterizer->Draw(draw_indexed, instance_count);
     } else {
@@ -365,6 +369,10 @@ void Maxwell3D::DrawManager::ProcessDrawIndirect(Maxwell3D& maxwell3d) {
         if (v2_stats) [[unlikely]] {
             VideoCommon::V2::Stats::NoteDraw(maxwell3d, static_cast<u32>(draw_state.topology),
                                              indirect_state.is_indexed, true);
+        }
+        if (VideoCommon::V2::On(VideoCommon::V2::Switch::RegSem)) [[unlikely]] {
+            VideoCommon::V2::RegSem::NoteDraw3D(maxwell3d.v2_groups,
+                                                maxwell3d.regs.reg_array.data());
         }
         const VideoCommon::V2::Stats::DrawScope v2_scope{v2_stats};
         maxwell3d.rasterizer->DrawIndirect();

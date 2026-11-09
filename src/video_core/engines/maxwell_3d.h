@@ -29,6 +29,7 @@
 #include "video_core/nx2_fast_draw.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/textures/texture.h"
+#include "video_core/v2/regsem.h"
 #include "video_core/v2/v2_stats.h"
 #include "video_core/engines/maxwell_3d.h"
 
@@ -3166,6 +3167,9 @@ public:
 
     /// EDEN_NX2_V2_STATS: register groups changed since the last draw, state hashes.
     VideoCommon::V2::Stats::DrawTracker v2_draw_tracker;
+    /// EDEN_NX2_V2_REGSEM: register groups changed since the last draw (draw_dirty for the draw
+    /// being resolved) and their fingerprints, kept by the thread executing the methods.
+    VideoCommon::V2::GroupTracker v2_groups;
 
     /// Reads a register value located at the input method address
     u32 GetRegisterValue(u32 method) const;
@@ -3427,6 +3431,16 @@ private:
     void ReleaseFront();
     void FrontWrite(VideoCommon::GpuSplit& split, FrontState& state, u32 method, u32 argument,
                     bool is_last_call, bool from_macro);
+    void FrontWriteV1(VideoCommon::GpuSplit& split, FrontState& state, u32 method, u32 argument,
+                      bool is_last_call, bool from_macro);
+    // EDEN_NX2_V2_REGSEM: the table-driven mirror (v2/regsem_3d.h).
+    void FrontWriteRegSem(VideoCommon::GpuSplit& split, FrontState& state, u32 method,
+                          u32 argument, bool is_last_call, bool from_macro);
+    void FrontMultiRegSem(FrontState& state, u32 method, const u32* base_start, u32 amount,
+                          bool apply);
+    void FrontRegSemResync(FrontState& state);
+    bool FrontRegSemEffect(VideoCommon::V2::RegSem::Effect effect, u32 a, u32 b);
+
     void FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split, FrontState& state);
     void FrontTrackInstanceLoop(FrontState& state, u32 method, u32 value);
     bool FrontSkipsLoopWrite(FrontState& state, u32 method, u32 value, bool shadow_kept);

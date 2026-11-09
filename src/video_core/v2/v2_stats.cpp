@@ -12,10 +12,10 @@
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/gpu_split.h"
 #include "video_core/nx2_profile.h"
+#include "video_core/v2/regsem.h"
 #include "video_core/v2/v2_stats.h"
 
 #define OFF(field_name) MAXWELL3D_REG_INDEX(field_name)
-#define NUM(field_name) (sizeof(::Tegra::Engines::Maxwell3D::Regs::field_name) / (sizeof(u32)))
 
 namespace VideoCommon::V2::Stats {
 
@@ -129,26 +129,10 @@ bool Satisfies(AcquireOp op, u32 word, u32 value) {
 // ---------------------------------------------------------------------------------------------
 // Draws.
 
-enum class Group : u8 {
-    Pipeline, ///< Everything not below: fixed-function and pipeline-key state
-    Viewport,
-    VertexStreams,
-    IndexBuffer,
-    CbufBind,
-    CbufData,
-    TexPools,
-    RenderTargets,
-    Shaders,
-    DrawParams,
-    Misc, ///< Triggers and state no draw reads (semaphores, uploads, clears, macros)
-    Count,
-};
-constexpr size_t NumGroups = static_cast<size_t>(Group::Count);
-
-constexpr std::array<const char*, NumGroups> group_names{
-    "pipeline", "viewport", "vertex streams", "index buffer", "cbuf bind", "cbuf data",
-    "tex pools", "render targets", "shaders", "draw params", "misc",
-};
+// The groups are the register semantics table's (regsem.h).
+using Group = RegGroup;
+constexpr size_t NumGroups = NumRegGroups;
+constexpr const auto& group_names = reg_group_names;
 
 constexpr u32 Bit(Group group) {
     return 1U << static_cast<u32>(group);
@@ -161,102 +145,10 @@ constexpr u32 IgnoredGroups = Bit(Group::DrawParams) | Bit(Group::Misc);
 constexpr u32 LightGroups = IgnoredGroups | Bit(Group::CbufData);
 constexpr u32 LightBindGroups = LightGroups | StreamGroups | Bit(Group::CbufBind);
 
-using GroupTable = std::array<Group, Maxwell3D::Regs::NUM_REGS>;
-
-GroupTable MakeGroupTable() {
-    GroupTable table;
-    table.fill(Group::Pipeline);
-    const auto fill = [&table](size_t begin, size_t count, Group group) {
-        std::fill_n(table.begin() + begin, std::min(count, table.size() - begin), group);
-    };
-    // Methods before 0x80: object binds, notifies, WFI, macro upload, shadow RAM control,
-    // inline-to-memory uploads.
-    fill(0, OFF(run_ds_now), Group::Misc);
-    fill(OFF(invalidate_shader_cache), 1, Group::Misc);
-    fill(OFF(sync_info), 1, Group::Misc);
-    fill(OFF(flush_invalidate_rop_mini_cache), 1, Group::Misc);
-    fill(OFF(decompress_surface), 1, Group::Misc);
-    fill(OFF(peer_semaphore_release), 1, Group::Misc);
-    fill(OFF(statistics_count), 1, Group::Misc);
-    fill(OFF(clear_rect), NUM(clear_rect), Group::Misc);
-    fill(OFF(clear_color), NUM(clear_color), Group::Misc);
-    fill(OFF(clear_depth), 1, Group::Misc);
-    fill(OFF(clear_stencil), 1, Group::Misc);
-    fill(OFF(clear_control), 1, Group::Misc);
-    fill(OFF(clear_surface), 1, Group::Misc);
-    fill(OFF(clear_clip_id_surface), 1, Group::Misc);
-    fill(OFF(clear_report_value), 1, Group::Misc);
-    fill(OFF(invalidate_shader_cache_no_wfi), 1, Group::Misc);
-    fill(OFF(fragment_barrier), 1, Group::Misc);
-    fill(OFF(invalidate_texture_data_cache), 1, Group::Misc);
-    fill(OFF(tiled_cache_barrier), 1, Group::Misc);
-    fill(OFF(invalidate_sampler_cache), 1, Group::Misc);
-    fill(OFF(invalidate_texture_header_cache), 1, Group::Misc);
-    fill(OFF(invalidate_texture_cache_no_wfi), 1, Group::Misc);
-    fill(OFF(invalidate_sampler_cache_lines), 1, Group::Misc);
-    fill(OFF(invalidate_texture_header_cache_lines), 1, Group::Misc);
-    fill(OFF(invalidate_texture_data_cache_lines), 1, Group::Misc);
-    fill(OFF(invalidate_sampler_cache_no_wfi), 1, Group::Misc);
-    fill(OFF(invalidate_texture_header_cache_no_wfi), 1, Group::Misc);
-    fill(OFF(invalidate_zcull), 1, Group::Misc);
-    fill(OFF(render_enable), NUM(render_enable), Group::Misc);
-    fill(OFF(report_semaphore), NUM(report_semaphore), Group::Misc);
-    fill(OFF(falcon), NUM(falcon), Group::Misc);
-    fill(OFF(shadow_scratch), NUM(shadow_scratch), Group::Misc);
-    // Binds are compared at the draw (the bound address comes from the const_buffer registers).
-    fill(OFF(bind_groups), NUM(bind_groups), Group::Misc);
-    fill(OFF(const_buffer), NUM(const_buffer), Group::CbufData);
-
-    fill(OFF(viewport_transform), NUM(viewport_transform), Group::Viewport);
-    fill(OFF(viewports), NUM(viewports), Group::Viewport);
-    fill(OFF(scissor_test), NUM(scissor_test), Group::Viewport);
-    fill(OFF(window_offset_x), 1, Group::Viewport);
-    fill(OFF(window_offset_y), 1, Group::Viewport);
-
-    fill(OFF(vertex_streams), NUM(vertex_streams), Group::VertexStreams);
-    fill(OFF(vertex_stream_limits), NUM(vertex_stream_limits), Group::VertexStreams);
-    fill(OFF(vertex_stream_instances), NUM(vertex_stream_instances), Group::VertexStreams);
-    // start address, limit, format; first and count are draw parameters.
-    fill(OFF(index_buffer), 5, Group::IndexBuffer);
-
-    fill(OFF(tex_header), NUM(tex_header), Group::TexPools);
-    fill(OFF(tex_sampler), NUM(tex_sampler), Group::TexPools);
-    fill(OFF(sampler_binding), NUM(sampler_binding), Group::TexPools);
-    fill(OFF(bindless_texture_const_buffer_slot), 1, Group::TexPools);
-
-    fill(OFF(rt), NUM(rt), Group::RenderTargets);
-    fill(OFF(zeta), NUM(zeta), Group::RenderTargets);
-    fill(OFF(zeta_size), NUM(zeta_size), Group::RenderTargets);
-    fill(OFF(zeta_enable), 1, Group::RenderTargets);
-    fill(OFF(rt_control), 1, Group::RenderTargets);
-    fill(OFF(surface_clip), NUM(surface_clip), Group::RenderTargets);
-    fill(OFF(rt_layer), 1, Group::RenderTargets);
-    fill(OFF(zeta_layer_offset), 1, Group::RenderTargets);
-
-    fill(OFF(pipelines), NUM(pipelines), Group::Shaders);
-    fill(OFF(program_region), NUM(program_region), Group::Shaders);
-
-    fill(OFF(vertex_buffer), NUM(vertex_buffer), Group::DrawParams);
-    fill(OFF(index_buffer) + 5, 2, Group::DrawParams);
-    fill(OFF(index_buffer32_first), OFF(index_buffer8_subsequent) - OFF(index_buffer32_first) + 1,
-         Group::DrawParams);
-    fill(OFF(draw), NUM(draw), Group::DrawParams);
-    fill(OFF(draw_inline_index), 1, Group::DrawParams);
-    fill(OFF(inline_index_2x16), NUM(inline_index_2x16), Group::DrawParams);
-    fill(OFF(inline_index_4x8), NUM(inline_index_4x8), Group::DrawParams);
-    fill(OFF(vertex_array_instance_first), 1, Group::DrawParams);
-    fill(OFF(vertex_array_instance_subsequent), 1, Group::DrawParams);
-    fill(OFF(global_base_vertex_index), 1, Group::DrawParams);
-    fill(OFF(global_base_instance_index), 1, Group::DrawParams);
-    fill(OFF(vertex_id_base), 1, Group::DrawParams);
-    fill(OFF(draw_zero_index), 1, Group::DrawParams);
-    fill(OFF(draw_auto_byte_count), 1, Group::DrawParams);
-    return table;
-}
+using GroupTable = std::array<Group, RegSem::Table3D::NumRegs>;
 
 const GroupTable& Groups() {
-    static const GroupTable table = MakeGroupTable();
-    return table;
+    return RegSem::GetTable3D().groups;
 }
 
 /// Simulated draw cache: direct mapped, fingerprint per slot.
@@ -609,6 +501,10 @@ void NoteWrite(DrawTracker& tracker, u32 method, u32 old_value, u32 value) {
     } else if ((bit & StreamGroups) != 0) {
         tracker.stream_hash ^= delta;
     }
+}
+
+void NoteHashDrift() {
+    ++Draws().hash_drift;
 }
 
 void NoteConstantData(DrawTracker& tracker) {

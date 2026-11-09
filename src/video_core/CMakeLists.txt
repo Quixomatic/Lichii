@@ -123,6 +123,9 @@ add_library(video_core STATIC
     nx2_perf.h
     nx2_download_trace.h
     v2/ir.h
+    v2/regsem.cpp
+    v2/regsem.h
+    v2/regsem_3d.h
     v2/v2_stats.cpp
     v2/v2_stats.h
     v2/v2_switches.cpp
