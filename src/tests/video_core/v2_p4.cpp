@@ -439,3 +439,52 @@ TEST_CASE("V2 P4: recipes compare field by field", "[video_core][v2_p4]") {
     reasons.clear();
     REQUIRE(DC::CompareRecipes(a, c, reasons));
 }
+
+TEST_CASE("V2 P4: buffer recipes compare what a replay would bind", "[video_core][v2_p4]") {
+    using Kind = DC::BufferBind::Kind;
+    DC::BufferBind vb{.stage = 0, .index = 1, .kind = Kind::Cached, .buffer_id = 7,
+                      .generation = 0, .device_addr = 0x1000, .size = 0x400};
+    REQUIRE(vb.Contains(0x1000, 0x400));
+    REQUIRE(vb.Contains(0x1100, 0x100));
+    REQUIRE_FALSE(vb.Contains(0x0ff0, 0x20));
+    REQUIRE_FALSE(vb.Contains(0x1300, 0x200));
+
+    DC::BufferRecipe hit;
+    hit.valid = true;
+    hit.has_index = true;
+    hit.index = {.buffer_id = 3, .device_addr = 0x8000, .size = 0x600};
+    hit.vertex.push_back(vb);
+    hit.uniform.push_back({.stage = 4, .index = 2, .kind = Kind::Version, .buffer_id = 9,
+                           .device_addr = 0x20000, .size = 0x100});
+    REQUIRE(DC::BufferRecipe::Find(hit.uniform, 4, 2) != nullptr);
+    REQUIRE(DC::BufferRecipe::Find(hit.uniform, 4, 3) == nullptr);
+
+    DC::BufferRecipe fresh = hit;
+    std::string reasons;
+    REQUIRE(DC::CompareBufferRecipes(hit, fresh, reasons));
+    REQUIRE(reasons.empty());
+
+    // Fewer indices this draw (a sub-range of the recorded one): same buffer, fine.
+    fresh.index.size = 0x300;
+    REQUIRE(DC::CompareBufferRecipes(hit, fresh, reasons));
+    // A relocated uniform buffer (outside the recorded range): the replay syncs it, not compared.
+    fresh.uniform[0].device_addr = 0x40000;
+    fresh.uniform[0].buffer_id = 11;
+    REQUIRE(DC::CompareBufferRecipes(hit, fresh, reasons));
+    // The full resolve found another buffer for a range the replay would take: a mismatch.
+    fresh.vertex[0].buffer_id = 8;
+    REQUIRE_FALSE(DC::CompareBufferRecipes(hit, fresh, reasons));
+    REQUIRE(reasons.find("buffers (vertex 0:1)") != std::string::npos);
+    // A cached binding the full resolve now streams: a mismatch in path.
+    fresh = hit;
+    fresh.uniform[0].kind = Kind::Cached;
+    reasons.clear();
+    REQUIRE_FALSE(DC::CompareBufferRecipes(hit, fresh, reasons));
+
+    // Clearing a recipe clears its buffers.
+    DC::Recipe recipe;
+    recipe.buffers = hit;
+    recipe.Clear();
+    REQUIRE_FALSE(recipe.buffers.valid);
+    REQUIRE(recipe.buffers.vertex.empty());
+}

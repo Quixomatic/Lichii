@@ -12,6 +12,7 @@
 #include <catch2/generators/catch_generators.hpp>
 
 #include "common/page_table.h"
+#include "common/scope_exit.h"
 #include "core/core.h"
 #include "core/device_memory.h"
 #include "core/hle/kernel/k_process.h"
@@ -23,6 +24,9 @@
 #include "video_core/control/channel_state.h"
 #include "video_core/gpu.h"
 #include "video_core/renderer_null/null_rasterizer.h"
+#include "video_core/v2/draw_cache.h"
+#include "video_core/v2/v2_switches.h"
+#include "video_core/v2/versions.h"
 
 namespace {
 
@@ -129,13 +133,50 @@ struct Runtime {
         ++host_read_barriers;
         Finish();
     }
-    void BindUniformBuffer(Buffer&, u32, u32) {}
+    void BindUniformBuffer(Buffer&, u32, u32) {
+        ++uniform_binds;
+    }
     std::span<u8> BindMappedUniformBuffer(size_t, u32, u32 size) {
         stream.resize(size);
+        ++stream_copies;
+        last_ref = StreamUniformRef{stream_copies};
         return stream;
     }
+    // Stream uniform references (P3 versions, P4 buffer replay).
+    struct StreamUniformRef {
+        u32 serial;
+    };
+    StreamUniformRef LastStreamUniformRef() const {
+        return last_ref;
+    }
+    void RebindStreamUniform(const StreamUniformRef&, u32) {
+        ++stream_rebinds;
+    }
+    u64 CurrentTick() const {
+        return current_tick;
+    }
+    void ClearBuffer(Buffer&, u64, u64, u32) {}
+    void CopyBuffer(Buffer& dst, Buffer& src, std::span<const VideoCommon::BufferCopy> copies, bool) {
+        for (const auto& copy : copies) {
+            std::memcpy(dst.bytes.data() + copy.dst_offset, src.bytes.data() + copy.src_offset,
+                        copy.size);
+        }
+    }
+    bool AnyVertexRepacked() const {
+        return false;
+    }
+    bool WidensUint8IndicesOnHost() const {
+        return false;
+    }
+    void BindStorageBuffer(Buffer&, u32, u32, bool) {
+        ++storage_binds;
+    }
+    void BindTextureBuffer(Buffer&, u32, u32, VideoCore::Surface::PixelFormat) {}
 
     u32 alignment{256};
+    u32 uniform_binds{}, stream_copies{}, stream_rebinds{}, storage_binds{};
+    u64 current_tick{1};
+    StreamUniformRef last_ref{};
     u32 allocations{}, downloads{}, uploads{}, finishes{}, waits{};
     u32 host_read_barriers{};
     u64 upload_bytes{}, waited_tick{};
@@ -228,6 +269,17 @@ struct BufferCacheTestAccess {
         cache.gpu_memory = &channel.gpu_memory;
         channel.uniform_buffers[0][0] = {.device_addr = address, .size = size, .buffer_id = id};
         cache.BindHostGraphicsUniformBuffer(0, 0, 0, true);
+    }
+    static void UseChannel(Cache& cache, BufferCacheChannelInfo& channel) {
+        cache.channel_state = &channel;
+        cache.maxwell3d = &channel.maxwell3d;
+        cache.gpu_memory = &channel.gpu_memory;
+    }
+    static void BindStage(Cache& cache) {
+        cache.BindHostStageBuffers(0);
+    }
+    static void MarkCpuModifiedSilently(Cache& cache, DAddr address, u64 size) {
+        cache.memory_tracker.MarkRegionAsCpuModified(address, size);
     }
     static void NextFrame(Cache& cache) {
         cache.native_indirect_uniforms_this_frame.clear();
@@ -626,4 +678,73 @@ TEST_CASE("Downloads keep CPU writes collected and not yet applied", "[buffer_po
     REQUIRE(f.bytes[0x20ff7] == 0x34);
     REQUIRE(std::all_of(f.bytes + 0x20ff8, f.bytes + 0x21008, [](u8 b) { return b == 0xee; }));
     REQUIRE(f.bytes[0x21008] == 0x34);
+}
+
+TEST_CASE("Draw cache buffer replay binds unchanged cached uniforms without syncing",
+          "[buffer_ports][v2_p4]") {
+    namespace V2 = VideoCommon::V2;
+    const auto saved = V2::g_modes;
+    V2::g_modes[static_cast<size_t>(V2::Switch::DrawCache)] = V2::Mode::On;
+    SCOPE_EXIT {
+        V2::g_modes = saved;
+    };
+    Fixture f;
+    Tegra::Control::ChannelState state{0};
+    state.memory_manager = &*f.memory;
+    state.payload.emplace(f.system, *f.memory, state);
+    VideoCommon::BufferCacheChannelInfo channel{state};
+    VideoCommon::UniformBufferSizes sizes{};
+    sizes[0][0] = 0x2000; // over the skip-cache size: the cached path
+    channel.uniform_buffer_sizes = &sizes;
+    channel.enabled_uniform_buffer_masks[0] = 1;
+    const auto id = Access::Add(*f.cache, 0x20000, 0x10000);
+    Access::UseChannel(*f.cache, channel);
+    channel.uniform_buffers[0][0] = {.device_addr = 0x20000, .size = 0x2000, .buffer_id = id};
+    V2::Versions::EpochMemo memo{V2::Versions::Pages(), V2::Versions::Stream(),
+                                 V2::Versions::Epochs()};
+
+    // A resolve: the guest wrote the range, the bind uploads it; the recipe records it.
+    std::memset(f.bytes + 0x10000, 0x11, 0x2000);
+    f.cache->WriteMemory(0x20000, 0x2000);
+    const u64 stamp = V2::Versions::Pages().Stamp();
+    Access::BindStage(*f.cache);
+    REQUIRE(f.runtime.uploads == 1);
+    REQUIRE(f.runtime.uniform_binds == 1);
+    V2::DrawCache::BufferRecipe recipe;
+    f.cache->RecordGraphicsBuffers(recipe, false, stamp);
+    REQUIRE(recipe.valid);
+    REQUIRE(recipe.uniform.size() == 1);
+    REQUIRE(recipe.uniform[0].kind == V2::DrawCache::BufferBind::Kind::Cached);
+    REQUIRE(f.cache->CountStaleRecipeRanges(recipe, memo) == 0);
+
+    // A replay with nothing written: bound from the recipe, no upload.
+    f.cache->ReplayHostStageBuffers(0, recipe, memo);
+    REQUIRE(f.runtime.uploads == 1);
+    REQUIRE(f.runtime.uniform_binds == 2);
+    REQUIRE(f.cache->TakeReplayCounts() == std::pair<u32, u32>{1, 0});
+
+    // A guest write (any path that marks it CPU-modified moves its version): synced again.
+    f.bytes[0x10010] = 0x22;
+    f.cache->WriteMemory(0x20010, 4);
+    f.cache->ReplayHostStageBuffers(0, recipe, memo);
+    REQUIRE(f.runtime.uploads == 2);
+    REQUIRE(Access::Get(*f.cache, id).bytes[0x10] == 0x22);
+    REQUIRE(f.cache->TakeReplayCounts() == std::pair<u32, u32>{0, 1});
+
+    // Recorded again after the sync (new stamp): replayed again.
+    const u64 restamp = V2::Versions::Pages().Stamp();
+    f.cache->RecordGraphicsBuffers(recipe, false, restamp);
+    f.cache->ReplayHostStageBuffers(0, recipe, memo);
+    REQUIRE(f.runtime.uploads == 2);
+    REQUIRE(f.cache->TakeReplayCounts() == std::pair<u32, u32>{1, 0});
+
+    // A rebound buffer (other range) takes the existing path.
+    channel.uniform_buffers[0][0] = {.device_addr = 0x24000, .size = 0x2000, .buffer_id = id};
+    f.cache->ReplayHostStageBuffers(0, recipe, memo);
+    REQUIRE(f.cache->TakeReplayCounts() == std::pair<u32, u32>{0, 1});
+    channel.uniform_buffers[0][0] = {.device_addr = 0x20000, .size = 0x2000, .buffer_id = id};
+
+    // Verify's byte check: CPU-modified behind unchanged versions is counted as stale.
+    Access::MarkCpuModifiedSilently(*f.cache, 0x20000, 0x1000);
+    REQUIRE(f.cache->CountStaleRecipeRanges(recipe, memo) == 1);
 }
