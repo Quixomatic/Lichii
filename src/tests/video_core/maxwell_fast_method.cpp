@@ -1117,6 +1117,49 @@ TEST_CASE("V2 register groups: compare-on-write and incremental fingerprints",
     REQUIRE(RegSem::Rehash3D(check, mirror->regs.data()) == 0);
 }
 
+namespace {
+/// A mirror whose group hashes wait in a HashLog3D, as the front's FrontState keeps them.
+struct LoggedMirror3D : VideoCommon::V2::RegSem::Mirror3D {
+    VideoCommon::V2::RegSem::HashLog3D v2_hash_log;
+};
+} // Anonymous namespace
+
+TEST_CASE("V2 deferred group hashes equal the per-write ones at every fold",
+          "[video_core][v2_regsem]") {
+    namespace RegSem = VideoCommon::V2::RegSem;
+    Fixture f; // Constructs a Maxwell3D, which builds the table.
+    const RegSem::Table3D& table = RegSem::GetTable3D();
+    auto eager = std::make_unique<RegSem::Mirror3D>();
+    auto logged = std::make_unique<LoggedMirror3D>();
+    eager->skip_same = true;
+    logged->skip_same = true;
+    RegSem::Rehash3D(eager->v2_groups, eager->regs.data());
+    RegSem::Rehash3D(logged->v2_groups, logged->regs.data());
+    const auto none = [](RegSem::Effect, u32, u32) { return true; };
+    std::mt19937 rng{11};
+    for (u32 round = 0; round < 200; ++round) {
+        // Few values, so registers often change back; long rounds overflow the log.
+        const u32 writes = rng() % 2 == 0 ? rng() % 16 : 1000;
+        for (u32 i = 0; i < writes; ++i) {
+            const u32 method = f.state_methods[rng() % f.state_methods.size()];
+            const u32 value = static_cast<u32>(rng() % 3);
+            REQUIRE(RegSem::Write3D(*eager, table, method, value, false, none) ==
+                    RegSem::Write3D(*logged, table, method, value, false, none));
+        }
+        // The dirty bits never wait; the hashes match after a fold.
+        REQUIRE(logged->v2_groups.dirty == eager->v2_groups.dirty);
+        logged->v2_hash_log.Fold(logged->v2_groups, table, logged->regs.data());
+        REQUIRE(logged->v2_hash_log.Size() == 0);
+        REQUIRE(logged->v2_groups.hashes == eager->v2_groups.hashes);
+        REQUIRE(logged->v2_groups.Fingerprint(VideoCommon::V2::HashedGroups) ==
+                eager->v2_groups.Fingerprint(VideoCommon::V2::HashedGroups));
+        eager->v2_groups.TakeDirty();
+        logged->v2_groups.TakeDirty();
+    }
+    VideoCommon::V2::GroupTracker check = logged->v2_groups;
+    REQUIRE(RegSem::Rehash3D(check, logged->regs.data()) == 0);
+}
+
 TEST_CASE("V2 typed records run on the back without thunks, as their deferred calls do",
           "[video_core][gpu_split_dispatch][v2_ir]") {
     using Access = VideoCommon::GpuSplitTestAccess;

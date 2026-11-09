@@ -95,12 +95,24 @@ inline void NoteCbufBind3D(State& s, u32 method) {
     }
 }
 
+#if defined(_MSC_VER) && !defined(__clang__)
+#define REGSEM_FORCE_INLINE __forceinline
+#else
+#define REGSEM_FORCE_INLINE inline __attribute__((always_inline))
+#endif
+
+/// States with a `v2_hash_log` (the front's FrontState) defer the group hashes to the log's
+/// Fold (HashLog3D); the others (verify mirrors, tests) update them per write.
 template <typename State>
-void Store3D(State& s, const Table3D& table, u32 index, u32 value) {
+REGSEM_FORCE_INLINE void Store3D(State& s, const Table3D& table, u32 index, u32 value) {
     const u32 old_value = s.regs[index];
     if (old_value != value) {
         s.regs[index] = value;
-        s.v2_groups.Change(table.groups[index], index, old_value, value);
+        if constexpr (requires { s.v2_hash_log; }) {
+            s.v2_hash_log.Change(s.v2_groups, table, index, old_value, s.regs.data());
+        } else {
+            s.v2_groups.Change(table.groups[index], index, old_value, value);
+        }
     }
 }
 
@@ -108,8 +120,8 @@ void Store3D(State& s, const Table3D& table, u32 index, u32 value) {
 /// (compare-on-write: no dirty bit, no ring entry), updates the registers, the groups and the
 /// back-side effects the mirror must reproduce. Returns whether the write goes to the back.
 template <typename State, typename Effects>
-bool Write3D(State& s, const Table3D& table, u32 method, u32 argument, bool from_macro,
-             Effects&& effects) {
+REGSEM_FORCE_INLINE bool Write3D(State& s, const Table3D& table, u32 method, u32 argument,
+                                 bool from_macro, Effects&& effects) {
     bool shadow_kept = true;
     const u32 value = ApplyShadow3D(s.control, s.shadow.data(), method, argument, &shadow_kept);
     const u16 flags = table.flags[method];

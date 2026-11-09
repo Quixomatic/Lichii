@@ -3456,6 +3456,8 @@ private:
     // EDEN_NX2_V2_REGSEM: the table-driven mirror (v2/regsem_3d.h).
     void FrontWriteRegSem(VideoCommon::GpuSplit& split, FrontState& state, u32 method,
                           u32 argument, bool is_last_call, bool from_macro);
+    void FrontWriteRegSemOn(VideoCommon::GpuSplit& split, FrontState& state, u32 method,
+                            u32 argument, bool is_last_call, bool from_macro);
     void FrontMultiRegSem(FrontState& state, u32 method, const u32* base_start, u32 amount,
                           bool apply);
     void FrontRegSemResync(FrontState& state);

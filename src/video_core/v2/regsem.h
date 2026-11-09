@@ -249,6 +249,65 @@ struct Table3D {
     u32 shadow_control{}; ///< shadow_ram_control: its shadow copy is the shadow RAM mode
 };
 
+/// Deferred group hashing for the split front's register mirror (Maxwell3D's FrontState with
+/// EDEN_NX2_V2_REGSEM=1; Perf fix D). A write that changes a register sets its group's dirty bit
+/// at once; for a hashed group it only logs the register's old value, the first time it changes
+/// after a fold. Fold brings every logged register into its group hash before anything reads
+/// the hashes (Draw records, P6 snapshots). XOR is order-free and a register changed several
+/// times between folds contributes mix(old) ^ mix(newest), so after a fold the hashes are the
+/// ones GroupTracker::Change would have kept per write.
+struct HashLog3D {
+    static constexpr u32 Capacity = 256;
+
+    /// `regs[index]` (already stored) changed from `old_value`.
+    void Change(GroupTracker& tracker, const Table3D& table, u32 index, u32 old_value,
+                const u32* regs) {
+        const u32 bit = GroupBit(table.groups[index]);
+        tracker.dirty |= bit;
+        if ((bit & HashedGroups) == 0) {
+            return;
+        }
+        u64& word = logged[index >> 6];
+        const u64 mask = u64{1} << (index & 63);
+        if ((word & mask) != 0) {
+            return;
+        }
+        word |= mask;
+        entries[count++] = Entry{index, old_value};
+        if (count == Capacity) [[unlikely]] {
+            Fold(tracker, table, regs);
+        }
+    }
+    /// The logged changes into `tracker`'s hashes; `regs` holds the newest values.
+    void Fold(GroupTracker& tracker, const Table3D& table, const u32* regs) {
+        for (u32 i = 0; i < count; ++i) {
+            const Entry entry = entries[i];
+            tracker.hashes[static_cast<size_t>(table.groups[entry.index])] ^=
+                MixRegister(entry.index, entry.old_value) ^
+                MixRegister(entry.index, regs[entry.index]);
+            logged[entry.index >> 6] &= ~(u64{1} << (entry.index & 63));
+        }
+        count = 0;
+    }
+    /// Forgets the log (the hashes were recomputed from the registers).
+    void Clear() {
+        logged.fill(0);
+        count = 0;
+    }
+    [[nodiscard]] u32 Size() const {
+        return count;
+    }
+
+private:
+    struct Entry {
+        u32 index;
+        u32 old_value;
+    };
+    std::array<u64, (Table3D::NumRegs + 63) / 64> logged{};
+    std::array<Entry, Capacity> entries{};
+    u32 count{};
+};
+
 /// EDEN_NX2_V2_REGSEM=verify on the executing Maxwell3D: the registers as the table-driven
 /// update function alone makes them (no side effects), compared with the engine's after each
 /// write (regsem_3d.h DryWrite3D / CompareBackWrite3D).
