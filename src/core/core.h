@@ -123,6 +123,11 @@ extern std::atomic<u64> g_nx2_present_count;
 /// server runs (g_nx2_present_time_services: debug services alive), for its frame_times tool.
 extern std::array<std::atomic<u64>, 4096> g_nx2_present_times_ns;
 extern std::atomic<u32> g_nx2_present_time_services;
+/// P5b: microseconds the guest's present waited on GPU fences since the renderer last took them
+/// (EDEN_NX2_V2_ADAPTSUBMIT's fast-flush mode), and the frames-ahead setting vi2 applied last
+/// (-1 automatic, 0, 1; EDEN_NX2_V2_PRESENTPACE).
+extern std::atomic<u64> g_nx2_guest_sync_wait_us;
+extern std::atomic<int> g_nx2_frames_ahead;
 
 class CpuManager;
 class Debugger;

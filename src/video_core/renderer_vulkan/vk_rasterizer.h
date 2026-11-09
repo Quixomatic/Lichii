@@ -27,6 +27,7 @@
 #include "video_core/renderer_vulkan/vk_descriptor_buffer.h"
 #include "video_core/renderer_vulkan/vk_descriptor_pool.h"
 #include "video_core/renderer_vulkan/vk_draw_cache.h"
+#include "video_core/v2/flush_heuristic.h"
 #include "video_core/v2/commit.h"
 #include "video_core/renderer_vulkan/vk_fence_manager.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
@@ -246,7 +247,13 @@ private:
     std::array<VAddr, 6> shader_write_addresses{};
     const GraphicsPipeline* shader_write_pipeline{};
 
-    void FlushWork();
+    void FlushWork(u32 cost = 1);
+
+    /// EDEN_NX2_V2_ADAPTSUBMIT: FlushWork's adaptive form.
+    void AdaptiveFlushWork(u32 cost);
+
+    /// A hint for the adaptive submission heuristic (no-op unless EDEN_NX2_V2_ADAPTSUBMIT).
+    void FlushHint(VideoCommon::V2::FlushHint hint);
 
     void TraceRenderState(bool is_indexed, const char* outcome, const Framebuffer* framebuffer);
 
@@ -338,6 +345,9 @@ private:
     boost::container::static_vector<VkSampler, MAX_TEXTURES> sampler_handles;
 
     u32 draw_counter = 0;
+    /// EDEN_NX2_V2_ADAPTSUBMIT
+    bool adapt_submit = false;
+    VideoCommon::V2::FlushHeuristic flush_heuristic;
 #ifdef EGLANTINE_STREAMLINE
     std::optional<u64> oot_camera_sample_frame;
     struct OcarinaMotionTrace {

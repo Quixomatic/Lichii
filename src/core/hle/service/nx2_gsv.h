@@ -1859,6 +1859,11 @@ private:
         m_previous_fence_id = ~w[22];
         m_previous_fence_value = w[24];
         const auto waited = std::chrono::steady_clock::now();
+        Core::g_nx2_guest_sync_wait_us.fetch_add(
+            static_cast<u64>(
+                std::chrono::duration_cast<std::chrono::microseconds>(waited - entered).count()),
+            std::memory_order_relaxed);
+        Core::g_nx2_frames_ahead.store(frames_ahead, std::memory_order_relaxed);
         Composite(w[5], ~w[22], w[24], w[7]);
         const auto composited = std::chrono::steady_clock::now();
         PaceToVblank(w[12], ctx.GetThread().GetOwnerProcess());

@@ -63,7 +63,9 @@
 #include "video_core/renderer_vulkan/vk_bindless_heap.h"
 #include "video_core/v2/cbuf_version.h"
 #include "video_core/v2/continued_draw.h"
+#include "core/core.h"
 #include "video_core/v2/p3_stats.h"
+#include "video_core/v2/p5b_stats.h"
 #include "video_core/v2/regsem.h"
 #include "video_core/v2/shader_writes.h"
 #include "video_core/v2/v2_stats.h"
@@ -436,6 +438,8 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
     VideoCommon::GpuSplit::Get().SetIdleHook(
         [](void* argument) { static_cast<Scheduler*>(argument)->FlushDeferred(); },
         &scheduler);
+    // EDEN_NX2_V2_ADAPTSUBMIT: adaptive submission for native titles (FlushWork).
+    adapt_submit = VideoCommon::V2::On(VideoCommon::V2::Switch::AdaptSubmit);
     if (VideoCommon::V2::On(VideoCommon::V2::Switch::Bindless)) [[unlikely]] {
         bindless_heap = BindlessHeap::Create(device, scheduler);
     }
@@ -2466,7 +2470,7 @@ void RasterizerVulkan::DispatchCompute() {
             CommitBindsAfterDraw();
         }
     };
-    FlushWork();
+    FlushWork(4); // DXVK's cost estimate: a dispatch weighs 4 draws
     gpu_memory->FlushCaching();
     if (frame_dump.Capturing()) {
         frame_dump.EndPass();
@@ -2745,6 +2749,10 @@ void RasterizerVulkan::ResetCounter(VideoCommon::QueryType type) {
 void RasterizerVulkan::Query(GPUVAddr gpu_addr, VideoCommon::QueryType type,
                              VideoCommon::QueryPropertiesFlags flags, u32 payload, u32 subreport) {
     query_cache.CounterReport(gpu_addr, type, flags, payload, subreport);
+    if (adapt_submit) [[unlikely]] {
+        // A release or report: something the guest (or another channel) waits on.
+        FlushHint(VideoCommon::V2::FlushHint::Strong);
+    }
 }
 
 void RasterizerVulkan::BindGraphicsUniformBuffer(size_t stage, u32 index, GPUVAddr gpu_addr,
@@ -3858,6 +3866,12 @@ void RasterizerVulkan::FrameDumpPass(const Framebuffer* framebuffer) {
 }
 
 void RasterizerVulkan::TickFrame() {
+    VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::Frames);
+    if (adapt_submit) [[unlikely]] {
+        flush_heuristic.NoteGuestSyncWait(
+            Core::g_nx2_guest_sync_wait_us.exchange(0, std::memory_order_relaxed));
+        flush_heuristic.NoteFrame();
+    }
     if (VideoCore::Nx2Debug::HasRequests()) {
         if (auto capture = VideoCore::Nx2Debug::TakeCapture()) {
             frame_dump.Arm(std::move(capture->directory), capture->sampled, capture->buffers,
@@ -4184,7 +4198,83 @@ void RasterizerVulkan::LoadDiskResources(u64 title_id, std::stop_token stop_load
     pipeline_cache.LoadDiskResources(title_id, stop_loading, callback);
 }
 
-void RasterizerVulkan::FlushWork() {
+void RasterizerVulkan::FlushHint(VideoCommon::V2::FlushHint hint) {
+    if (!adapt_submit) {
+        return;
+    }
+    flush_heuristic.Hint(hint);
+    if (hint >= VideoCommon::V2::FlushHint::Strong) {
+        // Work the guest reads back or waits on: submit now when enough is recorded or the GPU
+        // is about to go idle (DXVK's strong hint), instead of waiting for a chunk boundary.
+        auto& master = scheduler.GetMasterSemaphore();
+        const u64 current = master.CurrentTick();
+        const u64 done = master.KnownGpuTick();
+        const u32 pending = static_cast<u32>(current > done + 1 ? current - done - 1 : 0);
+        if (flush_heuristic.WantsFlushNow(pending)) {
+            scheduler.Flush();
+            pending_native_work = false;
+            flush_heuristic.NoteSubmit(static_cast<u64>(
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch())
+                    .count()));
+            VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::FlushStrong);
+        }
+    }
+}
+
+void RasterizerVulkan::AdaptiveFlushWork(u32 cost) {
+    // P5b: DXVK's GpuFlushTracker + Ryujinx's AutoFlushCounter in place of 128 draws per submit.
+    // The clock and the GPU progress are read only at chunk boundaries (and in fast-flush mode).
+    namespace P5b = VideoCommon::V2::P5bStats;
+    const auto& params = flush_heuristic.Params();
+    const u32 next = flush_heuristic.Draws() + 1;
+    const bool boundary = next % params.chunk_draws == 0 || next >= params.max_draws ||
+                          flush_heuristic.FastMode();
+    u64 now_us = 0;
+    u32 pending = 1;
+    if (boundary) {
+        now_us = static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                      std::chrono::steady_clock::now().time_since_epoch())
+                                      .count());
+        auto& master = scheduler.GetMasterSemaphore();
+        master.Refresh();
+        const u64 current = master.CurrentTick();
+        const u64 done = master.KnownGpuTick();
+        pending = static_cast<u32>(current > done + 1 ? current - done - 1 : 0);
+    }
+    const auto decision = flush_heuristic.Advance(cost, pending, now_us);
+    P5b::Add(P5b::Counter::SubmitDraws);
+    switch (decision.action) {
+    case VideoCommon::V2::FlushAction::None:
+        break;
+    case VideoCommon::V2::FlushAction::Dispatch:
+        scheduler.DispatchWork();
+        break;
+    case VideoCommon::V2::FlushAction::Flush:
+        scheduler.Flush();
+        pending_native_work = false;
+        if (P5b::Enabled()) {
+            using H = VideoCommon::V2::FlushHeuristic;
+            static constexpr std::array<P5b::Counter, H::ReasonCount> counters{
+                P5b::Counter::FlushOther,    P5b::Counter::FlushMax,    P5b::Counter::FlushCost,
+                P5b::Counter::FlushIdle,     P5b::Counter::FlushPending, P5b::Counter::FlushStrong,
+                P5b::Counter::FlushWeak,     P5b::Counter::FlushInterval, P5b::Counter::FlushFast,
+            };
+            P5b::Add(counters[decision.reason < counters.size() ? decision.reason : 0]);
+        }
+        return;
+    }
+    pending_native_work = true;
+}
+
+void RasterizerVulkan::FlushWork(u32 cost) {
+    if (adapt_submit && gpu_memory->UsesNativeTiling()) [[unlikely]] {
+        AdaptiveFlushWork(cost);
+        return;
+    }
+    if (VideoCommon::V2::P5bStats::Enabled()) [[unlikely]] {
+        VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::SubmitDraws);
+    }
 #ifdef __ANDROID__
     static constexpr bool android = true;
 #else
