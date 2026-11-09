@@ -127,6 +127,9 @@ class QuadStripIndexBuffer;
 class BufferCacheRuntime {
     friend Buffer;
 
+    /// EDEN_NX2_V2_XFERQ: CanReorderUpload's answer for the CopyBuffer that follows it.
+    bool reorder_to_transfer = false;
+
     using PrimitiveTopology = Tegra::Engines::Maxwell3D::Regs::PrimitiveTopology;
     using IndexFormat = Tegra::Engines::Maxwell3D::Regs::IndexFormat;
 

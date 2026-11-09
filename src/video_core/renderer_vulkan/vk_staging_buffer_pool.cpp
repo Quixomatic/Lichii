@@ -104,6 +104,7 @@ StagingBufferPool::StagingBufferPool(const Device& device_, MemoryAllocator& mem
     if (device.IsExtTransformFeedbackSupported()) {
         stream_ci.usage |= VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_BUFFER_BIT_EXT;
     }
+    device.ApplyTransferSharing(stream_ci); // EDEN_NX2_V2_XFERQ
     if (device.IsBufferDeviceAddressSupported()) {
         stream_ci.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
     }
@@ -237,6 +238,7 @@ StagingBufferRef StagingBufferPool::CreateStagingBuffer(size_t size, MemoryUsage
         .queueFamilyIndexCount = 0,
         .pQueueFamilyIndices = nullptr,
     };
+    device.ApplyTransferSharing(buffer_ci); // EDEN_NX2_V2_XFERQ
     if (device.IsExtTransformFeedbackSupported()) {
         buffer_ci.usage |= VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_BUFFER_BIT_EXT;
     }

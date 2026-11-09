@@ -438,6 +438,11 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
     VideoCommon::GpuSplit::Get().SetIdleHook(
         [](void* argument) { static_cast<Scheduler*>(argument)->FlushDeferred(); },
         &scheduler);
+    if (scheduler.HasTransferQueue()) {
+        // EDEN_NX2_V2_XFERQ: host-level sync positions become timeline joins on the back.
+        VideoCommon::GpuSplit::SetTransferJoinHook(
+            [](void* self) { static_cast<Scheduler*>(self)->NoteAcquireJoin(); }, &scheduler);
+    }
     // EDEN_NX2_V2_ADAPTSUBMIT: adaptive submission for native titles (FlushWork).
     adapt_submit = VideoCommon::V2::On(VideoCommon::V2::Switch::AdaptSubmit);
     if (VideoCommon::V2::On(VideoCommon::V2::Switch::Bindless)) [[unlikely]] {
@@ -472,6 +477,7 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
 
 RasterizerVulkan::~RasterizerVulkan() {
     VideoCommon::GpuSplit::Get().SetIdleHook(nullptr, nullptr);
+    VideoCommon::GpuSplit::SetTransferJoinHook(nullptr, nullptr);
     scheduler.WaitWorker();
     scheduler.Finish();
     // Its watched pages leave the write tracking while the caches still exist.

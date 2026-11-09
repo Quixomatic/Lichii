@@ -204,6 +204,12 @@ public:
     }
     /// Any thread, EDEN_NX2_V2_CPULANE: has the back run `hook` after its current entry (or at
     /// once if it waits for work).
+    /// EDEN_NX2_V2_XFERQ: run on the back at every host-level sync position (NoteSync). Set by
+    /// the renderer before the split starts.
+    static void SetTransferJoinHook(void (*hook)(void*), void* argument) {
+        transfer_join_hook = hook;
+        transfer_join_argument = argument;
+    }
     void SetCpuLaneHook(void (*hook)(void*), void* argument) {
         cpu_lane_hook = hook;
         cpu_lane_argument = argument;
@@ -412,6 +418,19 @@ public:
     void NoteSync() {
         IrCut();
         last_sync_position = write_position;
+        if (transfer_join_hook != nullptr) [[unlikely]] {
+            // EDEN_NX2_V2_XFERQ (MASTER_PLAN §6, multi-queue caveat): class B ordered work by the
+            // one in-order host queue; with a transfer queue the back turns this position into a
+            // timeline join (later transfer work waits for the graphics work before it).
+            struct Join {
+                void (*hook)(void*);
+                void* argument;
+                void operator()() const {
+                    hook(argument);
+                }
+            };
+            Defer(Join{transfer_join_hook, transfer_join_argument});
+        }
         if (tracks_writes) [[unlikely]] {
             hazards.NoteSync(write_position);
         }
@@ -663,6 +682,8 @@ private:
     /// the publish part of 62db242b34 (jpkto, PR #805) via a20471e48c.
     alignas(128) std::atomic<u64> back_idle_at{~u64{0}};
     std::jthread back_thread;
+    static inline void (*transfer_join_hook)(void*) = nullptr;
+    static inline void* transfer_join_argument = nullptr;
 };
 
 } // namespace VideoCommon

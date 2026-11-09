@@ -28,6 +28,8 @@
 #include "shader_recompiler/exception.h"
 
 #include <atomic>
+#include "video_core/v2/p5b_stats.h"
+#include "video_core/renderer_vulkan/vk_submit_engine.h"
 #include "video_core/gpu_logging/gpu_logging.h"
 #include "video_core/nx2.h"
 #include "video_core/render_trace.h"
@@ -1660,6 +1662,8 @@ void TextureCacheRuntime::CopyByteAddressedShadow(vk::CommandBuffer cmdbuf,
 
 void TextureCacheRuntime::ReinterpretImage(Image& dst, Image& src,
                                            std::span<const VideoCommon::ImageCopy> copies) {
+    dst.NoteV2Use();
+    src.NoteV2Use();
     boost::container::small_vector<VideoCommon::ImageCopy, 16> host_copies;
     copies = HostImageCopies(dst, src, copies, host_copies);
     if (copies.empty())
@@ -2572,6 +2576,8 @@ bool TextureCacheRuntime::IsFormatScalable(PixelFormat format) {
 
 void TextureCacheRuntime::CopyImage(Image& dst, Image& src,
                                     std::span<const VideoCommon::ImageCopy> copies) {
+    dst.NoteV2Use();
+    src.NoteV2Use();
     boost::container::small_vector<VideoCommon::ImageCopy, 16> host_copies;
     copies = HostImageCopies(dst, src, copies, host_copies);
     if (copies.empty())
@@ -2692,6 +2698,8 @@ void TextureCacheRuntime::CopyImage(Image& dst, Image& src,
 
 void TextureCacheRuntime::CopyImageMSAA(Image& dst, Image& src,
                                         std::span<const VideoCommon::ImageCopy> copies) {
+    dst.NoteV2Use();
+    src.NoteV2Use();
     boost::container::small_vector<VideoCommon::ImageCopy, 16> host_copies;
     copies = HostImageCopies(dst, src, copies, host_copies);
     if (copies.empty())
@@ -3217,6 +3225,10 @@ void Image::UploadMemory(VkBuffer buffer, VkDeviceSize offset,
         return;
     }
 
+    if (!is_rescaled && v2_staging_upload && scheduler->HasTransferQueue() &&
+        TryTransferUpload(buffer, offset, copies)) [[unlikely]] {
+        return;
+    }
     scheduler->RequestOutsideRenderPassOperationContext();
     auto vk_copies = TransformBufferImageCopies(copies, offset, aspect_mask);
     const VkBuffer src_buffer = buffer;
@@ -3228,14 +3240,135 @@ void Image::UploadMemory(VkBuffer buffer, VkDeviceSize offset,
                        vk_copies](vk::CommandBuffer cmdbuf) {
         CopyBufferToImage(cmdbuf, src_buffer, vk_image, vk_aspect_mask, was_initialized, vk_copies);
     });
+    NoteV2Use();
 
     if (is_rescaled) {
         ScaleUp();
     }
 }
 
+void Image::NoteV2Use() noexcept {
+    if (scheduler != nullptr) {
+        v2_track_id = (std::max)(v2_track_id, scheduler->CurrentTick());
+    }
+}
+
+bool Image::TryTransferUpload(VkBuffer buffer, VkDeviceSize offset,
+                              std::span<const VideoCommon::BufferImageCopy> copies) {
+    // Transfer-only queues copy color aspects only, with 4-byte aligned buffer offsets. The
+    // queue family acquire without a release discards the contents, so the copies must write
+    // every subresource whole.
+    if (aspect_mask != VK_IMAGE_ASPECT_COLOR_BIT || info.num_samples != 1 || !original_image ||
+        True(flags & (VideoCommon::ImageFlagBits::Sparse | VideoCommon::ImageFlagBits::SparseTiles |
+                      VideoCommon::ImageFlagBits::SparseLayers |
+                      VideoCommon::ImageFlagBits::Unbacked))) {
+        return false;
+    }
+    const u32 levels = HostMipLevels();
+    u64 level_mask = 0;
+    for (const auto& copy : copies) {
+        const s32 level = copy.image_subresource.base_level;
+        if (level < 0 || static_cast<u32>(level) >= levels || level >= 64 ||
+            copy.image_subresource.base_layer != 0 ||
+            copy.image_subresource.num_layers != info.resources.layers ||
+            copy.image_offset.x != 0 || copy.image_offset.y != 0 || copy.image_offset.z != 0 ||
+            ((offset + copy.buffer_offset) & 3) != 0) {
+            return false;
+        }
+        const auto mip = [level](u32 extent) { return (std::max)(extent >> level, 1U); };
+        if (copy.image_extent.width != mip(info.size.width) ||
+            copy.image_extent.height != mip(info.size.height) ||
+            copy.image_extent.depth != mip(info.size.depth)) {
+            return false;
+        }
+        level_mask |= u64{1} << level;
+    }
+    if (levels == 0 || levels > 64 || level_mask != (levels == 64 ? ~u64{0} : (u64{1} << levels) - 1)) {
+        return false;
+    }
+    if (!scheduler->TryHoistTransfer(v2_track_id)) {
+        return false;
+    }
+    if (ENABLE_MSAA_RESOLVE_CONSUME && runtime != nullptr) {
+        runtime->InvalidateResolveShadow(Handle());
+    }
+    auto vk_copies = TransformBufferImageCopies(copies, offset, aspect_mask);
+    const VkImage vk_image = *original_image;
+    const u32 transfer_family = scheduler->GetTransferQueue()->Family();
+    const u32 graphics_family = runtime->device.GetGraphicsFamily();
+    const VkImageSubresourceRange range{
+        .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+        .baseMipLevel = 0,
+        .levelCount = VK_REMAINING_MIP_LEVELS,
+        .baseArrayLayer = 0,
+        .layerCount = VK_REMAINING_ARRAY_LAYERS,
+    };
+    scheduler->RecordTransfer([buffer, vk_image, vk_copies, range, transfer_family,
+                               graphics_family](vk::CommandBuffer cmdbuf) {
+        const VkImageMemoryBarrier to_transfer{
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .pNext = nullptr,
+            .srcAccessMask = 0,
+            .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+            .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+            .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = vk_image,
+            .subresourceRange = range,
+        };
+        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                               0, to_transfer);
+        cmdbuf.CopyBufferToImage(buffer, vk_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                 vk_copies);
+        const VkImageMemoryBarrier release{
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .pNext = nullptr,
+            .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+            .dstAccessMask = 0,
+            .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+            .srcQueueFamilyIndex = transfer_family,
+            .dstQueueFamilyIndex = graphics_family,
+            .image = vk_image,
+            .subresourceRange = range,
+        };
+        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
+                               VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, release);
+    });
+    // The acquire half, at the start of the open submission (its upload command buffer runs
+    // first, after the submission waited for the transfer batch).
+    scheduler->RecordWithUploadBuffer([vk_image, range, transfer_family, graphics_family](
+                                          vk::CommandBuffer, vk::CommandBuffer upload_cmdbuf) {
+        const VkImageMemoryBarrier acquire{
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .pNext = nullptr,
+            .srcAccessMask = 0,
+            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
+                             VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
+                             VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT |
+                             VK_ACCESS_TRANSFER_WRITE_BIT,
+            .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+            .srcQueueFamilyIndex = transfer_family,
+            .dstQueueFamilyIndex = graphics_family,
+            .image = vk_image,
+            .subresourceRange = range,
+        };
+        upload_cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                                      VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, acquire);
+    });
+    initialized = true;
+    VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::TransferImageUploads);
+    return true;
+}
+
 void Image::UploadMemory(const StagingBufferRef& map, std::span<const BufferImageCopy> copies) {
+    // Only host-written staging may go to the transfer queue: other sources (buffer cache
+    // buffers for DMA copies) can hold GPU writes of the open submission.
+    v2_staging_upload = true;
     UploadMemory(map.buffer, map.offset, copies);
+    v2_staging_upload = false;
 }
 
 void Image::DownloadMemory(VkBuffer buffer, size_t offset,
@@ -3251,6 +3384,7 @@ void Image::DownloadMemory(VkBuffer buffer, size_t offset,
 
 void Image::DownloadMemory(std::span<VkBuffer> buffers_span, std::span<size_t> offsets_span,
                             std::span<const VideoCommon::BufferImageCopy> copies) {
+    NoteV2Use();
     boost::container::small_vector<VideoCommon::BufferImageCopy, 16> host_copies;
     if (HostMipLevels() < static_cast<u32>(info.resources.levels)) {
         VideoCommon::AppendHostMipEntries(

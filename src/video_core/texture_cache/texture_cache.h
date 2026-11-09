@@ -4436,6 +4436,10 @@ void TextureCache<P>::PrepareImage(ImageId image_id, bool is_modification, bool 
     if (commit != nullptr) [[unlikely]] {
         image.v2_track_id = (std::max)(image.v2_track_id, commit->submission);
         image.v2_touched_frame = frame_tick;
+    } else if (v2_track_uses) [[unlikely]] {
+        if constexpr (requires { runtime.CurrentTick(); }) {
+            image.v2_track_id = (std::max)(image.v2_track_id, runtime.CurrentTick());
+        }
     }
 }
 

@@ -526,6 +526,10 @@ private:
     void NoteCommitTime(u64 start_ns);
 
     V2::Commit::Context* commit = nullptr;
+    /// P5b (XFERQ, GPUDECODE, DYNRENDER): images keep their last-use tick (v2_track_id) so
+    /// uploads to images the open submission hasn't used may be hoisted ahead of it.
+    bool v2_track_uses = V2::On(V2::Switch::XferQ) || V2::On(V2::Switch::GpuDecode) ||
+                         V2::On(V2::Switch::DynRender);
     V2::Commit::RequestList v2_sampler_list; ///< deferred sampler table updates and creations
     bool v2_sampler_scope = false;
     /// Applies the deferred sampler requests and patches their proxies in `samplers`.

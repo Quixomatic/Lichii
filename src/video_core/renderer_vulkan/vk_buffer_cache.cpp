@@ -11,6 +11,7 @@
 #include <span>
 #include <vector>
 
+#include "video_core/v2/p5b_stats.h"
 #include "video_core/buffer_cache/buffer_cache_base.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/nx2_profile.h"
@@ -90,7 +91,7 @@ vk::Buffer CreateBuffer(const Device& device, const MemoryAllocator& memory_allo
     if (device.IsBufferDeviceAddressSupported()) {
         flags |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
     }
-    const VkBufferCreateInfo buffer_ci = {
+    VkBufferCreateInfo buffer_ci = {
         .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
         .pNext = nullptr,
         .flags = 0,
@@ -100,6 +101,7 @@ vk::Buffer CreateBuffer(const Device& device, const MemoryAllocator& memory_allo
         .queueFamilyIndexCount = 0,
         .pQueueFamilyIndices = nullptr,
     };
+    device.ApplyTransferSharing(buffer_ci); // EDEN_NX2_V2_XFERQ
     if (sparse_alignment > 1) {
         return memory_allocator.CreateBuffer(buffer_ci, MemoryUsage::DeviceLocal, sparse_alignment);
     }
@@ -567,6 +569,7 @@ void BufferCacheRuntime::WaitForHostRead(u64 tick) {
 
 bool BufferCacheRuntime::CanReorderUpload(const Buffer& buffer,
                                           std::span<const VideoCommon::BufferCopy> copies) {
+    reorder_to_transfer = false;
     if (Settings::values.disable_buffer_reorder) {
         return false;
     }
@@ -574,6 +577,12 @@ bool BufferCacheRuntime::CanReorderUpload(const Buffer& buffer,
         std::ranges::all_of(copies, [&](const VideoCommon::BufferCopy& copy) {
             return !buffer.IsRegionUsed(copy.dst_offset, copy.size);
         });
+    // EDEN_NX2_V2_XFERQ: regions no in-flight work uses (the condition above) can be copied on
+    // the transfer queue: no graphics tick to wait for, and the open submission waits for the
+    // transfer batch. TryHoistTransfer refuses after a class B join in this submission.
+    if (can_use_upload_cmdbuf && scheduler.HasTransferQueue()) [[unlikely]] {
+        reorder_to_transfer = scheduler.TryHoistTransfer(0);
+    }
     return can_use_upload_cmdbuf;
 }
 
@@ -599,6 +608,19 @@ void BufferCacheRuntime::CopyBuffer(VkBuffer dst_buffer, VkBuffer src_buffer,
     // Measuring a popular game, this number never exceeds the specified size once data is warmed up
     boost::container::small_vector<VkBufferCopy, 8> vk_copies(copies.size());
     std::ranges::transform(copies, vk_copies.begin(), MakeBufferCopy);
+    if (can_reorder_upload && std::exchange(reorder_to_transfer, false)) [[unlikely]] {
+        if (VideoCommon::V2::P5bStats::Enabled()) {
+            namespace P5b = VideoCommon::V2::P5bStats;
+            P5b::Add(P5b::Counter::TransferCopies, vk_copies.size());
+            for (const VkBufferCopy& copy : vk_copies) {
+                P5b::Add(P5b::Counter::TransferBytes, copy.size);
+            }
+        }
+        scheduler.RecordTransfer([src_buffer, dst_buffer, vk_copies](vk::CommandBuffer cmdbuf) {
+            cmdbuf.CopyBuffer(src_buffer, dst_buffer, vk_copies);
+        });
+        return;
+    }
     if (src_buffer == staging_pool.StreamBuf() && can_reorder_upload) {
         scheduler.RecordWithUploadBuffer([src_buffer, dst_buffer, vk_copies](
                                              vk::CommandBuffer, vk::CommandBuffer upload_cmdbuf) {

@@ -490,6 +490,17 @@ public:
     void UploadMemory(VkBuffer buffer, VkDeviceSize offset,
                       std::span<const VideoCommon::BufferImageCopy> copies);
 
+    /// P5b: the open submission used this image (track id for hoisting decisions).
+    void NoteV2Use() noexcept;
+
+    bool v2_staging_upload = false; ///< UploadMemory's source is host-written staging
+
+    /// EDEN_NX2_V2_XFERQ: uploads the whole image on the transfer queue ahead of the open
+    /// submission (queue family ownership moves back to graphics at its start). False when it
+    /// must stay in order.
+    bool TryTransferUpload(VkBuffer buffer, VkDeviceSize offset,
+                           std::span<const VideoCommon::BufferImageCopy> copies);
+
     void UploadMemory(const StagingBufferRef& map,
                       std::span<const VideoCommon::BufferImageCopy> copies);
 
