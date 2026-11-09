@@ -182,6 +182,10 @@ public:
     /// (its idle points: TickWork, the split's CPU lane hook, fence waits). Other threads: no-op.
     virtual void ServeCommitRequests() {}
 
+    /// Shutdown, once the GPU threads stopped for good: handed-over work is dropped and its
+    /// waiters released, as nothing serves it anymore.
+    virtual void OnCacheOwnerStopped() {}
+
     virtual void InnerInvalidation(std::span<const std::pair<DAddr, std::size_t>> sequences) {
         // The skip keeps the texture cache: software engine writes reach images only here.
         const auto which = Settings::values.skip_cpu_inner_invalidation.GetValue()

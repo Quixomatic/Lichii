@@ -253,6 +253,9 @@ struct GPU::Impl {
         u64 fence;
         {
             std::scoped_lock lck{lane_mutex};
+            if (lane_dropped) [[unlikely]] {
+                return;
+            }
             fence = ++lane_last;
             request.sequence = fence;
             lane_requests.push_back(std::move(request));
@@ -262,7 +265,7 @@ struct GPU::Impl {
         // Also through the ordered path: TickWork serves the lane too, should the back not.
         gpu_thread.TickGPU(is_async);
         std::unique_lock lck{lane_mutex};
-        lane_cv.wait(lck, [this, fence] { return lane_done >= fence; });
+        lane_cv.wait(lck, [this, fence] { return lane_done >= fence || lane_dropped; });
     }
 
     void TickCpuLane() {
@@ -357,6 +360,17 @@ struct GPU::Impl {
             sync_requests_dropped = true;
         }
         sync_request_cv.notify_all();
+        // Pipeline v2: the same for the CPU lane (EDEN_NX2_V2_CPULANE) and the caches' owner
+        // calls (EDEN_NX2_V2_COMMIT).
+        {
+            std::scoped_lock lane_lock{lane_mutex};
+            lane_requests.clear();
+            lane_dropped = true;
+        }
+        lane_cv.notify_all();
+        if (renderer) {
+            renderer->ReadRasterizer()->OnCacheOwnerStopped();
+        }
         std::unique_lock lk{sync_mutex};
         shutting_down.store(true, std::memory_order::relaxed);
         sync_cv.notify_all();
@@ -708,6 +722,7 @@ struct GPU::Impl {
     std::deque<SyncRequest> lane_requests;
     u64 lane_last{};
     u64 lane_done{};
+    bool lane_dropped{}; ///< NotifyShutdown dropped the lane (under lane_mutex)
     std::atomic<bool> lane_pending{};
     std::atomic<bool> lane_used{}; ///< Once set, TickWork serves the lane too
 

@@ -358,6 +358,11 @@ struct OwnerCall {
 
     void Run() {
         function(context);
+        Release();
+    }
+
+    /// Owner: done with the object (Run, or dropped at shutdown without running).
+    void Release() {
         if (state.exchange(Done, std::memory_order_acq_rel) == Sleeping) {
             std::scoped_lock lock{mutex};
             acked = true;
@@ -584,9 +589,36 @@ public:
         direct_users.fetch_sub(1, std::memory_order_release);
     }
 
+    /// External thread, around a push to the owner's queue: false once the owner stopped for
+    /// good (shutdown), when nothing would serve the push.
+    [[nodiscard]] bool BeginPush() {
+        pushers.fetch_add(1, std::memory_order_seq_cst);
+        if (!stopped.load(std::memory_order_seq_cst)) {
+            return true;
+        }
+        pushers.fetch_sub(1, std::memory_order_release);
+        return false;
+    }
+    void EndPush() {
+        pushers.fetch_sub(1, std::memory_order_release);
+    }
+    [[nodiscard]] bool Stopped() const {
+        return stopped.load(std::memory_order_acquire);
+    }
+
+    /// Shutdown, after the owner threads were joined: no push starts after this returns.
+    void Stop() {
+        stopped.store(true, std::memory_order_seq_cst);
+        while (pushers.load(std::memory_order_seq_cst) != 0) {
+            std::this_thread::yield();
+        }
+    }
+
 private:
     std::atomic<bool> owned{false};
     std::atomic<u32> direct_users{0};
+    std::atomic<bool> stopped{false};
+    std::atomic<u32> pushers{0};
 };
 
 /// DXVK's per-resource track id: the last submission (scheduler tick) that used the resource.

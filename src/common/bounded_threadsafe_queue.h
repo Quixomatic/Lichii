@@ -50,6 +50,23 @@ public:
         Emplace<PushMode::Wait>(std::forward<Args>(args)...);
     }
 
+    /// As EmplaceWait, but gives up once `stop_token` is stopped (returns false, nothing pushed).
+    template <typename... Args>
+    bool EmplaceWaitUnlessStopped(const std::stop_token& stop_token, Args&&... args) noexcept {
+        {
+            std::unique_lock lock{producer.cv_mutex};
+            const std::size_t write_index = producer.index.load(std::memory_order::relaxed);
+            if (!producer.cv.wait(lock, stop_token, [this, write_index] {
+                    return (write_index - consumer.index.load(std::memory_order::acquire)) <
+                           Capacity;
+                })) {
+                return false;
+            }
+        }
+        // Single producer: the slot found free stays free.
+        return Emplace<PushMode::Try>(std::forward<Args>(args)...);
+    }
+
     bool TryPop(T& t) noexcept {
         return Pop<PopMode::Try>(t);
     }

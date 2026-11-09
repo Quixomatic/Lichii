@@ -305,14 +305,22 @@ u64 ThreadManager::PushCommand(CpuRecord&& record, bool block, bool is_async) {
         block = true;
     }
 
+    const std::stop_token stop = thread.get_stop_token();
     std::unique_lock lk(state.write_lock);
     const u64 fence{++state.last_fence};
+    // Once the GPU thread stops (NotifyShutdown) nothing pops the queue: drop the record rather
+    // than fill the queue and block. Guest cores still run until the kernel suspends them.
+    if (stop.stop_requested()) [[unlikely]] {
+        return fence;
+    }
     record.sequence = fence;
     record.block = block;
-    state.queue.EmplaceWait(std::move(record));
+    if (!state.queue.EmplaceWaitUnlessStopped(stop, std::move(record))) [[unlikely]] {
+        return fence;
+    }
 
     if (block) {
-        state.cv.wait(lk, thread.get_stop_token(), [this, fence] {
+        state.cv.wait(lk, stop, [this, fence] {
             return fence <= state.signaled_fence.load(std::memory_order_relaxed);
         });
     }

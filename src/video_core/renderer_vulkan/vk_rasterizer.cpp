@@ -5471,9 +5471,9 @@ void RasterizerVulkan::WithCaches(Func&& func) {
         .kind = C::ExternalKind::Call,
         .arg = 0,
     };
-    while (!commit->external.TryPush(op)) {
-        gpu.WakeCacheOwner();
-        std::this_thread::yield();
+    // Shutdown: once the owner stopped, the call is skipped (OnCacheOwnerStopped).
+    if (!PushToOwner(op)) [[unlikely]] {
+        return;
     }
     C::Stats::Count(C::Stats::Get().owner_calls);
     gpu.WakeCacheOwner();
@@ -5516,10 +5516,37 @@ void RasterizerVulkan::PostOrRun(const VideoCommon::V2::Commit::ExternalOp& op, 
         return;
     }
     // No wake: nothing waits on it, and the owner drains the queue before its next lookup.
-    while (!commit->external.TryPush(op)) {
+    static_cast<void>(PushToOwner(op));
+}
+
+bool RasterizerVulkan::PushToOwner(const VideoCommon::V2::Commit::ExternalOp& op) {
+    auto& owner = commit->owner;
+    if (!owner.BeginPush()) {
+        return false;
+    }
+    bool pushed;
+    while (!(pushed = commit->external.TryPush(op)) && !owner.Stopped()) {
         gpu.WakeCacheOwner();
         std::this_thread::yield();
     }
+    owner.EndPush();
+    return pushed;
+}
+
+void RasterizerVulkan::OnCacheOwnerStopped() {
+    if (!commit_lock_free) {
+        return;
+    }
+    // The owner threads were joined, so this thread is the queue's only consumer now. Queued
+    // calls live on their waiters' stacks: release them without running, as nothing may touch
+    // the caches concurrently with the guest cores still running.
+    namespace C = VideoCommon::V2::Commit;
+    commit->owner.Stop();
+    commit->external.Drain([](const C::ExternalOp& op) {
+        if (op.kind == C::ExternalKind::Call) {
+            reinterpret_cast<C::OwnerCall*>(op.address)->Release();
+        }
+    });
 }
 
 void RasterizerVulkan::CommitBindsAfterDraw() {

@@ -180,6 +180,7 @@ public:
                                                             u32 pixel_stride);
 
     void ServeCommitRequests() override;
+    void OnCacheOwnerStopped() override;
 
 private:
     // Pipeline v2 P5a (EDEN_NX2_V2_COMMIT): the commit stage. Null when off.
@@ -204,6 +205,8 @@ private:
     /// The same for work nobody waits on: posted to the owner when the caller isn't it.
     template <typename Func>
     void PostOrRun(const VideoCommon::V2::Commit::ExternalOp& op, Func&& func);
+    /// Pushes `op` to the owner's queue, waking it while full. False once the owner stopped.
+    [[nodiscard]] bool PushToOwner(const VideoCommon::V2::Commit::ExternalOp& op);
     /// Applies deferred buffer binds a failed configure left (with the lock unless lock free).
     void CommitBindsAfterDraw();
     /// AccelerateDisplay's body, with the caches held.
