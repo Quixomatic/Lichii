@@ -472,6 +472,17 @@ public:
         recipe_render_targets = true;
     }
 
+    /// Whether EDEN_NX2_V2_COMMIT is on for this cache.
+    [[nodiscard]] bool CommitActive() const noexcept {
+        return commit != nullptr;
+    }
+
+    /// P5a item 4: true when the render target registers are clean and the bound targets are the
+    /// recipe's (whose generations the recipe's validation checked): the next UpdateRenderTargets
+    /// resolves nothing and binds the same views, so the replay needs no check after it. Pure.
+    [[nodiscard]] bool RenderTargetsUnchanged(std::span<const u32, NUM_RT> color_ids,
+                                              u32 depth_id) const noexcept;
+
 private:
     /// FillImageViews with COMMIT=1: pure lookups into requests, then one commit.
     void FillImageViewsCommit(std::span<ImageViewInOut> views, bool compute, bool blacklist);
@@ -509,6 +520,7 @@ private:
     /// alone (P5a item 4: re-marking it changes nothing).
     const ImageBase* v2_sole_newest = nullptr;
     bool recipe_render_targets = false;
+    u32 v2_rt_checks = 0; ///< verify samples of the render target skip rule
 
     /// Iterate over all page indices in a range
     template <typename Func>

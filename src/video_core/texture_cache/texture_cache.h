@@ -4627,6 +4627,20 @@ void TextureCache<P>::OnGPUASRegister([[maybe_unused]] size_t map_id) {
 // Pipeline v2 P5a (EDEN_NX2_V2_COMMIT): pure lookups, requests and their appliers.
 
 template <class P>
+bool TextureCache<P>::RenderTargetsUnchanged(std::span<const u32, NUM_RT> color_ids,
+                                             u32 depth_id) const noexcept {
+    if (maxwell3d->dirty.flags[Dirty::RenderTargets]) {
+        return false;
+    }
+    for (size_t index = 0; index < NUM_RT; ++index) {
+        if (render_targets.color_buffer_ids[index].index != color_ids[index]) {
+            return false;
+        }
+    }
+    return render_targets.depth_buffer_id.index == depth_id;
+}
+
+template <class P>
 auto TextureCache<P>::LookupImageView(u32 index, bool compute) const -> CommitViewLookup {
     const auto& table =
         compute ? channel_state->compute_image_table : channel_state->graphics_image_table;
@@ -4872,7 +4886,7 @@ void TextureCache<P>::PushRenderTargetRequests(bool is_clear) {
             continue;
         }
         const bool invalidate = is_clear && IsFullClear(id);
-        if (skip && !invalidate) {
+        if (!invalidate) {
             // P5a item 4: an image already GPU-modified and the sole holder of the newest
             // modification tick, touched this frame, with nothing to upload or copy in, needs no
             // request at all (the old path's re-mark changed no ordering decision).
@@ -4891,12 +4905,35 @@ void TextureCache<P>::PushRenderTargetRequests(bool is_clear) {
                 .special = True(image.flags & special),
                 .touched_this_frame = image.v2_touched_frame == frame_tick,
             };
-            if (!C::RenderTargetNeedsPrepare(state)) {
+            const bool would_skip = !C::RenderTargetNeedsPrepare(state);
+            if (would_skip && skip) {
                 if (commit->stats) {
                     C::Stats::Count(recipe_render_targets ? C::Stats::Get().rt_skipped
                                                           : C::Stats::Get().lookup_hits);
                 }
                 continue;
+            }
+            if (would_skip && (++v2_rt_checks & 63) == 0) {
+                // verify (1 in 64): the skip rests on no other image holding the newest tick.
+                const ImageId self = slot_image_views[id].image_id;
+                bool shared = false;
+                for (const auto [other_id, other] : slot_images) {
+                    if (other_id != self && other->modification_tick >= image.modification_tick) {
+                        shared = true;
+                        break;
+                    }
+                }
+                C::Stats::Count(C::Stats::Get().verify_draws);
+                if (shared) {
+                    C::Stats::Count(C::Stats::Get().verify_mismatches);
+                    static std::atomic<u32> logged{};
+                    if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+                        LOG_WARNING(HW_GPU,
+                                    "V2 commit verify: render target {:#x} would skip its prepare "
+                                    "but another image holds tick {}",
+                                    image.gpu_addr, image.modification_tick);
+                    }
+                }
             }
         }
         C::Request request{};

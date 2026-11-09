@@ -1386,18 +1386,33 @@ GraphicsPipeline::RecipeResult GraphicsPipeline::ConfigureRecipe(
     }
     {
         Profile::Scope scope{Profile::Zone::RenderTargets};
+        constexpr size_t NumColors = VideoCommon::V2::DrawCache::NumRecipeTargets - 1;
+        // EDEN_NX2_V2_COMMIT (P5a item 4): with clean render target registers and the recipe's
+        // targets bound, the update resolves nothing, and its commit only prepares targets the
+        // skip rule can't drop (an upload, a newer alias, the frame's first touch...).
+        bool targets_unchanged = false;
+        if (texture_cache.CommitActive()) [[unlikely]] {
+            std::array<u32, NumColors> colors{};
+            for (size_t rt = 0; rt < NumColors; ++rt) {
+                colors[rt] = recipe.targets[rt].id;
+            }
+            targets_unchanged =
+                texture_cache.RenderTargetsUnchanged(colors, recipe.targets[NumColors].id);
+            texture_cache.NoteRecipeRenderTargets();
+        }
         texture_cache.UpdateRenderTargets(false);
         // The key holds the render target registers: other views mean the texture cache moved
         // under them (resolved in full, which finds the same state again).
-        const auto& targets = texture_cache.GetRenderTargets();
-        for (size_t rt = 0; rt < VideoCommon::V2::DrawCache::NumRecipeTargets - 1; ++rt) {
-            if (targets.color_buffer_ids[rt].index != recipe.targets[rt].id) {
+        if (!targets_unchanged) {
+            const auto& targets = texture_cache.GetRenderTargets();
+            for (size_t rt = 0; rt < NumColors; ++rt) {
+                if (targets.color_buffer_ids[rt].index != recipe.targets[rt].id) {
+                    return RecipeResult::Rebuild;
+                }
+            }
+            if (targets.depth_buffer_id.index != recipe.targets[NumColors].id) {
                 return RecipeResult::Rebuild;
             }
-        }
-        if (targets.depth_buffer_id.index !=
-            recipe.targets[VideoCommon::V2::DrawCache::NumRecipeTargets - 1].id) {
-            return RecipeResult::Rebuild;
         }
         const std::span<const VideoCommon::ImageViewInOut> view_span{views.data(), views.size()};
         texture_cache.CheckFeedbackLoop(view_span);
