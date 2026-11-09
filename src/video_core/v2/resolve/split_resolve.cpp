@@ -38,13 +38,22 @@ size_t ShapeSlot(u64 shape) {
     return static_cast<size_t>((shape * 0x9e3779b97f4a7c15ULL) >> 52) % ShapeEntries;
 }
 
+/// Moves at every publish and clear: two resolves of one draw that read the table at different
+/// generations may differ in what the table answered (AP6 §3.2).
+std::atomic<u64> g_shape_generation{0};
+
 } // Anonymous namespace
 
 void PublishShape(u64 shape, u32 relevant_groups) {
     PublishShape(shape, relevant_groups, std::array<u32, CbufStages>{});
 }
 
+u64 ShapeGeneration() {
+    return g_shape_generation.load(std::memory_order_acquire);
+}
+
 void PublishShape(u64 shape, u32 relevant_groups, const std::array<u32, CbufStages>& key_cbufs) {
+    g_shape_generation.fetch_add(1, std::memory_order_acq_rel);
     ShapeEntry& entry = Shapes()[ShapeSlot(shape)];
     const u64 sequence = entry.sequence.load(std::memory_order_relaxed);
     entry.sequence.store(sequence + 1, std::memory_order_relaxed);
@@ -100,6 +109,7 @@ bool FindShape(u64 shape, u32* relevant_groups, std::array<u32, CbufStages>* key
 }
 
 void ClearShapes() {
+    g_shape_generation.fetch_add(1, std::memory_order_acq_rel);
     for (ShapeEntry& entry : Shapes()) {
         const u64 sequence = entry.sequence.load(std::memory_order_relaxed);
         entry.sequence.store(sequence + 1, std::memory_order_relaxed);
@@ -185,6 +195,7 @@ SerialReason SplitTraits::Resolve(Shard& shard, const Input& input, std::vector<
             // The draw-cache shape holds the pipeline key's hash: only the canonical key the
             // serial path uses with EDEN_NX2_V2_PIPEKEY equals the shard's.
             const bool state_hash = pre.pipeline_key != nullptr && On(Switch::PipeKey);
+            pre.shape_generation = ShapeGeneration();
             const ShardKey key = g_shard_key(ShardKeyInputs{
                 .regs = mirror.regs.data(),
                 .groups = &groups,
@@ -337,6 +348,19 @@ const char* SplitTraits::Compare(const Record& a, const Record& b) {
     }
     if (a.has_shape != b.has_shape || a.shape != b.shape) {
         return "shape";
+    }
+    // What the shape table answered: the resolves read it at different publish generations, so
+    // a difference in the table-derived parts is explained by a publish in between (dependent).
+    const bool key_differs = a.has_key != b.has_key || a.relevant != b.relevant ||
+                             a.has_full != b.has_full || a.full != b.full ||
+                             a.cbuf_masks != b.cbuf_masks;
+    const bool pipeline_key_differs =
+        (a.pipeline_key == nullptr) != (b.pipeline_key == nullptr) ||
+        (a.pipeline_key != nullptr && (a.pipeline_key->hash != b.pipeline_key->hash ||
+                                       a.pipeline_key->bytes != b.pipeline_key->bytes));
+    if (key_differs && a.shape_generation != b.shape_generation) {
+        Count(GetStats().verify_dependent);
+        return pipeline_key_differs ? "pipeline key" : nullptr;
     }
     // Which part of the key (Fix pass 1: "key" alone didn't tell the register-derived part from
     // the shape table's relevance mask the shard read).

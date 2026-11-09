@@ -88,6 +88,8 @@ void PublishShape(u64 shape, u32 relevant_groups, const std::array<u32, CbufStag
 [[nodiscard]] bool FindShape(u64 shape, u32* relevant_groups,
                              std::array<u32, CbufStages>* key_cbufs);
 void ClearShapes();
+/// The shape table's publish generation (moves at every PublishShape and ClearShapes).
+[[nodiscard]] u64 ShapeGeneration();
 /// The hash of a shape's key constant buffer slots (the commit checks the full key used these).
 [[nodiscard]] u64 CbufMasksHash(const std::array<u32, CbufStages>& key_cbufs);
 
@@ -108,6 +110,7 @@ struct PreDraw {
     u64 partial = 0;
     u64 full = 0;       ///< P6c: the whole draw-cache key
     u64 cbuf_masks = 0; ///< P6c: CbufMasksHash of the slots `full` used
+    u64 shape_generation = 0; ///< ShapeGeneration() before the key read the shape table
     std::shared_ptr<const PipelineKey> pipeline_key; ///< P6c (null: none computed)
     uintptr_t engine = 0;
     uintptr_t memory = 0;
