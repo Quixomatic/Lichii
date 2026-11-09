@@ -3474,6 +3474,11 @@ private:
     void FrontEmitDraws(VideoCommon::GpuSplit& split, FrontState& state, u32 method, u32 value,
                         const VideoCommon::V2::DrawOutput& out,
                         const VideoCommon::V2::GroupTracker* hashes);
+    /// EDEN_NX2_V2_PARALLEL: the segmenter sees the draws before their Draw records (a cut
+    /// snapshots the mirror and sends a Segment record).
+    void FrontParallelDraw(VideoCommon::GpuSplit& split, FrontState& state,
+                           const VideoCommon::V2::DrawOutput& out, u32 pending_method,
+                           bool may_cut);
     void FrontFillDraw(FrontState& state, VideoCommon::V2::Ir::DrawBody& body, u32 method,
                        u32 value, const VideoCommon::V2::DrawOutput& out, u32 first,
                        const VideoCommon::V2::GroupTracker* hashes);

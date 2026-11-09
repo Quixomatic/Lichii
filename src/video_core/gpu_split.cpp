@@ -30,6 +30,8 @@
 #include "video_core/nx2.h"
 #include "video_core/nx2_fast_draw.h"
 #include "video_core/nx2_profile.h"
+#include "video_core/v2/resolve/multifront.h"
+#include "video_core/v2/resolve/split_resolve.h"
 #include "video_core/v2/p5b_stats.h"
 #include "video_core/v2/qmd_front.h"
 #include "video_core/v2/ir_check.h"
@@ -146,6 +148,8 @@ void GpuSplit::MaybeStart(Core::System& system_) {
     if (draw_verify) {
         V2::IrCheck::Start();
     }
+    StartParallel();
+    V2::Resolve::MultiFront::SetActive(true);
     // P5a: with COMMIT=1 lock-free, the hook also serves work handed to the caches' owner.
     if (V2::On(V2::Switch::CpuLane) ||
         (V2::Get(V2::Switch::Commit) == V2::Mode::On && !V2::On(V2::Switch::CommitLocked))) {
@@ -186,6 +190,10 @@ void GpuSplit::Stop() {
     wake.notify_one();
     back_thread.join();
     active = false;
+    // The shards read the ring: they stop before it goes away.
+    delete parallel;
+    parallel = nullptr;
+    V2::Resolve::MultiFront::SetActive(false);
     // The split is static and outlives the emulation session. The next session's back thread
     // starts reading at 0: with the old positions kept it skipped through the new, empty ring a
     // wrap at a time and never reached the old write position (the next game's first GPU work
@@ -280,6 +288,37 @@ void GpuSplit::Publish() {
         wake.fetch_add(1, std::memory_order_seq_cst);
         wake.notify_one();
     }
+    if (parallel != nullptr) [[unlikely]] {
+        ParallelPublish();
+    }
+}
+
+void GpuSplit::StartParallel() {
+    if (!V2::On(V2::Switch::Parallel)) {
+        return;
+    }
+    // The shards replay the front's table-driven mirror and resolve the draw cache's keys.
+    const char* missing = !draw_records ? "EDEN_NX2_V2_IR and EDEN_NX2_V2_IR_DRAWS with front macros"
+                          : V2::Get(V2::Switch::RegSem) != V2::Mode::On ? "EDEN_NX2_V2_REGSEM=1"
+                          : !V2::On(V2::Switch::DrawCache)              ? "EDEN_NX2_V2_DRAWCACHE"
+                                                                       : nullptr;
+    if (missing != nullptr) {
+        LOG_WARNING(HW_GPU, "EDEN_NX2_V2_PARALLEL needs {}: off", missing);
+        return;
+    }
+    parallel = new V2::Resolve::SplitResolve(*this, ring.get(), &arena);
+}
+
+void GpuSplit::ParallelRecord(V2::Ir::Kind kind) {
+    parallel->OnRecord(kind);
+}
+
+void GpuSplit::ParallelBarrier(u32 op) {
+    parallel->OnBarrier(op);
+}
+
+void GpuSplit::ParallelPublish() {
+    parallel->OnPublish(published_local);
 }
 
 void GpuSplit::Drain(DrainSite site) {
@@ -671,6 +710,19 @@ size_t GpuSplit::ExecuteIr(const u64* entry) {
         engine->CallMultiMethod(*system, data.method,
                                 reinterpret_cast<const u32*>(arena.At(payload.index)),
                                 data.amount, data.methods_pending);
+        break;
+    }
+    case V2::Ir::Kind::Segment: {
+        // EDEN_NX2_V2_PARALLEL: the commit takes the next segment in order.
+        V2::Ir::SegmentBody segment;
+        std::memcpy(&segment, body, sizeof(segment));
+        if (parallel != nullptr) {
+            const auto* const maxwell3d =
+                objects->As<Tegra::Engines::Maxwell3D>(segment.engine);
+            parallel->OnSegment(segment, maxwell3d != nullptr && parallel->Verify()
+                                             ? maxwell3d->regs.reg_array.data()
+                                             : nullptr);
+        }
         break;
     }
     default: {

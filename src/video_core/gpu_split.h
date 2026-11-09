@@ -27,6 +27,11 @@ namespace Tegra::Engines {
 class EngineInterface;
 }
 
+namespace VideoCommon::V2::Resolve {
+class SplitResolve;
+struct SplitTraits;
+} // namespace VideoCommon::V2::Resolve
+
 namespace VideoCommon {
 
 /// Why the split's front waited for its back (EDEN_NX2_GPU_PROFILE counts each).
@@ -116,6 +121,11 @@ public:
     }
     /// Whether the front sends Draw/Dispatch records before the methods that draw or launch
     /// compute work (EDEN_NX2_V2_IR_DRAWS with the typed IR and front macros; fixed per start).
+    /// EDEN_NX2_V2_PARALLEL: the parallel resolve (front segmenter, shards, commit side), null
+    /// when off. Fixed between a start and a stop.
+    [[nodiscard]] V2::Resolve::SplitResolve* Parallel() const {
+        return parallel;
+    }
     [[nodiscard]] bool DrawRecords() const {
         return draw_records;
     }
@@ -329,6 +339,11 @@ public:
             IrBegin(kind, V2::Ir::BodyWordsOf<Body>, words, flags & FastDrawNeutral);
         std::memcpy(record + V2::Ir::HeaderWords, &body, sizeof(Body));
         Commit(words);
+        if constexpr (std::is_same_v<Body, V2::Ir::BarrierBody>) {
+            if (parallel != nullptr) [[unlikely]] {
+                ParallelBarrier(static_cast<u32>(body.op));
+            }
+        }
     }
     /// As Emit, with `payload_words` of variable data (to the payload arena).
     template <typename Body, typename Legacy>
@@ -446,6 +461,8 @@ public:
 
 private:
     friend struct GpuSplitTestAccess;
+    friend class V2::Resolve::SplitResolve;
+    friend struct V2::Resolve::SplitTraits;
 
     enum class Kind : u64 {
         Wrap,   ///< The rest of the ring is unused: continue at its start
@@ -557,6 +574,9 @@ private:
         if (ir_run != nullptr) {
             IrCloseRun();
         }
+        if (parallel != nullptr) [[unlikely]] {
+            ParallelRecord(kind);
+        }
         u64* const record = Reserve(words);
         record[0] = V2::Ir::MakeHeader(kind, body_words, words, flags);
         record[1] = ++ir_sequence;
@@ -607,6 +627,11 @@ private:
     size_t ExecuteIr(const u64* entry);
     void CheckIrRecord(const u64* entry);
     void AllocateIr();
+    // EDEN_NX2_V2_PARALLEL hooks (out of line: SplitResolve is incomplete here).
+    void ParallelRecord(V2::Ir::Kind kind);
+    void ParallelBarrier(u32 op);
+    void ParallelPublish();
+    void StartParallel();
 
     Core::System* system{};
     bool active{};
@@ -617,6 +642,7 @@ private:
     bool draw_records{}; ///< EDEN_NX2_V2_IR_DRAWS (DrawRecords)
     bool draw_verify{};  ///< EDEN_NX2_V2_IR_DRAWS=verify: the back checks draws (V2::IrCheck)
     std::unique_ptr<u64[]> ring;
+    V2::Resolve::SplitResolve* parallel{}; ///< EDEN_NX2_V2_PARALLEL (owned; deleted at Stop)
 
     // Front side.
     u64 write_position{};

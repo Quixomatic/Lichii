@@ -54,13 +54,14 @@ enum class Kind : u8 {
     Present,    ///< PresentBody: a composite request (executed by TickWork, see the log)
     SyncPoint,  ///< SyncPointBody: syncpoint increments, CPU queue fences, event signals
     Channel,    ///< ChannelBody: the rasterizer binds a channel
+    Segment,    ///< SegmentBody: a P6 parallel resolve segment starts (EDEN_NX2_V2_PARALLEL)
     Count,
 };
 
 inline constexpr const char* kind_names[] = {
     "invalid",  "engine",  "state run", "method data", "callback", "draw",
     "dispatch", "copy",    "release",   "acquire",     "barrier",  "readback",
-    "map",      "present", "sync point", "channel",
+    "map",      "present", "sync point", "channel",   "segment",
 };
 static_assert(std::size(kind_names) == static_cast<size_t>(Kind::Count));
 
@@ -355,6 +356,16 @@ struct ChannelBody {
     u32 reserved;
 };
 
+/// P6a (EDEN_NX2_V2_PARALLEL): the start of resolve segment `id`; its records run up to the next
+/// Segment record. The back takes the shards' result for it (V2::Resolve::SplitResolve).
+struct SegmentBody {
+    u64 id;
+    ObjectRef engine;     ///< the Maxwell3D whose draws the segment resolves
+    u32 serial;           ///< Resolve::SerialReason known at the cut (informational)
+    u32 cut;              ///< Resolve::CutReason
+    u32 pending_method;   ///< a write the snapshot holds that follows this record (~0: none)
+};
+
 template <typename Body>
 inline constexpr size_t BodyWordsOf = (sizeof(Body) + sizeof(u64) - 1) / sizeof(u64);
 
@@ -364,7 +375,7 @@ inline constexpr bool IsBody = std::is_trivially_copyable_v<Body> && sizeof(Body
 
 static_assert(IsBody<MethodDataBody> && IsBody<EngineBody> && IsBody<DrawBody> &&
               IsBody<DispatchBody> && IsBody<CopyBody> && IsBody<ReleaseBody> &&
-              IsBody<AcquireBody> && IsBody<BarrierBody> && IsBody<ReadbackBody> &&
+              IsBody<AcquireBody> && IsBody<BarrierBody> && IsBody<ReadbackBody> && IsBody<SegmentBody> &&
               IsBody<MapBody> && IsBody<PresentBody> && IsBody<SyncPointBody> &&
               IsBody<ChannelBody> && IsBody<PredictedDraw> && IsBody<HostIndirectDraw>);
 

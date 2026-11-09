@@ -165,6 +165,8 @@ add_library(video_core STATIC
     v2/resolve/parallel_resolve.cpp
     v2/resolve/parallel_resolve.h
     v2/resolve/segment.h
+    v2/resolve/split_resolve.cpp
+    v2/resolve/split_resolve.h
     v2/shader_writes.cpp
     v2/shader_writes.h
     v2/regsem.h

@@ -5,17 +5,29 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstring>
+#include <memory>
 #include <random>
 #include <thread>
 #include <vector>
 
 #include <catch2/catch_test_macros.hpp>
 
+#include "core/core.h"
+#include "core/device_memory.h"
+#include "tests/core/system_test_context.h"
+#include "video_core/engines/maxwell_3d.h"
+#include "video_core/host1x/gpu_device_memory_manager.h"
+#include "video_core/memory_manager.h"
+
 #include "video_core/v2/commit.h"
 #include "video_core/v2/resolve/cow_regs.h"
 #include "video_core/v2/resolve/multifront.h"
 #include "video_core/v2/resolve/parallel_resolve.h"
 #include "video_core/v2/resolve/segment.h"
+#include "video_core/v2/resolve/split_resolve.h"
+#include "video_core/v2/regsem_3d.h"
+#include "video_core/v2/ir_arena.h"
 
 namespace {
 
@@ -700,4 +712,177 @@ TEST_CASE("V2 P6b: the merge reports a dependency cycle instead of hanging",
     plan.groups = 2;
     plan.group_of = {{1, 0}, {2, 1}};
     CHECK(MF::MultiFrontOrder(events, plan, 0).empty());
+}
+
+namespace {
+
+/// A hand-built typed IR ring for the split's shard resolver.
+struct RingBuilder {
+    static constexpr size_t RingWords = size_t{1} << 20;
+    std::vector<u64> ring = std::vector<u64>(RingWords, 0);
+    V2::Ir::PayloadArena arena;
+    u64 position = 0;
+    u64 sequence = 0;
+
+    RingBuilder() {
+        arena.Allocate(1 << 16, 1 << 10);
+    }
+    void Wrap() {
+        ring[position & (RingWords - 1)] = 0; // Kind::Wrap
+        position += RingWords - (position & (RingWords - 1));
+    }
+    u64* Reserve(size_t words) {
+        if ((position & (RingWords - 1)) + words > RingWords) {
+            Wrap();
+        }
+        u64* const record = &ring[position & (RingWords - 1)];
+        position += words;
+        return record;
+    }
+    void StateRun(const std::vector<std::pair<u32, u32>>& writes) {
+        const size_t words = V2::Ir::HeaderWords + 1;
+        u64* const record = Reserve(words);
+        u64* const span = arena.Begin(writes.size(), ++sequence, position);
+        for (size_t i = 0; i < writes.size(); ++i) {
+            span[i] = 2 | (u64{writes[i].first & 0xffff} << 8) | (u64{writes[i].second} << 32);
+        }
+        record[0] = V2::Ir::MakeHeader(V2::Ir::Kind::StateRun, 0, words, V2::Ir::HasPayload);
+        record[1] = sequence;
+        record[2] = V2::Ir::PackRef(arena.IndexOf(span), static_cast<u32>(writes.size()));
+    }
+    void Draw(const V2::Ir::DrawBody& body) {
+        const size_t body_words = V2::Ir::BodyWordsOf<V2::Ir::DrawBody>;
+        const size_t words = V2::Ir::HeaderWords + body_words;
+        u64* const record = Reserve(words);
+        record[0] = V2::Ir::MakeHeader(V2::Ir::Kind::Draw, body_words, words, 0);
+        record[1] = ++sequence;
+        std::memcpy(record + V2::Ir::HeaderWords, &body, sizeof(body));
+    }
+};
+
+Resolve::ShardKey FakeShardKey(const Resolve::ShardKeyInputs& in) {
+    Resolve::ShardKey key;
+    key.shape = V2::Mix64(in.groups->Fingerprint(V2::AllGroups) ^ in.regs[0x200] ^ in.topology);
+    key.partial = key.shape + 1;
+    key.has_shape = key.has_key = true;
+    return key;
+}
+
+} // Anonymous namespace
+
+TEST_CASE("V2 P6: a shard replays its segment from the IR ring onto the snapshot",
+          "[video_core][v2_p6]") {
+    namespace RegSem = V2::RegSem;
+    // A Maxwell3D builds the register semantics table from its execution mask.
+    ScopedSystemTestContext context;
+    Core::System system;
+    Core::DeviceMemory physical;
+    Tegra::MaxwellDeviceMemoryManager device_memory{physical};
+    Tegra::MemoryManager memory{system, device_memory, 32, 1ULL << 31};
+    Tegra::Engines::Maxwell3D engine{memory};
+    const RegSem::Table3D& table = RegSem::GetTable3D();
+    const auto no_effects = [](RegSem::Effect, u32, u32) {};
+    // Plain state registers of the pipeline/viewport groups (stores with no side effect).
+    std::vector<u32> plain;
+    for (u32 index = 0x200; index < 0xd00 && plain.size() < 64; ++index) {
+        if ((table.flags[index] & RegSem::Exec) == 0 &&
+            table.groups[index] != V2::RegGroup::Misc &&
+            table.groups[index] != V2::RegGroup::CbufData) {
+            plain.push_back(index);
+        }
+    }
+    REQUIRE(plain.size() == 64);
+    auto serial = std::make_unique<RegSem::Mirror3D>();
+    std::mt19937 rng{5};
+    for (u32 i = 0; i < 2000; ++i) {
+        serial->regs[plain[rng() % plain.size()]] = rng() % 4;
+    }
+    RegSem::Rehash3D(serial->v2_groups, serial->regs.data());
+    // The snapshot at the cut.
+    auto snapshot = std::make_shared<Resolve::FrontSnapshot>();
+    Resolve::SnapshotBuilder<0xe00> builder;
+    snapshot->regs = builder.Take(serial->regs.data());
+    Resolve::SnapshotBuilder<0xe00> shadow_builder;
+    snapshot->shadow = shadow_builder.Take(serial->shadow.data());
+    snapshot->groups = serial->v2_groups;
+    snapshot->engine_ref = 3;
+    snapshot->engine = 0x1000;
+    snapshot->memory = 0x2000;
+
+    RingBuilder ring;
+    ring.position = RingBuilder::RingWords - 40; // the segment crosses the ring's end
+    const u64 begin = ring.position;
+    std::vector<u64> expected_shapes;
+    for (u32 draw = 0; draw < 12; ++draw) {
+        std::vector<std::pair<u32, u32>> writes;
+        for (u32 w = 0; w < 5; ++w) {
+            writes.emplace_back(plain[rng() % plain.size()], rng() % 4);
+        }
+        ring.StateRun(writes);
+        for (const auto& [method, value] : writes) {
+            RegSem::Write3D(*serial, table, method, value, false, no_effects);
+        }
+        V2::Ir::DrawBody body{};
+        body.op = V2::Ir::DrawOp::Predicted;
+        body.engine = 3;
+        body.flags = V2::Ir::DrawHasGroups;
+        body.num_draws = 1;
+        body.draws[0].kind = V2::Ir::DrawKind::Indexed;
+        body.draws[0].topology = 4;
+        body.fingerprint = serial->v2_groups.Fingerprint(V2::HashedGroups);
+        if (draw == 7) {
+            body.fingerprint ^= 1; // a record the replay disagrees with: drift
+        }
+        ring.Draw(body);
+        expected_shapes.push_back(V2::Mix64(serial->v2_groups.Fingerprint(V2::AllGroups) ^
+                                            serial->regs[0x200] ^ 4));
+        // Another engine's records in between are not this segment's.
+        V2::Ir::DrawBody other = body;
+        other.engine = 9;
+        ring.Draw(other);
+    }
+    Resolve::SegmentInput input;
+    input.id = 1;
+    input.begin = begin;
+    input.end = ring.position;
+    input.snapshot = snapshot;
+    input.ring = ring.ring.data();
+    input.arena = &ring.arena;
+
+    const Resolve::ShardKeyFn saved = Resolve::g_shard_key;
+    Resolve::g_shard_key = &FakeShardKey;
+    Resolve::SplitTraits::Shard shard;
+    std::vector<Resolve::PreDraw> records;
+    Commit::RequestList requests;
+    requests.Reset(1);
+    const SerialReason reason = Resolve::SplitTraits::Resolve(shard, input, records, requests);
+    Resolve::g_shard_key = saved;
+    REQUIRE(reason == SerialReason::None);
+    REQUIRE(records.size() == 12);
+    for (u32 draw = 0; draw < 12; ++draw) {
+        INFO("draw " << draw);
+        CHECK(records[draw].ordinal == draw);
+        CHECK(records[draw].indexed);
+        CHECK(records[draw].engine == 0x1000);
+        if (draw == 7) {
+            CHECK(records[draw].drift);
+            CHECK(!records[draw].has_shape);
+        } else {
+            CHECK(!records[draw].drift);
+            CHECK(records[draw].shape == expected_shapes[draw]);
+        }
+    }
+    CHECK(requests.Empty());
+}
+
+TEST_CASE("V2 P6: published shapes are found by the shards", "[video_core][v2_p6]") {
+    Resolve::ClearShapes();
+    u32 relevant = 0;
+    CHECK(!Resolve::FindShape(0x1234, &relevant));
+    Resolve::PublishShape(0x1234, 0x44);
+    REQUIRE(Resolve::FindShape(0x1234, &relevant));
+    CHECK(relevant == 0x44);
+    CHECK(!Resolve::FindShape(0x9999, &relevant));
+    Resolve::ClearShapes();
+    CHECK(!Resolve::FindShape(0x1234, &relevant));
 }

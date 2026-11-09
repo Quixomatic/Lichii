@@ -17,7 +17,9 @@
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
 #include "video_core/renderer_vulkan/vk_draw_cache.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
+#include "common/settings.h"
 #include "video_core/v2/regsem.h"
+#include "video_core/v2/resolve/split_resolve.h"
 #include "video_core/v2/v2_stats.h"
 
 namespace Vulkan {
@@ -84,6 +86,99 @@ constexpr bool ShapeWord(size_t word) {
     return word != 0xc && word != 0xd && (word < 0x1d || word > 0x2c);
 }
 
+using Maxwell = Tegra::Engines::Maxwell3D::Regs;
+
+/// The draw shape from a register file: shared by the serial path and the P6 shards, so both
+/// compute the same value by construction.
+u64 ShapeOf(const Maxwell& regs, const V2::GroupTracker& groups, const KeyInputs& inputs,
+            bool is_indexed, bool native_turing, uintptr_t engine, uintptr_t memory) {
+    u64 shape = groups.Fingerprint(ShapeGroups);
+    for (const u32 index : KeyViewportRegisters()) {
+        shape = DC::Mix(shape, (u64{index} << 32) | regs.reg_array[index]);
+    }
+    shape = DC::Mix(shape, static_cast<u64>(inputs.topology));
+    shape = DC::Mix(shape, static_cast<u64>(inputs.engine_state));
+    shape = DC::Mix(shape, inputs.squashed_iterated_blend ? 1 : 0);
+    shape = DC::Mix(shape, is_indexed ? 1 : 0);
+    shape = DC::Mix(shape, static_cast<u64>(regs.sampler_binding));
+    shape = DC::Mix(shape, native_turing ? 1 : 0);
+    shape = DC::Mix(shape, engine);
+    shape = DC::Mix(shape, memory);
+    return shape;
+}
+
+/// The key up to the constant buffer bindings: the relevant group fingerprints and the vertex
+/// stream layout (registers only).
+u64 KeyStreams(u64 shape, u32 relevant_groups, const Maxwell& regs,
+               const V2::GroupTracker& groups) {
+    // Relocation (AnyPS5's DrawRelocation, by construction): pointer-valued state the replay
+    // resolves anyway stays out of the key, so draws that differ only in it share a recipe. That is
+    // every uniform-only constant buffer address (bound per draw by the buffer cache), the index
+    // buffer, and the vertex buffer addresses and limits: of the vertex streams only the layout the
+    // pipeline reads (stride, enable, divisor, instancing, bound or not) is in the key.
+    u64 key = DC::Mix(shape,
+                      groups.Fingerprint(relevant_groups & ~GroupBit(RegGroup::VertexStreams)));
+    if ((relevant_groups & GroupBit(RegGroup::VertexStreams)) != 0) {
+        for (size_t index = 0; index < regs.vertex_streams.size(); ++index) {
+            const auto& stream = regs.vertex_streams[index];
+            if (stream.enable == 0) {
+                continue;
+            }
+            key = DC::Mix(key, (u64{static_cast<u32>(index)} << 48) |
+                                   (u64{stream.Address() != 0 ? 1U : 0U} << 40) |
+                                   (u64{regs.vertex_stream_instances.is_instanced[index] != 0 ? 1U : 0U}
+                                    << 32) |
+                                   stream.stride.Value());
+            key = DC::Mix(key, stream.frequency);
+        }
+    }
+    return key;
+}
+
+/// The handle and storage-descriptor constant buffers of the key (engine state, not registers).
+u64 KeyCbufs(u64 key, const DC::ShapeInfo& info, const Tegra::Engines::Maxwell3D& maxwell3d) {
+    for (size_t stage = 0; stage < info.key_cbufs.size(); ++stage) {
+        const auto& cbufs = maxwell3d.state.shader_stages[stage].const_buffers;
+        for (u32 mask = info.key_cbufs[stage]; mask != 0; mask &= mask - 1) {
+            const auto& cbuf = cbufs[std::countr_zero(mask)];
+            key = DC::Mix(key, cbuf.address);
+            key = DC::Mix(key, (u64{cbuf.size} << 1) | (cbuf.enabled ? 1 : 0));
+        }
+    }
+    return key;
+}
+
+/// EDEN_NX2_V2_PARALLEL: a shard's shape and partial key from its register mirror.
+V2::Resolve::ShardKey ShardKeyOf(const V2::Resolve::ShardKeyInputs& in) {
+    const Maxwell& regs = *reinterpret_cast<const Maxwell*>(in.regs);
+    const KeyInputs inputs{
+        .topology = static_cast<Maxwell::PrimitiveTopology>(in.topology),
+        .engine_state = Tegra::Engines::Maxwell3D::EngineHint::None,
+        .squashed_iterated_blend = Settings::values.use_squashed_iterated_blend ? true : false,
+    };
+    V2::Resolve::ShardKey key;
+    key.shape = ShapeOf(regs, *in.groups, inputs, in.indexed, in.native_turing, in.engine,
+                        in.memory);
+    key.has_shape = true;
+    u32 relevant = 0;
+    if (V2::Resolve::FindShape(key.shape, &relevant)) {
+        key.partial = KeyStreams(key.shape, relevant, regs, *in.groups);
+        key.relevant = relevant;
+        key.has_key = true;
+    }
+    return key;
+}
+
+void NoteParallelMismatch(const char* what, u64 shard, u64 serial) {
+    V2::Resolve::Count(V2::Resolve::GetStats().verify_draw_mismatches);
+    if (V2::Resolve::ShouldLogMismatch()) {
+        LOG_WARNING(HW_GPU,
+                    "V2 parallel verify: a draw's {} from the shard is {:#x}, the serial "
+                    "resolve has {:#x}",
+                    what, shard, serial);
+    }
+}
+
 DC::Counters& GraphicsCounters() {
     return DC::ThreadStats().graphics;
 }
@@ -97,6 +192,9 @@ DrawCacheGlue::DrawCacheGlue(Tegra::MaxwellDeviceMemoryManager& device_memory_)
     : device_memory{device_memory_}, graphics_table{GraphicsSets}, compute_table{ComputeSets},
       memo{Versions::Pages(), Versions::Stream(), Versions::Epochs()},
       graphics_sampler{DC::VerifyN()}, compute_sampler{DC::VerifyN()} {
+    // EDEN_NX2_V2_PARALLEL: the shards compute shapes and keys with the same code.
+    V2::Resolve::g_shard_key = &ShardKeyOf;
+    V2::Resolve::ClearShapes();
     // Guest CPU writes to the words recipes captured must trap (and move their pages' versions):
     // their pages stay in the device memory's write tracking while a recipe holds them.
     watch.SetTracker([this](DAddr address, u64 size, s32 delta) {
@@ -112,60 +210,18 @@ DrawCacheGlue::~DrawCacheGlue() {
 
 u64 DrawCacheGlue::GraphicsShape(bool is_indexed, const Tegra::Engines::Maxwell3D& maxwell3d,
                                  const Tegra::MemoryManager& memory) const {
-    u64 shape = maxwell3d.v2_groups.Fingerprint(ShapeGroups);
-    for (const u32 index : KeyViewportRegisters()) {
-        shape = DC::Mix(shape, (u64{index} << 32) | maxwell3d.regs.reg_array[index]);
-    }
-    const KeyInputs inputs = FixedPipelineState::CurrentInputs(maxwell3d);
-    shape = DC::Mix(shape, static_cast<u64>(inputs.topology));
-    shape = DC::Mix(shape, static_cast<u64>(inputs.engine_state));
-    shape = DC::Mix(shape, inputs.squashed_iterated_blend ? 1 : 0);
-    shape = DC::Mix(shape, is_indexed ? 1 : 0);
-    shape = DC::Mix(shape, static_cast<u64>(maxwell3d.regs.sampler_binding));
-    shape = DC::Mix(shape,
-                    const_cast<Tegra::Engines::Maxwell3D&>(maxwell3d).GetNativeMacroEngine()
-                            .native_turing
-                        ? 1
-                        : 0);
-    shape = DC::Mix(shape, reinterpret_cast<uintptr_t>(&maxwell3d));
-    shape = DC::Mix(shape, reinterpret_cast<uintptr_t>(&memory));
-    return shape;
+    return ShapeOf(maxwell3d.regs, maxwell3d.v2_groups,
+                   FixedPipelineState::CurrentInputs(maxwell3d), is_indexed,
+                   const_cast<Tegra::Engines::Maxwell3D&>(maxwell3d)
+                       .GetNativeMacroEngine()
+                       .native_turing,
+                   reinterpret_cast<uintptr_t>(&maxwell3d), reinterpret_cast<uintptr_t>(&memory));
 }
 
 u64 DrawCacheGlue::GraphicsKey(u64 shape, const DC::ShapeInfo& info,
                                const Tegra::Engines::Maxwell3D& maxwell3d) {
-    // Relocation (AnyPS5's DrawRelocation, by construction): pointer-valued state the replay
-    // resolves anyway stays out of the key, so draws that differ only in it share a recipe. That is
-    // every uniform-only constant buffer address (bound per draw by the buffer cache), the index
-    // buffer, and the vertex buffer addresses and limits: of the vertex streams only the layout the
-    // pipeline reads (stride, enable, divisor, instancing, bound or not) is in the key.
-    u64 key = DC::Mix(
-        shape, maxwell3d.v2_groups.Fingerprint(info.relevant_groups &
-                                               ~GroupBit(RegGroup::VertexStreams)));
-    if ((info.relevant_groups & GroupBit(RegGroup::VertexStreams)) != 0) {
-        const auto& regs = maxwell3d.regs;
-        for (size_t index = 0; index < regs.vertex_streams.size(); ++index) {
-            const auto& stream = regs.vertex_streams[index];
-            if (stream.enable == 0) {
-                continue;
-            }
-            key = DC::Mix(key, (u64{static_cast<u32>(index)} << 48) |
-                                   (u64{stream.Address() != 0 ? 1U : 0U} << 40) |
-                                   (u64{regs.vertex_stream_instances.is_instanced[index] != 0 ? 1U : 0U}
-                                    << 32) |
-                                   stream.stride.Value());
-            key = DC::Mix(key, stream.frequency);
-        }
-    }
-    for (size_t stage = 0; stage < info.key_cbufs.size(); ++stage) {
-        const auto& cbufs = maxwell3d.state.shader_stages[stage].const_buffers;
-        for (u32 mask = info.key_cbufs[stage]; mask != 0; mask &= mask - 1) {
-            const auto& cbuf = cbufs[std::countr_zero(mask)];
-            key = DC::Mix(key, cbuf.address);
-            key = DC::Mix(key, (u64{cbuf.size} << 1) | (cbuf.enabled ? 1 : 0));
-        }
-    }
-    return key;
+    return KeyCbufs(KeyStreams(shape, info.relevant_groups, maxwell3d.regs, maxwell3d.v2_groups),
+                    info, maxwell3d);
 }
 
 u64 DrawCacheGlue::ComputeShape(const Tegra::Engines::KeplerCompute& kepler,
@@ -240,10 +296,38 @@ DrawCacheGlue::Decision DrawCacheGlue::DecideDraw(bool continued, bool is_indexe
     pending_draw = {};
     const bool cache_on = !is_indirect && maxwell3d.draw_manager.draw_state
                                               .inline_index_draw_indexes.empty();
+    // EDEN_NX2_V2_PARALLEL: a shard resolved this draw's shape and partial key (taken for every
+    // draw, so the records stay in step with the draws).
+    const V2::Resolve::PreDraw* pre = nullptr;
+    if (V2::Resolve::SplitResolve* const parallel = V2::Resolve::SplitResolve::t_commit)
+        [[unlikely]] {
+        pre = parallel->TakeDraw(maxwell3d.v2_groups.Fingerprint(V2::HashedGroups), is_indexed);
+        if (pre != nullptr &&
+            (!pre->has_shape || pre->engine != reinterpret_cast<uintptr_t>(&maxwell3d) ||
+             pre->memory != reinterpret_cast<uintptr_t>(&memory) ||
+             maxwell3d.engine_state != Tegra::Engines::Maxwell3D::EngineHint::None)) {
+            pre = nullptr;
+        }
+    }
+    const bool parallel_verify = pre != nullptr && V2::Verify(V2::Switch::Parallel);
     const Decision decision = DC::Decide(
         continued, cache_on,
         [&](DC::Miss& miss) -> Recipe* {
-            const u64 shape = GraphicsShape(is_indexed, maxwell3d, memory);
+            u64 shape = 0;
+            if (pre != nullptr) {
+                V2::Resolve::Count(V2::Resolve::GetStats().draws_pre);
+                shape = pre->shape;
+                if (parallel_verify) {
+                    V2::Resolve::Count(V2::Resolve::GetStats().verify_draws);
+                    const u64 serial = GraphicsShape(is_indexed, maxwell3d, memory);
+                    if (serial != shape) {
+                        NoteParallelMismatch("shape", shape, serial);
+                        shape = serial;
+                    }
+                }
+            } else {
+                shape = GraphicsShape(is_indexed, maxwell3d, memory);
+            }
             pending_draw.shape = shape;
             pending_draw.valid = true;
             const DC::ShapeInfo* const info = graphics_shapes.Find(shape);
@@ -251,7 +335,24 @@ DrawCacheGlue::Decision DrawCacheGlue::DecideDraw(bool continued, bool is_indexe
                 miss = DC::Miss::NoShape;
                 return nullptr;
             }
-            Recipe* const recipe = graphics_table.Find(GraphicsKey(shape, *info, maxwell3d));
+            u64 key = 0;
+            if (pre != nullptr && pre->has_key && pre->shape == shape &&
+                pre->relevant == info->relevant_groups) {
+                key = KeyCbufs(pre->partial, *info, maxwell3d);
+                if (parallel_verify) {
+                    const u64 serial = GraphicsKey(shape, *info, maxwell3d);
+                    if (serial != key) {
+                        NoteParallelMismatch("key", key, serial);
+                        key = serial;
+                    }
+                }
+            } else {
+                if (pre != nullptr && !pre->has_key) {
+                    V2::Resolve::Count(V2::Resolve::GetStats().draws_no_shape);
+                }
+                key = GraphicsKey(shape, *info, maxwell3d);
+            }
+            Recipe* const recipe = graphics_table.Find(key);
             if (recipe == nullptr) {
                 miss = DC::Miss::NoEntry;
             }
@@ -474,6 +575,9 @@ void DrawCacheGlue::FinishDrawCapture(GraphicsPipeline& pipeline, const Decision
             pipeline.HandleConstantBuffers()[stage] | pipeline.StorageConstantBuffers()[stage];
     }
     graphics_shapes.Insert(info);
+    if (V2::On(V2::Switch::Parallel)) [[unlikely]] {
+        V2::Resolve::PublishShape(info.shape, info.relevant_groups);
+    }
     Store(graphics_table, GraphicsKey(pending_draw.shape, info, maxwell3d), recipe, decision, false);
     DC::ThreadStats().graphics_occupied = graphics_table.Occupied();
     DC::ThreadStats().graphics_capacity = graphics_table.Capacity();

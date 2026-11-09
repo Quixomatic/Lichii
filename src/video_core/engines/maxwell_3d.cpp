@@ -18,6 +18,7 @@
 #include "common/settings.h"
 #include "core/core.h"
 #include "core/core_timing.h"
+#include "video_core/v2/resolve/multifront.h"
 #include "video_core/dirty_flags.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/engines/maxwell_3d.h"
@@ -39,6 +40,7 @@
 #include "video_core/v2/front_writes.h"
 #include "video_core/v2/ir_exec.h"
 #include "video_core/v2/regsem_3d.h"
+#include "video_core/v2/resolve/split_resolve.h"
 #include "video_core/v2/shader_writes.h"
 #ifdef ARCHITECTURE_x86_64
 #include "video_core/macro_turing_jit.h"
@@ -2013,6 +2015,8 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
                               FrontState& fs) {
     const u32 method = fs.executing_macro;
     fs.executing_macro = 0;
+    VideoCommon::V2::Resolve::MultiFront::Note(
+        VideoCommon::V2::Resolve::MultiFront::EventKind::MacroCall, method);
     auto& engine = GetNativeMacroEngine();
     const auto positions = GetNativeMacroPositions();
     const u32 start = positions[((method - MacroRegistersStart) >> 1) % positions.size()];
@@ -2201,6 +2205,32 @@ void Maxwell3D::FrontEmitDraws(VideoCommon::GpuSplit& split, FrontState& fs, u32
     }
 }
 
+void Maxwell3D::FrontParallelDraw(VideoCommon::GpuSplit& split, FrontState& fs,
+                                  const VideoCommon::V2::DrawOutput& out, u32 pending_method,
+                                  bool may_cut) {
+    namespace Resolve = VideoCommon::V2::Resolve;
+    Resolve::SplitResolve* const parallel = split.Parallel();
+    if (out.count == 0 || fs.v2 == nullptr || fs.v2->mode != VideoCommon::V2::Mode::On) {
+        return;
+    }
+    const Resolve::SplitResolve::FrontView view{
+        .regs = fs.regs.data(),
+        .shadow = fs.shadow.data(),
+        .groups = &fs.v2_groups,
+        .control = static_cast<u32>(fs.control),
+        .instance_loop = fs.instance_loop,
+        .sink_pending = fs.sink_pending,
+        .draw_pending = fs.draw_pending,
+    };
+    const Resolve::SplitResolve::EngineInfo engine{
+        .ref = split.Ref(this),
+        .engine = reinterpret_cast<uintptr_t>(this),
+        .memory = reinterpret_cast<uintptr_t>(&memory_manager),
+        .native_turing = GetNativeMacroEngine().native_turing,
+    };
+    parallel->FrontDraw(view, engine, out, pending_method, may_cut);
+}
+
 void Maxwell3D::FrontDrawPre(VideoCommon::GpuSplit& split, FrontState& fs, u32 method, u32 value) {
     // A write the back stores (ProcessDirtyRegisters) ends a deferred instanced batch first.
     if (!fs.v2_draw_model.HasDeferredDraw() ||
@@ -2212,6 +2242,9 @@ void Maxwell3D::FrontDrawPre(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
     }
     VideoCommon::V2::DrawOutput out;
     fs.v2_draw_model.OnStore(method, fs.regs.data(), out);
+    if (split.Parallel() != nullptr) [[unlikely]] {
+        FrontParallelDraw(split, fs, out, ~0U, true);
+    }
     FrontEmitDraws(split, fs, method, value, out, nullptr);
 }
 
@@ -2237,6 +2270,10 @@ void Maxwell3D::FrontDrawPost(VideoCommon::GpuSplit& split, FrontState& fs, u32 
         }
         hashes = &pending;
     }
+    if (split.Parallel() != nullptr) [[unlikely]] {
+        // The mirror holds this write already; the ring gets it after the records.
+        FrontParallelDraw(split, fs, out, method, true);
+    }
     FrontEmitDraws(split, fs, method, value, out, hashes);
 }
 
@@ -2249,6 +2286,9 @@ void Maxwell3D::FrontDrawMulti(VideoCommon::GpuSplit& split, FrontState& fs, u32
     V2::DrawOutput out;
     if (!V2::DrawModel::IsInstanceLoopMethod(method)) {
         model.OnMultiStart(method, fs.regs.data(), out);
+        if (split.Parallel() != nullptr) [[unlikely]] {
+            FrontParallelDraw(split, fs, out, ~0U, true);
+        }
         FrontEmitDraws(split, fs, method, amount != 0 ? base_start[0] : 0, out, nullptr);
     }
     const bool replay = fs.control == Regs::ShadowRamControl::Replay;
@@ -2278,6 +2318,9 @@ void Maxwell3D::FrontDrawMulti(VideoCommon::GpuSplit& split, FrontState& fs, u32
         if (model.HasDeferredDraw() && !V2::DrawModel::IsInstanceLoopMethod(method) &&
             (execution_mask[method] || !fs.back_skip_same || fs.regs[method] != value)) {
             model.OnStore(method, fs.regs.data(), out);
+            if (split.Parallel() != nullptr) [[unlikely]] {
+                FrontParallelDraw(split, fs, out, ~0U, false);
+            }
             FrontEmitDraws(split, fs, method, value, out, &hashes);
             out.count = 0;
         }
@@ -2287,6 +2330,9 @@ void Maxwell3D::FrontDrawMulti(VideoCommon::GpuSplit& split, FrontState& fs, u32
         fs.regs[method] = value;
         if (execution_mask[method]) {
             model.OnExecute(method, value, fs.regs.data(), out);
+            if (split.Parallel() != nullptr) [[unlikely]] {
+                FrontParallelDraw(split, fs, out, ~0U, false);
+            }
             FrontEmitDraws(split, fs, method, value, out, &hashes);
         }
     }
