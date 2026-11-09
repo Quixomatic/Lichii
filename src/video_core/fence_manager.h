@@ -115,7 +115,8 @@ public:
             [[unlikely]] {
             V2::Commit::Stats::Count(V2::Commit::Stats::Get().writeback_queued);
         }
-        auto [should_flush, committed_flushes] = defer ? CacheFlushes{} : CommitCacheFlushes();
+        auto [should_flush, committed_flushes, early_only] =
+            defer ? CacheFlushes{} : CommitCacheFlushes();
         if (Nx2Profile::Enabled()) {
             NoteFenceDecision(delay_fence, committed_flushes);
         }
@@ -128,7 +129,12 @@ public:
         skipped_fences = 0;
         should_flush |= query_cache.HasUncommittedFlushes();
         query_cache.CommitAsyncFlushes();
-        TFence new_fence = CreateFence(!should_flush);
+        // EDEN_NX2_V2_READBACK early downloads alone (MASTER_PLAN §6 class C): recorded now,
+        // they go to the GPU with the next submission; the fence waits for it instead of making
+        // one (a lazy fence: no flush here or in Queue).
+        const bool lazy = !should_flush && early_only;
+        TFence new_fence = CreateFence(!should_flush && !lazy);
+        queue_lazily = lazy;
         if constexpr (can_async_check) {
             guard.lock();
         }
@@ -260,6 +266,10 @@ public:
     }
 
 protected:
+    /// The fence being queued is lazy (see SignalFence): the backend records its wait point
+    /// without submitting.
+    bool queue_lazily = false;
+
     explicit FenceManager(VideoCore::RasterizerInterface& rasterizer_, Tegra::GPU& gpu_,
                           TTextureCache& texture_cache_, TBufferCache& buffer_cache_,
                           TQueryCache& query_cache_)
@@ -468,6 +478,7 @@ private:
     struct CacheFlushes {
         bool should_flush;  ///< Downloads to wait for: the fence must reach the host GPU
         u8 committed;       ///< TextureFlushes, BufferFlushes: the caches that committed downloads
+        bool early_only;    ///< The buffer downloads are all learned early downloads
     };
 
     /// Commits the texture and buffer caches' downloads for a new fence (the query cache's are
@@ -489,8 +500,12 @@ private:
         {
             std::scoped_lock lock{buffer_cache.mutex};
             if (buffer_cache.HasUncommittedFlushes()) {
+                // Learned early downloads never make a submission of their own: they ride the
+                // next one (a lazy fence), unless something else here needs the fence flushed.
+                const bool early = buffer_cache.FlushesAreEarlyDownloads();
                 buffer_cache.CommitAsyncFlushes();
-                flushes.should_flush = true;
+                flushes.early_only = early;
+                flushes.should_flush |= !early;
                 flushes.committed |= BufferFlushes;
             }
         }

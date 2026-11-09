@@ -131,6 +131,7 @@ void BufferCache<P>::TickFrame() {
         return;
     }
     runtime.TickFrame(slot_buffers);
+    ++learned_frame;
     if (!readbacks_in_flight.empty()) [[unlikely]] {
         FreeLandedReadbacks();
     }
@@ -592,8 +593,14 @@ void BufferCache<P>::NoteLearnedWrite(DAddr device_addr, u64 size) {
         if (it == learned_pages.end() || !it->second.marked) {
             continue;
         }
+        // Counted once per frame: Ocarina of Time writes such pages several times a frame and
+        // reads them once, which flipped them between learned and unlearned every frame.
+        if (it->second.write_frame == learned_frame) {
+            continue;
+        }
+        it->second.write_frame = learned_frame;
         if (++it->second.unread_writes >= 4) {
-            // Written four times without a read: stop downloading it at every fence.
+            // Written in four frames without a read: stop downloading it at fences.
             memory_tracker.UnmarkRegionAsPreflushable(page << Core::DEVICE_PAGEBITS,
                                                       Core::DEVICE_PAGESIZE);
             learned_pages.erase(it);
@@ -1777,6 +1784,11 @@ void BufferCache<P>::FlushCachedWrites() {
 template <class P>
 bool BufferCache<P>::HasUncommittedFlushes() const noexcept {
     return !uncommitted_gpu_modified_ranges.Empty() || !committed_gpu_modified_ranges.empty();
+}
+
+template <class P>
+bool BufferCache<P>::FlushesAreEarlyDownloads() const {
+    return Tegra::g_nx2_ampere.load(std::memory_order_relaxed) && !AsyncBufferDownloads();
 }
 
 template <class P>

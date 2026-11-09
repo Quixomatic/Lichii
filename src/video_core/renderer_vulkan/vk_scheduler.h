@@ -7,6 +7,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
@@ -70,8 +71,17 @@ public:
     /// once); otherwise it goes with the next one. The back submits deferred work before it
     /// sleeps and when another thread asks (WaitSubmitted). True when the flush was deferred.
     bool DeferFlush();
-    /// Submits deferred work (the split's back, from its idle hook).
+    /// Submits deferred work (the split's back, from its idle hook), and a lazy fence's tick
+    /// another thread asked for (RequestLazyFlush).
     void FlushDeferred();
+    /// Any thread: a lazy fence (early downloads) waited long enough for `tick` to be submitted;
+    /// the back submits it at its next idle hook. Follow with WaitSubmitted.
+    void RequestLazyFlush(u64 tick) {
+        u64 current = lazy_flush_tick.load(std::memory_order_relaxed);
+        while (current < tick &&
+               !lazy_flush_tick.compare_exchange_weak(current, tick, std::memory_order_relaxed)) {
+        }
+    }
     /// Threads other than the split's back: waits until tick is submitted, asking the back to
     /// submit deferred work (logged every 2 s while it waits). False only when the back thread
     /// is not running, so nothing will submit it: the caller then submits it itself.
@@ -422,6 +432,7 @@ public:
 private:
     std::chrono::steady_clock::time_point last_flush{};
     bool flush_pending{};
+    std::atomic<u64> lazy_flush_tick{}; ///< RequestLazyFlush
 
     class Command {
     public:

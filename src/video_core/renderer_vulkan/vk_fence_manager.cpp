@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <memory>
+#include <thread>
 
 #include "common/logging.h"
 #include "video_core/gpu_split.h"
@@ -19,12 +20,17 @@ InnerFence::InnerFence(Scheduler& scheduler_, bool is_stubbed_)
 
 InnerFence::~InnerFence() = default;
 
-void InnerFence::Queue() {
+void InnerFence::Queue(bool lazy_) {
     if (is_stubbed) {
         return;
     }
     // Get the current tick so we can wait for it
     wait_tick = scheduler.CurrentTick();
+    if (lazy_) {
+        lazy = true;
+        queued_at = std::chrono::steady_clock::now();
+        return;
+    }
     if (!scheduler.DeferFlush()) {
         scheduler.Flush();
     }
@@ -44,6 +50,25 @@ void InnerFence::Wait() {
     // A deferred fence flush (Scheduler::DeferFlush) may not be submitted yet. Only the
     // split's back may submit; other threads (the fencing thread) ask it to and wait. If the back
     // has stopped, nothing else uses the scheduler and Wait below submits it.
+    if (lazy && !scheduler.IsSubmitted(wait_tick) && VideoCommon::GpuSplit::Get().Active() &&
+        !VideoCommon::GpuSplit::OnBackThread()) {
+        // A lazy fence (early downloads) goes with the next submission the back makes anyway
+        // (~1 per ms in heavy scenes). Only if none came within LazyWindow does it ask for one,
+        // so the fence operations queued behind it never wait long.
+        constexpr auto LazyWindow = std::chrono::milliseconds{1};
+        for (u32 spins = 0; !scheduler.IsSubmitted(wait_tick); ++spins) {
+            if (std::chrono::steady_clock::now() - queued_at >= LazyWindow ||
+                !VideoCommon::GpuSplit::Get().BackRunning()) {
+                scheduler.RequestLazyFlush(wait_tick);
+                break;
+            }
+            if (spins < 16) {
+                std::this_thread::yield();
+            } else {
+                std::this_thread::sleep_for(std::chrono::microseconds{50});
+            }
+        }
+    }
     if (!scheduler.IsSubmitted(wait_tick) && VideoCommon::GpuSplit::Get().Active() &&
         !VideoCommon::GpuSplit::OnBackThread() && scheduler.WaitSubmitted(wait_tick)) {
         scheduler.GetMasterSemaphore().Wait(wait_tick);
@@ -63,7 +88,7 @@ Fence FenceManager::CreateFence(bool is_stubbed) {
 }
 
 void FenceManager::QueueFence(Fence& fence) {
-    fence->Queue();
+    fence->Queue(queue_lazily);
 }
 
 bool FenceManager::IsFenceSignaled(Fence& fence) const {

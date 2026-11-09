@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <chrono>
 #include <memory>
 
 #include "video_core/fence_manager.h"
@@ -28,7 +29,8 @@ public:
     explicit InnerFence(Scheduler& scheduler_, bool is_stubbed_);
     ~InnerFence();
 
-    void Queue();
+    /// `lazy`: only record the wait point; the next submission takes the fence's work.
+    void Queue(bool lazy = false);
 
     bool IsSignaled() const;
 
@@ -37,6 +39,8 @@ public:
 private:
     Scheduler& scheduler;
     u64 wait_tick = 0;
+    bool lazy = false;
+    std::chrono::steady_clock::time_point queued_at{};
 };
 using Fence = std::shared_ptr<InnerFence>;
 

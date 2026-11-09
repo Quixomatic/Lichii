@@ -432,6 +432,10 @@ public:
     /// Return true when there are uncommitted buffers to be downloaded
     [[nodiscard]] bool HasUncommittedFlushes() const noexcept;
 
+    /// Whether the fence downloads queued are all learned early downloads (EDEN_NX2_V2_READBACK):
+    /// Switch 2 titles without async buffer downloads mark pages Preflushable only by learning.
+    [[nodiscard]] bool FlushesAreEarlyDownloads() const;
+
     void AccumulateFlushes();
 
     /// Return true when the caller should wait for async downloads
@@ -700,9 +704,11 @@ private:
     std::vector<std::shared_ptr<ReadbackState>> readbacks_in_flight;
     struct LearnedPage {
         u8 reads{};
-        u8 unread_writes{};
+        u8 unread_writes{}; ///< Frames with GPU writes and no read since
         bool marked{};
+        u64 write_frame{};  ///< learned_frame of the last write counted
     };
+    u64 learned_frame{1}; ///< +1 per TickFrame
     std::unordered_map<u64, LearnedPage> learned_pages;
     size_t learned_marked{};
     DAddr learned_lowest{~DAddr{0}};

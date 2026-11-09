@@ -239,6 +239,11 @@ bool Scheduler::DeferFlush() {
 void Scheduler::FlushDeferred() {
     if (flush_pending) {
         Flush();
+        return;
+    }
+    const u64 lazy = lazy_flush_tick.load(std::memory_order_relaxed);
+    if (lazy != 0 && !IsSubmitted(lazy)) [[unlikely]] {
+        Flush();
     }
 }
 

@@ -23,7 +23,10 @@ namespace {
 
 struct Cache {
     std::mutex mutex;
-    bool HasUncommittedFlushes() const { return true; }
+    bool uncommitted = true;
+    bool early = false;
+    bool HasUncommittedFlushes() const { return uncommitted; }
+    bool FlushesAreEarlyDownloads() const { return early; }
     bool HasAsyncFlushWork() const { return true; }
     bool ShouldWaitAsyncFlushes() const { return true; }
     void AccumulateFlushes() {}
@@ -62,14 +65,18 @@ public:
 
     u64 queued{};
     u32 submissions{};
+    bool last_stubbed{};
+    bool last_lazy{};
 
 protected:
     std::shared_ptr<Fence> CreateFence(bool stubbed) override {
+        last_stubbed = stubbed;
         return std::make_shared<Fence>(stubbed, queued + 1);
     }
 
     void QueueFence(std::shared_ptr<Fence>& fence) override {
         queued = fence->tick;
+        last_lazy = queue_lazily;
     }
 
     bool IsFenceSignaled(std::shared_ptr<Fence>& fence) const override {
@@ -160,4 +167,47 @@ TEST_CASE("Immediate fence waits still submit outstanding work", "[video_core][s
         REQUIRE_FALSE(submission.wrong_owner);
     }
     REQUIRE(callback.load());
+}
+
+TEST_CASE("Early downloads alone make a lazy fence that submits nothing",
+          "[video_core][split_fence_wait]") {
+    ScopedSystemTestContext context;
+    Core::System system;
+    Tegra::GPU gpu{system, false, false};
+    Null::RasterizerNull rasterizer{gpu};
+    Cache texture, buffer, query;
+    texture.uncommitted = false;
+    query.uncommitted = false;
+    buffer.early = true;
+    Submission submission;
+    const auto previous = Settings::values.gpu_fence_behavior.GetValue();
+    const auto previous_accuracy = Settings::values.current_gpu_accuracy;
+    SCOPE_EXIT {
+        Settings::values.gpu_fence_behavior.SetValue(previous);
+        Settings::values.current_gpu_accuracy = previous_accuracy;
+    };
+    Settings::values.gpu_fence_behavior.SetValue(Settings::GpuFenceBehavior::Default);
+    Settings::values.current_gpu_accuracy = Settings::GpuAccuracy::Low;
+    FenceManager manager{rasterizer, gpu, texture, buffer, query, submission};
+    manager.SignalFence([] {});
+    // Made (it carries the downloads), not stubbed (it waits for the GPU), queued lazily.
+    CHECK(manager.queued == 1);
+    CHECK_FALSE(manager.last_stubbed);
+    CHECK(manager.last_lazy);
+    CHECK(manager.submissions == 0);
+    // Any other download makes the fence flush as before.
+    buffer.early = false;
+    manager.SignalFence([] {});
+    CHECK(manager.queued == 2);
+    CHECK_FALSE(manager.last_stubbed);
+    CHECK_FALSE(manager.last_lazy);
+    buffer.early = true;
+    query.uncommitted = true;
+    manager.SignalFence([] {});
+    CHECK_FALSE(manager.last_lazy);
+    {
+        std::scoped_lock lock{submission.mutex};
+        submission.submitted = manager.queued;
+        submission.cv.notify_all();
+    }
 }
