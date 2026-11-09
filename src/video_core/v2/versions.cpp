@@ -166,8 +166,14 @@ bool EpochMemo::Unchanged(DAddr address, u64 size, u64 since) {
     Entry& entry = entries[static_cast<size_t>(key >> 56) % Entries];
     const u64 current_epoch = epoch->Current();
     if (entry.epoch == current_epoch && entry.begin == address && entry.end == end) {
+        // Every draw logs its constant buffer data: once more writes were logged since the
+        // memo than the range has pages, the walk below (a load per region and page) costs
+        // less than scanning the log (three loads per write), with the same answer (Perf fix D).
+        const u64 walk_loads = (size >> PageVersions::PageBits) + 2;
         const u64 head = log->Head();
-        if (entry.log_head == head || !log->WrittenSince(entry.log_head, address, end)) {
+        if (entry.log_head == head ||
+            ((head - entry.log_head) * 3 <= walk_loads + 48 &&
+             !log->WrittenSince(entry.log_head, address, end))) {
             entry.log_head = head;
             ++counters.hits;
             return entry.newest <= since;

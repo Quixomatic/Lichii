@@ -121,11 +121,29 @@ TEST_CASE("V2 P4: the epoch memo answers repeats and sees stream writes", "[vide
     counters = memo.TakeCounters();
     REQUIRE(counters.hits == 1);
 
+    // More stream writes elsewhere than the range has pages: the walk answers, the same way.
+    for (u32 i = 0; i < 40; ++i) {
+        log.Note(0x9000000, 0x9000010);
+    }
+    REQUIRE(memo.Unchanged(image, size, x));
+    counters = memo.TakeCounters();
+    REQUIRE(counters.walks == 1);
+    // One of them over the range: still seen.
+    versions.Note(image + 3 * Page, 16, Source::Inline);
+    log.Note(image + 3 * Page, image + 3 * Page + 16);
+    for (u32 i = 0; i < 40; ++i) {
+        log.Note(0x9000000, 0x9000010);
+    }
+    REQUIRE_FALSE(memo.Unchanged(image, size, x));
+    const u64 y = versions.Stamp();
+    REQUIRE(memo.Unchanged(image, size, y));
+    static_cast<void>(memo.TakeCounters());
+
     // More stream writes than the log holds: walk again.
     for (u32 i = 0; i < Versions::StreamLog::Size + 4; ++i) {
         log.Note(0x9000000, 0x9000010);
     }
-    REQUIRE(memo.Unchanged(image, size, x));
+    REQUIRE(memo.Unchanged(image, size, y));
     counters = memo.TakeCounters();
     REQUIRE(counters.walks == 1);
 }
