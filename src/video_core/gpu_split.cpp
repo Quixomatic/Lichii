@@ -37,6 +37,7 @@
 #include "video_core/v2/qmd_front.h"
 #include "video_core/v2/ir_check.h"
 #include "video_core/v2/ir_exec.h"
+#include "video_core/v2/front_writes.h"
 #include "video_core/v2/v2_stats.h"
 #include "video_core/v2/versions.h"
 
@@ -177,6 +178,7 @@ void GpuSplit::MaybeStart(Core::System& system_) {
     tracks_writes = acquire_mode != V2::Mode::Off || hazard_mode != V2::Mode::Off;
     feed_idle_back = acquire_mode != V2::Mode::Off;
     hazards.Clear();
+    pending_cb = {};
     unlanded.Clear();
     V2::Landing::landed.store(0, std::memory_order_relaxed);
     // AnyPS5's hand-off spin (HandoffSpin.hpp): spin before a kernel wait only with more than 8
@@ -247,6 +249,7 @@ void GpuSplit::Stop() {
     acquire_mode = V2::Mode::Off;
     hazard_mode = V2::Mode::Off;
     hazards.Clear();
+    pending_cb = {};
     unlanded.Clear();
     V2::Landing::landed.store(0, std::memory_order_relaxed);
     SetCpuLaneHook(nullptr, nullptr);
@@ -341,7 +344,18 @@ void GpuSplit::ParallelPublish() {
     parallel->OnPublish(published_local);
 }
 
+void GpuSplit::FlushCbWriteSlow() {
+    const PendingCb pending = pending_cb;
+    pending_cb = {};
+    V2::NoteRangeWriteGpu(*this, *pending.memory, pending.begin, pending.end - pending.begin,
+                          V2::Producer::CbData);
+}
+
 void GpuSplit::Drain(DrainSite site) {
+    if (site == DrainSite::Map) {
+        FlushCbWrite(); // Translated with the mapping the words were sent under
+        ++map_epoch;
+    }
     consumed_cache = consumed.load(std::memory_order_acquire);
     if (consumed_cache == write_position) {
         return;

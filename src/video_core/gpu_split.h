@@ -23,6 +23,10 @@ namespace Core {
 class System;
 }
 
+namespace Tegra {
+class MemoryManager;
+}
+
 namespace Tegra::Engines {
 class EngineInterface;
 }
@@ -159,17 +163,38 @@ public:
     /// rest of the run). Only writes that can land at a fence cut the run, so that each one has
     /// its own landing position (NoteUnlandedWrite retires by landing).
     void NoteKnownWrite(u64 device_address, const void* bytes, u32 size, V2::Producer producer) {
+        FlushCbWrite();
         CutForLanding(producer);
         PrepareHazardNote();
         hazards.NoteKnown(device_address, bytes, size, write_position, producer);
     }
     void NoteRangeWrite(u64 device_address, u64 size, V2::Producer producer) {
+        if (producer != V2::Producer::CbData) {
+            FlushCbWrite();
+        }
         CutForLanding(producer);
         PrepareHazardNote();
         hazards.NoteRange(device_address, size, write_position, producer);
     }
     void NoteUnboundedWrite(V2::Producer producer) {
         hazards.NoteUnbounded(producer, write_position);
+    }
+    /// Front, TracksWrites: constant buffer words just sent to a GPU range. Words that continue
+    /// the pending range on its GPU page join it (no translation, no table entry per word);
+    /// the range is noted before any lookup, any other write note and a map (FlushCbWrite).
+    void NoteCbWrite(const Tegra::MemoryManager& memory, u64 gpu_address, u64 size) {
+        if (gpu_address == pending_cb.end && &memory == pending_cb.memory && size != 0 &&
+            ((gpu_address + size - 1) >> 12) == (pending_cb.begin >> 12)) [[likely]] {
+            pending_cb.end += size;
+            return;
+        }
+        FlushCbWrite();
+        pending_cb = {&memory, gpu_address, gpu_address + size};
+    }
+    void FlushCbWrite() {
+        if (pending_cb.memory != nullptr) [[unlikely]] {
+            FlushCbWriteSlow();
+        }
     }
     /// Front: the draw just sent writes these device ranges (render and depth targets).
     void NoteDrawTargets(std::span<const std::pair<u64, u64>> ranges) {
@@ -178,6 +203,7 @@ public:
     /// Front: the queued writes to a device range that `filter` orders against (V2::HazardTable).
     [[nodiscard]] V2::HazardResult FindWrites(u64 device_address, u64 size,
                                               const V2::HazardFilter& filter, u8* out = nullptr) {
+        FlushCbWrite();
         const u64 done = ConsumedNow();
         hazards.Retire(done);
         return hazards.Find(device_address, size, done, filter, out);
@@ -189,6 +215,10 @@ public:
     /// of it was still queued.
     bool WaitForPosition(u64 position, DrainSite site) {
         return WaitFor(std::min(position, write_position), site);
+    }
+    /// Front: moves at every map drain (the front's GPU→device translations may change).
+    [[nodiscard]] u32 MapEpoch() const {
+        return map_epoch;
     }
     /// Front: the newest compute/copy work sent before the last host-level sync (NoteSync).
     [[nodiscard]] u64 SyncedWriterPosition() const {
@@ -530,6 +560,7 @@ private:
             Publish();
         }
     }
+    void FlushCbWriteSlow();
     void PrepareHazardNote() {
         if (hazards.Size() == V2::HazardTable::Capacity) [[unlikely]] {
             hazards.Retire(consumed.load(std::memory_order_acquire));
@@ -704,6 +735,13 @@ private:
     V2::Mode hazard_mode{};
     u64 spin_window_ns{};
     u64 idle_hook_ns{}; ///< EDEN_NX2_V2_SPIN: the back's idle hook after this long idle
+    struct PendingCb {
+        const Tegra::MemoryManager* memory;
+        u64 begin;
+        u64 end;
+    };
+    PendingCb pending_cb{}; ///< NoteCbWrite
+    u32 map_epoch{};        ///< MapEpoch
     u64 front_spin_start{};
     V2::HazardTable hazards;
     V2::HazardTable unlanded; ///< Fence-flagged known releases until they land (Landing)

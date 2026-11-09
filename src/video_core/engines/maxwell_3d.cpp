@@ -1444,6 +1444,13 @@ struct Maxwell3D::FrontState {
     u64 v2_macro_generation{~u64{0}};
     std::unique_ptr<VideoCommon::V2::MacroHle::Observation> v2_observation;
     bool v2_targets_dirty{true};
+    // FrontNoteDraw's verdict on the bound programs' stores, kept until a Shaders-group register,
+    // a register it reads, a summary (ShaderWrites::Generation) or a mapping (MapEpoch) changes.
+    bool v2_programs_dirty{true};
+    bool v2_programs_unbounded{};
+    u32 v2_programs_state{};
+    u32 v2_programs_generation{};
+    u32 v2_programs_map_epoch{};
     u32 v2_target_count{};
     std::array<std::pair<u64, u64>, 9> v2_targets{};
     /// A method the draw manager handles was sent since the back last ran DrawDeferred: only
@@ -1936,6 +1943,8 @@ void Maxwell3D::FrontNoteWrites(VideoCommon::GpuSplit& split, FrontState& fs, u3
         method == MAXWELL3D_REG_INDEX(anti_alias_samples_mode) ||
         method == MAXWELL3D_REG_INDEX(zeta_enable)) {
         fs.v2_targets_dirty = true;
+    } else if (table.groups[method] == V2::RegGroup::Shaders) {
+        fs.v2_programs_dirty = true;
     }
     if ((flags & V2::RegSem::DrawEnd) != 0 || method == MAXWELL3D_REG_INDEX(clear_surface)) {
         FrontNoteDraw(split, fs);
@@ -1956,8 +1965,9 @@ void Maxwell3D::FrontNoteWrites(VideoCommon::GpuSplit& split, FrontState& fs, u3
             fs.regs[MAXWELL3D_REG_INDEX(const_buffer.address_low)];
         const u64 bytes = u64{amount} * sizeof(u32);
         const u32 offset = fs.regs[MAXWELL3D_REG_INDEX(const_buffer.offset)];
-        V2::NoteRangeWriteGpu(split, memory_manager, buffer + offset - bytes, bytes,
-                              V2::Producer::CbData);
+        // Coalesced in the split while the words stay contiguous on one GPU page (macros write
+        // them one by one): one translation and one table entry per run.
+        split.NoteCbWrite(memory_manager, buffer + offset - bytes, bytes);
     } else if ((flags & V2::RegSem::ReportSemaphore) != 0 && amount != 0) {
         V2::NoteReport3D(split, memory_manager, fs.regs.data());
     }
@@ -1968,8 +1978,29 @@ void Maxwell3D::FrontNoteDraw(VideoCommon::GpuSplit& split, FrontState& fs) {
     // The front's registers have the engine's layout.
     const auto& r = *reinterpret_cast<const Regs*>(fs.regs.data());
     // Stores other than to the targets: every bound program must be known to store nothing.
-    bool unbounded = r.transform_feedback_enabled != 0;
+    // The verdict is cached: recomputed only when what it reads may have changed (B4).
     const bool native = GetNativeMacroEngine().native_turing;
+    const u32 inputs = (r.transform_feedback_enabled != 0 ? 1U : 0U) |
+                       (r.rasterize_enable != 0 ? 2U : 0U) | (r.IsMeshEnabled() ? 4U : 0U) |
+                       (native ? 8U : 0U);
+    const u32 generation = V2::ShaderWrites::Generation();
+    if (fs.v2_programs_dirty || inputs != fs.v2_programs_state ||
+        generation != fs.v2_programs_generation || split.MapEpoch() != fs.v2_programs_map_epoch) {
+        fs.v2_programs_dirty = false;
+        fs.v2_programs_state = inputs;
+        fs.v2_programs_generation = generation;
+        fs.v2_programs_map_epoch = split.MapEpoch();
+        fs.v2_programs_unbounded = FrontProgramsUnbounded(r, native);
+    }
+    if (fs.v2_programs_unbounded) {
+        split.NoteUnboundedWrite(V2::Producer::Draw);
+    }
+    FrontNoteTargets(split, fs, r);
+}
+
+bool Maxwell3D::FrontProgramsUnbounded(const Regs& r, bool native) {
+    namespace V2 = VideoCommon::V2;
+    bool unbounded = r.transform_feedback_enabled != 0;
     for (size_t index = 0; index < Regs::MaxShaderProgram && !unbounded; ++index) {
         if (!r.IsShaderConfigEnabled(index)) {
             continue;
@@ -1988,9 +2019,11 @@ void Maxwell3D::FrontNoteDraw(VideoCommon::GpuSplit& split, FrontState& fs) {
             device ? V2::ShaderWrites::Lookup(*device) : std::optional<V2::ShaderWrites::Summary>{};
         unbounded = !summary || !summary->WritesNothing();
     }
-    if (unbounded) {
-        split.NoteUnboundedWrite(V2::Producer::Draw);
-    }
+    return unbounded;
+}
+
+void Maxwell3D::FrontNoteTargets(VideoCommon::GpuSplit& split, FrontState& fs, const Regs& r) {
+    namespace V2 = VideoCommon::V2;
     if (fs.v2_targets_dirty) {
         fs.v2_targets_dirty = false;
         fs.v2_target_count = 0;

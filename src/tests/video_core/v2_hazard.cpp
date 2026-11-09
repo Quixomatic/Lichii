@@ -518,11 +518,19 @@ TEST_CASE("V2 write ranges: uploads and shader write summaries", "[video_core][v
         CHECK(!ShaderWrites::Lookup(far));
         ShaderWrites::Invalidate(address, address + 0x100);
         CHECK(!ShaderWrites::Lookup(address));
-        // Recorded again after an invalidation: found and invalidated again.
+        // Recorded again after an invalidation: found and invalidated again; each moves the
+        // generation the front caches its draw verdicts by, a miss doesn't.
+        const u32 generation = ShaderWrites::Generation();
         ShaderWrites::Record(address, info);
+        CHECK(ShaderWrites::Generation() != generation);
+        const u32 recorded = ShaderWrites::Generation();
+        ShaderWrites::Record(address, info);
+        ShaderWrites::Invalidate(address + 0x1000, address + 0x2000);
+        CHECK(ShaderWrites::Generation() == recorded);
         CHECK(ShaderWrites::Lookup(address));
         ShaderWrites::Invalidate(address & ~u64{0xfff}, (address & ~u64{0xfff}) + 0x1000);
         CHECK(!ShaderWrites::Lookup(address));
+        CHECK(ShaderWrites::Generation() != recorded);
     }
 }
 

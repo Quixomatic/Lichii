@@ -29,6 +29,7 @@ std::array<Slot, NumSlots> g_slots;
 // The pages and the address range of every key ever recorded (never shrink). Invalidations run
 // for every inline upload and pre-draw invalidation; almost none reach a program's page, so they
 // return here instead of walking every slot.
+std::atomic<u32> g_generation{};
 std::atomic<u64> g_lowest{~u64{0}};
 std::atomic<u64> g_highest{0};
 
@@ -118,6 +119,7 @@ void Record(u64 device_address, const Shader::Info& info) {
                               std::memory_order_relaxed);
     }
     slot.sequence.store(sequence + 2, std::memory_order_release);
+    g_generation.fetch_add(1, std::memory_order_release);
 }
 
 std::optional<Summary> Lookup(u64 device_address) {
@@ -154,8 +156,13 @@ void Invalidate(u64 begin, u64 end) {
         const u64 key = slot.key.load(std::memory_order_relaxed);
         if (key >= begin && key < end) {
             slot.key.store(0, std::memory_order_release);
+            g_generation.fetch_add(1, std::memory_order_release);
         }
     }
+}
+
+u32 Generation() {
+    return g_generation.load(std::memory_order_acquire);
 }
 
 } // namespace VideoCommon::V2::ShaderWrites

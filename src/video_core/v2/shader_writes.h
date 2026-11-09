@@ -53,4 +53,8 @@ void Record(u64 device_address, const Shader::Info& info);
 /// The shader cache dropped programs in [begin, end).
 void Invalidate(u64 begin, u64 end);
 
+/// Moves whenever a Lookup result may have changed (a new or changed summary, an invalidated
+/// key): the front caches verdicts built from Lookups until it moves.
+[[nodiscard]] u32 Generation();
+
 } // namespace VideoCommon::V2::ShaderWrites
