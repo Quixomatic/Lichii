@@ -190,6 +190,14 @@ void ThreadManager::SendToBack(CpuRecord& record, VideoCore::RasterizerInterface
     case CpuOp::Submit:
         break;
     case CpuOp::Tick: {
+        if (split.TypedIr()) {
+            // Composites at their position in the stream (MASTER_PLAN §5.2 Present records),
+            // before the TickWork that counts their placeholders' fences.
+            for (const V2::Ir::PresentBody& present : system.GPU().TakeQueuedPresents()) {
+                split.Emit(V2::Ir::Kind::Present, present,
+                           [gpu = &system.GPU(), present] { gpu->RunPresent(present); });
+            }
+        }
         // TickWork ends fast draw reuse itself when it runs a request.
         const V2::Ir::BarrierBody body{.op = V2::Ir::BarrierOp::TickWork,
                                        .object = split.Ref(&system.GPU()),

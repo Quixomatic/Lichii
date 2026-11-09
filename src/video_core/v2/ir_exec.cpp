@@ -241,7 +241,9 @@ bool Execute(const Ir::RecordView& record, const Context& context) {
         return true;
     case Ir::Kind::Copy:
     case Ir::Kind::Acquire:
+        return true;
     case Ir::Kind::Present:
+        context.system.GPU().RunPresent(record.As<Ir::PresentBody>());
         return true;
     default:
         return false;

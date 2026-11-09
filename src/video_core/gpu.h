@@ -249,6 +249,13 @@ public:
     void RequestComposite(std::vector<Tegra::FramebufferConfig>&& layers,
                           std::vector<Service::Nvidia::NvFence>&& fences);
 
+    /// The split's front at a Tick: takes the queued composites out of the sync request queue
+    /// (each leaves a placeholder that keeps the queue's fence order) for Present records that
+    /// run at their ring position (MASTER_PLAN §5.2).
+    [[nodiscard]] std::vector<VideoCommon::V2::Ir::PresentBody> TakeQueuedPresents();
+    /// A Present record on the split's back: composites the slot now, or once its fences signal.
+    void RunPresent(const VideoCommon::V2::Ir::PresentBody& present);
+
     void WaitForComposite();
 
     std::vector<u8> GetAppletCaptureBuffer();
