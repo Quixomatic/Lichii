@@ -22,6 +22,7 @@
 #include "core/memory.h"
 #include "tests/core/system_test_context.h"
 #include "video_core/dirty_flags.h"
+#include "video_core/engines/kepler_compute.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/gpu.h"
 #include "video_core/gpu_split.h"
@@ -1341,4 +1342,202 @@ TEST_CASE("V2 draw trigger table and the back's draw/dispatch checks",
     CHECK(counters.dispatches_unexpected == 1);
     CHECK(counters.dispatch_count_mismatches == 1);
     IrCheck::Stop();
+}
+
+namespace {
+
+void SetupEngine(Fixture& f, Maxwell3D& engine, bool fast) {
+    engine.fast_maxwell3d = fast;
+    engine.BindRasterizer(&f.rasterizer);
+    VideoCommon::Dirty::SetupDirtyFlags(engine.dirty.tables);
+    for (u32 method = 0; method < Maxwell3D::Regs::NUM_REGS; ++method) {
+        if (engine.dirty.tables[1][method] == 0) {
+            engine.dirty.tables[1][method] =
+                static_cast<u8>(VideoCommon::Dirty::LastCommonEntry + method % 61);
+        }
+    }
+    engine.dirty.flags.reset();
+    engine.CallMethod(f.system, CbAddressHigh, 0x1, true);
+    engine.CallMethod(f.system, CbAddressLow, 0x2000'0000, true);
+    engine.CallMethod(f.system, CbSize, 0x10000, true);
+}
+
+void CompareEngines(const Maxwell3D& a, const Maxwell3D& b) {
+    REQUIRE(a.regs.reg_array == b.regs.reg_array);
+    REQUIRE(a.shadow_state.reg_array == b.shadow_state.reg_array);
+    REQUIRE(a.dirty.flags == b.dirty.flags);
+    const auto& x = a.draw_manager.draw_state;
+    const auto& y = b.draw_manager.draw_state;
+    REQUIRE(x.topology == y.topology);
+    REQUIRE(x.draw_mode == y.draw_mode);
+    REQUIRE(x.draw_indexed == y.draw_indexed);
+    REQUIRE(x.instance_count == y.instance_count);
+    REQUIRE(x.drawn_instances == y.drawn_instances);
+    REQUIRE(x.base_index == y.base_index);
+    REQUIRE(x.base_instance == y.base_instance);
+    for (size_t stage = 0; stage < a.state.shader_stages.size(); ++stage) {
+        for (size_t slot = 0; slot < Maxwell3D::Regs::MaxConstBuffers; ++slot) {
+            REQUIRE(a.state.shader_stages[stage].const_buffers[slot].address ==
+                    b.state.shader_stages[stage].const_buffers[slot].address);
+        }
+    }
+    REQUIRE(a.root_tables.tables == b.root_tables.tables);
+    REQUIRE(a.root_tables.offset == b.root_tables.offset);
+}
+
+/// A recorded random stream of what the back's engines receive: method writes (fast and macro
+/// paths), multi-method runs and sink consumption.
+struct Step {
+    u32 kind; ///< 0 call, 1 multi, 2 sink write, 3 consume sink
+    u32 method;
+    std::vector<u32> words;
+    bool is_last;
+};
+
+std::vector<Step> RecordStream(Fixture& f, u32 seed, u32 count) {
+    std::mt19937 rng{seed};
+    std::vector<Step> steps;
+    const std::array<u32, 6> specials{ShadowControl, MAXWELL3D_REG_INDEX(falcon[4]),
+                                      MAXWELL3D_REG_INDEX(load_mme.start_address),
+                                      MAXWELL3D_REG_INDEX(load_mme.start_address_ptr),
+                                      CbData, CbData + 3};
+    for (u32 i = 0; i < count; ++i) {
+        const u32 choice = static_cast<u32>(rng() % 20);
+        Step step{};
+        step.is_last = rng() % 4 != 0;
+        if (choice < 8) {
+            step.kind = 0;
+            step.method = f.state_methods[rng() % f.state_methods.size()];
+            step.words = {rng() % 3 == 0 ? static_cast<u32>(rng()) : static_cast<u32>(rng() % 3)};
+        } else if (choice < 13) {
+            step.kind = 0;
+            step.method = executable_methods[rng() % executable_methods.size()];
+            step.words = {RandomArgument(rng, step.method, f.slow)};
+        } else if (choice < 15) {
+            step.kind = 0;
+            step.method = specials[rng() % specials.size()];
+            step.words = {step.method == ShadowControl ? static_cast<u32>(rng() % 4)
+                                                       : static_cast<u32>(rng() % 8)};
+        } else if (choice < 17) {
+            step.kind = 1;
+            step.method = rng() % 2 ? CbData : f.state_methods[rng() % f.state_methods.size()];
+            step.words.resize(1 + rng() % 6);
+            for (auto& word : step.words) {
+                word = static_cast<u32>(rng() % 3);
+            }
+        } else if (choice < 19) {
+            step.kind = 2;
+            step.method = f.state_methods[rng() % f.state_methods.size()];
+            step.words = {static_cast<u32>(rng() % 3)};
+        } else {
+            step.kind = 3;
+        }
+        steps.push_back(std::move(step));
+    }
+    return steps;
+}
+
+void Play(Fixture& f, Maxwell3D& engine, const Step& step) {
+    switch (step.kind) {
+    case 0:
+        engine.CallMethod(f.system, step.method, step.words[0], step.is_last);
+        break;
+    case 1:
+        engine.CallMultiMethod(f.system, step.method, step.words.data(),
+                               static_cast<u32>(step.words.size()),
+                               static_cast<u32>(step.words.size()));
+        break;
+    case 2:
+        engine.method_sink.emplace_back(step.method, step.words[0]);
+        break;
+    default:
+        engine.ConsumeSink(f.system);
+        break;
+    }
+}
+
+} // Anonymous namespace
+
+TEST_CASE("V2 back table path matches the engine's register path on recorded streams",
+          "[video_core][v2_regsem]") {
+    using VideoCommon::V2::Mode;
+    using VideoCommon::V2::Switch;
+    Fixture f;
+    for (const bool fast : {true, false}) {
+        const auto steps = RecordStream(f, fast ? 3 : 4, 30000);
+        auto legacy = std::make_unique<Maxwell3D>(f.memory);
+        std::unique_ptr<Maxwell3D> table;
+        std::unique_ptr<Maxwell3D> verify;
+        {
+            const V2SwitchScope scope{Switch::RegSem, Mode::On};
+            table = std::make_unique<Maxwell3D>(f.memory);
+        }
+        {
+            const V2SwitchScope scope{Switch::RegSem, Mode::Verify};
+            verify = std::make_unique<Maxwell3D>(f.memory);
+        }
+        for (auto* engine : {legacy.get(), table.get(), verify.get()}) {
+            SetupEngine(f, *engine, fast);
+        }
+        for (size_t i = 0; i < steps.size(); ++i) {
+            Play(f, *legacy, steps[i]);
+            {
+                const V2SwitchScope scope{Switch::RegSem, Mode::On};
+                Play(f, *table, steps[i]);
+            }
+            {
+                const V2SwitchScope scope{Switch::RegSem, Mode::Verify};
+                Play(f, *verify, steps[i]);
+            }
+            if ((i & 1023) == 0) {
+                CompareEngines(*legacy, *table);
+                CompareEngines(*legacy, *verify);
+            }
+        }
+        CompareEngines(*legacy, *table);
+        CompareEngines(*legacy, *verify);
+        CHECK(verify->V2BackMismatches() == 0);
+    }
+    // The compute table gives the engine's plain stores.
+    Tegra::Engines::KeplerCompute compute{f.memory};
+    CHECK(compute.NativePlainMethods() == VideoCommon::V2::RegSem::TableComputePlain());
+}
+
+TEST_CASE("V2 back table path cost per write", "[.][v2_regsem_bench]") {
+    using VideoCommon::V2::Mode;
+    using VideoCommon::V2::Switch;
+    Fixture f;
+    const auto steps = RecordStream(f, 9, 200000);
+    std::vector<Step> calls;
+    for (const auto& step : steps) {
+        if (step.kind == 0) {
+            calls.push_back(step);
+        }
+    }
+    // The engine's path against the table path, without the group trackers (the global switch
+    // is off while the writes run; the engine took its back mode when constructed).
+    const auto run = [&](Mode mode) {
+        std::unique_ptr<Maxwell3D> engine;
+        {
+            const V2SwitchScope scope{Switch::RegSem, mode};
+            engine = std::make_unique<Maxwell3D>(f.memory);
+        }
+        SetupEngine(f, *engine, true);
+        const auto start = std::chrono::steady_clock::now();
+        for (u32 pass = 0; pass < 20; ++pass) {
+            for (const auto& step : calls) {
+                engine->CallMethod(f.system, step.method, step.words[0], step.is_last);
+            }
+        }
+        const auto elapsed = std::chrono::steady_clock::now() - start;
+        return std::chrono::duration<double, std::nano>(elapsed).count() /
+               (20.0 * static_cast<double>(calls.size()));
+    };
+    run(Mode::Off); // warm up
+    const double legacy = run(Mode::Off);
+    const double table = run(Mode::On);
+    const double legacy2 = run(Mode::Off);
+    const double table2 = run(Mode::On);
+    WARN("V2 back register path: engine " << legacy << " / " << legacy2 << " ns per write, table "
+                                          << table << " / " << table2 << " ns per write");
 }

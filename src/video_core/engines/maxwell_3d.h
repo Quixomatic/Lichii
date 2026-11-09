@@ -32,6 +32,7 @@
 #include "video_core/v2/ir.h"
 #include "video_core/v2/macro_hle.h"
 #include "video_core/v2/regsem.h"
+#include "video_core/v2/v2_switches.h"
 #include "video_core/v2/v2_stats.h"
 #include "video_core/engines/maxwell_3d.h"
 
@@ -3310,6 +3311,11 @@ public:
     /// EDEN_NX2_V2_MACROHLE (back): a host indirect draw replacing an identified NVN2 macro.
     void RunMacroHleDraw(Core::System& system, const VideoCommon::V2::MacroHle::Draw& draw);
 
+    /// EDEN_NX2_V2_REGSEM=verify: register file mismatches the table-driven copy found.
+    [[nodiscard]] u64 V2BackMismatches() const {
+        return v2_back_mirror ? v2_back_mirror->mismatches : 0;
+    }
+
 private:
     void InitializeRegisterDefaults();
 
@@ -3477,6 +3483,20 @@ private:
     /// Sends a macro HLE host indirect draw (a HostIndirect Draw record).
     void FrontEmitHostIndirect(Core::System& system, VideoCommon::GpuSplit& split,
                                FrontState& state, const VideoCommon::V2::MacroHle::Draw& draw);
+    // EDEN_NX2_V2_REGSEM on the executing engine: the register update through the semantics
+    // table (=1), or the engine's own path compared with it on a register copy (verify).
+    void CallMethodV2(u32 method, u32 method_argument, bool is_last_call, bool fast);
+    void CallMethodSlowTail(u32 method, u32 method_argument, bool is_last_call);
+    void TableWrite(u32 method, u32 method_argument, bool is_last_call, bool fast);
+    void TableMethodCall(VideoCommon::V2::RegSem::Action3D action, u32 method, u32 argument,
+                         u32 nonshadow_argument, bool is_last_call);
+    void ConsumeSinkV2();
+    void VerifyMultiV2(VideoCommon::V2::RegSem::BackMirror3D& mirror, u32 method, const u32* base_start,
+                       u32 amount);
+    VideoCommon::V2::RegSem::BackMirror3D& BackMirror();
+    VideoCommon::V2::Mode v2_back_mode{};
+    const VideoCommon::V2::RegSem::Table3D* v2_table{};
+    std::unique_ptr<VideoCommon::V2::RegSem::BackMirror3D> v2_back_mirror;
     void FrontTrackInstanceLoop(FrontState& state, u32 method, u32 value);
     bool FrontSkipsLoopWrite(FrontState& state, u32 method, u32 value, bool shadow_kept);
     void FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& state, u32 macro, u32 method,

@@ -66,6 +66,8 @@ Maxwell3D::Maxwell3D(MemoryManager& memory_manager_)
     for (size_t i = 0; i < execution_mask.size(); i++)
         execution_mask[i] = IsMethodExecutable(u32(i));
     VideoCommon::V2::RegSem::InitTable3D(execution_mask);
+    v2_back_mode = VideoCommon::V2::Get(VideoCommon::V2::Switch::RegSem);
+    v2_table = &VideoCommon::V2::RegSem::GetTable3D();
     fast_maxwell3d = !record_write_history &&
                      !trace_first_method_writes && !VideoCommon::Nx2Profile::Enabled();
 }
@@ -336,6 +338,9 @@ void Maxwell3D::ConsumeSinkImpl(Core::System& system) {
     if (front_macros && !VideoCommon::GpuSplit::OnBackThread()) {
         ReleaseFront();
     }
+    if (v2_back_mode != VideoCommon::V2::Mode::Off) [[unlikely]] {
+        return ConsumeSinkV2();
+    }
     const auto control = shadow_state.shadow_ram_control;
     // Sunk methods are state writes only (not in execution_mask): skip unchanged values, as
     // CallMethod does.
@@ -547,6 +552,60 @@ void Maxwell3D::TraceFirstMethodWrite(u32 method, u32 argument) {
     }
 }
 
+#if defined(_MSC_VER) && !defined(__clang__)
+#define M3D_FORCE_INLINE __forceinline
+#else
+#define M3D_FORCE_INLINE inline __attribute__((always_inline))
+#endif
+
+M3D_FORCE_INLINE void Maxwell3D::TableWrite(u32 method, u32 method_argument, bool is_last_call,
+                                            bool fast) {
+    // EDEN_NX2_V2_REGSEM=1: the register update through the semantics table the front mirror
+    // uses (shadow RAM, compare-on-write, the action per register), then the action's handler.
+    namespace RegSem = VideoCommon::V2::RegSem;
+    using RegSem::Action3D;
+    const RegSem::Table3D& table = *v2_table;
+    const u32 argument = RegSem::ApplyShadow3D(shadow_state.shadow_ram_control,
+                                               shadow_state.reg_array.data(), method,
+                                               method_argument);
+    const Action3D action = table.actions[method];
+    if (action == Action3D::Store) {
+        if (!SkipSameValueWrites() || regs.reg_array[method] != argument) {
+            ProcessDirtyRegisters(method, argument);
+        }
+        return;
+    }
+    ProcessDirtyRegisters(method, argument);
+    switch (action) {
+    case Action3D::StoreExec:
+        return;
+    case Action3D::TopologyOverride:
+        if (!fast) {
+            // ProcessMethodCall: a method break, nothing for the draw manager to do.
+            VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Method, method);
+        }
+        return;
+    case Action3D::CbData:
+        return ProcessCBData(argument);
+    case Action3D::CbufBind0:
+        return ProcessCBBind(0);
+    case Action3D::CbufBind1:
+        return ProcessCBBind(1);
+    case Action3D::CbufBind2:
+        return ProcessCBBind(2);
+    case Action3D::CbufBind3:
+        return ProcessCBBind(3);
+    case Action3D::CbufBind4:
+        return ProcessCBBind(4);
+    case Action3D::DrawBegin:
+        return draw_manager.DrawBegin(*this);
+    case Action3D::DrawEnd:
+        return draw_manager.DrawEnd(*this);
+    default:
+        return TableMethodCall(action, method, argument, method_argument, is_last_call);
+    }
+}
+
 void Maxwell3D::CallMethod(Core::System& system, u32 method, u32 method_argument, bool is_last_call) {
     if (front_macros && !VideoCommon::GpuSplit::OnBackThread()) {
         ReleaseFront();
@@ -557,6 +616,12 @@ void Maxwell3D::CallMethod(Core::System& system, u32 method, u32 method_argument
     }
     if (perf_verify) {
         return VerifyCallMethod(system, method, method_argument, is_last_call);
+    }
+    if (v2_back_mode != VideoCommon::V2::Mode::Off) [[unlikely]] {
+        if (v2_back_mode == VideoCommon::V2::Mode::On) [[likely]] {
+            return TableWrite(method, method_argument, is_last_call, true);
+        }
+        return CallMethodV2(method, method_argument, is_last_call, true);
     }
     CallMethodFast(method, method_argument, is_last_call);
 }
@@ -712,6 +777,18 @@ void Maxwell3D::CallConstBufferWords(Core::System& system, const u32* methods,
     }
     memory_manager.WriteWordsCached(address + offset, values.data(), count);
     regs.const_buffer.offset += static_cast<u32>(bytes);
+    if (v2_back_mode == VideoCommon::V2::Mode::Verify) [[unlikely]] {
+        // The words as CbData table writes (the mirror was current before the batch).
+        auto& mirror = BackMirror();
+        const auto& table = VideoCommon::V2::RegSem::GetTable3D();
+        for (u32 i = 0; i < count; ++i) {
+            VideoCommon::V2::RegSem::DryWrite3D(mirror, table, methods[i], arguments[i],
+                                                SkipSameValueWrites());
+        }
+        VideoCommon::V2::RegSem::CompareBackWrite3D(mirror, table, methods[count - 1],
+                                                    arguments[count - 1], regs.reg_array.data(),
+                                                    shadow_state.reg_array.data());
+    }
 }
 
 void Maxwell3D::CallMethodSlow(Core::System& system, u32 method, u32 method_argument, bool is_last_call) {
@@ -749,6 +826,13 @@ void Maxwell3D::CallMethodSlow(Core::System& system, u32 method, u32 method_argu
         back_control_writes[back_control_count++ % back_control_writes.size()] = {
             method_argument, static_cast<u32>(shadow_state.shadow_ram_control), is_last_call ? 1U : 0U};
     }
+    if (v2_back_mode != VideoCommon::V2::Mode::Off) [[unlikely]] {
+        return CallMethodV2(method, method_argument, is_last_call, false);
+    }
+    CallMethodSlowTail(method, method_argument, is_last_call);
+}
+
+void Maxwell3D::CallMethodSlowTail(u32 method, u32 method_argument, bool is_last_call) {
     const u32 argument = ProcessShadowRam(method, method_argument);
     // A state register written with the value it holds changes nothing: no dirty flags (they
     // would make the next draw re-check that state), no method processing. Title 1 makes ~6
@@ -764,6 +848,179 @@ void Maxwell3D::CallMethodSlow(Core::System& system, u32 method, u32 method_argu
     }
     ProcessDirtyRegisters(method, argument);
     ProcessMethodCall(method, argument, method_argument, is_last_call);
+}
+
+VideoCommon::V2::RegSem::BackMirror3D& Maxwell3D::BackMirror() {
+    if (!v2_back_mirror) [[unlikely]] {
+        v2_back_mirror = std::make_unique<VideoCommon::V2::RegSem::BackMirror3D>();
+        VideoCommon::V2::RegSem::ResyncBackMirror3D(*v2_back_mirror, regs.reg_array.data(),
+                                                    shadow_state.reg_array.data());
+    }
+    return *v2_back_mirror;
+}
+
+void Maxwell3D::CallMethodV2(u32 method, u32 method_argument, bool is_last_call, bool fast) {
+    namespace RegSem = VideoCommon::V2::RegSem;
+    if (v2_back_mode == VideoCommon::V2::Mode::On) {
+        return TableWrite(method, method_argument, is_last_call, fast);
+    }
+    // Verify: the engine's own path decides; the table-driven update function runs on a copy of
+    // the registers and is compared.
+    auto& mirror = BackMirror();
+    if (fast) {
+        CallMethodFast(method, method_argument, is_last_call);
+    } else {
+        CallMethodSlowTail(method, method_argument, is_last_call);
+    }
+    const auto& table = RegSem::GetTable3D();
+    RegSem::DryWrite3D(mirror, table, method, method_argument, SkipSameValueWrites());
+    RegSem::CompareBackWrite3D(mirror, table, method, method_argument, regs.reg_array.data(),
+                               shadow_state.reg_array.data());
+}
+
+void Maxwell3D::VerifyMultiV2(VideoCommon::V2::RegSem::BackMirror3D& mirror, u32 method,
+                              const u32* base_start, u32 amount) {
+    namespace RegSem = VideoCommon::V2::RegSem;
+    const auto& table = RegSem::GetTable3D();
+    const u16 flags = table.flags[method];
+    const bool replay = shadow_state.shadow_ram_control == Regs::ShadowRamControl::Replay;
+    // Runs of other methods went through CallMethod word by word (verified there).
+    if ((flags & (RegSem::CbData | RegSem::InlineData)) == 0 &&
+        ((flags & RegSem::InlineIndex) == 0 || replay)) {
+        return;
+    }
+    RegSem::DryWriteMulti3D(mirror, table, method, base_start, amount, SkipSameValueWrites());
+    RegSem::CompareBackWrite3D(mirror, table, method, amount != 0 ? base_start[amount - 1] : 0,
+                               regs.reg_array.data(), shadow_state.reg_array.data());
+}
+
+void Maxwell3D::ConsumeSinkV2() {
+    namespace RegSem = VideoCommon::V2::RegSem;
+    const auto& table = RegSem::GetTable3D();
+    const bool skip_same = SkipSameValueWrites();
+    if (v2_back_mode == VideoCommon::V2::Mode::On) {
+        // Sunk methods are state writes (Action3D::Store): the table path's store.
+        for (const auto [method, value] : method_sink) {
+            const u32 argument = RegSem::ApplyShadow3D(shadow_state.shadow_ram_control,
+                                                       shadow_state.reg_array.data(), method,
+                                                       value);
+            if (!skip_same || regs.reg_array[method] != argument) {
+                ProcessDirtyRegisters(method, argument);
+            }
+        }
+        method_sink.clear();
+        return;
+    }
+    // Verify: the engine's loop, then the same writes on the mirror.
+    auto& mirror = BackMirror();
+    const auto control = shadow_state.shadow_ram_control;
+    const auto process = [&](u32 method, u32 value) {
+        if (!skip_same || regs.reg_array[method] != value) {
+            ProcessDirtyRegisters(method, value);
+        }
+    };
+    if (control == Regs::ShadowRamControl::Track || control == Regs::ShadowRamControl::TrackWithFilter) {
+        for (auto [method, value] : method_sink) {
+            shadow_state.reg_array[method] = value;
+            process(method, value);
+        }
+    } else if (control == Regs::ShadowRamControl::Replay) {
+        for (auto [method, value] : method_sink)
+            process(method, shadow_state.reg_array[method]);
+    } else {
+        for (auto [method, value] : method_sink)
+            process(method, value);
+    }
+    if (!method_sink.empty()) {
+        for (const auto [method, value] : method_sink) {
+            RegSem::DryWrite3D(mirror, table, method, value, skip_same);
+        }
+        const auto [last_method, last_value] = method_sink.back();
+        RegSem::CompareBackWrite3D(mirror, table, last_method, last_value, regs.reg_array.data(),
+                                   shadow_state.reg_array.data());
+    }
+    method_sink.clear();
+}
+
+void Maxwell3D::TableMethodCall(VideoCommon::V2::RegSem::Action3D action, u32 method,
+                                u32 argument, u32 nonshadow_argument, bool is_last_call) {
+    // ProcessMethodCall with the action from the table instead of a switch on the method.
+    using VideoCommon::V2::RegSem::Action3D;
+    const auto& table = VideoCommon::V2::RegSem::GetTable3D();
+    if ((table.flags[method] & VideoCommon::V2::RegSem::FastDrawQuiet) == 0) {
+        VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Method, method);
+    }
+    if (GetNativeMacroEngine().native_turing && method == MAXWELL3D_REG_INDEX(clear_surface)) {
+        LOG_DEBUG(HW_GPU, "Native GPU surface clear: value={:#x}", argument);
+    }
+    switch (action) {
+    case Action3D::RootSelect:
+        root_tables.selected = argument & 7;
+        root_tables.offset = (argument >> 8) & 0xff;
+        return;
+    case Action3D::RootLoad:
+        if (root_tables.offset < 256 && root_tables.offset % 4 == 0) {
+            root_tables.tables[root_tables.selected][root_tables.offset / 4] = argument;
+            root_tables.loaded = true;
+        }
+        root_tables.offset += 4;
+        return;
+    case Action3D::WaitForIdle:
+        return rasterizer->WaitForIdle();
+    case Action3D::ShadowControl:
+        shadow_state.shadow_ram_control = static_cast<Regs::ShadowRamControl>(nonshadow_argument);
+        return;
+    case Action3D::MacroCodePointer:
+        if (front_macros) return;
+        return GetNativeMacroEngine().ClearCode(regs.load_mme.instruction_ptr);
+    case Action3D::MacroCode:
+        if (front_macros) return;
+        return GetNativeMacroEngine().AddCode(regs.load_mme.instruction_ptr, argument);
+    case Action3D::MacroBind:
+        if (front_macros) {
+            ++regs.load_mme.start_address_ptr;
+            return;
+        }
+        return ProcessMacroBind(argument);
+    case Action3D::Falcon4:
+        return ProcessFirmwareCall4();
+    case Action3D::CbData:
+        return ProcessCBData(argument);
+    case Action3D::CbufBind0:
+        return ProcessCBBind(0);
+    case Action3D::CbufBind1:
+        return ProcessCBBind(1);
+    case Action3D::CbufBind2:
+        return ProcessCBBind(2);
+    case Action3D::CbufBind3:
+        return ProcessCBBind(3);
+    case Action3D::CbufBind4:
+        return ProcessCBBind(4);
+    case Action3D::ReportSemaphore:
+        return ProcessQueryGet();
+    case Action3D::RenderEnable:
+        return ProcessQueryCondition();
+    case Action3D::ClearReportValue:
+        return ProcessCounterReset();
+    case Action3D::SyncInfo:
+        return ProcessSyncPoint();
+    case Action3D::LaunchDma:
+        return upload_state.ProcessExec(regs.launch_dma.memory_layout.Value() ==
+                                        Regs::LaunchDMA::Layout::Pitch);
+    case Action3D::InlineData:
+        upload_state.ProcessData(argument, is_last_call);
+        return;
+    case Action3D::FragmentBarrier:
+        return rasterizer->FragmentBarrier();
+    case Action3D::InvalidateTextureDataCache:
+        rasterizer->InvalidateGPUCache();
+        return rasterizer->WaitForIdle();
+    case Action3D::TiledCacheBarrier:
+        return rasterizer->TiledCacheBarrier();
+    default:
+        draw_manager.ProcessMethodCall(*this, method, argument);
+        return;
+    }
 }
 
 void Maxwell3D::DumpRecentWrites(u32 method) {
@@ -797,6 +1054,14 @@ void Maxwell3D::CallMultiMethod(Core::System& system, u32 method, const u32* bas
         ProcessMacro(system, method, base_start, amount, amount == methods_pending);
         return;
     }
+    // EDEN_NX2_V2_REGSEM=verify: the runs below that don't go through CallMethod per word.
+    VideoCommon::V2::RegSem::BackMirror3D* const v2_mirror =
+        v2_back_mode == VideoCommon::V2::Mode::Verify ? &BackMirror() : nullptr;
+    SCOPE_EXIT {
+        if (v2_mirror != nullptr) [[unlikely]] {
+            VerifyMultiV2(*v2_mirror, method, base_start, amount);
+        }
+    };
     // As in ProcessDirtyRegisters: the paths below write without it.
     if (draw_manager.HasDeferredDraw() && !DrawManager::IsInstanceLoopMethod(method)) [[unlikely]] {
         draw_manager.DrawDeferred(*this, true);

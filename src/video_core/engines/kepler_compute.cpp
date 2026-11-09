@@ -80,7 +80,23 @@ KeplerCompute::KeplerCompute(MemoryManager& memory_manager_)
         for (u32 method = 0xc6; method <= 0x108; ++method) {
             native_plain_methods[method] = false;
         }
+    } else if (VideoCommon::V2::On(VideoCommon::V2::Switch::RegSem)) [[unlikely]] {
+        // EDEN_NX2_V2_REGSEM: the plain stores come from the semantics table (=1); verify
+        // checks the table gives the same set.
+        const auto& table = VideoCommon::V2::RegSem::TableComputePlain();
+        if (VideoCommon::V2::Verify(VideoCommon::V2::Switch::RegSem)) {
+            for (u32 method = 0; method < 0xe00; ++method) {
+                if (table[method] != native_plain_methods[method]) {
+                    LOG_WARNING(HW_GPU, "V2 regsem compute: method {:#x} plain table {} engine {}",
+                                method, bool{table[method]}, bool{native_plain_methods[method]});
+                }
+            }
+        } else {
+            native_plain_methods = table;
+            v2_compute_table = true;
+        }
     }
+    v2_compute_verify = VideoCommon::V2::Verify(VideoCommon::V2::Switch::RegSem);
 }
 
 KeplerCompute::~KeplerCompute() = default;
@@ -472,6 +488,9 @@ void KeplerCompute::CallMethod(Core::System& system, u32 method, u32 method_argu
                 VideoCommon::V2::RegSem::NoteWriteCompute(v2_groups, method,
                                                           native_registers[method],
                                                           method_argument);
+                if (v2_compute_verify) {
+                    return VerifyComputeWrite(system, method, method_argument, is_last_call);
+                }
             }
             native_registers[method] = method_argument;
             if (method < Regs::NUM_REGS) {
@@ -479,8 +498,23 @@ void KeplerCompute::CallMethod(Core::System& system, u32 method, u32 method_argu
             }
             return;
         }
+        if (v2_compute_table && method < 0xe00 &&
+            (VideoCommon::V2::RegSem::TableCompute()[method] &
+             (VideoCommon::V2::RegSem::ComputeClearCode | VideoCommon::V2::RegSem::ComputeAddCode |
+              VideoCommon::V2::RegSem::ComputeBindPointer | VideoCommon::V2::RegSem::ComputeBind)) !=
+                0) [[unlikely]] {
+            return TableComputeMacroWrite(method, method_argument);
+        }
+        if (v2_compute_verify && method < 0xe00) [[unlikely]] {
+            return VerifyComputeWrite(system, method, method_argument, is_last_call);
+        }
         if (ProcessNativeMethod(system, method, method_argument, is_last_call)) return;
     }
+    CallMethodKepler(system, method, method_argument, is_last_call);
+}
+
+void KeplerCompute::CallMethodKepler(Core::System& system, u32 method, u32 method_argument,
+                                     bool is_last_call) {
     if (method >= Regs::NUM_REGS) {
         LOG_ERROR(HW_GPU, "Compute register out of range: {:#x}", method);
         return;
@@ -1409,6 +1443,113 @@ bool KeplerCompute::TryFireEmblemUpscale(bool allow_history) {
                  output->Width(), output->Height(), jitter->offset[0], jitter->offset[1]);
     }
     return done;
+}
+
+void KeplerCompute::TableComputeMacroWrite(u32 method, u32 argument) {
+    // EDEN_NX2_V2_REGSEM=1: the compute macro upload and bind registers through the table-driven
+    // update function the front mirror uses (RegSem::ApplyCompute).
+    namespace RegSem = VideoCommon::V2::RegSem;
+    if (front_macros) {
+        // The split's front loaded and bound them (ProcessNativeMethod stores only).
+        RegSem::NoteWriteCompute(v2_groups, method, native_registers[method], argument);
+        native_registers[method] = argument;
+        return;
+    }
+    bool uploaded_without_context = false;
+    struct BackState {
+        std::array<u32, 0x1000>& registers;
+        bool& compute_uploaded;
+        u32& bind_pointer;
+        VideoCommon::V2::ComputeGroupTracker& v2_groups;
+    } back_state{native_registers,
+                 native_context ? native_compute_uploaded : uploaded_without_context,
+                 native_bind_pointer, v2_groups};
+    const auto select = [this] {
+        if (native_context) {
+            native_macro = native_compute_uploaded ? &native_context->compute_engine
+                                                   : &native_context->engine;
+            native_macro_positions = native_compute_uploaded
+                                         ? std::span<u32>{native_context->compute_positions}
+                                         : std::span<u32>{native_context->positions};
+        }
+    };
+    RegSem::ApplyCompute(back_state, method, argument, [&](RegSem::Effect effect, u32 a, u32 b) {
+        select();
+        switch (effect) {
+        case RegSem::Effect::ClearCode:
+            native_macro->ClearCode(a);
+            return true;
+        case RegSem::Effect::AddCode:
+            native_macro->AddCode(a, b);
+            return true;
+        case RegSem::Effect::Bind:
+            break;
+        }
+        if (a < native_macro_positions.size()) {
+            native_macro_positions[a] = b;
+            return true;
+        }
+        LOG_ERROR(HW_GPU, "Native compute macro bind out of bounds");
+        return false;
+    });
+    select();
+}
+
+void KeplerCompute::VerifyComputeWrite(Core::System& system, u32 method, u32 argument,
+                                       bool is_last_call) {
+    // EDEN_NX2_V2_REGSEM=verify: the engine's own path decides; the table-driven update runs on
+    // a copy of the registers and is compared.
+    namespace RegSem = VideoCommon::V2::RegSem;
+    if (!v2_compute_mirror) {
+        v2_compute_mirror = std::make_unique<RegSem::MirrorCompute>();
+        v2_compute_mirror->registers = native_registers;
+        v2_compute_mirror->compute_uploaded = native_compute_uploaded;
+        v2_compute_mirror->bind_pointer = native_bind_pointer;
+    }
+    RegSem::MirrorCompute& copy = *v2_compute_mirror;
+    if (native_plain_methods[method]) {
+        // CallMethod's plain store (the group tracker took it already).
+        native_registers[method] = argument;
+        if (method < Regs::NUM_REGS) {
+            regs.reg_array[method] = argument;
+        }
+    } else if (!ProcessNativeMethod(system, method, argument, is_last_call)) {
+        // The Kepler class's upload registers: the old path continues in CallMethod.
+        CallMethodKepler(system, method, argument, is_last_call);
+    }
+    const bool macro_method = (RegSem::TableCompute()[method] &
+                               (RegSem::ComputeClearCode | RegSem::ComputeAddCode |
+                                RegSem::ComputeBindPointer | RegSem::ComputeBind)) != 0;
+    if (front_macros && macro_method) {
+        copy.registers[method] = argument;
+    } else {
+        const size_t positions = native_macro_positions.size();
+        RegSem::ApplyCompute(copy, method, argument, [positions](RegSem::Effect effect, u32 a, u32) {
+            return effect != RegSem::Effect::Bind || a < positions;
+        });
+        if (!native_context) {
+            copy.compute_uploaded = native_compute_uploaded;
+        }
+    }
+    bool same = copy.registers[method] == native_registers[method] &&
+                copy.compute_uploaded == native_compute_uploaded &&
+                copy.bind_pointer == native_bind_pointer;
+    if (same && (++v2_compute_writes & 4095) == 0) {
+        same = copy.registers == native_registers;
+    }
+    if (!same) {
+        if (RegSem::ReportMismatch()) {
+            LOG_WARNING(HW_GPU,
+                        "V2 regsem compute back write {:#x} = {:#x}: register table {:#x} engine "
+                        "{:#x}, uploaded {} / {}, bind pointer {} / {}",
+                        method, argument, copy.registers[method], native_registers[method],
+                        copy.compute_uploaded, native_compute_uploaded, copy.bind_pointer,
+                        native_bind_pointer);
+        }
+        copy.registers = native_registers;
+        copy.compute_uploaded = native_compute_uploaded;
+        copy.bind_pointer = native_bind_pointer;
+    }
 }
 
 void KeplerCompute::NoteV2Dispatch(bool native) {

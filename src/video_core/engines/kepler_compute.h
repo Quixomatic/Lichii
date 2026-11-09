@@ -7,6 +7,7 @@
 #pragma once
 
 #include <array>
+#include <bitset>
 #include <atomic>
 #include <cstddef>
 #include <memory>
@@ -32,6 +33,9 @@ class System;
 
 namespace VideoCommon {
 class GpuSplit;
+namespace V2::RegSem {
+struct MirrorCompute;
+}
 }
 
 namespace Tegra {
@@ -275,6 +279,11 @@ public:
         return v2_groups;
     }
 
+    /// Native methods CallMethod only stores (tests: the table must give the same set).
+    [[nodiscard]] const std::bitset<0xe00>& NativePlainMethods() const {
+        return native_plain_methods;
+    }
+
 private:
     struct FrontState;
     FrontState& Front(VideoCommon::GpuSplit& split);
@@ -371,6 +380,10 @@ private:
     /// (native_registers, or regs for the Kepler class); draw_dirty is what the current
     /// dispatch sees changed (NoteDispatchCompute).
     VideoCommon::V2::ComputeGroupTracker v2_groups;
+    bool v2_compute_table{};  ///< EDEN_NX2_V2_REGSEM=1 (TableComputeMacroWrite)
+    bool v2_compute_verify{}; ///< EDEN_NX2_V2_REGSEM=verify (VerifyComputeWrite)
+    u64 v2_compute_writes{};
+    std::unique_ptr<VideoCommon::V2::RegSem::MirrorCompute> v2_compute_mirror;
     std::array<u32, 0x1000> native_registers{};
     /// Native methods that only store their value (no macro, QMD, upload, semaphore or code
     /// side effect): CallMethod writes those directly.
@@ -381,6 +394,13 @@ private:
     std::optional<u32> native_executing_macro;
     u32 native_bind_pointer{};
 
+    /// CallMethod after the native class's methods: the Kepler class's registers and uploads.
+    void CallMethodKepler(Core::System& system, u32 method, u32 method_argument,
+                          bool is_last_call);
+    /// EDEN_NX2_V2_REGSEM=1: compute macro upload/bind registers through RegSem::ApplyCompute.
+    void TableComputeMacroWrite(u32 method, u32 argument);
+    /// EDEN_NX2_V2_REGSEM=verify: the native method, compared with the table on a copy.
+    void VerifyComputeWrite(Core::System& system, u32 method, u32 argument, bool is_last_call);
     void ProcessLaunch();
     /// EDEN_NX2_V2_REGSEM: a dispatch is about to run (compute group dirty bits, hash checks).
     void NoteV2Dispatch(bool native);

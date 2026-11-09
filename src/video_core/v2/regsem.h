@@ -168,17 +168,65 @@ enum Flags3D : u16 {
     InlineData = 1 << 12,    ///< inline_data: upload data only
     CbufBindFlag = 1 << 13,  ///< bind_groups[].raw_config: CbufBind is dirty on every write
     ReportSemaphore = 1 << 14, ///< report_semaphore.query: a release
+    FastDrawQuiet = 1 << 15,   ///< Instance loop or fast draw delta method: no method break
+};
+
+/// What the executing Maxwell3D does with a method after the register file took it
+/// (Maxwell3D::TableWrite, EDEN_NX2_V2_REGSEM=1): the side effects of ProcessMethodCall and the
+/// draw manager, one per register, from the same table the front mirror uses.
+enum class Action3D : u8 {
+    Store,            ///< Not executable: stored when it changes the register (compare-on-write)
+    StoreExec,        ///< Executable, stored only (vertex_buffer.first/count, index_buffer.first)
+    TopologyOverride, ///< Stored; outside the fast path a method break
+    CbData,           ///< Constant buffer data: upload, offset += 4
+    CbufBind0,        ///< Constant buffer binds of stages 0-4
+    CbufBind1,
+    CbufBind2,
+    CbufBind3,
+    CbufBind4,
+    DrawBegin,
+    DrawEnd,
+    RootSelect,
+    RootLoad,
+    WaitForIdle,
+    ShadowControl,    ///< The shadow RAM mode: the unshadowed argument
+    MacroCodePointer, ///< Macro upload pointer (the front's with front macros)
+    MacroCode,
+    MacroBind,        ///< positions[start_address_ptr++]
+    Falcon4,          ///< shadow_scratch[0] = 1
+    ReportSemaphore,
+    RenderEnable,
+    ClearReportValue,
+    SyncInfo,
+    LaunchDma,
+    InlineData,
+    FragmentBarrier,
+    InvalidateTextureDataCache,
+    TiledCacheBarrier,
+    DrawManager, ///< The draw manager's ProcessMethodCall
 };
 
 struct Table3D {
     static constexpr size_t NumRegs = 0xe00;
     std::array<u16, NumRegs> flags{};
     std::array<RegGroup, NumRegs> groups{};
+    std::array<Action3D, NumRegs> actions{};
     // Register indices the side effects touch.
     u32 const_buffer_offset{};
     u32 instruction_ptr{};
     u32 start_address_ptr{};
     u32 shadow_scratch{};
+    u32 shadow_control{}; ///< shadow_ram_control: its shadow copy is the shadow RAM mode
+};
+
+/// EDEN_NX2_V2_REGSEM=verify on the executing Maxwell3D: the registers as the table-driven
+/// update function alone makes them (no side effects), compared with the engine's after each
+/// write (regsem_3d.h DryWrite3D / CompareBackWrite3D).
+struct BackMirror3D {
+    std::array<u32, Table3D::NumRegs> regs{};
+    std::array<u32, Table3D::NumRegs> shadow{};
+    u64 writes{};
+    u64 mismatches{};
 };
 
 /// Builds the Maxwell3D table once (the first Maxwell3D constructor), from its execution mask.
@@ -226,6 +274,9 @@ enum FlagsCompute : u8 {
 };
 
 [[nodiscard]] const std::array<u8, 0x1000>& TableCompute();
+/// Native compute methods that only store their value (no table flag, not an inline upload,
+/// not a macro call): KeplerCompute's plain-store fast path, from the table.
+[[nodiscard]] const std::bitset<0xe00>& TableComputePlain();
 /// The group of each compute register.
 [[nodiscard]] const std::array<ComputeGroup, 0x1000>& TableComputeGroups();
 

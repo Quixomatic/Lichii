@@ -44,6 +44,24 @@ struct Front3D {
     u64 mismatches{};
 };
 
+/// The shadow RAM step of every Maxwell3D register write (ProcessShadowRam): Track keeps the
+/// argument in the shadow copy, Replay writes the shadow copy instead. Shared by the front
+/// mirrors and the executing engine's table path. `kept`: whether the shadow already held it.
+[[nodiscard]] inline u32 ApplyShadow3D(ShadowRamControl control, u32* shadow, u32 method,
+                                       u32 argument, bool* kept = nullptr) {
+    if (control == ShadowRamControl::Track || control == ShadowRamControl::TrackWithFilter) {
+        if (kept != nullptr) {
+            *kept = shadow[method] == argument;
+        }
+        shadow[method] = argument;
+        return argument;
+    }
+    if (control == ShadowRamControl::Replay) {
+        return shadow[method];
+    }
+    return argument;
+}
+
 template <typename State>
 void Store3D(State& s, const Table3D& table, u32 index, u32 value) {
     const u32 old_value = s.regs[index];
@@ -59,14 +77,8 @@ void Store3D(State& s, const Table3D& table, u32 index, u32 value) {
 template <typename State, typename Effects>
 bool Write3D(State& s, const Table3D& table, u32 method, u32 argument, bool from_macro,
              Effects&& effects) {
-    u32 value = argument;
     bool shadow_kept = true;
-    if (s.control == ShadowRamControl::Track || s.control == ShadowRamControl::TrackWithFilter) {
-        shadow_kept = s.shadow[method] == argument;
-        s.shadow[method] = argument;
-    } else if (s.control == ShadowRamControl::Replay) {
-        value = s.shadow[method];
-    }
+    const u32 value = ApplyShadow3D(s.control, s.shadow.data(), method, argument, &shadow_kept);
     const u16 flags = table.flags[method];
     if ((flags & Exec) == 0) {
         // The back skips same-value state writes and its shadow RAM holds the value already.
@@ -149,13 +161,7 @@ void WriteMulti3D(State& s, const Table3D& table, u32 method, const u32* words, 
         // Each word as a CallMethod; a word may change the shadow RAM mode for the next.
         for (u32 i = 0; i < amount; ++i) {
             const u32 argument = words[i];
-            u32 value = argument;
-            if (s.control == ShadowRamControl::Track ||
-                s.control == ShadowRamControl::TrackWithFilter) {
-                s.shadow[method] = argument;
-            } else if (s.control == ShadowRamControl::Replay) {
-                value = s.shadow[method];
-            }
+            const u32 value = ApplyShadow3D(s.control, s.shadow.data(), method, argument);
             Store3D(s, table, method, value);
             if ((flags & DrawBegin) != 0) {
                 const u32 instance = (value >> 26) & 3;
@@ -265,6 +271,113 @@ void CompareWrite3D(Front3D& front, const State& s, const Table3D& table, u32 me
     }
     ++front.mismatches;
     CopyMirror3D(m, s);
+}
+
+// The executing Maxwell3D (EDEN_NX2_V2_REGSEM=verify): what the table-driven update function
+// does to the register file, without the side effects, next to the engine's own path.
+
+/// One method write as Maxwell3D::TableWrite applies it to the registers. Returns the action.
+inline Action3D DryWrite3D(BackMirror3D& m, const Table3D& table, u32 method, u32 argument,
+                           bool skip_same) {
+    const auto control = static_cast<ShadowRamControl>(m.shadow[table.shadow_control]);
+    const u32 value = ApplyShadow3D(control, m.shadow.data(), method, argument);
+    const Action3D action = table.actions[method];
+    if (action == Action3D::Store) {
+        if (!skip_same || m.regs[method] != value) {
+            m.regs[method] = value;
+        }
+        return action;
+    }
+    m.regs[method] = value;
+    switch (action) {
+    case Action3D::CbData:
+        m.regs[table.const_buffer_offset] += static_cast<u32>(sizeof(u32));
+        break;
+    case Action3D::ShadowControl:
+        m.shadow[table.shadow_control] = argument;
+        break;
+    case Action3D::MacroBind:
+        ++m.regs[table.start_address_ptr];
+        break;
+    case Action3D::Falcon4:
+        m.regs[table.shadow_scratch] = 1;
+        break;
+    default:
+        break;
+    }
+    return action;
+}
+
+/// A multi-method run outside macros (Maxwell3D::CallMultiMethod) on the registers.
+inline void DryWriteMulti3D(BackMirror3D& m, const Table3D& table, u32 method, const u32* words,
+                            u32 amount, bool skip_same) {
+    const u16 flags = table.flags[method];
+    const auto control = static_cast<ShadowRamControl>(m.shadow[table.shadow_control]);
+    if ((flags & CbData) != 0) {
+        m.regs[table.const_buffer_offset] += amount * static_cast<u32>(sizeof(u32));
+    } else if ((flags & InlineData) != 0) {
+        // Upload data only.
+    } else if ((flags & InlineIndex) != 0 && control != ShadowRamControl::Replay) {
+        if (amount != 0) {
+            m.regs[method] = ApplyShadow3D(control, m.shadow.data(), method, words[amount - 1]);
+        }
+    } else {
+        for (u32 i = 0; i < amount; ++i) {
+            DryWrite3D(m, table, method, words[i], skip_same);
+        }
+    }
+}
+
+/// Starts the mirror over from the engine's registers.
+inline void ResyncBackMirror3D(BackMirror3D& m, const u32* regs, const u32* shadow) {
+    std::memcpy(m.regs.data(), regs, sizeof(m.regs));
+    std::memcpy(m.shadow.data(), shadow, sizeof(m.shadow));
+}
+
+/// After the engine's own path ran a write the mirror also took: compares the registers the
+/// write path touches (all of them every 4096 writes), logs the first mismatches ("V2 regsem
+/// back write ...") and resynchronizes. Returns whether they matched.
+inline bool CompareBackWrite3D(BackMirror3D& m, const Table3D& table, u32 method, u32 argument,
+                               const u32* regs, const u32* shadow) {
+    const u32 touched[] = {method, table.const_buffer_offset, table.start_address_ptr,
+                           table.shadow_scratch};
+    bool same = m.shadow[method] == shadow[method] &&
+                m.shadow[table.shadow_control] == shadow[table.shadow_control];
+    for (const u32 index : touched) {
+        same = same && m.regs[index] == regs[index];
+    }
+    if (same && (++m.writes & 4095) != 0) [[likely]] {
+        return true;
+    }
+    if (same) {
+        for (u32 i = 0; i < Table3D::NumRegs; ++i) {
+            if (m.regs[i] != regs[i] || m.shadow[i] != shadow[i]) {
+                if (ReportMismatch()) {
+                    LOG_WARNING(HW_GPU,
+                                "V2 regsem back registers: {:#x} table {:#x} engine {:#x}, "
+                                "shadow table {:#x} engine {:#x}",
+                                i, m.regs[i], regs[i], m.shadow[i], shadow[i]);
+                }
+                same = false;
+            }
+        }
+        if (same) {
+            return true;
+        }
+    } else if (ReportMismatch()) {
+        LOG_WARNING(HW_GPU,
+                    "V2 regsem back write {:#x} = {:#x} ({}): register table {:#x} engine {:#x}, "
+                    "shadow table {:#x} engine {:#x}, mode table {:#x} engine {:#x}, offset "
+                    "{:#x} / {:#x}, macro bind {:#x} / {:#x}",
+                    method, argument, static_cast<u32>(table.actions[method]), m.regs[method],
+                    regs[method], m.shadow[method], shadow[method],
+                    m.shadow[table.shadow_control], shadow[table.shadow_control],
+                    m.regs[table.const_buffer_offset], regs[table.const_buffer_offset],
+                    m.regs[table.start_address_ptr], regs[table.start_address_ptr]);
+    }
+    ++m.mismatches;
+    ResyncBackMirror3D(m, regs, shadow);
+    return false;
 }
 
 // Native compute.

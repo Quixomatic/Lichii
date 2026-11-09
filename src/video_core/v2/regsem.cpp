@@ -157,6 +157,7 @@ Table3D BuildTable3D(const std::bitset<(std::numeric_limits<u16>::max)()>& execu
     table.instruction_ptr = OFF(load_mme.instruction_ptr);
     table.start_address_ptr = OFF(load_mme.start_address_ptr);
     table.shadow_scratch = OFF(shadow_scratch);
+    table.shadow_control = OFF(shadow_ram_control);
     constexpr u32 cb_data = OFF(const_buffer.buffer);
     for (u32 method = 0; method < Table3D::NumRegs; ++method) {
         u16 flags = 0;
@@ -191,6 +192,54 @@ Table3D BuildTable3D(const std::bitset<(std::numeric_limits<u16>::max)()>& execu
     add(OFF(bind_groups[2].raw_config), CbufBindFlag);
     add(OFF(bind_groups[3].raw_config), CbufBindFlag);
     add(OFF(bind_groups[4].raw_config), CbufBindFlag);
+    // Methods ProcessMethodCall doesn't break fast draw reuse for.
+    for (u32 method = 0; method < Table3D::NumRegs; ++method) {
+        if (Maxwell3D::DrawManager::IsInstanceLoopMethod(method) ||
+            Maxwell3D::IsFastDrawDeltaMethod(method)) {
+            table.flags[method] |= FastDrawQuiet;
+        }
+    }
+    // The executing engine's action per register (Maxwell3D::TableWrite).
+    for (u32 method = 0; method < Table3D::NumRegs; ++method) {
+        Action3D action = Action3D::Store;
+        if (execution_mask[method]) {
+            action = (table.flags[method] & CbData) != 0 ? Action3D::CbData : Action3D::DrawManager;
+        }
+        table.actions[method] = action;
+    }
+    const auto set = [&table, &execution_mask](u32 method, Action3D action) {
+        if (execution_mask[method]) {
+            table.actions[method] = action;
+        }
+    };
+    set(OFF(vertex_buffer.first), Action3D::StoreExec);
+    set(OFF(vertex_buffer.count), Action3D::StoreExec);
+    set(OFF(index_buffer.first), Action3D::StoreExec);
+    set(OFF(topology_override), Action3D::TopologyOverride);
+    set(OFF(bind_groups[0].raw_config), Action3D::CbufBind0);
+    set(OFF(bind_groups[1].raw_config), Action3D::CbufBind1);
+    set(OFF(bind_groups[2].raw_config), Action3D::CbufBind2);
+    set(OFF(bind_groups[3].raw_config), Action3D::CbufBind3);
+    set(OFF(bind_groups[4].raw_config), Action3D::CbufBind4);
+    set(OFF(draw.begin), Action3D::DrawBegin);
+    set(OFF(draw.end), Action3D::DrawEnd);
+    set(Maxwell3D::RootTables::SelectMethod, Action3D::RootSelect);
+    set(Maxwell3D::RootTables::LoadMethod, Action3D::RootLoad);
+    set(OFF(wait_for_idle), Action3D::WaitForIdle);
+    set(OFF(shadow_ram_control), Action3D::ShadowControl);
+    set(OFF(load_mme.instruction_ptr), Action3D::MacroCodePointer);
+    set(OFF(load_mme.instruction), Action3D::MacroCode);
+    set(OFF(load_mme.start_address), Action3D::MacroBind);
+    set(OFF(falcon[4]), Action3D::Falcon4);
+    set(OFF(report_semaphore.query), Action3D::ReportSemaphore);
+    set(OFF(render_enable.mode), Action3D::RenderEnable);
+    set(OFF(clear_report_value), Action3D::ClearReportValue);
+    set(OFF(sync_info), Action3D::SyncInfo);
+    set(OFF(launch_dma), Action3D::LaunchDma);
+    set(OFF(inline_data), Action3D::InlineData);
+    set(OFF(fragment_barrier), Action3D::FragmentBarrier);
+    set(OFF(invalidate_texture_data_cache), Action3D::InvalidateTextureDataCache);
+    set(OFF(tiled_cache_barrier), Action3D::TiledCacheBarrier);
     // The flags the front mirror acts on must be on executable methods (FrontWrite).
     for (const size_t method : {OFF(shadow_ram_control), OFF(load_mme.instruction_ptr),
                              OFF(load_mme.instruction), OFF(load_mme.start_address),
@@ -324,6 +373,18 @@ void NoteDispatchCompute(ComputeGroupTracker& tracker, const u32* registers, u32
         }
     }
     tracker.BeginDraw();
+}
+
+const std::bitset<0xe00>& TableComputePlain() {
+    static const std::bitset<0xe00> plain = [] {
+        std::bitset<0xe00> bits;
+        const auto& flags = TableCompute();
+        for (u32 method = 0; method < 0xe00; ++method) {
+            bits[method] = flags[method] == 0 && method != 0x6c && method != 0x6d;
+        }
+        return bits;
+    }();
+    return plain;
 }
 
 const std::array<u8, 0x1000>& TableCompute() {
