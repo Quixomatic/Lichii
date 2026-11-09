@@ -191,7 +191,11 @@ struct ViewCheck {
 // EDEN_NX2_V2_ACQUIRE (MASTER_PLAN.md section 6): decides an acquire from the front's semaphore
 // view (the hazard table's releases) and memory, without draining the split. A targeted wait
 // for one write (V2::AcquireVerdict::WaitFor) is done here, after which memory decides.
-ViewCheck CheckWithView(DmaPusher& dma_pusher, GPUVAddr address, u32 value, V2::SemaphoreOp op) {
+// `wait`: a decision that needs a queued dispatch to run first waits for it here. Without it
+// (ACQUIRE=1) such an acquire is not met yet: the channel suspends and its polls decide once the
+// back ran the dispatch (MASTER_PLAN §6: suspend, don't block the front).
+ViewCheck CheckWithView(DmaPusher& dma_pusher, GPUVAddr address, u32 value, V2::SemaphoreOp op,
+                        bool wait = true) {
     auto& split = VideoCommon::GpuSplit::Get();
     // Macros on the back send 3D reports the front doesn't see.
     if (!split.Active() || !split.FrontMacros() || !ReleasesLandAtOnce()) {
@@ -226,6 +230,9 @@ ViewCheck CheckWithView(DmaPusher& dma_pusher, GPUVAddr address, u32 value, V2::
     case V2::AcquireVerdict::NotMet:
         return {decision.verdict, Reason::NotMet, false};
     case V2::AcquireVerdict::WaitFor: {
+        if (!wait && split.ConsumedNow() < decision.position) {
+            return {V2::AcquireVerdict::NotMet, Reason::NotMet, false};
+        }
         split.WaitForPosition(decision.position, VideoCommon::DrainSite::Acquire);
         // The dispatch waited for may have written the word through the buffer cache.
         if (Nx2MayBeGpuWritten(*device, sizeof(u32))) {
@@ -334,7 +341,7 @@ bool Puller::PollAcquireView(DmaPusher& dma_pusher) {
     const GPUVAddr address = acquire.address;
     const u32 value = acquire.value;
     const u32 operation = acquire.operation;
-    const ViewCheck check = CheckWithView(dma_pusher, address, value, ViewOp(operation));
+    const ViewCheck check = CheckWithView(dma_pusher, address, value, ViewOp(operation), verify);
     bool decided = false;
     bool passes = false;
     if (Passes(check)) {
@@ -593,8 +600,9 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
         bool view_passes = false;
         const V2::Mode view_mode = split.AcquireMode();
         if (view_mode != V2::Mode::Off) [[unlikely]] {
-            const ViewCheck view = CheckWithView(dma_pusher, acquire.address, acquire.value,
-                                                 ViewOp(acquire.operation));
+            const ViewCheck view =
+                CheckWithView(dma_pusher, acquire.address, acquire.value,
+                              ViewOp(acquire.operation), view_mode != V2::Mode::On);
             view_passes = Passes(view);
             if (view.verdict == V2::AcquireVerdict::NotMet && view_mode == V2::Mode::On) {
                 // Nothing sent to the word meets it: a drain can't change that, only a release
