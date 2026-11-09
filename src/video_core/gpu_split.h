@@ -9,6 +9,7 @@
 #include <cstring>
 #include <functional>
 #include <memory>
+#include <span>
 #include <thread>
 #include <type_traits>
 #include <utility>
@@ -17,6 +18,7 @@
 #include "video_core/v2/hazard.h"
 #include "video_core/v2/ir.h"
 #include "video_core/v2/ir_arena.h"
+#include "video_core/v2/ir_trace.h"
 #include "video_core/v2/landing.h"
 #include "video_core/v2/v2_switches.h"
 
@@ -180,6 +182,10 @@ public:
     /// Front, S1: inline index words for `method` (V2::S1 Inline entries).
     void S1Inline(Tegra::Engines::EngineInterface* engine, u32 method, const u32* words,
                   u32 count);
+
+    /// Front, typed IR (tests, CI, v2/ir_trace.h): sends a traced record again, its payload
+    /// copied to this split's arena; object references must name this split's object table.
+    void ReplayIrRecord(std::span<const u64> record, std::span<const u64> payload);
     /// Whether Draw/Dispatch records carry their full bodies (group hashes, predicted draws):
     /// only when something reads them, EDEN_NX2_V2_PARALLEL or IR_DRAWS=verify. Otherwise they
     /// are V2::Ir::CompactBody records.
@@ -778,6 +784,10 @@ private:
     bool ir_checks{}; ///< ir_verify, draw_verify or V2 stats: ExecuteIr's per-record checks
     bool s1_exec{};   ///< S1Exec
     bool s1_check{};  ///< S1Check
+    /// EDEN_NX2_V2_IR_TRACE: the back's record of the frame it runs (null when off).
+    std::unique_ptr<V2::IrTrace::Recorder> ir_trace;
+    u64 ir_trace_frame{};
+    void TraceIrRecord(const u64* entry);
     std::unique_ptr<u64[]> ring;
     V2::Resolve::SplitResolve* parallel{}; ///< EDEN_NX2_V2_PARALLEL (owned; deleted at Stop)
 

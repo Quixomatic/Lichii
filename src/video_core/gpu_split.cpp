@@ -165,6 +165,10 @@ void GpuSplit::MaybeStart(Core::System& system_) {
     draw_verify = draw_records && V2::Verify(V2::Switch::IrDraws);
     full_draw_records = draw_records && (draw_verify || V2::On(V2::Switch::Parallel));
     ir_checks = ir_verify || draw_verify || V2::Stats::Enabled();
+    if (ir && !V2::IrTrace::Directory().empty()) {
+        ir_trace = std::make_unique<V2::IrTrace::Recorder>();
+        LOG_INFO(HW_GPU, "V2 IR trace: one file per frame in {}", V2::IrTrace::Directory());
+    }
     {
         // S1 single owner (Fix F1): the back applies the front's classified entries.
         const V2::Mode regsem = V2::Get(V2::Switch::RegSem);
@@ -249,6 +253,7 @@ void GpuSplit::Stop() {
     ir_checks = false;
     s1_exec = false;
     s1_check = false;
+    ir_trace.reset();
     ir_run_classified = false;
     s1_open_words = 0;
     s1_cbuf = nullptr;
@@ -805,9 +810,52 @@ void GpuSplit::CheckIrRecord(const u64* entry) {
     }
 }
 
+void GpuSplit::TraceIrRecord(const u64* entry) {
+    const V2::Ir::RecordView record = V2::Ir::Decode(entry);
+    std::span<const u64> payload;
+    if (record.has_payload) {
+        payload = {arena.At(record.payload.index), record.payload.words};
+    }
+    ir_trace->Add({entry, record.words}, payload);
+    if (record.kind == V2::Ir::Kind::Present) {
+        // One file per frame, cut at its present.
+        const std::string path = fmt::format("{}/ir_frame_{:06}.irt",
+                                             V2::IrTrace::Directory(), ir_trace_frame++);
+        if (!ir_trace->Write(path) && ir_trace_frame < 4) {
+            LOG_WARNING(HW_GPU, "V2 IR trace: could not write {}", path);
+        }
+        ir_trace->Clear();
+    }
+}
+
+void GpuSplit::ReplayIrRecord(std::span<const u64> record, std::span<const u64> payload) {
+    IrCut();
+    const size_t words = record.size();
+    const u64 head = record[0];
+    if (payload.empty() || (head & V2::Ir::HasPayload) == 0) {
+        u64* const out = Reserve(words);
+        std::memcpy(out, record.data(), words * sizeof(u64));
+        out[1] = ++ir_sequence;
+        Commit(words);
+        return;
+    }
+    u64* const span = ArenaBegin(payload.size(), ir_sequence + 1, write_position + words);
+    std::memcpy(span, payload.data(), payload.size() * sizeof(u64));
+    u64* const out = Reserve(words);
+    std::memcpy(out, record.data(), words * sizeof(u64));
+    out[1] = ++ir_sequence;
+    out[V2::Ir::HeaderWords] =
+        V2::Ir::PackRef(arena.IndexOf(span), static_cast<u32>(payload.size()));
+    Commit(words);
+    Advance(payload.size());
+}
+
 size_t GpuSplit::ExecuteIr(const u64* entry) {
     const u64 head = entry[0];
     const size_t size = V2::Ir::RecordWords(head);
+    if (ir_trace) [[unlikely]] {
+        TraceIrRecord(entry);
+    }
     if (ir_checks) [[unlikely]] {
         if (ir_verify) {
             CheckIrRecord(entry);

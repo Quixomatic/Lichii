@@ -95,6 +95,18 @@ struct GpuSplitTestAccess {
         split.s1_check = check;
     }
 
+    /// The back records every IR record it executes (EDEN_NX2_V2_IR_TRACE without files).
+    static void StartTrace(GpuSplit& split) {
+        split.ir_trace = std::make_unique<V2::IrTrace::Recorder>();
+    }
+    static const V2::IrTrace::Recorder& Trace(const GpuSplit& split) {
+        return *split.ir_trace;
+    }
+    /// Interns `object` in the object table (a replay's objects, in the recording's order).
+    static void Intern(GpuSplit& split, const void* object) {
+        static_cast<void>(split.IrRef(object));
+    }
+
     /// Runs everything sent so far on the calling thread as the back.
     static void RunBack(GpuSplit& split) {
         split.Publish();
@@ -1938,6 +1950,7 @@ TEST_CASE("V2 S1 deltas applied on the back match the method executor on random 
         Access::SetIr(split, true);
         Access::SetDrawRecords(split, false);
         Access::SetS1(split, true, false);
+        Access::StartTrace(split);
         std::mt19937 rng{seed};
         const auto call = [&](u32 method, u32 value, bool is_last) {
             ref.CallMethod(f.system, method, value, is_last);
@@ -2044,6 +2057,33 @@ TEST_CASE("V2 S1 deltas applied on the back match the method executor on random 
             compare();
         }
         REQUIRE(!ref_draws.draws.empty());
+
+        // U-08: the back's IR trace, replayed into another split and engine, reproduces the
+        // registers and every draw.
+        Maxwell3D replay{f.memory};
+        RecordingRasterizer replay_draws{f.gpu};
+        replay_draws.engine = &replay;
+        replay.fast_maxwell3d = true;
+        replay.BindRasterizer(&replay_draws);
+        VideoCommon::Dirty::SetupDirtyFlags(replay.dirty.tables);
+        replay.CallMethod(f.system, CbAddressHigh, 0x1, true);
+        replay.CallMethod(f.system, CbAddressLow, 0x2000'0000, true);
+        replay.CallMethod(f.system, CbSize, 0x10000, true);
+        VideoCommon::GpuSplit replay_split;
+        Access::Initialize(replay_split, f.system);
+        Access::SetIr(replay_split, true);
+        // The recording's object 0 is its engine: the replay's engine takes that index.
+        Access::Intern(replay_split, &replay);
+        const auto& trace = Access::Trace(split);
+        REQUIRE(trace.Records() != 0);
+        const bool parsed = VideoCommon::V2::IrTrace::ForEach(
+            trace.Words(), [&](const VideoCommon::V2::IrTrace::TraceRecord& record) {
+                replay_split.ReplayIrRecord(record.record, record.payload);
+            });
+        REQUIRE(parsed);
+        Access::RunBack(replay_split);
+        REQUIRE(replay.regs.reg_array == s1.regs.reg_array);
+        REQUIRE(replay_draws.draws == s1_draws.draws);
     }
 }
 
