@@ -655,3 +655,26 @@ TEST_CASE("V2 P5: verify compare classifies mismatches", "[video_core][v2_p5]") 
     REQUIRE(result.mismatches == 1);
     REQUIRE(result.field == Commit::CompareResult::Field::Effects);
 }
+
+// Fix pass 1 (Ocarina of Time, ~55k mismatches per window: "predicted rt update effects 0x0, old
+// path rt update effects 0x20/0x22"): a full render target update prepares every target it binds.
+TEST_CASE("V2 P5: render target updates carry their prepare effects", "[video_core][v2_p5]") {
+    Request update = MakeRequest(Kind::RenderTargets, 0);
+    update.resource = Resource::RenderTargets;
+    const std::vector<Commit::LogEntry> actual{
+        {Kind::RenderTargets, Resource::RenderTargets, 0,
+         Commit::EffectModify | Commit::EffectUpload}};
+    // The old request carried no effects: a mismatch on every update that marked a target.
+    REQUIRE(Commit::Compare(std::vector<Request>{update}, actual).mismatches == 1);
+    // A bound view the registers still name: refresh (CPU-modified) and the modification mark.
+    update.effects = Commit::PredictPrepare({.prepares = true,
+                                             .cpu_modified = true,
+                                             .newer_alias = false,
+                                             .modification = true,
+                                             .invalidate = false});
+    REQUIRE(Commit::Compare(std::vector<Request>{update}, actual).mismatches == 0);
+    // A target that may be another view: the effects are unknown and not compared.
+    update.effects = Commit::EffectNone;
+    update.slot = Commit::InvalidSlot;
+    REQUIRE(Commit::Compare(std::vector<Request>{update}, actual).mismatches == 0);
+}

@@ -4962,6 +4962,15 @@ void TextureCache<P>::PushRenderTargetRequests(bool is_clear) {
         request.resource = C::Resource::RenderTargets;
         request.address = is_clear ? 1 : 0;
         request.slot = 0;
+        // Fix pass 1: the update prepares every target it binds (refresh, alias sync, the
+        // modification mark), which the request carried no effects for. Predict them from the
+        // views it will find; a target the bound view can't be shown to be (another address,
+        // format or size: FindRenderTargetView may make a new image) leaves the effects unknown.
+        bool known = true;
+        request.effects = PredictRenderTargetUpdate(is_clear, known);
+        if (!known) {
+            request.slot = C::InvalidSlot; // Compare skips the effects of an unknown slot
+        }
         commit->list.Push(request);
         return;
     }
@@ -5034,6 +5043,48 @@ void TextureCache<P>::PushRenderTargetRequests(bool is_clear) {
         request.effects = PredictSegmentPrepare(id, true, invalidate);
         commit->list.Push(request);
     }
+}
+
+template <class P>
+u32 TextureCache<P>::PredictRenderTargetUpdate(bool is_clear, bool& known) {
+    const auto& regs = maxwell3d->regs;
+    v2_prepared.clear();
+    u32 effects = V2::Commit::EffectNone;
+    // The view bound at a slot is the one the update finds when the registers name the same
+    // address, format and size; no target (count, address 0, format NONE, depth off) binds none.
+    const auto predict = [&](ImageViewId bound, const ImageInfo& info, GPUVAddr gpu_addr) {
+        if (!bound || bound == NULL_IMAGE_VIEW_ID) {
+            known = false;
+            return;
+        }
+        const ImageViewBase& view = slot_image_views[bound];
+        if (view.gpu_addr != gpu_addr || view.format != info.format ||
+            view.size.width != info.size.width || view.size.height != info.size.height) {
+            known = false;
+            return;
+        }
+        effects |= PredictSegmentPrepare(bound, true, is_clear && IsFullClear(bound));
+    };
+    for (size_t index = 0; index < NUM_RT; ++index) {
+        if (index >= regs.rt_control.count) {
+            continue;
+        }
+        const auto& rt = regs.rt[index];
+        const GPUVAddr gpu_addr = rt.Address();
+        if (gpu_addr == 0 || rt.format == Tegra::RenderTargetFormat::NONE) {
+            continue;
+        }
+        predict(render_targets.color_buffer_ids[index],
+                ImageInfo(regs.rt[index], regs.anti_alias_samples_mode), gpu_addr);
+    }
+    if (regs.zeta_enable) {
+        const GPUVAddr gpu_addr = regs.zeta.Address();
+        if (gpu_addr != 0) {
+            predict(render_targets.depth_buffer_id,
+                    ImageInfo(regs.zeta, regs.zeta_size, regs.anti_alias_samples_mode), gpu_addr);
+        }
+    }
+    return effects;
 }
 
 template <class P>

@@ -503,6 +503,9 @@ private:
     /// UpdateRenderTargets with COMMIT=1, and its requests (pure).
     void UpdateRenderTargetsCommit(bool is_clear);
     void PushRenderTargetRequests(bool is_clear);
+    /// The effects of a full render target update (dirty registers), from the views it will find.
+    /// `known` turns false when a target may not be the bound view.
+    u32 PredictRenderTargetUpdate(bool is_clear, bool& known);
     /// The old UpdateRenderTargets body.
     void UpdateRenderTargetsImpl(bool is_clear);
     /// Prepares views through requests and one commit (memo hits, recipe replays). False when
