@@ -186,6 +186,12 @@ public:
         query_cache = &query_cache_;
     }
 
+    /// Recording thread: runs at the start of every submission's closing (P5b: the GPU decode
+    /// batch goes into the closing submission's upload command buffer).
+    void RegisterPreSubmit(std::function<void()>&& func) {
+        pre_submit = std::move(func);
+    }
+
     // Registers a callback to perform on queue submission.
     void RegisterOnSubmit(std::function<void()>&& func) {
         on_submit = std::move(func);
@@ -573,6 +579,7 @@ private:
 
     std::unique_ptr<CommandChunk> chunk;
     std::function<void()> on_submit;
+    std::function<void()> pre_submit;
 
     State state;
     u64 recording_epoch = 0;

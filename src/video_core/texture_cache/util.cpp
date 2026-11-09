@@ -853,6 +853,64 @@ bool IsValidEntry(const Tegra::MemoryManager& gpu_memory, const TICEntry& config
     return gpu_memory.GpuToCpuAddress(address, guest_size_bytes).has_value();
 }
 
+std::optional<GpuUnswizzlePlan> PlanGpuUnswizzle(const ImageInfo& info, bool native_tiling) {
+    if (info.type == ImageType::Linear || info.type == ImageType::Buffer || info.num_samples != 1) {
+        return std::nullopt;
+    }
+    const u32 bpp_log2 = BytesPerBlockLog2(info.format);
+    const Extent2D tile_size = DefaultBlockSize(info.format);
+    const Extent3D size = info.size;
+    const LevelInfo level_info = MakeLevelInfo(info);
+    const s32 num_levels = info.resources.levels;
+    const std::array level_sizes = CalculateLevelSizes(level_info, num_levels);
+    const Extent2D gob = GobSize(bpp_log2, info.block.height, info.tile_width_spacing);
+    const u32 layer_size = CalculateLevelBytes(level_sizes, num_levels);
+    const u32 layer_stride = AlignLayerSize(layer_size, size, level_info.block, tile_size.height,
+                                            info.tile_width_spacing);
+    GpuUnswizzlePlan plan;
+    plan.copies.resize(num_levels);
+    size_t guest_offset = 0;
+    u32 host_offset = 0;
+    for (s32 level = 0; level < num_levels; ++level) {
+        const Extent3D level_size = AdjustMipSize(size, level);
+        const u32 num_blocks_per_layer = NumBlocks(level_size, tile_size);
+        const u32 host_bytes_per_layer = num_blocks_per_layer << bpp_log2;
+        if ((host_bytes_per_layer & 3) != 0) {
+            return std::nullopt; // The shader writes whole words
+        }
+        plan.copies[level] = BufferImageCopy{
+            .buffer_offset = host_offset,
+            .buffer_size = static_cast<size_t>(host_bytes_per_layer) * info.resources.layers,
+            .buffer_row_length = Common::AlignUp(level_size.width, tile_size.width),
+            .buffer_image_height = Common::AlignUp(level_size.height, tile_size.height),
+            .image_subresource =
+                {
+                    .base_level = level,
+                    .base_layer = 0,
+                    .num_layers = info.resources.layers,
+                },
+            .image_offset = {0, 0, 0},
+            .image_extent = level_size,
+        };
+        const Extent3D num_tiles = AdjustTileSize(level_size, tile_size);
+        const Extent3D block =
+            AdjustMipBlockSize(num_tiles, level_info.block, level, level_info.num_levels);
+        const u32 stride_alignment = StrideAlignment(num_tiles, info.block, gob, bpp_log2);
+        size_t guest_layer_offset = 0;
+        for (s32 layer = 0; layer < info.resources.layers; ++layer) {
+            plan.segments.push_back(V2::GpuUnswizzle::MakeSegment(
+                static_cast<u32>(guest_offset + guest_layer_offset), host_offset, 1U << bpp_log2,
+                num_tiles.width, num_tiles.height, num_tiles.depth, block.height, block.depth,
+                stride_alignment, native_tiling));
+            guest_layer_offset += layer_stride;
+            host_offset += host_bytes_per_layer;
+        }
+        guest_offset += level_sizes[level];
+    }
+    plan.output_size = host_offset;
+    return plan;
+}
+
 boost::container::small_vector<BufferImageCopy, 16> UnswizzleImage(
     Tegra::MemoryManager& gpu_memory, GPUVAddr gpu_addr, const ImageInfo& info,
     std::span<const u8> input, std::span<u8> output, Tegra::Texture::UnswizzleWorker* worker) {

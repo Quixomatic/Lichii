@@ -15,6 +15,7 @@
 #include "common/common_types.h"
 #include "common/scratch_buffer.h"
 
+#include "video_core/v2/gpu_unswizzle.h"
 #include "video_core/surface.h"
 #include "video_core/texture_cache/image_base.h"
 #include "video_core/texture_cache/types.h"
@@ -102,6 +103,17 @@ struct UnswizzlePlan {
 /// Executes a precalculated unswizzle plan directly into destination memory (e.g. mapped staging span).
 void ExecuteUnswizzlePlan(Tegra::MemoryManager& gpu_memory, const UnswizzlePlan& plan,
                          std::span<u8> output);
+
+/// EDEN_NX2_V2_GPUDECODE: UnswizzleImage's loop as compute segments (one per level and layer)
+/// and the same copies; nothing when a segment's output isn't 4-byte aligned or the image isn't
+/// block linear.
+struct GpuUnswizzlePlan {
+    std::vector<V2::GpuUnswizzle::Segment> segments;
+    boost::container::small_vector<BufferImageCopy, 16> copies;
+    u64 output_size = 0;
+};
+[[nodiscard]] std::optional<GpuUnswizzlePlan> PlanGpuUnswizzle(const ImageInfo& info,
+                                                                bool native_tiling);
 
 [[nodiscard]] boost::container::small_vector<BufferImageCopy, 16> UnswizzleImage(
     Tegra::MemoryManager& gpu_memory, GPUVAddr gpu_addr, const ImageInfo& info,

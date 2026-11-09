@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <array>
+#include <bit>
 #include <map>
 #include <random>
 #include <vector>
@@ -12,6 +13,8 @@
 #include "video_core/v2/barrier_tracker.h"
 #include "video_core/v2/flush_heuristic.h"
 #include "video_core/v2/frame_pacer.h"
+#include "video_core/v2/gpu_unswizzle.h"
+#include "video_core/textures/decoders.h"
 #include "video_core/v2/qmd_front.h"
 #include "video_core/v2/tick_ring.h"
 #include "video_core/v2/timeline_join.h"
@@ -510,4 +513,36 @@ TEST_CASE("V2 P5b front QMD scheduler counts", "[video_core][v2_p5b]") {
     inline_qmds.Note(A, memory[A]);
     REQUIRE(inline_qmds.Find(A) != nullptr);
     REQUIRE(inline_qmds.Find(B) == nullptr);
+}
+
+TEST_CASE("V2 P5b GPU untile math matches UnswizzleTexture", "[video_core][v2_p5b]") {
+    namespace G = VideoCommon::V2::GpuUnswizzle;
+    std::mt19937 rng{99};
+    for (int trial = 0; trial < 300; ++trial) {
+        const u32 bpp = 1U << (rng() % 5);
+        const u32 width = 1 + rng() % 80;
+        const u32 height = 1 + rng() % 70;
+        const u32 depth = rng() % 4 == 0 ? 1 + rng() % 5 : 1;
+        const u32 block_height = rng() % 5;
+        const u32 block_depth = depth > 1 ? rng() % 3 : 0;
+        const u32 stride_alignment = rng() % 2 == 0 ? 0 : 6 - std::countr_zero(bpp) % 7;
+        const bool native = rng() % 2 == 0;
+        const auto segment = G::MakeSegment(0, 0, bpp, width, height, depth, block_height,
+                                            block_depth, stride_alignment % 8, native);
+        // Input big enough for any swizzled offset of the image.
+        const u32 input_size = (segment.slice_size + segment.block_size + 4096) *
+                               ((depth >> block_depth) + 2);
+        std::vector<u8> input(input_size);
+        for (auto& value : input) {
+            value = static_cast<u8>(rng());
+        }
+        std::vector<u8> expected(segment.num_bytes);
+        Tegra::Texture::UnswizzleTexture(expected, input, bpp, width, height, depth, block_height,
+                                         block_depth, stride_alignment % 8, native);
+        for (u32 b = 0; b < segment.num_bytes; ++b) {
+            const u32 source = G::SourceByte(segment, b);
+            REQUIRE(source < input.size());
+            REQUIRE(input[source] == expected[b]);
+        }
+    }
 }

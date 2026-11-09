@@ -12,6 +12,8 @@
 #include <optional>
 #include <span>
 
+#include "video_core/v2/tick_ring.h"
+#include "video_core/texture_cache/util.h"
 #include "video_core/texture_cache/texture_cache_base.h"
 
 #include "shader_recompiler/shader_info.h"
@@ -312,6 +314,35 @@ public:
     std::vector<PendingTranscode> free_transcodes;
 
     std::optional<BlockLinearUnswizzle3DPass> bl3d_unswizzle_pass;
+
+public:
+    /// EDEN_NX2_V2_GPUDECODE: whether `image` can be untiled by the compute path.
+    [[nodiscard]] bool GpuDecodeAvailable(const Image& image) const noexcept;
+    /// Untiles `raw` (the guest bytes) with compute into a fence-tracked scratch ring and copies
+    /// it into the image: hoisted into the submission's upload stream (batched) when the open
+    /// submission hasn't used the image, else in order. False (nothing recorded) when the ring
+    /// has no free space: the caller takes the CPU path.
+    bool GpuDecode(Image& image, const StagingBufferRef& raw,
+                   const VideoCommon::GpuUnswizzlePlan& plan);
+
+private:
+    struct DecodeJob {
+        const void* descriptors{};
+        VkImage image{};
+        VkImageAspectFlags aspect{};
+        bool initialized{};
+        u32 bytes_per_block{};
+        std::vector<VideoCommon::V2::GpuUnswizzle::Segment> segments;
+        boost::container::small_vector<VkBufferImageCopy, 16> copies;
+    };
+    void FlushDecodeBatch();
+    void EncodeDecodes(vk::CommandBuffer cmdbuf, std::span<const DecodeJob> jobs);
+    std::optional<BlockLinearUnswizzleLinearPass> linear_unswizzle_pass;
+    vk::Buffer decode_scratch;
+    VideoCommon::V2::TickRing decode_ring;
+    std::vector<DecodeJob> decode_batch;
+
+public:
     const Settings::ResolutionScalingInfo& resolution;
     std::array<std::vector<VkFormat>, VideoCore::Surface::MaxPixelFormat> view_formats;
 
@@ -497,6 +528,11 @@ public:
 
     /// P5b: the open submission used this image (track id for hoisting decisions).
     void NoteV2Use() noexcept;
+
+    /// Marks the image initialized; returns whether it already was (first upload discards).
+    bool TakeInitialized() noexcept {
+        return std::exchange(initialized, true);
+    }
 
     bool v2_staging_upload = false; ///< UploadMemory's source is host-written staging
 

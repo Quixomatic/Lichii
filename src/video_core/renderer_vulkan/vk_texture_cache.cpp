@@ -1337,6 +1337,126 @@ TextureCacheRuntime::TextureCacheRuntime(const Device& device_, Scheduler& sched
         bl3d_unswizzle_pass.emplace(device, scheduler, descriptor_pool,
                                    staging_buffer_pool, compute_pass_descriptor_queue);
     }
+    if (VideoCommon::V2::On(VideoCommon::V2::Switch::GpuDecode)) {
+        // EDEN_NX2_V2_GPUDECODE: a device-local scratch ring the untile writes and the copies
+        // read; allocations come back by tick and never wait.
+        constexpr VkDeviceSize ScratchSize = 64ULL << 20;
+        linear_unswizzle_pass.emplace(device, scheduler, descriptor_pool,
+                                      compute_pass_descriptor_queue);
+        decode_scratch = memory_allocator.CreateBuffer(
+            VkBufferCreateInfo{
+                .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+                .pNext = nullptr,
+                .flags = 0,
+                .size = ScratchSize,
+                .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+                .queueFamilyIndexCount = 0,
+                .pQueueFamilyIndices = nullptr,
+            },
+            MemoryUsage::DeviceLocal);
+        decode_ring.Reset(ScratchSize,
+                          (std::max<VkDeviceSize>)(256, device.GetStorageBufferAlignment()));
+        scheduler.RegisterPreSubmit([this] { FlushDecodeBatch(); });
+    }
+}
+
+bool TextureCacheRuntime::GpuDecodeAvailable(const Image& image) const noexcept {
+    using VideoCommon::ImageFlagBits;
+    return linear_unswizzle_pass.has_value() && image.info.num_samples == 1 &&
+           image.AspectMask() == VK_IMAGE_ASPECT_COLOR_BIT &&
+           image.HostMipLevels() == static_cast<u32>(image.info.resources.levels) &&
+           False(image.flags & (ImageFlagBits::Converted | ImageFlagBits::AcceleratedUpload |
+                                ImageFlagBits::Rescaled | ImageFlagBits::Sparse |
+                                ImageFlagBits::SparseTiles | ImageFlagBits::SparseLayers |
+                                ImageFlagBits::Unbacked | ImageFlagBits::TrimmedLevels));
+}
+
+bool TextureCacheRuntime::GpuDecode(Image& image, const StagingBufferRef& raw,
+                                    const VideoCommon::GpuUnswizzlePlan& plan) {
+    namespace P5b = VideoCommon::V2::P5bStats;
+    const u64 tick = scheduler.CurrentTick();
+    const auto offset = decode_ring.Allocate(plan.output_size, tick,
+                                             scheduler.GetMasterSemaphore().KnownGpuTick());
+    if (!offset) {
+        P5b::Add(P5b::Counter::GpuDecodeFallbacks);
+        return false;
+    }
+    if (ENABLE_MSAA_RESOLVE_CONSUME) {
+        InvalidateResolveShadow(image.Handle());
+    }
+    DecodeJob job;
+    job.descriptors = linear_unswizzle_pass->Prepare(
+        raw.buffer, raw.offset, Common::AlignUp(image.guest_size_bytes, 4), *decode_scratch,
+        *offset, Common::AlignUp(plan.output_size, 4));
+    job.image = image.Handle();
+    job.aspect = image.AspectMask();
+    job.initialized = image.TakeInitialized();
+    job.bytes_per_block = VideoCore::Surface::BytesPerBlock(image.info.format);
+    job.segments = plan.segments;
+    job.copies = TransformBufferImageCopies(plan.copies, *offset, job.aspect);
+    if (P5b::Enabled()) {
+        P5b::Add(P5b::Counter::GpuDecodes);
+        P5b::Add(P5b::Counter::GpuDecodeBytes, image.guest_size_bytes);
+    }
+    if (image.v2_track_id < tick) {
+        // Unused by the open submission: batched into its upload stream (no pass break).
+        decode_batch.push_back(std::move(job));
+        P5b::Add(P5b::Counter::HoistedUploads);
+        return true;
+    }
+    scheduler.RequestOutsideRenderPassOperationContext();
+    scheduler.Record([this, job = std::move(job)](vk::CommandBuffer cmdbuf) {
+        EncodeDecodes(cmdbuf, std::span{&job, 1});
+    });
+    image.NoteV2Use();
+    return true;
+}
+
+void TextureCacheRuntime::FlushDecodeBatch() {
+    if (decode_batch.empty()) {
+        return;
+    }
+    // One batch per submission, grouped by format (block size).
+    std::ranges::stable_sort(decode_batch, {}, &DecodeJob::bytes_per_block);
+    VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::GpuDecodeBatches);
+    scheduler.RecordWithUploadBuffer([this, jobs = std::move(decode_batch)](
+                                         vk::CommandBuffer, vk::CommandBuffer upload_cmdbuf) {
+        EncodeDecodes(upload_cmdbuf, jobs);
+    });
+    decode_batch.clear();
+}
+
+void TextureCacheRuntime::EncodeDecodes(vk::CommandBuffer cmdbuf,
+                                        std::span<const DecodeJob> jobs) {
+    // Earlier work (previous submissions included) finishes before the untile and the copies
+    // overwrite the scratch range and the images.
+    static constexpr VkMemoryBarrier BEFORE{
+        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+        .pNext = nullptr,
+        .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+    };
+    cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                           0, BEFORE);
+    for (const DecodeJob& job : jobs) {
+        linear_unswizzle_pass->Bind(cmdbuf, job.descriptors);
+        for (const auto& segment : job.segments) {
+            linear_unswizzle_pass->Dispatch(cmdbuf, &segment, segment.num_bytes);
+        }
+    }
+    static constexpr VkMemoryBarrier UNTILED{
+        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+        .pNext = nullptr,
+        .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+    };
+    cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+                           UNTILED);
+    for (const DecodeJob& job : jobs) {
+        CopyBufferToImage(cmdbuf, *decode_scratch, job.image, job.aspect, job.initialized,
+                          job.copies);
+    }
 }
 
 void TextureCacheRuntime::Finish() {

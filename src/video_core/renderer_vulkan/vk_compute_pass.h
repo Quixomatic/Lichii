@@ -196,6 +196,31 @@ private:
     ComputePassDescriptorQueue& compute_pass_descriptor_queue;
 };
 
+/// EDEN_NX2_V2_GPUDECODE: generic block-linear -> linear untile of one segment per dispatch
+/// (block_linear_unswizzle_linear.comp). The caller records the encoding (batched per
+/// submission in the upload command buffer); this owns the pipeline and descriptors.
+class BlockLinearUnswizzleLinearPass final : public ComputePass {
+public:
+    explicit BlockLinearUnswizzleLinearPass(const Device& device_, Scheduler& scheduler_,
+                                            DescriptorPool& descriptor_pool_,
+                                            ComputePassDescriptorQueue& queue_);
+    ~BlockLinearUnswizzleLinearPass();
+
+    /// Recording thread: the descriptor payload binding `src` and `dst` ranges.
+    const void* Prepare(VkBuffer src, VkDeviceSize src_offset, VkDeviceSize src_size,
+                        VkBuffer dst, VkDeviceSize dst_offset, VkDeviceSize dst_size);
+
+    /// Worker thread: binds the pipeline and the payload's set.
+    void Bind(vk::CommandBuffer cmdbuf, const void* descriptor_data);
+
+    /// Worker thread: one segment (push constants + dispatch).
+    void Dispatch(vk::CommandBuffer cmdbuf, const void* push_constants, u32 num_bytes);
+
+private:
+    Scheduler& scheduler;
+    ComputePassDescriptorQueue& queue;
+};
+
 class BlockLinearUnswizzle3DPass final : public ComputePass {
 public:
     explicit BlockLinearUnswizzle3DPass(const Device& device_, Scheduler& scheduler_,

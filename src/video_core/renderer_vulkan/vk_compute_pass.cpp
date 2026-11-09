@@ -28,6 +28,7 @@
 #include "video_core/host_shaders/vulkan_uint8_comp_spv.h"
 #include "video_core/host_shaders/vulkan_vertex_repack_comp_spv.h"
 #include "video_core/host_shaders/block_linear_unswizzle_3d_bcn_comp_spv.h"
+#include "video_core/host_shaders/block_linear_unswizzle_linear_comp_spv.h"
 #include "video_core/renderer_vulkan/vk_compute_pass.h"
 #include "video_core/renderer_vulkan/vertex_repack.h"
 #include "video_core/surface.h"
@@ -961,6 +962,41 @@ BlockLinearUnswizzle3DPass::BlockLinearUnswizzle3DPass(
       compute_pass_descriptor_queue{compute_pass_descriptor_queue_} {}
 
 BlockLinearUnswizzle3DPass::~BlockLinearUnswizzle3DPass() = default;
+
+BlockLinearUnswizzleLinearPass::BlockLinearUnswizzleLinearPass(const Device& device_,
+                                                               Scheduler& scheduler_,
+                                                               DescriptorPool& descriptor_pool_,
+                                                               ComputePassDescriptorQueue& queue_)
+    : ComputePass(device_, scheduler_, descriptor_pool_, INPUT_OUTPUT_DESCRIPTOR_SET_BINDINGS,
+                  INPUT_OUTPUT_DESCRIPTOR_UPDATE_TEMPLATE, INPUT_OUTPUT_BANK_INFO,
+                  COMPUTE_PUSH_CONSTANT_RANGE<64>, BLOCK_LINEAR_UNSWIZZLE_LINEAR_COMP_SPV),
+      scheduler{scheduler_}, queue{queue_} {}
+
+BlockLinearUnswizzleLinearPass::~BlockLinearUnswizzleLinearPass() = default;
+
+const void* BlockLinearUnswizzleLinearPass::Prepare(VkBuffer src, VkDeviceSize src_offset,
+                                                    VkDeviceSize src_size, VkBuffer dst,
+                                                    VkDeviceSize dst_offset,
+                                                    VkDeviceSize dst_size) {
+    queue.Acquire(scheduler, 2);
+    queue.AddBuffer(src, src_offset, src_size);
+    queue.AddBuffer(dst, dst_offset, dst_size);
+    return queue.UpdateData();
+}
+
+void BlockLinearUnswizzleLinearPass::Bind(vk::CommandBuffer cmdbuf, const void* descriptor_data) {
+    const VkDescriptorSet set = descriptor_allocator.Commit();
+    device.GetLogical().UpdateDescriptorSet(set, *descriptor_template, descriptor_data);
+    cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, *pipeline);
+    cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, *layout, 0, set, {});
+}
+
+void BlockLinearUnswizzleLinearPass::Dispatch(vk::CommandBuffer cmdbuf,
+                                              const void* push_constants, u32 num_bytes) {
+    cmdbuf.PushConstants(*layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, 64, push_constants);
+    const u32 words = (num_bytes + 3) / 4;
+    cmdbuf.Dispatch((words + 255) / 256, 1, 1);
+}
 
 // God have mercy on my soul
 void BlockLinearUnswizzle3DPass::Unswizzle(

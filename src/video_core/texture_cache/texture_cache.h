@@ -24,6 +24,7 @@
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "common/slot_vector.h"
+#include "video_core/v2/p5b_stats.h"
 #include "video_core/control/channel_state.h"
 #include "video_core/dirty_flags.h"
 #include "video_core/nx2_fast_draw.h"
@@ -2622,6 +2623,25 @@ void TextureCache<P>::UploadImageContents(Image& image, StagingBuffer& staging) 
         return;
     }
 
+    if constexpr (requires { runtime.GpuDecodeAvailable(image); }) {
+        // EDEN_NX2_V2_GPUDECODE: compute untile as the default; tiny images, formats that need
+        // a CPU conversion and a full scratch ring keep the CPU path.
+        if (image.guest_size_bytes >= V2::GpuUnswizzle::MinGpuBytes &&
+            mapped_span.size_bytes() >= image.guest_size_bytes &&
+            runtime.GpuDecodeAvailable(image)) [[unlikely]] {
+            if (const auto plan = PlanGpuUnswizzle(image.info, gpu_memory->UsesNativeTiling())) {
+                gpu_memory->ReadBlock(gpu_addr, mapped_span.data(), image.guest_size_bytes,
+                                      VideoCommon::CacheType::NoTextureCache);
+                if (runtime.GpuDecode(image, staging, *plan)) {
+                    return;
+                }
+            }
+        }
+    }
+    if (V2::P5bStats::Enabled()) [[unlikely]] {
+        V2::P5bStats::Add(V2::P5bStats::Counter::CpuDecodes);
+        V2::P5bStats::Add(V2::P5bStats::Counter::CpuDecodeBytes, image.guest_size_bytes);
+    }
     Tegra::Memory::GpuGuestMemory<u8, Tegra::Memory::GuestMemoryFlags::UnsafeRead> swizzle_data(
         *gpu_memory, gpu_addr, image.guest_size_bytes, &swizzle_data_buffer);
     if (True(image.flags & ImageFlagBits::Converted)) {

@@ -896,6 +896,9 @@ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_se
         g_profile_submits.fetch_add(1, std::memory_order_relaxed);
         ReportSubmitCounts();
     }
+    if (pre_submit) [[unlikely]] {
+        pre_submit();
+    }
     EndPendingOperations();
     InvalidateState();
 
