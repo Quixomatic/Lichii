@@ -162,6 +162,7 @@ void GpuSplit::MaybeStart(Core::System& system_) {
     draw_records = ir && front_macros && V2::On(V2::Switch::IrDraws);
     draw_verify = draw_records && V2::Verify(V2::Switch::IrDraws);
     full_draw_records = draw_records && (draw_verify || V2::On(V2::Switch::Parallel));
+    ir_checks = ir_verify || draw_verify || V2::Stats::Enabled();
     if (draw_verify) {
         V2::IrCheck::Start();
     }
@@ -234,6 +235,7 @@ void GpuSplit::Stop() {
     draw_records = false;
     draw_verify = false;
     full_draw_records = false;
+    ir_checks = false;
     V2::IrCheck::Stop();
     ir_sequence = 0;
     ir_run = nullptr;
@@ -599,14 +601,14 @@ void GpuSplit::MultiMethod(Tegra::Engines::EngineInterface* engine, u32 method, 
     }
 }
 
-SPLIT_FORCE_INLINE size_t GpuSplit::ExecuteMethod(const u64* entry, size_t words) {
+/// Nx2Perf: a method entry for a Maxwell3D with fast_maxwell3d, as ExecuteMethod below without
+/// the profile zones (off with fast_maxwell3d) and the virtual call.
+SPLIT_FORCE_INLINE size_t GpuSplit::ExecuteMethod3D(Tegra::Engines::EngineInterface* engine,
+                                                    const u64* entry, size_t words) {
     const u64 head = entry[0];
     const u32 method = static_cast<u32>((head >> 8) & 0xffff);
     const u32 argument = static_cast<u32>(head >> 32);
-    auto* const engine = back_engine;
-    if (engine->fast_maxwell3d) {
-        // Nx2Perf: as below without the profile zones (off with fast_maxwell3d) and the
-        // virtual call.
+    {
         using Tegra::Engines::Maxwell3D;
         auto* const maxwell3d = static_cast<Maxwell3D*>(engine);
         constexpr u32 cb_data = MAXWELL3D_REG_INDEX(const_buffer.buffer);
@@ -652,6 +654,16 @@ SPLIT_FORCE_INLINE size_t GpuSplit::ExecuteMethod(const u64* entry, size_t words
         }
         return (head & HasSegment) != 0 ? 2 : 1;
     }
+}
+
+SPLIT_FORCE_INLINE size_t GpuSplit::ExecuteMethod(const u64* entry, size_t words) {
+    auto* const engine = back_engine;
+    if (engine->fast_maxwell3d) {
+        return ExecuteMethod3D(engine, entry, words);
+    }
+    const u64 head = entry[0];
+    const u32 method = static_cast<u32>((head >> 8) & 0xffff);
+    const u32 argument = static_cast<u32>(head >> 32);
     if (!engine->reports_fast_draw_breaks) {
         Nx2FastDraw::Break(Nx2FastDraw::Reason::OtherEngine);
     }
@@ -695,17 +707,19 @@ void GpuSplit::CheckIrRecord(const u64* entry) {
 size_t GpuSplit::ExecuteIr(const u64* entry) {
     const u64 head = entry[0];
     const size_t size = V2::Ir::RecordWords(head);
-    if (ir_verify) [[unlikely]] {
-        CheckIrRecord(entry);
-    }
-    if (draw_verify) [[unlikely]] {
-        V2::IrCheck::OnRecord(V2::Ir::KindOf(head));
-    }
-    if (V2::Stats::Enabled()) [[unlikely]] {
-        V2::Stats::NoteIrRecord(static_cast<u32>(V2::Ir::KindOf(head)), size,
-                                (head & V2::Ir::HasPayload) != 0
-                                    ? V2::Ir::UnpackRef(entry[V2::Ir::HeaderWords]).words
-                                    : 0);
+    if (ir_checks) [[unlikely]] {
+        if (ir_verify) {
+            CheckIrRecord(entry);
+        }
+        if (draw_verify) {
+            V2::IrCheck::OnRecord(V2::Ir::KindOf(head));
+        }
+        if (V2::Stats::Enabled()) {
+            V2::Stats::NoteIrRecord(static_cast<u32>(V2::Ir::KindOf(head)), size,
+                                    (head & V2::Ir::HasPayload) != 0
+                                        ? V2::Ir::UnpackRef(entry[V2::Ir::HeaderWords]).words
+                                        : 0);
+        }
     }
     back_sequence = entry[1];
     const V2::Ir::PayloadRef payload = (head & V2::Ir::HasPayload) != 0
@@ -722,10 +736,33 @@ size_t GpuSplit::ExecuteIr(const u64* entry) {
     case V2::Ir::Kind::StateRun: {
         // Every method of the run ends at the record's end (the front notes its writes there;
         // releases and reports close the run, GpuSplit::CutForLanding).
+        // A run goes to one engine (the front opens a new one when it switches), so the
+        // engine's path is chosen once per run, not per method.
         const u64* it = arena.At(payload.index);
         const u64* const end = it + payload.words;
-        while (it < end) {
-            it += ExecuteMethod(it, static_cast<size_t>(end - it));
+        auto* const engine = back_engine;
+        if (engine->fast_maxwell3d) {
+            while (it < end) {
+                it += ExecuteMethod3D(engine, it, static_cast<size_t>(end - it));
+            }
+        } else {
+            while (it < end) {
+                it += ExecuteMethod(it, static_cast<size_t>(end - it));
+            }
+        }
+        break;
+    }
+    case V2::Ir::Kind::Compact: {
+        // One per draw trigger and macro end: only a macro end runs anything (as
+        // V2::IrExec::Execute, without decoding the record there).
+        if ((head & FastDrawNeutral) == 0) {
+            Nx2FastDraw::Break(Nx2FastDraw::Reason::Call);
+        }
+        V2::Ir::CompactBody compact;
+        std::memcpy(&compact, body, sizeof(compact));
+        if (compact.full_kind == V2::Ir::Kind::Draw &&
+            compact.op == static_cast<u8>(V2::Ir::DrawOp::MacroEnd)) {
+            objects->As<Tegra::Engines::Maxwell3D>(compact.engine)->FinishFrontMacro(*system);
         }
         break;
     }

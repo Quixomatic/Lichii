@@ -702,6 +702,9 @@ private:
     size_t Execute(const u64* entry, size_t words);
     /// One method entry (the old Method entry, or one in an IR StateRun), returns its size.
     size_t ExecuteMethod(const u64* entry, size_t words);
+    /// ExecuteMethod for a back engine with fast_maxwell3d (chosen once per StateRun).
+    size_t ExecuteMethod3D(Tegra::Engines::EngineInterface* engine, const u64* entry,
+                           size_t words);
     size_t ExecuteIr(const u64* entry);
     void CheckIrRecord(const u64* entry);
     void AllocateIr();
@@ -720,6 +723,7 @@ private:
     bool draw_records{}; ///< EDEN_NX2_V2_IR_DRAWS (DrawRecords)
     bool draw_verify{};  ///< EDEN_NX2_V2_IR_DRAWS=verify: the back checks draws (V2::IrCheck)
     bool full_draw_records{}; ///< FullDrawRecords
+    bool ir_checks{}; ///< ir_verify, draw_verify or V2 stats: ExecuteIr's per-record checks
     std::unique_ptr<u64[]> ring;
     V2::Resolve::SplitResolve* parallel{}; ///< EDEN_NX2_V2_PARALLEL (owned; deleted at Stop)
 
