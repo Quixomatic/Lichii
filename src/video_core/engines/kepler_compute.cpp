@@ -47,6 +47,7 @@
 #include "video_core/v2/shader_writes.h"
 #include "video_core/v2/ir_check.h"
 #include "video_core/v2/regsem_3d.h"
+#include "video_core/v2/s1_deltas.h"
 
 namespace Tegra::Engines {
 
@@ -295,7 +296,8 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
         native_parameters.clear();
         return true;
     }
-    if (VideoCommon::V2::On(VideoCommon::V2::Switch::RegSem)) [[unlikely]] {
+    // S1 (F1-05): the front sent this engine's groups; the back hashes nothing.
+    if (VideoCommon::V2::On(VideoCommon::V2::Switch::RegSem) && !s1_compute) [[unlikely]] {
         VideoCommon::V2::RegSem::NoteWriteCompute(v2_groups, method, native_registers[method],
                                                   argument);
     }
@@ -310,32 +312,10 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
     if (method == 0x107) {
         const GPUVAddr address = ((GPUVAddr{native_registers[0xc6]} << 32) |
             native_registers[0xc7]) << 8;
-        const GPUVAddr program = (GPUVAddr{native_registers[0xc8 + 49] & 0x1ffff} << 32) |
-            native_registers[0xc8 + 48];
         const u32 control = native_registers[0xa7];
-        LOG_DEBUG(HW_GPU, "Native inline QMD: address={:#x}, program={:#x}, control={:#x}, grid={}/{}/{}",
-            address, program, control, native_registers[0xc8 + 12],
-            native_registers[0xc8 + 13] & 0xffff, native_registers[0xc8 + 14] & 0xffff);
-        if (static const bool diagnostics = std::getenv("EDEN_NATIVE_DRAW_DIAGNOSTICS") != nullptr;
-            diagnostics) {
-            std::ofstream dump("native-inline-qmd.bin", std::ios::binary);
-            dump.write(reinterpret_cast<const char*>(native_registers.data() + 0xc8), 256);
-            std::ofstream registers("native-inline-compute-registers.bin", std::ios::binary);
-            registers.write(reinterpret_cast<const char*>(native_registers.data()), sizeof(native_registers));
-            if (memory_manager.IsFullyMappedRange(program, 0x10000)) {
-                std::vector<u8> code(0x10000);
-                memory_manager.ReadBlockUnsafe(program, code.data(), code.size());
-                std::ofstream shader("native-inline-compute-shader.bin", std::ios::binary);
-                shader.write(reinterpret_cast<const char*>(code.data()), code.size());
-            }
-        }
-        if (!memory_manager.IsFullyMappedRange(address, 256)) {
-            native_macro->native_execution_failed = true;
-            LOG_ERROR(HW_GPU, "Unmapped native inline QMD destination");
+        if (!NativeInlineQmdUpload()) {
             return true;
         }
-        rasterizer->AccelerateInlineToMemory(address, 256,
-            std::span<const u8>{reinterpret_cast<const u8*>(native_registers.data() + 0xc8), 256});
         if ((control & (1U << 24)) || !(native_registers[0xcc] & (1U << 12))) {
             const u32 previous = native_registers[0xad];
             const u32 inline_qmd = static_cast<u32>(address >> 8);
@@ -487,6 +467,85 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
         // The inline upload register block is shared with the older class.
         if (method < Regs::NUM_REGS) regs.reg_array[method] = argument;
         return method != KEPLER_COMPUTE_REG_INDEX(exec_upload) && method != KEPLER_COMPUTE_REG_INDEX(data_upload);
+    }
+}
+
+bool KeplerCompute::NativeInlineQmdUpload() {
+    const GPUVAddr address = ((GPUVAddr{native_registers[0xc6]} << 32) |
+        native_registers[0xc7]) << 8;
+    const GPUVAddr program = (GPUVAddr{native_registers[0xc8 + 49] & 0x1ffff} << 32) |
+        native_registers[0xc8 + 48];
+    const u32 control = native_registers[0xa7];
+    LOG_DEBUG(HW_GPU, "Native inline QMD: address={:#x}, program={:#x}, control={:#x}, grid={}/{}/{}",
+        address, program, control, native_registers[0xc8 + 12],
+        native_registers[0xc8 + 13] & 0xffff, native_registers[0xc8 + 14] & 0xffff);
+    if (static const bool diagnostics = std::getenv("EDEN_NATIVE_DRAW_DIAGNOSTICS") != nullptr;
+        diagnostics) {
+        std::ofstream dump("native-inline-qmd.bin", std::ios::binary);
+        dump.write(reinterpret_cast<const char*>(native_registers.data() + 0xc8), 256);
+        std::ofstream registers("native-inline-compute-registers.bin", std::ios::binary);
+        registers.write(reinterpret_cast<const char*>(native_registers.data()), sizeof(native_registers));
+        if (memory_manager.IsFullyMappedRange(program, 0x10000)) {
+            std::vector<u8> code(0x10000);
+            memory_manager.ReadBlockUnsafe(program, code.data(), code.size());
+            std::ofstream shader("native-inline-compute-shader.bin", std::ios::binary);
+            shader.write(reinterpret_cast<const char*>(code.data()), code.size());
+        }
+    }
+    if (!memory_manager.IsFullyMappedRange(address, 256)) {
+        native_macro->native_execution_failed = true;
+        LOG_ERROR(HW_GPU, "Unmapped native inline QMD destination");
+        return false;
+    }
+    rasterizer->AccelerateInlineToMemory(address, 256,
+        std::span<const u8>{reinterpret_cast<const u8*>(native_registers.data() + 0xc8), 256});
+    return true;
+}
+
+void KeplerCompute::ExecuteS1Run(Core::System& system, const u64* it, const u64* const end) {
+    // The front ran the register semantics and decided the inline QMD launches: store the
+    // deltas, take the groups, run only what has side effects (no hashing, no register write
+    // of the back's own).
+    namespace S1 = VideoCommon::V2::S1;
+    while (it < end) {
+        const u64 word = *it;
+        const u32 index = S1::IndexOf(word);
+        const u32 value = S1::ValueOf(word);
+        switch (S1::TagOf(word)) {
+        case S1::Tag::Delta:
+            native_registers[index] = value;
+            if (index < Regs::NUM_REGS) {
+                regs.reg_array[index] = value;
+            }
+            ++it;
+            break;
+        case S1::Tag::Exec:
+            ++it;
+            if ((word & S1::ComputeNoLaunch) != 0) {
+                native_registers[index] = value;
+                s1_inline_failed = !NativeInlineQmdUpload();
+                break;
+            }
+            if ((word & S1::ComputeInlineLaunch) != 0 && s1_inline_failed) {
+                break; // as ProcessNativeMethod: no launch from an unmapped upload
+            }
+            CallMethod(system, index, value, (word & S1::IsLast) != 0);
+            break;
+        case S1::Tag::ComputeGroups: {
+            const u32 groups = S1::GroupsDirty(word);
+            ++it;
+            for (u32 bits = groups & VideoCommon::V2::HashedComputeGroups; bits != 0;
+                 bits &= bits - 1) {
+                v2_groups.hashes[std::countr_zero(bits)] = *it++;
+            }
+            v2_groups.dirty |= groups;
+            v2_groups.valid = true;
+            break;
+        }
+        default:
+            it += S1::EntryWords(it);
+            break;
+        }
     }
 }
 
@@ -1665,6 +1724,9 @@ struct KeplerCompute::FrontState {
         std::vector<std::pair<GPUVAddr, u64>> releases; ///< release words
     };
     std::deque<QmdSignal> qmd_signals; ///< this write's signals, consumed by the notes
+    /// S1 single owner (GpuSplit::S1Exec, REGSEM=1, the native class): classified entries
+    /// instead of method words (F1-05).
+    bool s1{};
 };
 
 KeplerCompute::FrontState& KeplerCompute::Front(VideoCommon::GpuSplit& split) {
@@ -1698,6 +1760,12 @@ KeplerCompute::FrontState& KeplerCompute::Front(VideoCommon::GpuSplit& split) {
                                                    front->v2_mirror->registers.data());
         } else if (front->v2_mode == VideoCommon::V2::Mode::On) [[unlikely]] {
             VideoCommon::V2::RegSem::RehashCompute(front->v2_groups, front->registers.data());
+            // Drained above: the back's groups equal these, and it hashes nothing from now on.
+            front->s1 = split.S1Exec() && native_mode;
+            s1_compute = front->s1;
+            if (front->s1) {
+                v2_groups = front->v2_groups;
+            }
         }
     }
     return *front;
@@ -1712,6 +1780,7 @@ void KeplerCompute::ReleaseFront() {
     native_macro = front->macro;
     front.reset();
     front_macros = false;
+    s1_compute = false;
     LOG_INFO(HW_GPU, "GPU thread split stopped: compute macros back on the engine");
 }
 
@@ -1849,6 +1918,7 @@ void KeplerCompute::FrontCallMethod(Core::System& system, VideoCommon::GpuSplit&
         }
         return;
     }
+    const u32 old_value = fs.registers[method];
     FrontApply(fs, method, argument);
     if (VideoCommon::V2::Resolve::MultiFront::g_recording) [[unlikely]] {
         NoteQmdUse(method);
@@ -1856,13 +1926,92 @@ void KeplerCompute::FrontCallMethod(Core::System& system, VideoCommon::GpuSplit&
     if (fs.qmd_model != VideoCommon::V2::Mode::Off) [[unlikely]] {
         FrontModelQmd(split, fs, method, &argument, 1);
     }
-    if (split.DrawRecords()) [[unlikely]] {
-        FrontDispatchRecord(split, fs, method, &argument, 1);
+    // A data upload word needs its pushbuffer address on the back (the upload source): it
+    // stays a method word.
+    if (fs.s1 && method != KEPLER_COMPUTE_REG_INDEX(data_upload)) [[likely]] {
+        FrontS1Write(split, fs, method, old_value, is_last_call);
+    } else {
+        if (split.DrawRecords()) [[unlikely]] {
+            FrontDispatchRecord(split, fs, method, &argument, 1);
+        }
+        split.Method(this, method, argument, is_last_call, segment);
     }
-    split.Method(this, method, argument, is_last_call, segment);
     if (split.TracksWrites()) [[unlikely]] {
         FrontNoteWrites(split, fs, method, argument);
     }
+}
+
+void KeplerCompute::FrontS1Write(VideoCommon::GpuSplit& split, FrontState& fs, u32 method,
+                                 u32 old_value, bool is_last) {
+    namespace S1 = VideoCommon::V2::S1;
+    const u32 value = fs.registers[method];
+    if (method >= 0x45 && method <= 0x48) {
+        return; // macro code and bindings live on the front (FrontApply)
+    }
+    if (native_plain_methods[method]) {
+        if (value != old_value) {
+            split.S1Word(this, S1::MakeRegister(S1::Tag::Delta, method, value));
+        }
+        return;
+    }
+    switch (method) {
+    case 0x107: {
+        // As ProcessNativeMethod: the QMD upload, then a launch unless it waits for a
+        // dependency, with the launch address in 0xad for the signal and restored after it.
+        // The register writes are the front's deltas; the back only uploads and signals.
+        split.S1Word(this, S1::MakeRegister(S1::Tag::Exec, method, value, S1::ComputeNoLaunch));
+        const u32* const r = fs.registers.data();
+        if ((r[0xa7] & (1U << 24)) == 0 && (r[0xcc] & (1U << 12)) != 0) {
+            return;
+        }
+        const u32 previous = r[0xad];
+        const GPUVAddr address = ((GPUVAddr{r[0xc6]} << 32) | r[0xc7]) << 8;
+        FrontS1Store(split, fs, 0xad, static_cast<u32>(address >> 8));
+        FrontS1Groups(split, fs);
+        FrontApply(fs, 0xb0, 3);
+        split.S1Word(this, S1::MakeRegister(S1::Tag::Exec, 0xb0, 3,
+                                            S1::ComputeInlineLaunch | S1::IsLast));
+        FrontS1Store(split, fs, 0xad, previous);
+        return;
+    }
+    case 0xae:
+    case 0xaf:
+    case 0xb0:
+        FrontS1Groups(split, fs); // a QMD signal may launch work
+        break;
+    default:
+        break;
+    }
+    split.S1Word(this, S1::MakeRegister(S1::Tag::Exec, method, value, is_last ? S1::IsLast : 0));
+}
+
+void KeplerCompute::FrontS1Store(VideoCommon::GpuSplit& split, FrontState& fs, u32 method,
+                                 u32 value) {
+    namespace S1 = VideoCommon::V2::S1;
+    const u32 old_value = fs.registers[method];
+    FrontApply(fs, method, value);
+    if (fs.registers[method] != old_value) {
+        split.S1Word(this, S1::MakeRegister(S1::Tag::Delta, method, fs.registers[method]));
+    }
+}
+
+void KeplerCompute::FrontS1Groups(VideoCommon::GpuSplit& split, FrontState& fs) {
+    namespace S1 = VideoCommon::V2::S1;
+    VideoCommon::V2::ComputeGroupTracker& groups = fs.v2_groups;
+    const u32 changed = groups.dirty;
+    if (changed == 0) {
+        return; // the back's groups hold (its dispatches see nothing changed)
+    }
+    const u32 hashed = changed & VideoCommon::V2::HashedComputeGroups;
+    const size_t size = 1 + static_cast<size_t>(std::popcount(hashed));
+    u64* const entry = split.S1Begin(this, size);
+    entry[0] = static_cast<u64>(S1::Tag::ComputeGroups) | (u64{changed & 0xffff} << 8);
+    size_t slot = 1;
+    for (u32 bits = hashed; bits != 0; bits &= bits - 1) {
+        entry[slot++] = groups.hashes[std::countr_zero(bits)];
+    }
+    split.S1Commit(size);
+    groups.BeginDraw();
 }
 
 void KeplerCompute::FrontDispatchRecord(VideoCommon::GpuSplit& split, FrontState& fs, u32 method,
@@ -2210,7 +2359,9 @@ void KeplerCompute::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuS
                                          u32 method, const u32* base_start, u32 amount,
                                          u32 methods_pending, const GPUVAddr* segment) {
     auto& fs = Front(split);
-    if (method >= 0xe00 && method < fs.registers.size()) {
+    // S1: every word is classified on its own (an upload stays one MethodData record).
+    const bool s1_words = fs.s1 && method < 0xe00 && method != KEPLER_COMPUTE_REG_INDEX(data_upload);
+    if ((method >= 0xe00 && method < fs.registers.size()) || s1_words) {
         for (u32 i = 0; i < amount; ++i) {
             FrontCallMethod(system, split, method, base_start[i], methods_pending - i <= 1, segment);
         }
@@ -2274,14 +2425,19 @@ void KeplerCompute::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& s
         if (address >= 0xe00) {
             return false;
         }
+        const u32 old_value = fs.registers[address];
         FrontApply(fs, address, value);
         if (fs.qmd_model != VideoCommon::V2::Mode::Off) [[unlikely]] {
             FrontModelQmd(split, fs, address, &value, 1);
         }
-        if (split.DrawRecords()) [[unlikely]] {
-            FrontDispatchRecord(split, fs, address, &value, 1);
+        if (fs.s1 && address != KEPLER_COMPUTE_REG_INDEX(data_upload)) [[likely]] {
+            FrontS1Write(split, fs, address, old_value, true);
+        } else {
+            if (split.DrawRecords()) [[unlikely]] {
+                FrontDispatchRecord(split, fs, address, &value, 1);
+            }
+            split.MacroWrite(this, address, value);
         }
-        split.MacroWrite(this, address, value);
         if (dump_identity && observation.writes.size() < 64) [[unlikely]] {
             observation.writes.emplace_back(address, value);
         }

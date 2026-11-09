@@ -308,8 +308,28 @@ private:
     /// The storage buffer ranges a QMD's program writes (false: unknown, unbounded).
     bool FrontQmdWriteRanges(VideoCommon::GpuSplit& split, const u32* qmd,
                              std::vector<std::pair<GPUVAddr, u64>>& out);
+    /// S1 single owner (F1-05): a write FrontApply took becomes classified entries (`old_value`:
+    /// the register before it).
+    void FrontS1Write(VideoCommon::GpuSplit& split, FrontState& state, u32 method, u32 old_value,
+                      bool is_last);
+    /// S1: a register write the front makes itself (the inline QMD's launch address).
+    void FrontS1Store(VideoCommon::GpuSplit& split, FrontState& state, u32 method, u32 value);
+    /// S1: the front's compute groups and hashes before a write that may launch QMDs.
+    void FrontS1Groups(VideoCommon::GpuSplit& split, FrontState& state);
+    /// The inline QMD (0x107) upload; false when its destination is not mapped.
+    bool NativeInlineQmdUpload();
     std::unique_ptr<FrontState> front;
     bool front_macros{}; ///< The front owns the macro code and bindings (the back skips them)
+    /// S1 for this engine (set on the front before its first classified run is published): the
+    /// back takes register groups from the front and hashes nothing itself.
+    bool s1_compute{};
+    bool s1_inline_failed{}; ///< Back, S1: the last inline QMD upload found no mapped memory
+
+public:
+    /// Back, S1 single owner: a classified StateRun of this engine (V2::S1 entries).
+    void ExecuteS1Run(Core::System& system, const u64* it, const u64* end);
+
+private:
 
     bool DispatchNativeCompute(const NativeQmdScheduler::Descriptor& descriptor);
     void ProcessNativeReportSemaphore(u32 argument);

@@ -46,6 +46,9 @@ enum class Tag : u8 {
     Draw = 11,
     Inline = 12,
     Groups = 13,
+    /// KeplerCompute (native class): [tag][dirty 8-23], then one hash per hashed compute group
+    /// in dirty; the front's compute groups before a write that may launch QMDs.
+    ComputeGroups = 14,
 };
 
 inline constexpr u64 TagMask = 0xf;
@@ -57,6 +60,10 @@ inline constexpr u64 CbufStore = 1 << 4;
 inline constexpr u64 CbufInc = 1 << 5;
 inline constexpr u64 GroupsRegisterBreak = 1 << 4;
 inline constexpr u64 GroupsMethodBreak = 1 << 5;
+/// Compute Exec of the inline QMD (0x107): the upload only; the launch follows as entries.
+inline constexpr u64 ComputeNoLaunch = 1 << 5;
+/// Compute Exec of the inline QMD's launch: skipped when its upload found no mapped memory.
+inline constexpr u64 ComputeInlineLaunch = 1 << 6;
 inline constexpr u32 MaxCbufWords = 256;
 inline constexpr u32 MaxInlineWords = 512;
 inline constexpr size_t DrawWords = 1 + sizeof(Ir::PredictedDraw) / sizeof(u64);
@@ -122,6 +129,8 @@ inline constexpr u32 LightGroups = GroupBit(RegGroup::DrawParams) |
         return 1 + (size_t{ValueOf(word)} + 1) / 2;
     case Tag::Groups:
         return 1 + static_cast<size_t>(std::popcount(GroupsDirty(word) & HashedGroups));
+    case Tag::ComputeGroups:
+        return 1 + static_cast<size_t>(std::popcount(GroupsDirty(word) & HashedComputeGroups));
     default:
         return 1;
     }

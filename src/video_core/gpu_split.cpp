@@ -23,6 +23,7 @@
 #include "common/thread.h"
 #include "core/core.h"
 #include "video_core/engines/engine_interface.h"
+#include "video_core/engines/kepler_compute.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/gpu.h"
 #include "video_core/gpu_split.h"
@@ -939,7 +940,17 @@ size_t GpuSplit::ExecuteIr(const u64* entry) {
         auto* const engine = back_engine;
         if ((head & V2::Ir::Classified) != 0) {
             // S1 single owner: register deltas and typed entries, no method execution.
-            static_cast<Tegra::Engines::Maxwell3D*>(engine)->ExecuteS1Run(it, end);
+            if (engine->fast_maxwell3d) [[likely]] {
+                static_cast<Tegra::Engines::Maxwell3D*>(engine)->ExecuteS1Run(it, end);
+            } else {
+                // Only the native compute class sends classified runs besides 3D (F1-05).
+                if (!engine->reports_fast_draw_breaks) {
+                    Nx2FastDraw::Break(Nx2FastDraw::Reason::OtherEngine);
+                }
+                Nx2Profile::Scope method_scope{Nx2Profile::Zone::Method};
+                static_cast<Tegra::Engines::KeplerCompute*>(engine)->ExecuteS1Run(*system, it,
+                                                                                  end);
+            }
             break;
         }
         if (engine->fast_maxwell3d) {
