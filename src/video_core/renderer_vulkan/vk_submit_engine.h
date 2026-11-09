@@ -154,14 +154,17 @@ private:
     std::mutex submit_queue_mutex;
     std::condition_variable_any submit_cv;
     std::deque<SubmitWork> submit_queue;
+    bool submit_waiting{};   ///< under submit_queue_mutex: the submit thread sleeps
     std::atomic<u64> handed{};
     std::atomic<u64> submitted{};
     std::condition_variable submitted_cv;
     std::mutex submitted_mutex;
+    u32 submitted_waiters{}; ///< under submitted_mutex
 
     std::mutex finish_mutex;
     std::condition_variable_any finish_cv;
     std::deque<SubmitContext*> finish_queue;
+    bool finish_waiting{};   ///< under finish_mutex: the finish thread sleeps
 
     std::mutex retire_mutex;
     std::deque<Retire> retires;

@@ -262,12 +262,17 @@ void SubmitEngine::Submit(SubmitWork&& work) {
         return;
     }
     work.handed = std::chrono::steady_clock::now();
+    // Perf fix C: wake the submit thread only when it sleeps (it pops the queue before it does).
+    bool wake;
     {
         std::scoped_lock lock{submit_queue_mutex};
         submit_queue.push_back(std::move(work));
         handed.fetch_add(1, std::memory_order_release);
+        wake = submit_waiting;
     }
-    submit_cv.notify_one();
+    if (wake) {
+        submit_cv.notify_one();
+    }
 }
 
 void SubmitEngine::WaitSubmitted() {
@@ -279,8 +284,10 @@ void SubmitEngine::WaitSubmitted() {
         return;
     }
     std::unique_lock lock{submitted_mutex};
+    ++submitted_waiters;
     submitted_cv.wait(lock,
                       [&] { return submitted.load(std::memory_order_acquire) >= target; });
+    --submitted_waiters;
 }
 
 void SubmitEngine::RetireAfter(u64 tick, std::function<void()>&& func) {
@@ -319,7 +326,11 @@ void SubmitEngine::SubmitThread(std::stop_token token) {
         SubmitWork work;
         {
             std::unique_lock lock{submit_queue_mutex};
-            submit_cv.wait(lock, token, [this] { return !submit_queue.empty(); });
+            submit_cv.wait(lock, token, [this] {
+                submit_waiting = submit_queue.empty();
+                return !submit_waiting;
+            });
+            submit_waiting = false;
             if (submit_queue.empty()) {
                 return; // Stop requested with nothing left to submit
             }
@@ -327,16 +338,24 @@ void SubmitEngine::SubmitThread(std::stop_token token) {
             submit_queue.pop_front();
         }
         DoSubmit(work);
+        bool wake_finish;
         {
             std::scoped_lock lock{finish_mutex};
             finish_queue.push_back(work.context);
+            wake_finish = finish_waiting;
         }
-        finish_cv.notify_one();
+        if (wake_finish) {
+            finish_cv.notify_one();
+        }
+        bool wake_waiters;
         {
             std::scoped_lock lock{submitted_mutex};
             submitted.fetch_add(1, std::memory_order_release);
+            wake_waiters = submitted_waiters != 0;
         }
-        submitted_cv.notify_all();
+        if (wake_waiters) {
+            submitted_cv.notify_all();
+        }
     }
 }
 
@@ -346,7 +365,11 @@ void SubmitEngine::FinishThread(std::stop_token token) {
         SubmitContext* context = nullptr;
         {
             std::unique_lock lock{finish_mutex};
-            finish_cv.wait(lock, token, [this] { return !finish_queue.empty(); });
+            finish_cv.wait(lock, token, [this] {
+                finish_waiting = finish_queue.empty();
+                return !finish_waiting;
+            });
+            finish_waiting = false;
             if (finish_queue.empty()) {
                 return;
             }
