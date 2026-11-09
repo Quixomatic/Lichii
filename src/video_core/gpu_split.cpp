@@ -842,8 +842,15 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
                 Pause();
                 available = published.load(std::memory_order_acquire);
             }
+            if (available == read_position && hook_requested.load(std::memory_order_relaxed)) {
+                // A request ended the spin, not the idle timeout: serve it and keep spinning (a
+                // lane request alone doesn't submit deferred work; going idle below does).
+                ServeHookRequests();
+                continue;
+            }
             if (available == read_position && idle_hook != nullptr) {
                 hook_requested.store(false, std::memory_order_seq_cst);
+                idle_hook_requested.store(false, std::memory_order_relaxed);
                 ServeCpuLane();
                 idle_hook(idle_argument);
                 available = published.load(std::memory_order_acquire);
@@ -873,12 +880,9 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
             const size_t size =
                 Execute(&ring[index], std::min<u64>(available - read_position, RingWords - index));
             read_position += size != 0 ? size : RingWords - index;
-            if (hook_requested.load(std::memory_order_relaxed) &&
-                idle_hook != nullptr) [[unlikely]] {
-                hook_requested.store(false, std::memory_order_seq_cst);
+            if (hook_requested.load(std::memory_order_relaxed)) [[unlikely]] {
                 // EDEN_NX2_V2_CPULANE: a guest CPU flush runs here, after the current entry.
-                ServeCpuLane();
-                idle_hook(idle_argument);
+                ServeHookRequests();
             }
             // Hand ring space back now and then while working through a long batch, and at once
             // when the front waits for this position (WaitForWriters).

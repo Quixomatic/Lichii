@@ -227,9 +227,11 @@ public:
         cpu_lane_hook = hook;
         cpu_lane_argument = argument;
     }
+    /// Serving a lane request runs no idle hook (no deferred submit): a request that needs the
+    /// GPU submits or waits for its own tick (WaitSubmitted asks for the idle hook).
     void RequestCpuLane() {
         cpu_lane_requested.store(true, std::memory_order_seq_cst);
-        RequestIdleHook();
+        WakeBackForHook();
     }
 
     /// Whether the calling thread is the back.
@@ -247,9 +249,8 @@ public:
     }
     /// Any thread: has the back call the idle hook soon, between entries or at once if it sleeps.
     void RequestIdleHook() {
-        hook_requested.store(true, std::memory_order_seq_cst);
-        wake.fetch_add(1, std::memory_order_seq_cst);
-        wake.notify_one();
+        idle_hook_requested.store(true, std::memory_order_seq_cst);
+        WakeBackForHook();
     }
 
     /// Starts the back thread once the split is wanted (EDEN_NX2_SPLIT=1, a Switch 2 title,
@@ -609,6 +610,22 @@ private:
     void Backoff(u32 spins, u64 target);
     /// EDEN_NX2_V2_SPIN: whether a wait that started spinning at `start` (ns) still spins.
     [[nodiscard]] bool SpinWindowOpen(u32 spins, u64& start) const;
+    void WakeBackForHook() {
+        hook_requested.store(true, std::memory_order_seq_cst);
+        wake.fetch_add(1, std::memory_order_seq_cst);
+        wake.notify_one();
+    }
+    /// Back, hook_requested seen: serves the CPU lane, and runs the idle hook only if it was
+    /// asked for (RequestIdleHook), not for a lane request alone.
+    void ServeHookRequests() {
+        hook_requested.store(false, std::memory_order_seq_cst);
+        ServeCpuLane();
+        if (idle_hook_requested.load(std::memory_order_relaxed) &&
+            idle_hook_requested.exchange(false, std::memory_order_seq_cst) &&
+            idle_hook != nullptr) {
+            idle_hook(idle_argument);
+        }
+    }
     /// Back: runs the CPU lane hook if one was asked for (EDEN_NX2_V2_CPULANE).
     void ServeCpuLane() {
         if (cpu_lane_requested.load(std::memory_order_relaxed) &&
@@ -697,6 +714,7 @@ private:
     void* cpu_lane_argument{};
     std::atomic<bool> cpu_lane_requested{};
     alignas(64) std::atomic<bool> hook_requested{};
+    std::atomic<bool> idle_hook_requested{};
     std::atomic<bool> back_running{};
 
     // 128 bytes: x86 spatial prefetchers pull 64-byte lines in pairs. back_waiting and wake are

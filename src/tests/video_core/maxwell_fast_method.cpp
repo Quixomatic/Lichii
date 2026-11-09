@@ -60,6 +60,10 @@ struct GpuSplitTestAccess {
         return GpuSplit::RingWords - 1;
     }
 
+    static void ServeHookRequests(GpuSplit& split) {
+        split.ServeHookRequests();
+    }
+
     static void SetIr(GpuSplit& split, bool ir) {
         split.ir = ir;
         split.ir_verify = ir;
@@ -1645,4 +1649,31 @@ TEST_CASE("V2 IR: constant buffer and other non-landing notes keep the StateRun 
     CHECK(f.fast.regs.vertex_buffer.first == 11);
     CHECK(f.fast.regs.vertex_buffer.count == 12);
     CHECK(Access::IrBadRecords(split) == 0);
+}
+
+TEST_CASE("GpuSplit: a CPU lane request runs the lane hook, not the idle hook (no submit)",
+          "[video_core][gpu_split_dispatch]") {
+    using Access = VideoCommon::GpuSplitTestAccess;
+    VideoCommon::GpuSplit split;
+    int lane = 0;
+    int idle = 0;
+    split.SetCpuLaneHook([](void* argument) { ++*static_cast<int*>(argument); }, &lane);
+    split.SetIdleHook([](void* argument) { ++*static_cast<int*>(argument); }, &idle);
+    split.RequestCpuLane();
+    Access::ServeHookRequests(split);
+    CHECK(lane == 1);
+    CHECK(idle == 0);
+    // A WaitSubmitted-style request still runs the idle hook (the deferred submit).
+    split.RequestIdleHook();
+    Access::ServeHookRequests(split);
+    CHECK(lane == 1);
+    CHECK(idle == 1);
+    split.RequestCpuLane();
+    split.RequestIdleHook();
+    Access::ServeHookRequests(split);
+    CHECK(lane == 2);
+    CHECK(idle == 2);
+    Access::ServeHookRequests(split);
+    CHECK(lane == 2);
+    CHECK(idle == 2);
 }
