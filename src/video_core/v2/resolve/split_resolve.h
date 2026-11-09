@@ -27,6 +27,9 @@ struct DrawOutput;
 namespace VideoCommon::V2::RegSem {
 struct Mirror3D;
 }
+namespace VideoCommon::V2::Resolve {
+class SnapshotView;
+}
 
 // Pipeline v2 P6a in the split (EDEN_NX2_V2_PARALLEL): the segmenter on the front (S1), shards
 // that resolve segments from the typed IR ring, and the back as the commit thread.
@@ -48,10 +51,11 @@ struct Mirror3D;
 // still on the commit thread.
 namespace VideoCommon::V2::Resolve {
 
-/// What the draw cache needs to compute a draw's shape and partial key from a register file.
+/// What the draw cache needs to compute a draw's shape and key from a register file.
 struct ShardKeyInputs {
     const u32* regs = nullptr; ///< Maxwell3D register layout
     const GroupTracker* groups = nullptr;
+    const CbufTable* cbufs = nullptr; ///< P6c: the bindings, for the full key
     u8 topology = 0;
     bool indexed = false;
     bool native_turing = false;
@@ -61,9 +65,12 @@ struct ShardKeyInputs {
 struct ShardKey {
     u64 shape = 0;
     u64 partial = 0;    ///< the key before the constant buffer bindings are mixed in
+    u64 full = 0;       ///< P6c: the whole draw-cache key (the bindings mixed in)
+    u64 cbuf_masks = 0; ///< P6c: hash of the shape's key constant buffer slots the full key used
     u32 relevant = 0;   ///< the shape's relevant groups the partial key used
     bool has_shape = false;
     bool has_key = false;
+    bool has_full = false;
 };
 /// Set by the Vulkan draw cache (the key code lives with it, shared with the serial path).
 using ShardKeyFn = ShardKey (*)(const ShardKeyInputs&);
@@ -73,13 +80,32 @@ inline ShardKeyFn g_shard_key = nullptr;
 /// lock-free readers through a per-entry sequence lock).
 void PublishShape(u64 shape, u32 relevant_groups);
 [[nodiscard]] bool FindShape(u64 shape, u32* relevant_groups);
+/// P6c: with the shape's key constant buffer slots per stage (DrawCache::ShapeInfo::key_cbufs).
+void PublishShape(u64 shape, u32 relevant_groups, const std::array<u32, CbufStages>& key_cbufs);
+[[nodiscard]] bool FindShape(u64 shape, u32* relevant_groups,
+                             std::array<u32, CbufStages>* key_cbufs);
 void ClearShapes();
+/// The hash of a shape's key constant buffer slots (the commit checks the full key used these).
+[[nodiscard]] u64 CbufMasksHash(const std::array<u32, CbufStages>& key_cbufs);
+
+/// P6c: a draw's pipeline key computed by a shard (the Vulkan FixedPipelineState, opaque here).
+struct PipelineKey {
+    u64 hash = 0;   ///< FixedPipelineState::Hash
+    u64 inputs = 0; ///< what it was computed from (shards reuse it while that holds)
+    std::vector<u8> bytes;
+};
+/// Set by the Vulkan pipeline cache (the key code lives with it, shared with the serial path).
+using PipelineKeyFn = std::shared_ptr<const PipelineKey> (*)(const SnapshotView& view);
+inline PipelineKeyFn g_pipeline_key = nullptr;
 
 /// A draw resolved by a shard.
 struct PreDraw {
     u64 fingerprint = 0; ///< the Draw record's (equals the back's group fingerprint at the draw)
     u64 shape = 0;
     u64 partial = 0;
+    u64 full = 0;       ///< P6c: the whole draw-cache key
+    u64 cbuf_masks = 0; ///< P6c: CbufMasksHash of the slots `full` used
+    std::shared_ptr<const PipelineKey> pipeline_key; ///< P6c (null: none computed)
     uintptr_t engine = 0;
     uintptr_t memory = 0;
     u32 relevant = 0;
@@ -87,9 +113,8 @@ struct PreDraw {
     bool indexed = false;
     bool has_shape = false;
     bool has_key = false;
+    bool has_full = false;
     bool drift = false; ///< the shard's registers disagreed with the record's fingerprint
-
-    bool operator==(const PreDraw&) const = default;
 };
 
 /// The front's register state at a cut.
@@ -185,6 +210,21 @@ public:
     void OnSegment(const Ir::SegmentBody& body, const u32* back_regs, const CbufTable* back_cbufs);
     /// The shard's record for the draw the back is about to decide (null: none matches).
     [[nodiscard]] const PreDraw* TakeDraw(u64 fingerprint, bool indexed);
+    /// P6c: the record DecideDraw accepted for the draw being resolved (engine, memory and
+    /// engine hint checked), for the later resolve steps of the same draw. Cleared when the
+    /// draw's pipeline is chosen (EndDraw), so a step of a later draw never sees it.
+    void SetTaken(const PreDraw* pre) {
+        taken = pre;
+    }
+    void EndDraw() {
+        taken = nullptr;
+    }
+    /// The shard's pipeline key for the draw being resolved, once (null: none).
+    [[nodiscard]] const PipelineKey* TakePipelineKey() {
+        const PreDraw* const pre = taken;
+        taken = nullptr;
+        return pre != nullptr ? pre->pipeline_key.get() : nullptr;
+    }
     [[nodiscard]] bool Verify() const {
         return verify;
     }
@@ -217,6 +257,7 @@ private:
     u64 held_id = 0;
     Resolver::Result* current = nullptr;
     size_t cursor = 0;
+    const PreDraw* taken = nullptr;
     AdaptiveSize adaptive;
     u64 last_report_ns = 0;
 

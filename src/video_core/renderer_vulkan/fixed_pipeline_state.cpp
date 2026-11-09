@@ -134,8 +134,13 @@ void FixedPipelineState::Refresh(Tegra::Engines::Maxwell3D& maxwell3d, DynamicFe
 
 void FixedPipelineState::RefreshCore(const Tegra::Engines::Maxwell3D& maxwell3d,
                                      const DynamicFeatures& features) {
-    const Maxwell& regs = maxwell3d.regs;
-    const auto topology_ = maxwell3d.draw_manager.draw_state.topology;
+    RefreshCore(maxwell3d.regs, maxwell3d.draw_manager.draw_state.topology, maxwell3d.engine_state,
+                features);
+}
+
+void FixedPipelineState::RefreshCore(const Maxwell& regs, Maxwell::PrimitiveTopology topology_,
+                                     Tegra::Engines::Maxwell3D::EngineHint engine_state,
+                                     const DynamicFeatures& features) {
 
     driver_id = features.driver_id;
     driver_version = features.driver_version;
@@ -201,7 +206,7 @@ void FixedPipelineState::RefreshCore(const Tegra::Engines::Maxwell3D& maxwell3d,
     smooth_lines.Assign(regs.line_anti_alias_enable != 0 ? 1 : 0);
     alpha_to_coverage_enabled.Assign(regs.anti_alias_alpha_control.alpha_to_coverage != 0 ? 1 : 0);
     alpha_to_one_enabled.Assign(regs.anti_alias_alpha_control.alpha_to_one != 0 ? 1 : 0);
-    app_stage.Assign(maxwell3d.engine_state);
+    app_stage.Assign(engine_state);
 
     depth_bounds_min = static_cast<u32>(regs.depth_bounds[0]);
     depth_bounds_max = static_cast<u32>(regs.depth_bounds[1]);
@@ -228,7 +233,13 @@ void FixedPipelineState::RefreshCore(const Tegra::Engines::Maxwell3D& maxwell3d,
 
 void FixedPipelineState::RefreshVertexInput(Tegra::Engines::Maxwell3D& maxwell3d,
                                             const DynamicFeatures& features, bool touch_flags) {
-    const Maxwell& regs = maxwell3d.regs;
+    if (!features.has_dynamic_vertex_input && touch_flags) {
+        maxwell3d.dirty.flags[Dirty::VertexInput] = false;
+    }
+    RefreshVertexInput(maxwell3d.regs, features);
+}
+
+void FixedPipelineState::RefreshVertexInput(const Maxwell& regs, const DynamicFeatures& features) {
     if (features.has_dynamic_vertex_input) {
         // Dirty flag will be reset by the command buffer update
         static constexpr std::array LUT{
@@ -249,9 +260,6 @@ void FixedPipelineState::RefreshVertexInput(Tegra::Engines::Maxwell3D& maxwell3d
             attribute_types |= static_cast<u64>(type & mask) << (i * 2);
         }
         return;
-    }
-    if (touch_flags) {
-        maxwell3d.dirty.flags[Dirty::VertexInput] = false;
     }
     enabled_divisors = 0;
     for (size_t index = 0; index < Maxwell::NumVertexArrays; ++index) {
@@ -334,8 +342,35 @@ u32 FixedPipelineState::RefreshIncremental(Tegra::Engines::Maxwell3D& maxwell3d,
                                            const DynamicFeatures& features, u32 groups,
                                            const KeyInputs& previous, bool force,
                                            bool touch_flags) {
-    const Maxwell& regs = maxwell3d.regs;
-    const KeyInputs inputs = CurrentInputs(maxwell3d);
+    const bool vertex_input = force || maxwell3d.dirty.flags[Dirty::VertexInput];
+    const bool swizzles = force || maxwell3d.dirty.flags[Dirty::ViewportSwizzles];
+    if (touch_flags) {
+        // What the blocks below consume (as Refresh clears them).
+        if (vertex_input && !features.has_dynamic_vertex_input) {
+            maxwell3d.dirty.flags[Dirty::VertexInput] = false;
+        }
+        if (swizzles) {
+            maxwell3d.dirty.flags[Dirty::ViewportSwizzles] = false;
+        }
+    }
+    const u32 repacked = RefreshBlocks(maxwell3d.regs, CurrentInputs(maxwell3d), features, groups,
+                                       previous, force, vertex_input, swizzles);
+    if (touch_flags && (repacked & KeyBlockBit(KeyBlock::Blend)) != 0) {
+        maxwell3d.dirty.flags[Dirty::Blending] = false;
+    }
+    return repacked;
+}
+
+void FixedPipelineState::RefreshFull(const Maxwell& regs, const KeyInputs& inputs,
+                                     const DynamicFeatures& features) {
+    RefreshBlocks(regs, inputs, features, 0, inputs, true, true, true);
+    CanonicalizeDynamic(features);
+}
+
+u32 FixedPipelineState::RefreshBlocks(const Maxwell& regs, const KeyInputs& inputs,
+                                      const DynamicFeatures& features, u32 groups,
+                                      const KeyInputs& previous, bool force, bool vertex_input,
+                                      bool swizzles) {
     const auto& masks = KeyBlockGroups();
     const auto block_dirty = [&](KeyBlock block) {
         return force || (groups & masks[static_cast<size_t>(block)]) != 0;
@@ -346,18 +381,15 @@ u32 FixedPipelineState::RefreshIncremental(Tegra::Engines::Maxwell3D& maxwell3d,
     // offsets and strides the repack rewrites).
     if (block_dirty(KeyBlock::Core) || topology_changed ||
         inputs.engine_state != previous.engine_state) {
-        RefreshCore(maxwell3d, features);
+        RefreshCore(regs, inputs.topology, inputs.engine_state, features);
         repacked |= KeyBlockBit(KeyBlock::Core);
     }
     // These two followed their Maxwell3D dirty flags in Refresh already.
-    if (force || maxwell3d.dirty.flags[Dirty::VertexInput]) {
-        RefreshVertexInput(maxwell3d, features, touch_flags);
+    if (vertex_input) {
+        RefreshVertexInput(regs, features);
         repacked |= KeyBlockBit(KeyBlock::VertexInput);
     }
-    if (force || maxwell3d.dirty.flags[Dirty::ViewportSwizzles]) {
-        if (touch_flags) {
-            maxwell3d.dirty.flags[Dirty::ViewportSwizzles] = false;
-        }
+    if (swizzles) {
         RefreshSwizzles(regs);
         repacked |= KeyBlockBit(KeyBlock::Swizzles);
     }
@@ -368,9 +400,6 @@ u32 FixedPipelineState::RefreshIncremental(Tegra::Engines::Maxwell3D& maxwell3d,
     if (!extended_dynamic_state_3_blend &&
         (block_dirty(KeyBlock::Blend) ||
          inputs.squashed_iterated_blend != previous.squashed_iterated_blend)) {
-        if (touch_flags) {
-            maxwell3d.dirty.flags[Dirty::Blending] = false;
-        }
         RefreshBlend(regs);
         repacked |= KeyBlockBit(KeyBlock::Blend);
     }

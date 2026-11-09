@@ -20,6 +20,7 @@
 #include "common/settings.h"
 #include "video_core/v2/regsem.h"
 #include "video_core/v2/resolve/split_resolve.h"
+#include "video_core/v2/resolve/state_view.h"
 #include "video_core/v2/v2_stats.h"
 
 namespace Vulkan {
@@ -135,17 +136,10 @@ u64 KeyStreams(u64 shape, u32 relevant_groups, const Maxwell& regs,
     return key;
 }
 
-/// The handle and storage-descriptor constant buffers of the key (engine state, not registers).
+/// The handle and storage-descriptor constant buffers of the key (engine state, not registers:
+/// read through the state view, the live engine here, a shard's snapshot in ShardKeyOf).
 u64 KeyCbufs(u64 key, const DC::ShapeInfo& info, const Tegra::Engines::Maxwell3D& maxwell3d) {
-    for (size_t stage = 0; stage < info.key_cbufs.size(); ++stage) {
-        const auto& cbufs = maxwell3d.state.shader_stages[stage].const_buffers;
-        for (u32 mask = info.key_cbufs[stage]; mask != 0; mask &= mask - 1) {
-            const auto& cbuf = cbufs[std::countr_zero(mask)];
-            key = DC::Mix(key, cbuf.address);
-            key = DC::Mix(key, (u64{cbuf.size} << 1) | (cbuf.enabled ? 1 : 0));
-        }
-    }
-    return key;
+    return V2::Resolve::KeyCbufs(key, info.key_cbufs, V2::Resolve::LiveView{maxwell3d});
 }
 
 /// EDEN_NX2_V2_PARALLEL: a shard's shape and partial key from its register mirror.
@@ -161,10 +155,23 @@ V2::Resolve::ShardKey ShardKeyOf(const V2::Resolve::ShardKeyInputs& in) {
                         in.memory);
     key.has_shape = true;
     u32 relevant = 0;
-    if (V2::Resolve::FindShape(key.shape, &relevant)) {
+    std::array<u32, 5> key_cbufs{};
+    if (V2::Resolve::FindShape(key.shape, &relevant, &key_cbufs)) {
         key.partial = KeyStreams(key.shape, relevant, regs, *in.groups);
         key.relevant = relevant;
         key.has_key = true;
+        if (in.cbufs != nullptr) {
+            // P6c: the bindings from the shard's snapshot view: the whole key.
+            const V2::Resolve::SnapshotView view{in.regs,
+                                                 in.cbufs,
+                                                 in.groups,
+                                                 inputs.topology,
+                                                 V2::Resolve::ViewDraw{},
+                                                 in.native_turing};
+            key.full = V2::Resolve::KeyCbufs(key.partial, key_cbufs, view);
+            key.cbuf_masks = V2::Resolve::CbufMasksHash(key_cbufs);
+            key.has_full = true;
+        }
     }
     return key;
 }
@@ -299,8 +306,8 @@ DrawCacheGlue::Decision DrawCacheGlue::DecideDraw(bool continued, bool is_indexe
     // EDEN_NX2_V2_PARALLEL: a shard resolved this draw's shape and partial key (taken for every
     // draw, so the records stay in step with the draws).
     const V2::Resolve::PreDraw* pre = nullptr;
-    if (V2::Resolve::SplitResolve* const parallel = V2::Resolve::SplitResolve::t_commit)
-        [[unlikely]] {
+    V2::Resolve::SplitResolve* const parallel = V2::Resolve::SplitResolve::t_commit;
+    if (parallel != nullptr) [[unlikely]] {
         pre = parallel->TakeDraw(maxwell3d.v2_groups.Fingerprint(V2::HashedGroups), is_indexed);
         if (pre != nullptr &&
             (!pre->has_shape || pre->engine != reinterpret_cast<uintptr_t>(&maxwell3d) ||
@@ -308,8 +315,16 @@ DrawCacheGlue::Decision DrawCacheGlue::DecideDraw(bool continued, bool is_indexe
              maxwell3d.engine_state != Tegra::Engines::Maxwell3D::EngineHint::None)) {
             pre = nullptr;
         }
+        // The later steps of this draw (the pipeline key) take the same record.
+        parallel->SetTaken(pre);
     }
     const bool parallel_verify = pre != nullptr && V2::Verify(V2::Switch::Parallel);
+    const auto note_step = [parallel](V2::Resolve::Step step, bool by_shard) {
+        if (parallel != nullptr) [[unlikely]] {
+            V2::Resolve::Count(by_shard ? V2::Resolve::GetStats().step_shard[static_cast<size_t>(step)]
+                                        : V2::Resolve::GetStats().step_commit[static_cast<size_t>(step)]);
+        }
+    };
     const Decision decision = DC::Decide(
         continued, cache_on,
         [&](DC::Miss& miss) -> Recipe* {
@@ -328,6 +343,7 @@ DrawCacheGlue::Decision DrawCacheGlue::DecideDraw(bool continued, bool is_indexe
             } else {
                 shape = GraphicsShape(is_indexed, maxwell3d, memory);
             }
+            note_step(V2::Resolve::Step::Shape, pre != nullptr);
             pending_draw.shape = shape;
             pending_draw.valid = true;
             const DC::ShapeInfo* const info = graphics_shapes.Find(shape);
@@ -336,9 +352,23 @@ DrawCacheGlue::Decision DrawCacheGlue::DecideDraw(bool continued, bool is_indexe
                 return nullptr;
             }
             u64 key = 0;
-            if (pre != nullptr && pre->has_key && pre->shape == shape &&
-                pre->relevant == info->relevant_groups) {
+            if (pre != nullptr && pre->has_full && pre->shape == shape &&
+                pre->relevant == info->relevant_groups &&
+                pre->cbuf_masks == V2::Resolve::CbufMasksHash(info->key_cbufs)) {
+                // P6c: the whole key, the bindings read from the shard's snapshot view.
+                key = pre->full;
+                note_step(V2::Resolve::Step::DrawKey, true);
+                if (parallel_verify) {
+                    const u64 serial = GraphicsKey(shape, *info, maxwell3d);
+                    if (serial != key) {
+                        NoteParallelMismatch("full key (constant buffer bindings)", key, serial);
+                        key = serial;
+                    }
+                }
+            } else if (pre != nullptr && pre->has_key && pre->shape == shape &&
+                       pre->relevant == info->relevant_groups) {
                 key = KeyCbufs(pre->partial, *info, maxwell3d);
+                note_step(V2::Resolve::Step::DrawKey, false);
                 if (parallel_verify) {
                     const u64 serial = GraphicsKey(shape, *info, maxwell3d);
                     if (serial != key) {
@@ -351,6 +381,7 @@ DrawCacheGlue::Decision DrawCacheGlue::DecideDraw(bool continued, bool is_indexe
                     V2::Resolve::Count(V2::Resolve::GetStats().draws_no_shape);
                 }
                 key = GraphicsKey(shape, *info, maxwell3d);
+                note_step(V2::Resolve::Step::DrawKey, false);
             }
             Recipe* const recipe = graphics_table.Find(key);
             if (recipe == nullptr) {
@@ -576,7 +607,7 @@ void DrawCacheGlue::FinishDrawCapture(GraphicsPipeline& pipeline, const Decision
     }
     graphics_shapes.Insert(info);
     if (V2::On(V2::Switch::Parallel)) [[unlikely]] {
-        V2::Resolve::PublishShape(info.shape, info.relevant_groups);
+        V2::Resolve::PublishShape(info.shape, info.relevant_groups, info.key_cbufs);
     }
     Store(graphics_table, GraphicsKey(pending_draw.shape, info, maxwell3d), recipe, decision, false);
     DC::ThreadStats().graphics_occupied = graphics_table.Occupied();

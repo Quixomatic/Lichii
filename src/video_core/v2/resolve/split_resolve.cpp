@@ -8,6 +8,7 @@
 #include "video_core/v2/draw_model.h"
 #include "video_core/v2/regsem_3d.h"
 #include "video_core/v2/resolve/split_resolve.h"
+#include "video_core/v2/resolve/state_view.h"
 #include "video_core/v2/v2_stats.h"
 
 namespace VideoCommon::V2::Resolve {
@@ -20,6 +21,7 @@ struct ShapeEntry {
     std::atomic<u64> sequence{};
     std::atomic<u64> shape{};
     std::atomic<u32> relevant{};
+    std::array<std::atomic<u32>, CbufStages> key_cbufs{};
 };
 constexpr size_t ShapeEntries = 4096;
 
@@ -35,16 +37,35 @@ size_t ShapeSlot(u64 shape) {
 } // Anonymous namespace
 
 void PublishShape(u64 shape, u32 relevant_groups) {
+    PublishShape(shape, relevant_groups, std::array<u32, CbufStages>{});
+}
+
+void PublishShape(u64 shape, u32 relevant_groups, const std::array<u32, CbufStages>& key_cbufs) {
     ShapeEntry& entry = Shapes()[ShapeSlot(shape)];
     const u64 sequence = entry.sequence.load(std::memory_order_relaxed);
     entry.sequence.store(sequence + 1, std::memory_order_relaxed);
     std::atomic_thread_fence(std::memory_order_release);
     entry.shape.store(shape, std::memory_order_relaxed);
     entry.relevant.store(relevant_groups, std::memory_order_relaxed);
+    for (size_t stage = 0; stage < CbufStages; ++stage) {
+        entry.key_cbufs[stage].store(key_cbufs[stage], std::memory_order_relaxed);
+    }
     entry.sequence.store(sequence + 2, std::memory_order_release);
 }
 
 bool FindShape(u64 shape, u32* relevant_groups) {
+    return FindShape(shape, relevant_groups, nullptr);
+}
+
+u64 CbufMasksHash(const std::array<u32, CbufStages>& key_cbufs) {
+    u64 hash = 0x5bd1e9955bd1e995ULL;
+    for (const u32 mask : key_cbufs) {
+        hash = Mix64(hash ^ mask);
+    }
+    return hash;
+}
+
+bool FindShape(u64 shape, u32* relevant_groups, std::array<u32, CbufStages>* key_cbufs) {
     const ShapeEntry& entry = Shapes()[ShapeSlot(shape)];
     for (u32 attempt = 0; attempt < 16; ++attempt) {
         const u64 before = entry.sequence.load(std::memory_order_acquire);
@@ -54,6 +75,10 @@ bool FindShape(u64 shape, u32* relevant_groups) {
         }
         const u64 stored = entry.shape.load(std::memory_order_relaxed);
         const u32 relevant = entry.relevant.load(std::memory_order_relaxed);
+        std::array<u32, CbufStages> masks{};
+        for (size_t stage = 0; stage < CbufStages; ++stage) {
+            masks[stage] = entry.key_cbufs[stage].load(std::memory_order_relaxed);
+        }
         std::atomic_thread_fence(std::memory_order_acquire);
         if (entry.sequence.load(std::memory_order_relaxed) != before) {
             continue;
@@ -62,6 +87,9 @@ bool FindShape(u64 shape, u32* relevant_groups) {
             return false;
         }
         *relevant_groups = relevant;
+        if (key_cbufs != nullptr) {
+            *key_cbufs = masks;
+        }
         return true;
     }
     return false;
@@ -201,6 +229,7 @@ SerialReason SplitTraits::Resolve(Shard& shard, const Input& input, std::vector<
                     const ShardKey key = g_shard_key(ShardKeyInputs{
                         .regs = mirror.regs.data(),
                         .groups = &groups,
+                        .cbufs = &mirror.v2_cbufs,
                         .topology = draw.topology,
                         .indexed = pre.indexed,
                         .native_turing = snapshot.native_turing,
@@ -209,9 +238,30 @@ SerialReason SplitTraits::Resolve(Shard& shard, const Input& input, std::vector<
                     });
                     pre.shape = key.shape;
                     pre.partial = key.partial;
+                    pre.full = key.full;
+                    pre.cbuf_masks = key.cbuf_masks;
                     pre.relevant = key.relevant;
                     pre.has_shape = key.has_shape;
                     pre.has_key = key.has_key;
+                    pre.has_full = key.has_full;
+                    if (g_pipeline_key != nullptr) {
+                        // P6c step (a): the draw's pipeline key from the same state view.
+                        const SnapshotView view{
+                            mirror.regs.data(),
+                            &mirror.v2_cbufs,
+                            &groups,
+                            static_cast<MaxwellRegs::PrimitiveTopology>(draw.topology),
+                            ViewDraw{
+                                .first = draw.first,
+                                .count = draw.count,
+                                .instances = draw.instances,
+                                .base_vertex = draw.base_vertex,
+                                .base_instance = draw.base_instance,
+                                .indexed = pre.indexed,
+                            },
+                            snapshot.native_turing};
+                        pre.pipeline_key = g_pipeline_key(view);
+                    }
                 }
                 records.push_back(pre);
             }
@@ -236,6 +286,17 @@ const char* SplitTraits::Compare(const Record& a, const Record& b) {
     }
     if (a.has_key != b.has_key || a.partial != b.partial || a.relevant != b.relevant) {
         return "key";
+    }
+    if (a.has_full != b.has_full || a.full != b.full || a.cbuf_masks != b.cbuf_masks) {
+        return "full key (constant buffer bindings)";
+    }
+    if ((a.pipeline_key == nullptr) != (b.pipeline_key == nullptr)) {
+        return "pipeline key presence";
+    }
+    if (a.pipeline_key != nullptr &&
+        (a.pipeline_key->hash != b.pipeline_key->hash ||
+         a.pipeline_key->bytes != b.pipeline_key->bytes)) {
+        return "pipeline key";
     }
     return nullptr;
 }
@@ -374,6 +435,7 @@ void SplitResolve::OnSegment(const Ir::SegmentBody& body, const u32* back_regs,
         holding = false;
         current = nullptr;
     }
+    taken = nullptr;
     Resolver::Result& result = resolver->Take(body.id);
     resolver->NoteOrder(body.id);
     holding = true;

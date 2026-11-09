@@ -67,6 +67,7 @@
 #include "video_core/v2/p3_stats.h"
 #include "video_core/v2/p5b_stats.h"
 #include "video_core/v2/regsem.h"
+#include "video_core/v2/resolve/split_resolve.h"
 #include "video_core/v2/shader_writes.h"
 #include "video_core/v2/v2_stats.h"
 #include "video_core/v2/v2_switches.h"
@@ -1030,6 +1031,18 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     const bool drawcache = VideoCommon::V2::On(VideoCommon::V2::Switch::DrawCache);
     const u64 drawcache_start =
         drawcache && VideoCommon::V2::Stats::Enabled() ? Profile::Now() : 0;
+    // EDEN_NX2_V2_PARALLEL (P6c): the commit thread's time per draw (the metric the shards cut).
+    namespace Resolve = VideoCommon::V2::Resolve;
+    Resolve::SplitResolve* const parallel_commit =
+        drawcache ? Resolve::SplitResolve::t_commit : nullptr;
+    const u64 parallel_start =
+        parallel_commit != nullptr && VideoCommon::V2::Stats::Enabled() ? Resolve::NowNs() : 0;
+    SCOPE_EXIT {
+        if (parallel_start != 0) [[unlikely]] {
+            Resolve::Count(Resolve::GetStats().commit_draws);
+            Resolve::Count(Resolve::GetStats().commit_draw_ns, Resolve::NowNs() - parallel_start);
+        }
+    };
     {
         Profile::Scope scope{Profile::Zone::FlushWork};
         FlushWork();
@@ -1079,6 +1092,9 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         return pipeline_cache.CurrentGraphicsPipeline();
     }()};
     cont_lookup_valid = false;
+    if (parallel_commit != nullptr) [[unlikely]] {
+        parallel_commit->EndDraw(); // the shard's record is this draw's only
+    }
     const bool verify_views = verify_pipeline != nullptr && verify_pipeline == pipeline;
     if (pipeline != nullptr && replay_pipeline == nullptr &&
         VideoCommon::V2::ShaderWrites::Enabled()) [[unlikely]] {

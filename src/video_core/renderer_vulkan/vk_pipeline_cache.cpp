@@ -41,6 +41,7 @@
 #include "video_core/pipeline_cache_files.h"
 #include "video_core/renderer_vulkan/async_draw_policy.h"
 #include "video_core/renderer_vulkan/fixed_pipeline_state.h"
+#include "video_core/renderer_vulkan/vk_state_tracker.h"
 #include "video_core/renderer_vulkan/mesh_fallback_limits.h"
 #include "video_core/renderer_vulkan/maxwell_to_vk.h"
 #include "video_core/renderer_vulkan/pipeline_helper.h"
@@ -61,6 +62,8 @@
 #include "video_core/shader_notify.h"
 #include "video_core/shader_warm/shader_warm_builder.h"
 #include "video_core/v2/p3_stats.h"
+#include "video_core/v2/resolve/split_resolve.h"
+#include "video_core/v2/resolve/state_view.h"
 #include "video_core/v2/v2_switches.h"
 #include "video_core/v2/versions.h"
 #include "video_core/surface.h"
@@ -480,6 +483,100 @@ bool DriverCachesPipelines(const Device& device) {
         return false;
     }
 }
+
+// ---- EDEN_NX2_V2_PARALLEL (P6c step a): the pipeline key on the shards -------------------------
+
+/// The device's dynamic state features, fixed once the pipeline cache is made.
+DynamicFeatures g_shard_features{};
+std::atomic<u64> g_shard_features_generation{};
+
+/// The register groups some key block reads (KeyBlockGroups), and whether all are hashed: only
+/// then does an unchanged group fingerprint prove an unchanged key.
+u32 ShardKeyGroups() {
+    static const u32 groups = [] {
+        u32 mask = 0;
+        for (const u32 block : KeyBlockGroups()) {
+            mask |= block;
+        }
+        return mask;
+    }();
+    return groups;
+}
+
+/// A shard's pipeline key from its snapshot view: the same FixedPipelineState code the commit
+/// thread runs (RefreshFull is RefreshIncremental's blocks, forced), from a zeroed state. A
+/// shard reuses its last key while the key's register groups, the topology and the device
+/// features are unchanged.
+std::shared_ptr<const VideoCommon::V2::Resolve::PipelineKey> ShardPipelineKey(
+    const VideoCommon::V2::Resolve::SnapshotView& view) {
+    namespace V2 = VideoCommon::V2;
+    const u32 groups = ShardKeyGroups();
+    const bool reusable = (groups & ~V2::HashedGroups) == 0;
+    const bool squashed = Settings::values.use_squashed_iterated_blend ? true : false;
+    u64 inputs = view.Groups().Fingerprint(groups);
+    inputs = V2::Mix64(inputs ^ static_cast<u64>(view.Topology()));
+    inputs = V2::Mix64(inputs ^ (static_cast<u64>(view.EngineState()) << 1) ^ (squashed ? 1 : 0));
+    inputs = V2::Mix64(inputs ^ g_shard_features_generation.load(std::memory_order_relaxed));
+    thread_local std::shared_ptr<const V2::Resolve::PipelineKey> last;
+    if (reusable && last != nullptr && last->inputs == inputs) {
+        return last;
+    }
+    FixedPipelineState state;
+    std::memset(&state, 0, sizeof(state));
+    state.RefreshFull(view.Regs(),
+                      KeyInputs{
+                          .topology = view.Topology(),
+                          .engine_state = view.EngineState(),
+                          .squashed_iterated_blend = squashed,
+                      },
+                      g_shard_features);
+    auto key = std::make_shared<V2::Resolve::PipelineKey>();
+    key->hash = state.Hash();
+    key->inputs = inputs;
+    key->bytes.resize(sizeof(state));
+    std::memcpy(key->bytes.data(), &state, sizeof(state));
+    last = key;
+    return key;
+}
+
+void PublishShardPipelineKey(const DynamicFeatures& features) {
+    g_shard_features = features;
+    g_shard_features_generation.fetch_add(1, std::memory_order_relaxed);
+    VideoCommon::V2::Resolve::g_pipeline_key = &ShardPipelineKey;
+}
+
+/// The FixedPipelineState field holding byte `offset` (verify logs).
+const char* PipelineKeyField(size_t offset) {
+    struct Field {
+        size_t begin;
+        const char* name;
+    };
+    static const std::array fields{
+        Field{0, "raw1"},
+        Field{offsetof(FixedPipelineState, raw2), "raw2"},
+        Field{offsetof(FixedPipelineState, color_formats), "color_formats"},
+        Field{offsetof(FixedPipelineState, driver_id), "driver"},
+        Field{offsetof(FixedPipelineState, alpha_test_ref), "alpha_test_ref"},
+        Field{offsetof(FixedPipelineState, point_size), "point_size"},
+        Field{offsetof(FixedPipelineState, viewport_swizzles), "viewport_swizzles"},
+        Field{offsetof(FixedPipelineState, attribute_types), "attribute_types/divisors"},
+        Field{offsetof(FixedPipelineState, dynamic_state), "dynamic_state"},
+        Field{offsetof(FixedPipelineState, attachments), "attachments"},
+        Field{offsetof(FixedPipelineState, attributes), "attributes"},
+        Field{offsetof(FixedPipelineState, binding_divisors), "binding_divisors"},
+        Field{offsetof(FixedPipelineState, vertex_strides), "vertex_strides"},
+        Field{offsetof(FixedPipelineState, xfb_state), "xfb_state"},
+        Field{offsetof(FixedPipelineState, depth_bounds_min), "depth_bounds"},
+        Field{offsetof(FixedPipelineState, line_stipple_factor), "line_stipple"},
+    };
+    const char* name = "raw1";
+    for (const Field& field : fields) {
+        if (offset >= field.begin) {
+            name = field.name;
+        }
+    }
+    return name;
+}
 } // Anonymous namespace
 
 PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
@@ -727,6 +824,7 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
         device.SupportsProvokingVertexLastMode();
     dynamic_features.has_provoking_vertex_tf_preserve =
         device.SupportsTransformFeedbackProvokingVertexPreservation();
+    PublishShardPipelineKey(dynamic_features);
 }
 
 namespace {
@@ -809,6 +907,7 @@ PipelineCache::~PipelineCache() {
     VideoCommon::V2::Versions::HookBumpEpoch(VideoCommon::V2::Versions::Epoch::Pipelines);
     graphics_cache.clear();
     evicted_pipelines.clear();
+    VideoCommon::V2::Resolve::g_pipeline_key = nullptr;
 }
 
 void PipelineCache::SaveUsedPipelines() {
@@ -1813,15 +1912,69 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineV2() {
     }
     const bool stats = V2::P3Stats::Enabled();
     const bool verify = V2::Verify(V2::Switch::PipeKey);
+    // EDEN_NX2_V2_PARALLEL (P6c): a shard computed this draw's key from its snapshot view.
+    const V2::Resolve::PipelineKey* shard_key = nullptr;
+    V2::Resolve::SplitResolve* const parallel =
+        V2::On(V2::Switch::Parallel) ? V2::Resolve::SplitResolve::t_commit : nullptr;
+    if (parallel != nullptr) [[unlikely]] {
+        shard_key = parallel->TakePipelineKey();
+        if (shard_key != nullptr && (shard_key->bytes.size() != sizeof(FixedPipelineState) ||
+                                     maxwell3d->engine_state !=
+                                         Tegra::Engines::Maxwell3D::EngineHint::None)) {
+            shard_key = nullptr;
+        }
+    }
+    const bool use_shard_key = shard_key != nullptr && !verify && !parallel->Verify();
     // What changed since the key was last refreshed: the register groups of this engine, or
     // everything when the key was built for another channel's engine.
     const bool force = !v2_key.valid || v2_key.engine != maxwell3d;
     const u32 groups = maxwell3d->v2_groups.TakeSink(V2::GroupSink::PipelineKey);
     FixedPipelineState& incremental = verify ? v2_key.shadow : graphics_key.state;
-    const u32 repacked = incremental.RefreshIncremental(*maxwell3d, dynamic_features, groups,
-                                                        v2_key.inputs, force, !verify);
-    if (repacked != 0) {
-        incremental.CanonicalizeDynamic(dynamic_features);
+    u32 repacked = 0;
+    if (use_shard_key) [[unlikely]] {
+        // The whole key, as the forced refresh makes it; consume the dirty flags it covers.
+        std::memcpy(&graphics_key.state, shard_key->bytes.data(), sizeof(FixedPipelineState));
+        auto& flags = maxwell3d->dirty.flags;
+        if (!dynamic_features.has_dynamic_vertex_input) {
+            flags[Dirty::VertexInput] = false;
+        }
+        flags[Dirty::ViewportSwizzles] = false;
+        if (!graphics_key.state.extended_dynamic_state_3_blend) {
+            flags[Dirty::Blending] = false;
+        }
+        repacked = AllKeyBlocks;
+        V2::Resolve::Count(
+            V2::Resolve::GetStats().step_shard[static_cast<size_t>(V2::Resolve::Step::PipelineKey)]);
+    } else {
+        repacked = incremental.RefreshIncremental(*maxwell3d, dynamic_features, groups,
+                                                  v2_key.inputs, force, !verify);
+        if (repacked != 0) {
+            incremental.CanonicalizeDynamic(dynamic_features);
+        }
+        if (parallel != nullptr) [[unlikely]] {
+            V2::Resolve::Count(V2::Resolve::GetStats()
+                                   .step_commit[static_cast<size_t>(V2::Resolve::Step::PipelineKey)]);
+            if (shard_key != nullptr && parallel->Verify() && !verify) {
+                // PARALLEL=verify: the shard's key against the serial key, byte by byte.
+                V2::Resolve::Count(V2::Resolve::GetStats().verify_draws);
+                const size_t size = graphics_key.state.Size();
+                const auto* const serial = reinterpret_cast<const u8*>(&graphics_key.state);
+                const u8* const shard = shard_key->bytes.data();
+                size_t offset = 0;
+                while (offset < size && serial[offset] == shard[offset]) {
+                    ++offset;
+                }
+                if (offset != size || shard_key->hash != graphics_key.state.Hash()) {
+                    V2::Resolve::Count(V2::Resolve::GetStats().verify_draw_mismatches);
+                    if (V2::Resolve::ShouldLogMismatch()) {
+                        LOG_WARNING(Render_Vulkan,
+                                    "V2 parallel verify: a draw's pipeline key from the shard "
+                                    "differs from the serial key at byte {:#x} of {:#x} ({})",
+                                    offset, size, PipelineKeyField(offset));
+                    }
+                }
+            }
+        }
     }
     v2_key.inputs = FixedPipelineState::CurrentInputs(*maxwell3d);
     v2_key.engine = maxwell3d;
@@ -1870,7 +2023,7 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineV2() {
         current_pipeline->MarkUsed(frame_count);
         return BuiltPipeline(current_pipeline);
     }
-    const u64 state_hash = graphics_key.state.Hash();
+    const u64 state_hash = use_shard_key ? shard_key->hash : graphics_key.state.Hash();
     pipeline = v2_lookup.Find(graphics_key.unique_hashes, state_hash, &graphics_key.state,
                               graphics_key.state.Size());
     if (pipeline != nullptr) {

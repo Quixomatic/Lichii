@@ -115,6 +115,19 @@ void ReportStats(const char* thread_name, u64 window_ns) {
     const u64 unmatched = Take(stats.draws_unmatched);
     const u64 drift = Take(stats.draws_drift);
     const u64 no_shape = Take(stats.draws_no_shape);
+    std::string steps;
+    for (size_t step = 0; step < NumSteps; ++step) {
+        const u64 shard = Take(stats.step_shard[step]);
+        const u64 commit = Take(stats.step_commit[step]);
+        steps += fmt::format("{}{} {:.1f}% of {:.0f}/s", steps.empty() ? "" : ", ",
+                             step_names[step],
+                             shard + commit != 0 ? 100.0 * static_cast<double>(shard) /
+                                                       static_cast<double>(shard + commit)
+                                                 : 0.0,
+                             static_cast<double>(shard + commit) / seconds);
+    }
+    const u64 commit_draws = Take(stats.commit_draws);
+    const u64 commit_draw_ns = Take(stats.commit_draw_ns);
     LOG_INFO(
         HW_GPU,
         "V2 stats {} P6 parallel resolve | segments {:.0f}/s ({:.1f} draws each), by shards "
@@ -123,7 +136,8 @@ void ReportStats(const char* thread_name, u64 window_ns) {
         "ms/s | refused {} | snapshot blocks copied {:.0f}/s, shared {:.1f}% | pre-resolved draws "
         "{:.0f}/s, unmatched {:.0f}/s, drift {}, no shape {:.0f}/s | verify: {} segments, {} "
         "mismatches ({} dependent); {} draws, {} mismatches; {} snapshots, {} mismatches | determinism: {} "
-        "in order, {} out of order",
+        "in order, {} out of order | steps on shards: {} | commit per draw {:.2f} us ({:.0f} "
+        "draws/s)",
         thread_name, static_cast<double>(segments) / seconds,
         segments != 0 ? static_cast<double>(records) / static_cast<double>(segments) : 0.0,
         segments != 0 ? 100.0 * static_cast<double>(by_shard) / static_cast<double>(segments) : 0.0,
@@ -146,7 +160,11 @@ void ReportStats(const char* thread_name, u64 window_ns) {
         Take(stats.verify_mismatches), Take(stats.verify_dependent), Take(stats.verify_draws),
         Take(stats.verify_draw_mismatches), Take(stats.snapshot_checks),
         Take(stats.snapshot_mismatches), Take(stats.determinism_checks),
-        stats.determinism_failures.load(std::memory_order_relaxed));
+        stats.determinism_failures.load(std::memory_order_relaxed), steps,
+        commit_draws != 0
+            ? static_cast<double>(commit_draw_ns) / 1e3 / static_cast<double>(commit_draws)
+            : 0.0,
+        static_cast<double>(commit_draws) / seconds);
 }
 
 } // namespace VideoCommon::V2::Resolve

@@ -47,6 +47,16 @@
 namespace VideoCommon::V2::Resolve {
 
 /// EDEN_NX2_V2_STATS counters of the parallel resolve (process-wide, relaxed atomics).
+/// P6c: the resolve steps a shard can perform for the commit thread (stats per step).
+enum class Step : u8 {
+    Shape,       ///< P4 draw-cache shape
+    DrawKey,     ///< P4 draw-cache key with the constant buffer bindings
+    PipelineKey, ///< P3 pipeline key (FixedPipelineState) and its hash
+    Count,
+};
+inline constexpr size_t NumSteps = static_cast<size_t>(Step::Count);
+inline constexpr std::array<const char*, NumSteps> step_names{"shape", "draw key", "pipeline key"};
+
 struct Stats {
     static constexpr size_t MaxShards = 16;
     std::atomic<u64> segments{};      ///< committed
@@ -79,6 +89,11 @@ struct Stats {
     std::atomic<u64> verify_draw_mismatches{};
     std::atomic<u64> snapshot_checks{};
     std::atomic<u64> snapshot_mismatches{};
+    // P6c: who performed each resolve step of a draw on the commit thread's path.
+    std::array<std::atomic<u64>, NumSteps> step_shard{};
+    std::array<std::atomic<u64>, NumSteps> step_commit{};
+    std::atomic<u64> commit_draws{};   ///< draws resolved and recorded on the commit thread
+    std::atomic<u64> commit_draw_ns{}; ///< their time in PrepareDraw
 };
 Stats& GetStats();
 

@@ -3,11 +3,13 @@
 
 #pragma once
 
+#include <bit>
 #include <concepts>
 #include <cstddef>
 
 #include "common/common_types.h"
 #include "video_core/engines/maxwell_3d.h"
+#include "video_core/v2/draw_cache.h"
 #include "video_core/v2/regsem.h"
 #include "video_core/v2/resolve/cbuf_table.h"
 
@@ -179,6 +181,21 @@ template <StateView View>
     const auto& config = regs.pipelines[index];
     return native ? (static_cast<u64>(config.reserved[0] & 0xff) << 32) | config.reserved[1]
                   : regs.program_region.Address() + config.offset;
+}
+
+/// Step (a): the P4 draw-cache key's constant buffer part. The bindings of the slots in
+/// `key_cbufs` (per stage: the handle and storage-descriptor buffers) are mixed into `key`.
+template <StateView View>
+[[nodiscard]] u64 KeyCbufs(u64 key, const std::array<u32, CbufStages>& key_cbufs,
+                           const View& view) {
+    for (size_t stage = 0; stage < CbufStages; ++stage) {
+        for (u32 mask = key_cbufs[stage]; mask != 0; mask &= mask - 1) {
+            const CbufBinding cbuf = view.Cbuf(stage, static_cast<size_t>(std::countr_zero(mask)));
+            key = DrawCache::Mix(key, cbuf.address);
+            key = DrawCache::Mix(key, (u64{cbuf.size} << 1) | (cbuf.enabled != 0 ? 1 : 0));
+        }
+    }
+    return key;
 }
 
 /// The whole binding table of a view (verify, tests).

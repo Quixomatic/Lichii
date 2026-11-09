@@ -19,6 +19,8 @@
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/memory_manager.h"
+#include "video_core/renderer_vulkan/fixed_pipeline_state.h"
+#include "video_core/renderer_vulkan/vk_state_tracker.h"
 
 #include "video_core/v2/commit.h"
 #include "video_core/v2/resolve/cow_regs.h"
@@ -1068,4 +1070,242 @@ TEST_CASE("V2 P6c: a snapshot view after replay equals the live engine view",
         }
     }
     CHECK(programs_seen > 0);
+}
+
+namespace {
+
+Vulkan::DynamicFeatures g_test_features{};
+constexpr std::array<u32, 5> TestKeyCbufs{0x3, 0x0, 0x10, 0x0, 0x6};
+constexpr u64 TestShape = 0x5eed5eed;
+
+/// The shard side of step (a) as the Vulkan glue does it, from the shard's state.
+Resolve::ShardKey TestShardKey(const Resolve::ShardKeyInputs& in) {
+    Resolve::ShardKey key;
+    key.shape = TestShape;
+    key.has_shape = true;
+    u32 relevant = 0;
+    std::array<u32, 5> masks{};
+    if (Resolve::FindShape(key.shape, &relevant, &masks)) {
+        key.partial = in.groups->Fingerprint(V2::HashedGroups);
+        key.relevant = relevant;
+        key.has_key = true;
+        const Resolve::SnapshotView view{in.regs,
+                                         in.cbufs,
+                                         in.groups,
+                                         static_cast<Resolve::MaxwellRegs::PrimitiveTopology>(
+                                             in.topology),
+                                         Resolve::ViewDraw{},
+                                         in.native_turing};
+        key.full = Resolve::KeyCbufs(key.partial, masks, view);
+        key.cbuf_masks = Resolve::CbufMasksHash(masks);
+        key.has_full = true;
+    }
+    return key;
+}
+
+std::shared_ptr<const Resolve::PipelineKey> TestPipelineKey(const Resolve::SnapshotView& view) {
+    Vulkan::FixedPipelineState state;
+    std::memset(&state, 0, sizeof(state));
+    state.RefreshFull(view.Regs(),
+                      Vulkan::KeyInputs{.topology = view.Topology(),
+                                        .engine_state = view.EngineState(),
+                                        .squashed_iterated_blend = false},
+                      g_test_features);
+    auto key = std::make_shared<Resolve::PipelineKey>();
+    key->hash = state.Hash();
+    key->bytes.resize(sizeof(state));
+    std::memcpy(key->bytes.data(), &state, sizeof(state));
+    return key;
+}
+
+} // Anonymous namespace
+
+TEST_CASE("V2 P6c: shards resolve the draw key and the pipeline key as the serial path does",
+          "[video_core][v2_p6c]") {
+    namespace RegSem = V2::RegSem;
+    ScopedSystemTestContext context;
+    Core::System system;
+    Core::DeviceMemory physical;
+    Tegra::MaxwellDeviceMemoryManager device_memory{physical};
+    Tegra::MemoryManager memory{system, device_memory, 32, 1ULL << 31};
+    const RegSem::Table3D& table = [&]() -> const RegSem::Table3D& {
+        Tegra::Engines::Maxwell3D first{memory}; // builds the register semantics table
+        return RegSem::GetTable3D();
+    }();
+    const auto no_effects = [](RegSem::Effect, u32, u32) {};
+    const ViewStream stream{table};
+    // Every register a pipeline key block reads (non-executable ones: plain stores).
+    std::vector<u32> key_registers;
+    for (size_t block = 0; block < Vulkan::NumKeyBlocks; ++block) {
+        for (const auto& [first, count] :
+             Vulkan::KeyBlockRegisters(static_cast<Vulkan::KeyBlock>(block))) {
+            for (u32 index = first; index < first + count && index < 0xe00; ++index) {
+                if ((table.flags[index] & RegSem::Exec) == 0) {
+                    key_registers.push_back(index);
+                }
+            }
+        }
+    }
+    REQUIRE(key_registers.size() > 100);
+
+    Vulkan::DynamicFeatures none{};
+    Vulkan::DynamicFeatures eds = none;
+    eds.has_extended_dynamic_state = true;
+    eds.has_extended_dynamic_state_2 = true;
+    eds.has_extended_dynamic_state_2_logic_op = true;
+    eds.has_extended_dynamic_state_3_blend = true;
+    eds.has_extended_dynamic_state_3_enables = true;
+    eds.has_dynamic_state3_alpha_to_coverage = true;
+    eds.has_provoking_vertex = true;
+    eds.has_provoking_vertex_last_mode = true;
+    Vulkan::DynamicFeatures vertex = none;
+    vertex.has_dynamic_vertex_input = true;
+    vertex.has_extended_dynamic_state = true;
+    Vulkan::DynamicFeatures repack = none;
+    repack.has_static_vertex_repack = true;
+    const std::array feature_sets{none, eds, vertex, repack};
+
+    const Resolve::ShardKeyFn saved_key = Resolve::g_shard_key;
+    const Resolve::PipelineKeyFn saved_pipeline = Resolve::g_pipeline_key;
+    Resolve::g_shard_key = &TestShardKey;
+    Resolve::g_pipeline_key = &TestPipelineKey;
+    Resolve::ClearShapes();
+    Resolve::PublishShape(TestShape, V2::AllGroups, TestKeyCbufs);
+
+    u64 draws_checked = 0;
+    u64 keys_changed = 0;
+    for (size_t set = 0; set < feature_sets.size(); ++set) {
+        INFO("feature set " << set);
+        g_test_features = feature_sets[set];
+        Tegra::Engines::Maxwell3D engine{memory};
+        auto front = std::make_unique<RegSem::Mirror3D>();
+        std::memcpy(front->regs.data(), engine.regs.reg_array.data(), sizeof(front->regs));
+        front->v2_cbufs = Resolve::CbufTableOf(Resolve::LiveView{engine});
+        RegSem::Rehash3D(front->v2_groups, front->regs.data());
+        RegSem::Rehash3D(engine.v2_groups, engine.regs.reg_array.data());
+
+        // The serial path: the incremental key on the live engine, driven by its group sink.
+        Vulkan::FixedPipelineState serial_key;
+        std::memset(&serial_key, 0, sizeof(serial_key));
+        Vulkan::KeyInputs previous{};
+        bool first_key = true;
+        std::mt19937 rng{static_cast<u32>(97 + set)};
+        u64 last_hash = 0;
+
+        for (u32 segment_index = 0; segment_index < 4; ++segment_index) {
+            auto snapshot = std::make_shared<Resolve::FrontSnapshot>();
+            Resolve::SnapshotBuilder<0xe00> builder;
+            Resolve::SnapshotBuilder<0xe00> shadow_builder;
+            snapshot->regs = builder.Take(front->regs.data());
+            snapshot->shadow = shadow_builder.Take(front->shadow.data());
+            snapshot->groups = front->v2_groups;
+            snapshot->cbufs = std::make_shared<const Resolve::CbufTable>(front->v2_cbufs);
+            snapshot->engine_ref = 3;
+            snapshot->engine = 0x1000;
+            snapshot->memory = 0x2000;
+
+            RingBuilder ring;
+            ring.position = RingBuilder::RingWords - 64 * (segment_index + 1);
+            const u64 begin = ring.position;
+            struct Serial {
+                u64 full;
+                std::vector<u8> pipeline;
+                u64 hash;
+            };
+            std::vector<Serial> expected;
+            const u32 draws = 8 + rng() % 24;
+            for (u32 draw = 0; draw < draws; ++draw) {
+                std::vector<std::pair<u32, u32>> writes;
+                for (u32 w = rng() % 8; w > 0; --w) {
+                    if (rng() % 3 == 0) {
+                        writes.push_back(stream.Next(rng));
+                    } else {
+                        const u32 index = key_registers[rng() % key_registers.size()];
+                        writes.emplace_back(index, rng() % 2 == 0 ? rng() % 4 : rng());
+                    }
+                }
+                if (!writes.empty()) {
+                    ring.StateRun(writes);
+                }
+                for (const auto& [method, value] : writes) {
+                    RegSem::Write3D(*front, table, method, value, false, no_effects);
+                    RegSem::NoteWrite3D(engine.v2_groups, method, engine.regs.reg_array[method],
+                                        value);
+                    EngineWrite(engine, table, method, value);
+                }
+                const u8 topology = static_cast<u8>(rng() % 10);
+                V2::Ir::DrawBody body{};
+                body.op = V2::Ir::DrawOp::Predicted;
+                body.engine = 3;
+                body.flags = V2::Ir::DrawHasGroups;
+                body.num_draws = 1;
+                body.draws[0].kind = V2::Ir::DrawKind::Indexed;
+                body.draws[0].topology = topology;
+                body.fingerprint = front->v2_groups.Fingerprint(V2::HashedGroups);
+                ring.Draw(body);
+
+                // Serial resolve of the same draw on the live engine.
+                engine.draw_manager.draw_state.topology =
+                    static_cast<Resolve::MaxwellRegs::PrimitiveTopology>(topology);
+                const Resolve::LiveView live{engine};
+                Serial& serial = expected.emplace_back();
+                serial.full = Resolve::KeyCbufs(engine.v2_groups.Fingerprint(V2::HashedGroups),
+                                                TestKeyCbufs, live);
+                engine.dirty.flags[Vulkan::Dirty::VertexInput] = true;
+                engine.dirty.flags[Vulkan::Dirty::ViewportSwizzles] = true;
+                const u32 groups = engine.v2_groups.TakeSink(V2::GroupSink::PipelineKey);
+                const u32 repacked = serial_key.RefreshIncremental(
+                    engine, g_test_features, groups, previous, first_key, true);
+                if (repacked != 0) {
+                    serial_key.CanonicalizeDynamic(g_test_features);
+                }
+                previous = Vulkan::FixedPipelineState::CurrentInputs(engine);
+                first_key = false;
+                serial.hash = serial_key.Hash();
+                serial.pipeline.assign(reinterpret_cast<const u8*>(&serial_key),
+                                       reinterpret_cast<const u8*>(&serial_key) +
+                                           serial_key.Size());
+                keys_changed += serial.hash != last_hash ? 1 : 0;
+                last_hash = serial.hash;
+            }
+
+            Resolve::SegmentInput input;
+            input.id = segment_index + 1;
+            input.begin = begin;
+            input.end = ring.position;
+            input.snapshot = snapshot;
+            input.ring = ring.ring.data();
+            input.arena = &ring.arena;
+            Resolve::SplitTraits::Shard shard;
+            std::vector<Resolve::PreDraw> records;
+            Commit::RequestList requests;
+            requests.Reset(input.id);
+            REQUIRE(Resolve::SplitTraits::Resolve(shard, input, records, requests) ==
+                    SerialReason::None);
+            REQUIRE(records.size() == expected.size());
+            for (size_t draw = 0; draw < records.size(); ++draw) {
+                INFO("segment " << segment_index << " draw " << draw);
+                const Resolve::PreDraw& pre = records[draw];
+                REQUIRE(!pre.drift);
+                REQUIRE(pre.has_full);
+                CHECK(pre.full == expected[draw].full);
+                CHECK(pre.cbuf_masks == Resolve::CbufMasksHash(TestKeyCbufs));
+                REQUIRE(pre.pipeline_key != nullptr);
+                CHECK(pre.pipeline_key->hash == expected[draw].hash);
+                const std::vector<u8>& serial = expected[draw].pipeline;
+                REQUIRE(pre.pipeline_key->bytes.size() >= serial.size());
+                size_t offset = 0;
+                while (offset < serial.size() && serial[offset] == pre.pipeline_key->bytes[offset]) {
+                    ++offset;
+                }
+                CHECK(offset == serial.size());
+                ++draws_checked;
+            }
+        }
+    }
+    Resolve::g_shard_key = saved_key;
+    Resolve::g_pipeline_key = saved_pipeline;
+    Resolve::ClearShapes();
+    CHECK(draws_checked > 100);
+    CHECK(keys_changed > 40);
 }

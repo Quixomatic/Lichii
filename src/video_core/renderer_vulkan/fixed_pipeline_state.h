@@ -312,6 +312,11 @@ struct FixedPipelineState {
     u32 RefreshIncremental(Tegra::Engines::Maxwell3D& maxwell3d, const DynamicFeatures& features,
                            u32 groups, const KeyInputs& previous, bool force, bool touch_flags);
 
+    /// EDEN_NX2_V2_PARALLEL (P6c): the whole key from a register file and the non-register
+    /// inputs, as RefreshIncremental with `force` followed by CanonicalizeDynamic (no dirty flag
+    /// read or cleared). Fields no block writes keep their value: start from a zeroed state.
+    void RefreshFull(const Maxwell& regs, const KeyInputs& inputs, const DynamicFeatures& features);
+
     /// The non-register inputs Refresh reads now.
     [[nodiscard]] static KeyInputs CurrentInputs(const Tegra::Engines::Maxwell3D& maxwell3d);
 
@@ -353,8 +358,16 @@ struct FixedPipelineState {
 
 private:
     void RefreshCore(const Tegra::Engines::Maxwell3D& maxwell3d, const DynamicFeatures& features);
+    void RefreshCore(const Maxwell& regs, Maxwell::PrimitiveTopology topology,
+                     Tegra::Engines::Maxwell3D::EngineHint engine_state,
+                     const DynamicFeatures& features);
     void RefreshVertexInput(Tegra::Engines::Maxwell3D& maxwell3d, const DynamicFeatures& features,
                             bool touch_flags);
+    void RefreshVertexInput(const Maxwell& regs, const DynamicFeatures& features);
+    /// The blocks of RefreshIncremental; `vertex_input`, `swizzles`: their dirty flags.
+    u32 RefreshBlocks(const Maxwell& regs, const KeyInputs& inputs, const DynamicFeatures& features,
+                      u32 groups, const KeyInputs& previous, bool force, bool vertex_input,
+                      bool swizzles);
     void RefreshSwizzles(const Maxwell& regs);
     void RefreshDynamic(const Maxwell& regs, Maxwell::PrimitiveTopology topology,
                         const DynamicFeatures& features);
