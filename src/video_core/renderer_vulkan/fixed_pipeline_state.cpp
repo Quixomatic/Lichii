@@ -389,8 +389,15 @@ u32 FixedPipelineState::RefreshBlocks(const Maxwell& regs, const KeyInputs& inpu
     // offsets and strides the repack rewrites).
     if (block_dirty(KeyBlock::Core) || topology_changed ||
         inputs.engine_state != previous.engine_state) {
+        const bool had_xfb = xfb_enabled != 0;
         RefreshCore(regs, inputs.topology, inputs.engine_state, features);
         repacked |= KeyBlockBit(KeyBlock::Core);
+        if (had_xfb && xfb_enabled == 0) {
+            // Every byte is owned by a block or zero, as in a key built from a zeroed state
+            // (the P6 shards): the other fields no block writes depend only on device features
+            // and stay zero from the key's construction.
+            xfb_state = {};
+        }
     }
     // These two followed their Maxwell3D dirty flags in Refresh already.
     if (vertex_input) {

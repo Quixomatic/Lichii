@@ -517,13 +517,37 @@ private:
         Count(GetStats().verify_dependent, requests.dependent);
         const char* field = requests.field;
         size_t index = 0;
-        if (field == nullptr && verify_records.size() != result.records.size()) {
-            field = "record count";
-        }
-        for (; field == nullptr && index < verify_records.size(); ++index) {
-            field = Traits::Compare(result.records[index], verify_records[index]);
-            if (field != nullptr) {
-                break;
+        if constexpr (requires(const Record& r) { r.ordinal; }) {
+            // Records pair up by their draw ordinal: a draw only one side kept is reported as
+            // that, not as a difference in every draw after it.
+            size_t other = 0;
+            while (field == nullptr && index < result.records.size() &&
+                   other < verify_records.size()) {
+                const auto lhs = result.records[index].ordinal;
+                const auto rhs = verify_records[other].ordinal;
+                if (lhs != rhs) {
+                    field = "draw kept by one side only";
+                    break;
+                }
+                field = Traits::Compare(result.records[index], verify_records[other]);
+                if (field == nullptr) {
+                    ++index;
+                    ++other;
+                }
+            }
+            if (field == nullptr &&
+                (index != result.records.size() || other != verify_records.size())) {
+                field = "record count";
+            }
+        } else {
+            if (field == nullptr && verify_records.size() != result.records.size()) {
+                field = "record count";
+            }
+            for (; field == nullptr && index < verify_records.size(); ++index) {
+                field = Traits::Compare(result.records[index], verify_records[index]);
+                if (field != nullptr) {
+                    break;
+                }
             }
         }
         if (field != nullptr) {

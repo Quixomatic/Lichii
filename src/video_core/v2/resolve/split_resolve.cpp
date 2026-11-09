@@ -161,17 +161,20 @@ SerialReason SplitTraits::Resolve(Shard& shard, const Input& input, std::vector<
     const auto no_effects = [](RegSem::Effect, u32, u32) {};
     constexpr u64 RingWords = GpuSplit::RingWords;
     bool active = true;
+    // Counts every draw of the segment, skipped ones too (other kinds, other engines, host
+    // indirect), so a draw one side skips does not shift the ordinals Compare checks.
     u32 ordinal = 0;
     // One predicted draw: its draw-cache shape and keys from the mirror at its position.
     const auto add_draw = [&](const Ir::PredictedDraw& draw, u64 fingerprint, bool drift,
                               const GroupTracker& groups) {
+        const u32 draw_ordinal = ordinal++;
         if (draw.kind != Ir::DrawKind::Array && draw.kind != Ir::DrawKind::Indexed) {
             return;
         }
         PreDraw pre;
         pre.fingerprint = fingerprint;
         pre.indexed = draw.kind == Ir::DrawKind::Indexed;
-        pre.ordinal = ordinal++;
+        pre.ordinal = draw_ordinal;
         pre.engine = snapshot.engine;
         pre.memory = snapshot.memory;
         pre.drift = drift;
@@ -315,6 +318,7 @@ SerialReason SplitTraits::Resolve(Shard& shard, const Input& input, std::vector<
         case Ir::Kind::Draw: {
             const auto& body = record.As<Ir::DrawBody>();
             if (body.engine != snapshot.engine_ref || body.op == Ir::DrawOp::HostIndirect) {
+                ordinal += body.op == Ir::DrawOp::HostIndirect ? 1 : body.num_draws;
                 break;
             }
             // The record's hashes are the back's at the draw: either these registers, or these
