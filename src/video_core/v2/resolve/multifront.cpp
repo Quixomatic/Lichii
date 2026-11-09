@@ -11,6 +11,7 @@
 
 #include "common/logging.h"
 #include "video_core/v2/resolve/multifront.h"
+#include "video_core/v2/v2_stats.h"
 #include "video_core/v2/v2_switches.h"
 
 namespace VideoCommon::V2::Resolve::MultiFront {
@@ -605,12 +606,26 @@ void Analyze(std::span<const Event> window, u64 seed) {
 } // Anonymous namespace
 
 void Record(EventKind kind, u64 address, u64 value, AcquireOp op) {
+    if (t_channel == ~0U) {
+        return; // only the front thread records (the back runs macros too in split mode 1)
+    }
     Recorder& recorder = GetRecorder();
     GetCounters().events[static_cast<size_t>(kind)].fetch_add(1, std::memory_order_relaxed);
     recorder.window.push_back(Event{address, value, t_channel, kind, op});
     if (recorder.window.size() >= Window) {
         Analyze(recorder.window, recorder.seed++);
         recorder.window.clear();
+        if (V2::Stats::Enabled()) {
+            const u64 now = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                 std::chrono::steady_clock::now().time_since_epoch())
+                                                 .count());
+            if (now - recorder.window_start_ns > 10'000'000'000ULL) {
+                if (recorder.window_start_ns != 0) {
+                    ReportStats("GPU thread");
+                }
+                recorder.window_start_ns = now;
+            }
+        }
     }
 }
 

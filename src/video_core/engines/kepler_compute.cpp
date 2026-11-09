@@ -22,6 +22,7 @@
 #include "common/settings.h"
 #include "shader_recompiler/exception.h"
 #include "core/core.h"
+#include "video_core/v2/resolve/multifront.h"
 #include "video_core/gpu_split.h"
 #include "video_core/fire_emblem_upscale.h"
 #include "video_core/nx2_profile.h"
@@ -809,6 +810,19 @@ bool KeplerCompute::DispatchNativeCompute(const NativeQmdScheduler::Descriptor& 
     }
     return dispatched;
 }
+
+namespace {
+
+/// EDEN_NX2_V2_MULTIFRONT: methods that read or change the process-wide QMD dependency table
+/// (the signals 0xae-0xb0 and the inline QMD launch 0x107).
+void NoteQmdUse(u32 method) {
+    if (method == 0xae || method == 0xaf || method == 0xb0 || method == 0x107) {
+        VideoCommon::V2::Resolve::MultiFront::Note(
+            VideoCommon::V2::Resolve::MultiFront::EventKind::QmdUse, method);
+    }
+}
+
+} // Anonymous namespace
 
 namespace {
 constexpr u32 DLSS_NETWORK_CLEAN_EVALUATIONS = 8;
@@ -1808,6 +1822,9 @@ void KeplerCompute::FrontCallMethod(Core::System& system, VideoCommon::GpuSplit&
         return;
     }
     FrontApply(fs, method, argument);
+    if (VideoCommon::V2::Resolve::MultiFront::g_recording) [[unlikely]] {
+        NoteQmdUse(method);
+    }
     if (fs.qmd_model != VideoCommon::V2::Mode::Off) [[unlikely]] {
         FrontModelQmd(split, fs, method, &argument, 1);
     }
@@ -2161,6 +2178,9 @@ void KeplerCompute::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuS
         for (u32 i = 0; i < amount; ++i) {
             FrontApply(fs, method, base_start[i]);
         }
+    }
+    if (VideoCommon::V2::Resolve::MultiFront::g_recording) [[unlikely]] {
+        NoteQmdUse(method);
     }
     if (fs.qmd_model != VideoCommon::V2::Mode::Off) [[unlikely]] {
         FrontModelQmd(split, fs, method, base_start, amount);

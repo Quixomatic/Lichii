@@ -1349,6 +1349,8 @@ static void Dump(u64 hash, std::span<const u32> code, bool decompiled = false) {
 void MacroEngine::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, u32 method,
                           std::span<const u32> parameters) {
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Macro};
+    VideoCommon::V2::Resolve::MultiFront::Note(
+        VideoCommon::V2::Resolve::MultiFront::EventKind::MacroCall, method);
     if (native_turing) {
         // The parameters are the words the pusher fetched, as on the split front (FrontRunMacro):
         // read again from guest memory, they are whatever reused that command memory since.

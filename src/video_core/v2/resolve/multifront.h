@@ -248,7 +248,7 @@ struct CompareResult {
 /// Set when the switch is on and the split runs (one load per hook).
 inline bool g_recording = false;
 /// The channel the front is dispatching (Scheduler::BindChannel).
-inline thread_local u32 t_channel = 0;
+inline thread_local u32 t_channel = ~0U; ///< ~0: not the front thread
 
 /// Front thread: records one coupling event of the current channel. Every Window events the
 /// window is analysed (grouping plan; with verify, the multi-front order is compared with the real

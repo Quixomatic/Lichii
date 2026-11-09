@@ -10,6 +10,7 @@
 
 #include "common/assert.h"
 #include "core/core.h"
+#include "video_core/v2/resolve/multifront.h"
 #include "video_core/control/channel_state.h"
 #include "video_core/control/scheduler.h"
 #include "video_core/gpu.h"
@@ -18,6 +19,8 @@
 namespace Tegra::Control {
 
 void Scheduler::BindChannel(GPU& gpu, s32 bind_id) {
+    // EDEN_NX2_V2_MULTIFRONT: the channel the front dispatches next.
+    VideoCommon::V2::Resolve::MultiFront::t_channel = static_cast<u32>(bind_id);
     // With the GPU thread split the rasterizer's channel switches with the methods around it, on
     // the back thread (deferred outside the lock: the back takes it to bind).
     if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
@@ -48,6 +51,7 @@ void Scheduler::Push(GPU& gpu, s32 channel, CommandList&& entries) {
         channel_state = it->second;
     }
     BindChannel(gpu, channel_state->bind_id);
+    VideoCommon::V2::Resolve::MultiFront::Note(VideoCommon::V2::Resolve::MultiFront::EventKind::Work);
     // Process commands outside the lock to reduce contention.
     // Multiple channels can prepare their commands in parallel.
     channel_state->payload->dma_pusher.Push(std::move(entries));

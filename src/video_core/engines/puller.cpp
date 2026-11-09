@@ -13,6 +13,7 @@
 #include "common/logging.h"
 #include "common/settings.h"
 #include "core/core.h"
+#include "video_core/v2/resolve/multifront.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/control/channel_state.h"
 #include "video_core/dma_pusher.h"
@@ -82,6 +83,8 @@ void OnBackBarrier(DmaPusher& dma_pusher, VideoCommon::V2::Ir::BarrierOp op, con
 template <typename Func>
 void OnBackRelease(DmaPusher& dma_pusher, GPUVAddr address, u32 payload, u32 bytes,
                    const Func& func) {
+    VideoCommon::V2::Resolve::MultiFront::Note(
+        VideoCommon::V2::Resolve::MultiFront::EventKind::Release, address, payload);
     if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
         const VideoCommon::V2::Ir::ReleaseBody body{
             .address = address,
@@ -572,6 +575,11 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
             return;
         }
         VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AcquireChecks, 1);
+        VideoCommon::V2::Resolve::MultiFront::Note(
+            VideoCommon::V2::Resolve::MultiFront::EventKind::Acquire, acquire.address, acquire.value,
+            op == GpuSemaphoreOperation::AcquireEqual
+                ? VideoCommon::V2::Resolve::MultiFront::AcquireOp::Equal
+                : VideoCommon::V2::Resolve::MultiFront::AcquireOp::GreaterEqual);
         auto& split = VideoCommon::GpuSplit::Get();
         // EDEN_NX2_V2_ACQUIRE: met by memory (class A) or by a release queued ahead (B) passes
         // without draining; anything else takes the path below, as before.
@@ -700,6 +708,9 @@ void Puller::ProcessSemaphoreRelease(DmaPusher& dma_pusher) {
 }
 
 void Puller::ProcessSemaphoreAcquire(DmaPusher& dma_pusher) {
+    VideoCommon::V2::Resolve::MultiFront::Note(
+        VideoCommon::V2::Resolve::MultiFront::EventKind::Acquire,
+        regs.semaphore_address.SemaphoreAddress(), regs.semaphore_acquire);
     DrainBack();
     // The CPU may rewrite what the next draws read once it sees the release this waits for.
     VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Fence);
