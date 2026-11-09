@@ -1566,9 +1566,23 @@ void EmitContext::DefineTextureBuffers(const Info& info, u32& binding) {
 
     const Id type{TypePointer(spv::StorageClass::UniformConstant, image_buffer_type)};
     texture_buffers.reserve(info.texture_buffer_descriptors.size());
-    for (const TextureBufferDescriptor& desc : info.texture_buffer_descriptors) {
+    for (size_t index = 0; index < info.texture_buffer_descriptors.size(); ++index) {
+        const TextureBufferDescriptor& desc{info.texture_buffer_descriptors[index]};
         if (desc.count != 1) {
             throw NotImplementedException("Array of texture buffers");
+        }
+        if (UsesHeapTexel(info, index)) [[unlikely]] {
+            // EDEN_NX2_V2_HEAP_TEXEL: an element of the heap's uniform texel buffer array.
+            uses_heap = true;
+            uses_heap_uniform_texel = true;
+            DefineHeapWords();
+            texture_buffers.push_back({
+                .id = HeapArray(image_buffer_type, HEAP_UNIFORM_TEXEL_BINDING, false),
+                .count = desc.count,
+                .heap = true,
+                .heap_word = HeapTexelWord(info, index),
+            });
+            continue;
         }
         const Id id{AddGlobalVariable(type, spv::StorageClass::UniformConstant)};
         Decorate(id, spv::Decoration::Binding, binding);
@@ -1587,12 +1601,30 @@ void EmitContext::DefineTextureBuffers(const Info& info, u32& binding) {
 
 void EmitContext::DefineImageBuffers(const Info& info, u32& binding) {
     image_buffers.reserve(info.image_buffer_descriptors.size());
-    for (const ImageBufferDescriptor& desc : info.image_buffer_descriptors) {
+    for (size_t index = 0; index < info.image_buffer_descriptors.size(); ++index) {
+        const ImageBufferDescriptor& desc{info.image_buffer_descriptors[index]};
         const spv::ImageFormat format{GetImageFormat(desc.format)};
         const Id sampled_type{desc.is_integer ? U32[1] : F32[1]};
         const Id image_type{
             TypeImage(sampled_type, spv::Dim::Buffer, false, false, false, 2, format)};
         const Id pointer_type{TypePointer(spv::StorageClass::UniformConstant, image_type)};
+        if (UsesHeapImageBuffer(info, index)) [[unlikely]] {
+            // EDEN_NX2_V2_HEAP_TEXEL: elements of the heap's storage texel buffer array.
+            uses_heap = true;
+            uses_heap_storage_texel = true;
+            DefineHeapWords();
+            image_buffers.push_back({
+                .id = HeapArray(image_type, HeapStorageTexelBinding(desc.is_integer),
+                                info.requires_coherent_image_memory),
+                .image_type = image_type,
+                .pointer_type = pointer_type,
+                .count = desc.count,
+                .is_integer = desc.is_integer,
+                .heap = true,
+                .heap_word = HeapImageBufferWord(info, index),
+            });
+            continue;
+        }
         const Id id{AddGlobalVariable(pointer_type, spv::StorageClass::UniformConstant)};
         Decorate(id, spv::Decoration::Binding, binding);
         Decorate(id, spv::Decoration::DescriptorSet, 0U);

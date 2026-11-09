@@ -10,6 +10,7 @@
 #include "video_core/renderer_vulkan/vk_bindless_heap.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/v2/p3_stats.h"
+#include "video_core/v2/v2_switches.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 
 namespace Vulkan {
@@ -73,7 +74,26 @@ std::unique_ptr<BindlessHeap> BindlessHeap::Create(const Device& device, Schedul
         indexing.maxPerStageDescriptorUpdateAfterBindStorageImages >= storage &&
         indexing.maxDescriptorSetUpdateAfterBindStorageImages >= storage &&
         indexing.maxUpdateAfterBindDescriptorsInAllPools >= images + storage + Capacity;
-    std::unique_ptr<BindlessHeap> heap{new BindlessHeap(device, scheduler, storage_images)};
+    // P5a (EDEN_NX2_V2_HEAP_TEXEL): uniform texel buffers count as sampled images and storage
+    // texel buffers as storage images in the per-stage and per-set limits.
+    const u64 texel_sampled = images + Capacity;
+    const u64 texel_storage = storage + u64{Capacity} * 2;
+    const bool texel_buffers =
+        VideoCommon::V2::On(VideoCommon::V2::Switch::HeapTexel) && storage_images &&
+        device.IsTexelBufferHeapSupported() &&
+        indexing.maxPerStageDescriptorUpdateAfterBindSampledImages >= texel_sampled &&
+        indexing.maxDescriptorSetUpdateAfterBindSampledImages >= texel_sampled &&
+        indexing.maxPerStageDescriptorUpdateAfterBindStorageImages >= texel_storage &&
+        indexing.maxDescriptorSetUpdateAfterBindStorageImages >= texel_storage &&
+        indexing.maxUpdateAfterBindDescriptorsInAllPools >=
+            texel_sampled + texel_storage + Capacity;
+    if (VideoCommon::V2::On(VideoCommon::V2::Switch::HeapTexel) && !texel_buffers) {
+        LOG_WARNING(Render_Vulkan, "EDEN_NX2_V2_HEAP_TEXEL: the device lacks update-after-bind or "
+                                   "dynamically indexed texel buffer arrays (or their limits); "
+                                   "texel buffers keep descriptors");
+    }
+    std::unique_ptr<BindlessHeap> heap{
+        new BindlessHeap(device, scheduler, storage_images, texel_buffers)};
     if (heap->set == VK_NULL_HANDLE) {
         return nullptr;
     }
@@ -82,7 +102,8 @@ std::unique_ptr<BindlessHeap> BindlessHeap::Create(const Device& device, Schedul
              "EDEN_NX2_V2_BINDLESS: heap of {} elements x {} sampled image arrays, {} storage "
              "image arrays{}, samplers",
              Capacity, SampledBindings, StorageBindings,
-             storage_images ? "" : " (storage images unsupported: kept as descriptors)");
+             storage_images ? (texel_buffers ? ", texel buffer arrays" : "")
+                            : " (storage images unsupported: kept as descriptors)");
     return heap;
 }
 
@@ -90,8 +111,10 @@ BindlessHeap* BindlessHeap::Active() noexcept {
     return g_active.load(std::memory_order_acquire);
 }
 
-BindlessHeap::BindlessHeap(const Device& device_, Scheduler& scheduler_, bool storage_images_)
-    : device{device_}, scheduler{scheduler_}, storage_images{storage_images_} {
+BindlessHeap::BindlessHeap(const Device& device_, Scheduler& scheduler_, bool storage_images_,
+                           bool texel_buffers_)
+    : device{device_}, scheduler{scheduler_}, storage_images{storage_images_},
+      texel_buffers{texel_buffers_} {
     VkShaderStageFlags stages = VK_SHADER_STAGE_ALL_GRAPHICS | VK_SHADER_STAGE_COMPUTE_BIT;
     if (device.IsExtMeshShaderSupported()) {
         stages |= VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT;
@@ -99,15 +122,16 @@ BindlessHeap::BindlessHeap(const Device& device_, Scheduler& scheduler_, bool st
     std::array<VkDescriptorSetLayoutBinding, NumBindings> bindings{};
     std::array<VkDescriptorBindingFlags, NumBindings> flags{};
     for (u32 binding = 0; binding < NumBindings; ++binding) {
-        const bool is_storage = binding >= SPIRV::HEAP_FIRST_STORAGE_BINDING;
+        const bool unused = (IsStorageImageBinding(binding) && !storage_images) ||
+                            (IsTexelBinding(binding) && !texel_buffers);
         bindings[binding] = VkDescriptorSetLayoutBinding{
             .binding = binding,
             .descriptorType = DescriptorType(binding),
-            .descriptorCount = is_storage && !storage_images ? 0 : Capacity,
+            .descriptorCount = unused ? 0 : Capacity,
             .stageFlags = stages,
             .pImmutableSamplers = nullptr,
         };
-        flags[binding] = is_storage && !storage_images
+        flags[binding] = unused
                              ? VkDescriptorBindingFlags{}
                              : VkDescriptorBindingFlags{
                                    VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT |
@@ -139,13 +163,15 @@ BindlessHeap::BindlessHeap(const Device& device_, Scheduler& scheduler_, bool st
         VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_SAMPLER, Capacity},
         VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, Capacity * SampledBindings},
         VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, Capacity * StorageBindings},
+        VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, Capacity},
+        VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER, Capacity * 2},
     };
     pool = dev.CreateDescriptorPool({
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
         .pNext = nullptr,
         .flags = VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT,
         .maxSets = 1,
-        .poolSizeCount = static_cast<u32>(storage_images ? sizes.size() : 2),
+        .poolSizeCount = static_cast<u32>(texel_buffers ? sizes.size() : storage_images ? 3 : 2),
         .pPoolSizes = sizes.data(),
     });
     const VkDescriptorSetLayout set_layout = *layout;
@@ -169,7 +195,8 @@ BindlessHeap::BindlessHeap(const Device& device_, Scheduler& scheduler_, bool st
         if (binding != SPIRV::HEAP_SAMPLER_BINDING) {
             // A null view (devices with null descriptors) is element 0 of every image array.
             space.next = 1;
-            const bool written = binding < SPIRV::HEAP_FIRST_STORAGE_BINDING || storage_images;
+            const bool written = (!IsStorageImageBinding(binding) || storage_images) &&
+                                 (!IsTexelBinding(binding) || texel_buffers);
             if (written && device.HasNullDescriptor()) {
                 Write(binding, 0, 0);
             }
@@ -228,9 +255,11 @@ void BindlessHeap::Write(u32 binding, u32 slot, u64 handle) {
         .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
     };
     const bool is_sampler = binding == SPIRV::HEAP_SAMPLER_BINDING;
+    const bool is_texel = IsTexelBinding(binding);
+    const VkBufferView texel_view = is_texel ? FromHandle<VkBufferView>(handle) : VK_NULL_HANDLE;
     if (is_sampler) {
         image_info.sampler = FromHandle<VkSampler>(handle);
-    } else {
+    } else if (!is_texel) {
         image_info.imageView = FromHandle<VkImageView>(handle);
     }
     const VkDescriptorType type = DescriptorType(binding);
@@ -242,9 +271,9 @@ void BindlessHeap::Write(u32 binding, u32 slot, u64 handle) {
         .dstArrayElement = slot,
         .descriptorCount = 1,
         .descriptorType = type,
-        .pImageInfo = &image_info,
+        .pImageInfo = is_texel ? nullptr : &image_info,
         .pBufferInfo = nullptr,
-        .pTexelBufferView = nullptr,
+        .pTexelBufferView = is_texel ? &texel_view : nullptr,
     };
     device.GetLogical().UpdateDescriptorSets(write, {});
     ++writes;
@@ -284,6 +313,38 @@ u32 BindlessHeap::SamplerSlot(VkSampler sampler) {
     return slot;
 }
 
+u32 BindlessHeap::TexelSlot(u32 binding, VkBufferView view) {
+    const u64 handle = ToHandle(view);
+    if (handle == 0) {
+        return 0;
+    }
+    std::scoped_lock lock{mutex};
+    Space& space = spaces[binding];
+    const auto it = space.slots.find(handle);
+    if (it != space.slots.end()) {
+        space.last_use[it->second] = scheduler.CurrentTick();
+        return it->second;
+    }
+    const u32 slot = Acquire(space, handle);
+    Write(binding, slot, handle);
+    return slot;
+}
+
+VkBufferView BindlessHeap::TexelAt(u32 binding, u32 slot) const {
+    return FromHandle<VkBufferView>(spaces[binding].handles[slot]);
+}
+
+void BindlessHeap::ForgetBufferView(VkBufferView view) {
+    if (view == VK_NULL_HANDLE) {
+        return;
+    }
+    const u64 handle = ToHandle(view);
+    std::scoped_lock lock{mutex};
+    for (u32 binding = SPIRV::HEAP_UNIFORM_TEXEL_BINDING; binding < NumBindings; ++binding) {
+        Forget(spaces[binding], handle);
+    }
+}
+
 VkImageView BindlessHeap::ImageAt(u32 binding, u32 slot) const {
     return FromHandle<VkImageView>(spaces[binding].handles[slot]);
 }
@@ -310,7 +371,7 @@ void BindlessHeap::ForgetImageView(VkImageView view) {
     const u64 handle = ToHandle(view);
     std::scoped_lock lock{mutex};
     for (u32 binding = 0; binding < NumBindings; ++binding) {
-        if (binding != SPIRV::HEAP_SAMPLER_BINDING) {
+        if (binding != SPIRV::HEAP_SAMPLER_BINDING && !IsTexelBinding(binding)) {
             Forget(spaces[binding], handle);
         }
     }

@@ -315,6 +315,14 @@ Id Texture(EmitContext& ctx, IR::TextureInstInfo info, [[maybe_unused]] const IR
 Id TextureImage(EmitContext& ctx, IR::TextureInstInfo info, const IR::Value& index) {
     if (info.type == TextureType::Buffer) {
         const TextureBufferDefinition& def{ctx.texture_buffers.at(info.descriptor_index)};
+        if (def.heap) [[unlikely]] {
+            // EDEN_NX2_V2_HEAP_TEXEL: the heap texel buffer of the element's word.
+            const Id word{ctx.HeapWord(def.heap_word, index, def.count > 1)};
+            const Id pointer_type{
+                ctx.TypePointer(spv::StorageClass::UniformConstant, ctx.image_buffer_type)};
+            return ctx.OpLoad(ctx.image_buffer_type,
+                              HeapImagePointer(ctx, pointer_type, def.id, word, false));
+        }
         if (def.count > 1) {
             const Id idx{index.IsImmediate() ? ctx.Const(index.U32()) : ctx.Def(index)};
             const bool non_uniform{
@@ -356,6 +364,23 @@ Id TextureImage(EmitContext& ctx, IR::TextureInstInfo info, const IR::Value& ind
 std::pair<Id, bool> Image(EmitContext& ctx, const IR::Value& index, IR::TextureInstInfo info) {
     if (info.type == TextureType::Buffer) {
         const ImageBufferDefinition def{ctx.image_buffers.at(info.descriptor_index)};
+        if (def.heap) [[unlikely]] {
+            // EDEN_NX2_V2_HEAP_TEXEL: the heap storage texel buffer of the element's word.
+            const bool non_uniform{
+                def.count > 1 && !index.IsImmediate() &&
+                IsNonUniformSupported(ctx.profile, NonUniformKind::StorageTexelBuffer)};
+            if (non_uniform) {
+                ctx.uses_nonuniform_storage_texel_buffer = true;
+            }
+            const Id word{ctx.HeapWord(def.heap_word, index, def.count > 1)};
+            const Id image{ctx.OpLoad(def.image_type, HeapImagePointer(ctx, def.pointer_type,
+                                                                        def.id, word,
+                                                                        non_uniform))};
+            if (non_uniform) {
+                DecorateNonUniform(ctx, image);
+            }
+            return {image, def.is_integer};
+        }
         if (def.count > 1) {
             const Id idx{index.IsImmediate() ? ctx.Const(index.U32()) : ctx.Def(index)};
             const bool non_uniform{

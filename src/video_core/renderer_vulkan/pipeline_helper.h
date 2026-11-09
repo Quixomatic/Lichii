@@ -151,7 +151,7 @@ inline void WriteDescriptorBuffer(const Device& device, const DescriptorBufferLa
 /// EDEN_NX2_V2_BINDLESS: why descriptors stay out of the heap (Info::heap_block_reasons).
 enum HeapReason : u32 {
     HeapReasonMeshEmulation = 1 << 0,  ///< mesh programs run as compute: their own layout
-    HeapReasonTexelBuffers = 1 << 1,   ///< texel buffers keep descriptors
+    HeapReasonTexelBuffers = 1 << 1,   ///< texel buffers keep descriptors (HEAP_TEXEL off)
     HeapReasonByteAddressed = 1 << 2,  ///< byte-addressed storage views (compute shadow copies)
     HeapReasonNoStorage = 1 << 3,      ///< device lacks update-after-bind storage images
     HeapReasonStorageType = 1 << 4,    ///< cube or buffer storage images
@@ -182,6 +182,42 @@ struct HeapPushConstant {
     BindlessHeap* heap{};
     bool verify{};
 };
+
+/// P5a (EDEN_NX2_V2_HEAP_TEXEL): a stage's texel buffer bindings, in the buffer cache's binding
+/// index order (texture buffers' elements, then image buffers'), that read the heap; which are
+/// storage texel buffers, and which of those are integer.
+struct HeapTexelMasks {
+    u64 heap{};
+    u64 storage{};
+    u64 integer{};
+};
+[[nodiscard]] inline HeapTexelMasks MakeHeapTexelMasks(const Shader::Info& info) {
+    namespace SPIRV = Shader::Backend::SPIRV;
+    HeapTexelMasks masks{};
+    u32 index = 0;
+    for (size_t desc = 0; desc < info.texture_buffer_descriptors.size(); ++desc) {
+        for (u32 element = 0; element < info.texture_buffer_descriptors[desc].count;
+             ++element, ++index) {
+            if (index < 64 && SPIRV::UsesHeapTexel(info, desc)) {
+                masks.heap |= u64{1} << index;
+            }
+        }
+    }
+    for (size_t desc = 0; desc < info.image_buffer_descriptors.size(); ++desc) {
+        const Shader::ImageBufferDescriptor& image{info.image_buffer_descriptors[desc]};
+        for (u32 element = 0; element < image.count; ++element, ++index) {
+            if (index >= 64) {
+                continue;
+            }
+            masks.storage |= u64{1} << index;
+            masks.integer |= image.is_integer ? u64{1} << index : 0;
+            if (SPIRV::UsesHeapImageBuffer(info, desc)) {
+                masks.heap |= u64{1} << index;
+            }
+        }
+    }
+    return masks;
+}
 
 class DescriptorLayoutBuilder {
 public:
@@ -371,8 +407,10 @@ public:
 
         Add(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, stage, info.constant_buffer_descriptors);
         Add(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, stage, info.storage_buffers_descriptors);
-        Add(VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, stage, info.texture_buffer_descriptors);
-        Add(VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER, stage, info.image_buffer_descriptors);
+        Add(VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, stage, info.texture_buffer_descriptors,
+            info.heap_texel_mask);
+        Add(VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER, stage, info.image_buffer_descriptors,
+            info.heap_image_buffer_mask);
         Add(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, stage, info.texture_descriptors,
             info.heap_texture_mask);
         Add(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, stage, info.image_descriptors,

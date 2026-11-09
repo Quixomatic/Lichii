@@ -594,7 +594,10 @@ TEST_CASE("V2 P3 heap descriptors index the bindless heap through the word table
         bindings.push_back(SPIRV::HeapImageBinding(Shader::TextureType::Color2D, true, integer));
         bindings.push_back(
             SPIRV::HeapImageBinding(Shader::TextureType::ColorArray2D, true, integer));
+        // P5a: storage texel buffers.
+        bindings.push_back(SPIRV::HeapStorageTexelBinding(integer));
     }
+    bindings.push_back(SPIRV::HEAP_UNIFORM_TEXEL_BINDING);
     std::ranges::sort(bindings);
     REQUIRE(std::ranges::adjacent_find(bindings) == bindings.end());
     REQUIRE(bindings.front() == SPIRV::HEAP_SAMPLER_BINDING + 1);
@@ -645,4 +648,143 @@ TEST_CASE("V2 P3 heap descriptors index the bindless heap through the word table
     REQUIRE(array.words_binding);
     REQUIRE(array.non_uniform);
     REQUIRE(array.set1_decorations == 2);
+}
+
+namespace {
+struct TexelModule {
+    u32 set1_decorations{};
+    u32 set0_decorations{};
+    bool words_binding{};
+    bool uniform_dynamic{};
+    bool storage_dynamic{};
+};
+
+/// A fragment program fetching texture buffer 0 and reading integer image buffer 0, with
+/// `heap` texel buffers in the heap (EDEN_NX2_V2_HEAP_TEXEL).
+TexelModule EmitTexelProgram(bool heap, const char* name) {
+    using namespace Shader;
+    ObjectPool<IR::Inst> pool;
+    IR::Block block{pool};
+    IR::Program program;
+    program.stage = Stage::Fragment;
+    program.blocks = {&block};
+    program.post_order_blocks = {&block};
+    program.syntax_list = {{{.block = &block}, IR::AbstractSyntaxNode::Type::Block},
+                           {{}, IR::AbstractSyntaxNode::Type::Return}};
+    IR::IREmitter ir{block};
+    IR::TextureInstInfo fetch_flags{};
+    fetch_flags.type.Assign(TextureType::Buffer);
+    fetch_flags.descriptor_index.Assign(0);
+    const IR::Value fetch{
+        ir.ImageFetch(ir.Imm32(0), ir.Imm32(5), {}, ir.Imm32(0), {}, fetch_flags)};
+    fetch.InstRecursive()->ReplaceOpcode(IR::Opcode::ImageFetch);
+    IR::TextureInstInfo read_flags{};
+    read_flags.type.Assign(TextureType::Buffer);
+    read_flags.descriptor_index.Assign(0);
+    const IR::Value read{ir.ImageRead(ir.Imm32(0), ir.Imm32(7), read_flags)};
+    read.InstRecursive()->ReplaceOpcode(IR::Opcode::ImageRead);
+    program.info.texture_buffer_descriptors.push_back(TextureBufferDescriptor{
+        .has_secondary = false,
+        .cbuf_index = 2,
+        .cbuf_offset = 0x10,
+        .shift_left = 0,
+        .secondary_cbuf_index = 0,
+        .secondary_cbuf_offset = 0,
+        .secondary_shift_left = 0,
+        .count = 1,
+        .size_shift = 0,
+    });
+    program.info.image_buffer_descriptors.push_back(ImageBufferDescriptor{
+        .format = ImageFormat::R32_UINT,
+        .is_written = false,
+        .is_read = true,
+        .is_integer = true,
+        .cbuf_index = 2,
+        .cbuf_offset = 0x20,
+        .count = 1,
+        .size_shift = 0,
+    });
+    program.info.uses_image_buffers = true;
+    program.info.heap_texel_mask = heap ? 1 : 0;
+    program.info.heap_image_buffer_mask = heap ? 1 : 0;
+    program.info.heap_word_base = 2;
+    Profile profile;
+    profile.supported_spirv = 0x00010500;
+    profile.unified_descriptor_binding = true;
+    const std::vector<u32> code = Backend::SPIRV::EmitSPIRV(profile, program);
+    if (const char* directory = std::getenv("EDEN_V2_HEAP_TEST_OUTPUT")) {
+        std::filesystem::create_directories(directory);
+        std::ofstream file{std::filesystem::path{directory} / name, std::ios::binary};
+        file.write(reinterpret_cast<const char*>(code.data()),
+                   static_cast<std::streamsize>(code.size() * sizeof(u32)));
+    }
+    TexelModule module;
+    for (size_t i = 5; i < code.size();) {
+        const u32 opcode = code[i] & 0xffff;
+        const u32 words = code[i] >> 16;
+        REQUIRE(words != 0);
+        if (opcode == 71 && words >= 4 && code[i + 2] == 34) { // OpDecorate DescriptorSet
+            ++(code[i + 3] == 1 ? module.set1_decorations : module.set0_decorations);
+        }
+        if (opcode == 71 && words >= 4 && code[i + 2] == 33 && code[i + 3] == 1023) {
+            module.words_binding = true;
+        }
+        if (opcode == 17 && words >= 2) { // OpCapability
+            module.uniform_dynamic |= code[i + 1] == 5304;
+            module.storage_dynamic |= code[i + 1] == 5305;
+        }
+        i += words;
+    }
+    return module;
+}
+} // Anonymous namespace
+
+TEST_CASE("V2 P5 texel buffers index the bindless heap through the word table",
+          "[video_core][v2_p5]") {
+    namespace SPIRV = Shader::Backend::SPIRV;
+    // Words: per stage the heap texel buffers come first (texture buffers, then image buffers),
+    // then the heap textures and storage images.
+    Shader::Info info;
+    for (int i = 0; i < 2; ++i) {
+        Shader::TextureBufferDescriptor texel{};
+        texel.count = 1;
+        info.texture_buffer_descriptors.push_back(texel);
+    }
+    Shader::ImageBufferDescriptor image_buffer{};
+    image_buffer.count = 3;
+    info.image_buffer_descriptors.push_back(image_buffer);
+    Shader::TextureDescriptor texture{};
+    texture.type = Shader::TextureType::Color2D;
+    texture.count = 1;
+    info.texture_descriptors.push_back(texture);
+    Shader::ImageDescriptor image{};
+    image.type = Shader::TextureType::Color2D;
+    image.count = 2;
+    info.image_descriptors.push_back(image);
+    info.heap_texel_mask = 0b10; // texture buffer 1 only
+    info.heap_image_buffer_mask = 0b1;
+    info.heap_texture_mask = 0b1;
+    info.heap_image_mask = 0b1;
+    info.heap_word_base = 7;
+    REQUIRE_FALSE(SPIRV::UsesHeapTexel(info, 0));
+    REQUIRE(SPIRV::UsesHeapTexel(info, 1));
+    REQUIRE(SPIRV::HeapTexelWord(info, 1) == 7);
+    REQUIRE(SPIRV::HeapImageBufferWord(info, 0) == 8);
+    REQUIRE(SPIRV::HeapTexelWordCount(info) == 4);
+    REQUIRE(SPIRV::HeapTextureWord(info, 0) == 11);
+    REQUIRE(SPIRV::HeapImageWord(info, 0) == 12);
+    REQUIRE(SPIRV::HeapWordCount(info) == 7);
+    // Emission: without the masks two set 0 texel bindings; with them the heap's uniform and
+    // storage texel arrays at set 1 and the word table, with the dynamic indexing capabilities.
+    const TexelModule plain = EmitTexelProgram(false, "texel_plain.spv");
+    REQUIRE(plain.set0_decorations == 2);
+    REQUIRE(plain.set1_decorations == 0);
+    REQUIRE_FALSE(plain.words_binding);
+    REQUIRE_FALSE(plain.uniform_dynamic);
+    const TexelModule heap = EmitTexelProgram(true, "texel_heap.spv");
+    REQUIRE(heap.set0_decorations == 1);
+    REQUIRE(heap.set1_decorations == 2);
+    REQUIRE(heap.words_binding);
+    REQUIRE(heap.uniform_dynamic);
+    REQUIRE(heap.storage_dynamic);
 }

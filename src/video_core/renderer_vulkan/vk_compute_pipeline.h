@@ -171,6 +171,7 @@ private:
     /// EDEN_NX2_V2_BINDLESS: textures or storage images read the heap (set 1, word table).
     bool heap_pipeline{false};
     HeapPushConstant heap_push{};
+    HeapTexelMasks heap_texels{}; ///< P5a: texel buffer bindings that read the heap
     u32 heap_reasons{};
     std::vector<u32> last_heap_words;
     VkBuffer last_heap_buffer{};

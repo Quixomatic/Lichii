@@ -224,7 +224,12 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
     builder.Add(info, VK_SHADER_STAGE_COMPUTE_BIT);
     // EDEN_NX2_V2_BINDLESS: the pipeline cache marked heap descriptors before emission.
     BindlessHeap* const heap = BindlessHeap::Active();
-    heap_pipeline = heap != nullptr && (info.heap_texture_mask != 0 || info.heap_image_mask != 0);
+    heap_pipeline = heap != nullptr && (info.heap_texture_mask != 0 || info.heap_image_mask != 0 ||
+                                        info.heap_texel_mask != 0 ||
+                                        info.heap_image_buffer_mask != 0);
+    if (heap_pipeline) {
+        heap_texels = MakeHeapTexelMasks(info);
+    }
     // EDEN_NX2_V2_DRAWCACHE: what a dispatch recipe records and replays.
     {
         bool computed = false;
@@ -691,8 +696,18 @@ bool ComputePipeline::ConfigureImpl(Tegra::Engines::KeplerCompute& kepler_comput
     std::ranges::for_each(info.texture_buffer_descriptors, add_buffer);
     std::ranges::for_each(info.image_buffer_descriptors, add_buffer);
 
+    // The heap words start with the texel buffers' (EDEN_NX2_V2_HEAP_TEXEL), bound next.
+    heap_push.words.clear();
     buffer_cache.UpdateComputeBuffers();
-    buffer_cache.BindHostComputeBuffers();
+    if (heap_texels.heap != 0) [[unlikely]] {
+        buffer_cache.runtime.BeginHeapTexels(heap_push.words, heap_texels.heap,
+                                             heap_texels.storage, heap_texels.integer,
+                                             heap_push.verify);
+        buffer_cache.BindHostComputeBuffers();
+        buffer_cache.runtime.EndHeapTexels();
+    } else {
+        buffer_cache.BindHostComputeBuffers();
+    }
     if (buffer_cache.any_buffer_uploaded) {
         buffer_cache.runtime.PostCopyBarrier();
         buffer_cache.any_buffer_uploaded = false;
@@ -702,7 +717,6 @@ bool ComputePipeline::ConfigureImpl(Tegra::Engines::KeplerCompute& kepler_comput
     const VideoCommon::SamplerId* samplers_it{samplers.data()};
     const VideoCommon::ImageViewInOut* views_it{views.data()};
     HeapPushConstant* const heap{heap_pipeline ? &heap_push : nullptr};
-    heap_push.words.clear();
     if (!shadow) {
         PushImageDescriptors(texture_cache, guest_descriptor_queue, info, rescaling, samplers_it,
                              views_it, heap);

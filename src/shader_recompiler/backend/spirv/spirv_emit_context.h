@@ -54,6 +54,8 @@ struct TextureDefinition {
 struct TextureBufferDefinition {
     Id id;
     u32 count;
+    bool heap{};     ///< P5a: an element of the heap's uniform texel buffer array
+    u32 heap_word{}; ///< its first word in the heap word table
 };
 
 struct ImageBufferDefinition {
@@ -62,6 +64,8 @@ struct ImageBufferDefinition {
     Id pointer_type;
     u32 count;
     bool is_integer;
+    bool heap{};     ///< P5a: elements of the heap's storage texel buffer array
+    u32 heap_word{};
 };
 
 struct ImageDefinition {
@@ -344,6 +348,9 @@ public:
     Id heap_words{};
     Id heap_word_pointer{};
     bool uses_heap{};
+    /// P5a: a heap texel buffer array was declared (needs the dynamic indexing capabilities).
+    bool uses_heap_uniform_texel{};
+    bool uses_heap_storage_texel{};
 
     /// The heap word of element `index` (when `arrayed`) of a heap descriptor whose first word is
     /// `word`.

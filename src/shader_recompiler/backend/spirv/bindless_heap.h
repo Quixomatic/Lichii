@@ -9,11 +9,15 @@
 // Pipeline v2 P3 (EDEN_NX2_V2_BINDLESS): sampled textures and storage images read from a host
 // descriptor heap. The heap is descriptor set 1: binding 0 is an array of samplers, then arrays of
 // sampled images (one per image class and component type), then arrays of storage images (one per
-// dimension and component type). A descriptor marked in Info::heap_texture_mask or
-// Info::heap_image_mask declares no binding of its own: each of its elements reads a word from
-// the draw's heap word table, a storage buffer at set 0, binding HEAP_WORDS_BINDING, and takes
-// its image (low 16 bits) and, for textures, its sampler (high 16 bits) from the heap.
-// The host and the shader take every index below from these functions, so they agree.
+// dimension and component type), then (P5a, EDEN_NX2_V2_HEAP_TEXEL) an array of uniform texel
+// buffers and two of storage texel buffers (float, integer). A descriptor marked in
+// Info::heap_texture_mask, heap_image_mask, heap_texel_mask or heap_image_buffer_mask declares no
+// binding of its own: each of its elements reads a word from the draw's heap word table, a
+// storage buffer at set 0, binding HEAP_WORDS_BINDING, and takes its image or texel buffer (low
+// 16 bits) and, for textures, its sampler (high 16 bits) from the heap. Per stage the words are
+// the heap texture buffers' elements, the heap image buffers', the heap textures', then the heap
+// storage images' (the order the host binds them in). The host and the shader take every index
+// below from these functions, so they agree.
 namespace Shader::Backend::SPIRV {
 
 inline constexpr u32 HEAP_SET = 1;
@@ -24,7 +28,11 @@ inline constexpr u32 NUM_HEAP_IMAGE_CLASSES = 9;
 /// Storage image classes: 1D, 1D array, 2D, 2D array, 3D.
 inline constexpr u32 NUM_HEAP_STORAGE_CLASSES = 5;
 inline constexpr u32 HEAP_FIRST_STORAGE_BINDING = 1 + NUM_HEAP_IMAGE_CLASSES * 2;
-inline constexpr u32 NUM_HEAP_BINDINGS = HEAP_FIRST_STORAGE_BINDING + NUM_HEAP_STORAGE_CLASSES * 2;
+/// P5a: texel buffers (uniform; then storage float, storage integer).
+inline constexpr u32 HEAP_UNIFORM_TEXEL_BINDING =
+    HEAP_FIRST_STORAGE_BINDING + NUM_HEAP_STORAGE_CLASSES * 2;
+inline constexpr u32 HEAP_FIRST_STORAGE_TEXEL_BINDING = HEAP_UNIFORM_TEXEL_BINDING + 1;
+inline constexpr u32 NUM_HEAP_BINDINGS = HEAP_FIRST_STORAGE_TEXEL_BINDING + 2;
 /// Elements of every heap array (the shader's array type and the host's descriptor counts must
 /// be equal).
 inline constexpr u32 MAX_HEAP_ARRAY_LENGTH = 4096;
@@ -98,6 +106,11 @@ inline constexpr u32 HEAP_WORDS_BINDING = 1023;
     return HEAP_FIRST_STORAGE_BINDING + storage_class * 2 + (is_integer ? 1 : 0);
 }
 
+/// The heap binding of a storage texel buffer (image buffer) descriptor's elements.
+[[nodiscard]] constexpr u32 HeapStorageTexelBinding(bool is_integer) {
+    return HEAP_FIRST_STORAGE_TEXEL_BINDING + (is_integer ? 1 : 0);
+}
+
 /// Whether texture descriptor `index` of `info` reads the heap.
 [[nodiscard]] constexpr bool UsesHeap(const Info& info, size_t index) {
     return index < 64 && ((info.heap_texture_mask >> index) & 1) != 0;
@@ -108,9 +121,53 @@ inline constexpr u32 HEAP_WORDS_BINDING = 1023;
     return index < 64 && ((info.heap_image_mask >> index) & 1) != 0;
 }
 
-/// The words a stage reads: its heap textures' elements, then its heap images' elements.
-[[nodiscard]] inline u32 HeapWordCount(const Info& info) {
+/// Whether texture buffer descriptor `index` of `info` reads the heap.
+[[nodiscard]] constexpr bool UsesHeapTexel(const Info& info, size_t index) {
+    return index < 64 && ((info.heap_texel_mask >> index) & 1) != 0;
+}
+
+/// Whether image buffer descriptor `index` of `info` reads the heap.
+[[nodiscard]] constexpr bool UsesHeapImageBuffer(const Info& info, size_t index) {
+    return index < 64 && ((info.heap_image_buffer_mask >> index) & 1) != 0;
+}
+
+/// The words a stage's heap texel buffers take (they come first).
+[[nodiscard]] inline u32 HeapTexelWordCount(const Info& info) {
     u32 words = 0;
+    for (size_t i = 0; i < info.texture_buffer_descriptors.size(); ++i) {
+        words += UsesHeapTexel(info, i) ? info.texture_buffer_descriptors[i].count : 0;
+    }
+    for (size_t i = 0; i < info.image_buffer_descriptors.size(); ++i) {
+        words += UsesHeapImageBuffer(info, i) ? info.image_buffer_descriptors[i].count : 0;
+    }
+    return words;
+}
+
+/// The word of the first element of heap texture buffer descriptor `index`.
+[[nodiscard]] inline u32 HeapTexelWord(const Info& info, size_t index) {
+    u32 word = info.heap_word_base;
+    for (size_t i = 0; i < index; ++i) {
+        word += UsesHeapTexel(info, i) ? info.texture_buffer_descriptors[i].count : 0;
+    }
+    return word;
+}
+
+/// The word of the first element of heap image buffer descriptor `index`.
+[[nodiscard]] inline u32 HeapImageBufferWord(const Info& info, size_t index) {
+    u32 word = info.heap_word_base;
+    for (size_t i = 0; i < info.texture_buffer_descriptors.size(); ++i) {
+        word += UsesHeapTexel(info, i) ? info.texture_buffer_descriptors[i].count : 0;
+    }
+    for (size_t i = 0; i < index; ++i) {
+        word += UsesHeapImageBuffer(info, i) ? info.image_buffer_descriptors[i].count : 0;
+    }
+    return word;
+}
+
+/// The words a stage reads: its heap texel buffers', its heap textures', then its heap images'
+/// elements.
+[[nodiscard]] inline u32 HeapWordCount(const Info& info) {
+    u32 words = HeapTexelWordCount(info);
     for (size_t i = 0; i < info.texture_descriptors.size(); ++i) {
         words += UsesHeap(info, i) ? info.texture_descriptors[i].count : 0;
     }
@@ -122,7 +179,7 @@ inline constexpr u32 HEAP_WORDS_BINDING = 1023;
 
 /// The word of the first element of heap texture descriptor `index`.
 [[nodiscard]] inline u32 HeapTextureWord(const Info& info, size_t index) {
-    u32 word = info.heap_word_base;
+    u32 word = info.heap_word_base + HeapTexelWordCount(info);
     for (size_t i = 0; i < index; ++i) {
         word += UsesHeap(info, i) ? info.texture_descriptors[i].count : 0;
     }
@@ -131,7 +188,7 @@ inline constexpr u32 HEAP_WORDS_BINDING = 1023;
 
 /// The word of the first element of heap storage image descriptor `index`.
 [[nodiscard]] inline u32 HeapImageWord(const Info& info, size_t index) {
-    u32 word = info.heap_word_base;
+    u32 word = info.heap_word_base + HeapTexelWordCount(info);
     for (size_t i = 0; i < info.texture_descriptors.size(); ++i) {
         word += UsesHeap(info, i) ? info.texture_descriptors[i].count : 0;
     }

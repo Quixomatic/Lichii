@@ -1662,10 +1662,12 @@ void ReportUnsupportedMeshPipeline(const GraphicsPipelineCacheKey& key, const Pr
 namespace {
 /// EDEN_NX2_V2_BINDLESS: marks the textures and storage images of one stage that read the heap
 /// (bindless_heap.h), its first word `word_base`, and why the rest stay out. Returns its words.
-u32 MarkHeapStage(Shader::Info& info, u32 word_base, bool storage_images) {
+u32 MarkHeapStage(Shader::Info& info, u32 word_base, bool storage_images, bool texel_buffers) {
     namespace SPIRV = Shader::Backend::SPIRV;
     info.heap_texture_mask = 0;
     info.heap_image_mask = 0;
+    info.heap_texel_mask = 0;
+    info.heap_image_buffer_mask = 0;
     info.heap_word_base = word_base;
     info.heap_block_reasons = 0;
     for (size_t desc = 0; desc < info.texture_descriptors.size(); ++desc) {
@@ -1693,7 +1695,24 @@ u32 MarkHeapStage(Shader::Info& info, u32 word_base, bool storage_images) {
             info.heap_image_mask |= u64{1} << desc;
         }
     }
-    if (!info.texture_buffer_descriptors.empty() || !info.image_buffer_descriptors.empty()) {
+    if (texel_buffers) {
+        // P5a (EDEN_NX2_V2_HEAP_TEXEL): texel buffers read the heap's texel buffer arrays.
+        for (size_t desc = 0; desc < info.texture_buffer_descriptors.size(); ++desc) {
+            if (desc >= 64) {
+                info.heap_block_reasons |= HeapReasonBindings;
+                break;
+            }
+            info.heap_texel_mask |= u64{1} << desc;
+        }
+        for (size_t desc = 0; desc < info.image_buffer_descriptors.size(); ++desc) {
+            if (desc >= 64) {
+                info.heap_block_reasons |= HeapReasonBindings;
+                break;
+            }
+            info.heap_image_buffer_mask |= u64{1} << desc;
+        }
+    } else if (!info.texture_buffer_descriptors.empty() ||
+               !info.image_buffer_descriptors.empty()) {
         info.heap_block_reasons |= HeapReasonTexelBuffers;
     }
     return SPIRV::HeapWordCount(info);
@@ -1703,6 +1722,8 @@ u32 MarkHeapStage(Shader::Info& info, u32 word_base, bool storage_images) {
 void UnmarkHeapStage(Shader::Info& info, u32 reason) {
     info.heap_texture_mask = 0;
     info.heap_image_mask = 0;
+    info.heap_texel_mask = 0;
+    info.heap_image_buffer_mask = 0;
     info.heap_word_base = 0;
     info.heap_block_reasons = reason;
 }
@@ -1713,7 +1734,7 @@ void UnmarkHeapStage(Shader::Info& info, u32 reason) {
 /// bindings would reach the heap word table's binding.
 void MarkHeapTextures(std::span<Shader::IR::Program> programs, const GraphicsPipelineCacheKey& key,
                       size_t first, bool emulated_layer, bool mesh_emulation,
-                      bool storage_images) {
+                      bool storage_images, bool texel_buffers) {
     namespace SPIRV = Shader::Backend::SPIRV;
     const auto active = [&](size_t index) {
         return key.unique_hashes[index] != 0 ||
@@ -1730,7 +1751,7 @@ void MarkHeapTextures(std::span<Shader::IR::Program> programs, const GraphicsPip
             UnmarkHeapStage(info, HeapReasonMeshEmulation);
             continue;
         }
-        words += MarkHeapStage(info, words, storage_images);
+        words += MarkHeapStage(info, words, storage_images, texel_buffers);
         bindings += static_cast<u32>(info.constant_buffer_descriptors.size() +
                                      info.storage_buffers_descriptors.size() +
                                      info.texture_buffer_descriptors.size() +
@@ -2315,7 +2336,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     if (const BindlessHeap* const heap = BindlessHeap::Active()) {
         MarkHeapTextures(programs, key, uses_vertex_a && uses_vertex_b ? 1 : 0,
                          layer_source_program != nullptr, mesh_emulation.has_value(),
-                         heap->StorageImages());
+                         heap->StorageImages(), heap->TexelBuffers());
     }
     std::array<const Shader::Info*, Maxwell::MaxShaderStage> infos{};
     std::array<vk::ShaderModule, Maxwell::MaxShaderStage> modules;
@@ -2625,7 +2646,7 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
     }
     // EDEN_NX2_V2_BINDLESS: the textures and storage images that read the heap.
     if (const BindlessHeap* const heap = BindlessHeap::Active()) {
-        MarkHeapStage(program.info, 0, heap->StorageImages());
+        MarkHeapStage(program.info, 0, heap->StorageImages(), heap->TexelBuffers());
         const Shader::Info& info{program.info};
         if (info.constant_buffer_descriptors.size() + info.storage_buffers_descriptors.size() +
                 info.texture_buffer_descriptors.size() + info.image_buffer_descriptors.size() +

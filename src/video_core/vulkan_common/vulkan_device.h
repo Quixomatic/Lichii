@@ -1021,6 +1021,15 @@ FN_MAX_LIMIT_LIST
     bool IsStorageImageUpdateAfterBindSupported() const {
         return features.descriptor_indexing.descriptorBindingStorageImageUpdateAfterBind;
     }
+    /// Pipeline v2 P5a (EDEN_NX2_V2_HEAP_TEXEL): texel buffer arrays written after bind and
+    /// indexed dynamically (enabled only with the switch).
+    bool IsTexelBufferHeapSupported() const {
+        const auto& indexing = features.descriptor_indexing;
+        return indexing.descriptorBindingUniformTexelBufferUpdateAfterBind &&
+               indexing.descriptorBindingStorageTexelBufferUpdateAfterBind &&
+               indexing.shaderUniformTexelBufferArrayDynamicIndexing &&
+               indexing.shaderStorageTexelBufferArrayDynamicIndexing;
+    }
 
     bool HasTimelineSemaphore() const;
 

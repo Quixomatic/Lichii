@@ -18,6 +18,8 @@
 #include "video_core/renderer_vulkan/vertex_repack.h"
 
 #include "video_core/renderer_vulkan/maxwell_to_vk.h"
+#include "video_core/renderer_vulkan/vk_bindless_heap.h"
+#include "video_core/v2/p3_stats.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
@@ -168,8 +170,45 @@ VkBufferView Buffer::View(u32 offset, u32 size, VideoCore::Surface::PixelFormat 
             .offset = offset,
             .range = size,
         }),
+        .heap_slot = {},
     });
+    if (BindlessHeap* const heap = BindlessHeap::Active(); heap != nullptr && heap->TexelBuffers())
+        [[unlikely]] {
+        // The view may get heap slots: it frees them when it dies.
+        views.back().heap_slot = HeapSlotOwner{*views.back().handle};
+    }
     return *views.back().handle;
+}
+
+void Buffer::HeapSlotOwner::Forget() noexcept {
+    if (view == VK_NULL_HANDLE) {
+        return;
+    }
+    if (BindlessHeap* const heap = BindlessHeap::Active()) {
+        heap->ForgetBufferView(view);
+    }
+    view = VK_NULL_HANDLE;
+}
+
+void BufferCacheRuntime::BindHeapTexelBuffer(Buffer& buffer, u32 offset, u32 size,
+                                             VideoCore::Surface::PixelFormat format, u32 index) {
+    namespace SPIRV = Shader::Backend::SPIRV;
+    BindlessHeap* const heap = BindlessHeap::Active();
+    const VkBufferView view = buffer.View(offset, size, format);
+    const bool storage = ((heap_texel_storage >> index) & 1) != 0;
+    const bool integer = ((heap_texel_integer >> index) & 1) != 0;
+    const u32 binding = storage ? SPIRV::HeapStorageTexelBinding(integer)
+                                : SPIRV::HEAP_UNIFORM_TEXEL_BINDING;
+    const u32 slot = heap->TexelSlot(binding, view);
+    heap_texel_words->push_back(slot);
+    if (heap_texel_verify) {
+        // EDEN_NX2_V2_BINDLESS=verify: what the old path would bind against what the heap holds.
+        auto& data = VideoCommon::V2::P3Stats::Get();
+        ++data.heap_verify;
+        if (heap->TexelAt(binding, slot) != view) {
+            ++data.heap_mismatches;
+        }
+    }
 }
 
 class QuadIndexBuffer {

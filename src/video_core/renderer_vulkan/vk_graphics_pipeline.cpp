@@ -482,8 +482,15 @@ GraphicsPipeline::GraphicsPipeline(
     BindlessHeap* const heap = BindlessHeap::Active();
     heap_pipeline = heap != nullptr && !mesh_emulation &&
                     std::ranges::any_of(stage_infos, [](const Shader::Info& info) {
-                        return info.heap_texture_mask != 0 || info.heap_image_mask != 0;
+                        return info.heap_texture_mask != 0 || info.heap_image_mask != 0 ||
+                               info.heap_texel_mask != 0 || info.heap_image_buffer_mask != 0;
                     });
+    if (heap_pipeline) {
+        // P5a (EDEN_NX2_V2_HEAP_TEXEL): the texel buffer bindings of each stage in the heap.
+        for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
+            heap_texels[stage] = MakeHeapTexelMasks(stage_infos[stage]);
+        }
+    }
     for (const Shader::Info& info : stage_infos) {
         heap_reasons |= info.heap_block_reasons;
         heap_words += Shader::Backend::SPIRV::HeapWordCount(info);
@@ -1056,7 +1063,7 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     const auto prepare_stage{[&](size_t stage) LAMBDA_FORCEINLINE {
         {
             Profile::Scope scope{Profile::Zone::BindStageBuffers};
-            buffer_cache.BindHostStageBuffers(stage);
+            WithHeapTexels(stage, [&] { buffer_cache.BindHostStageBuffers(stage); });
         }
         {
             Profile::Scope scope{Profile::Zone::PushDescriptors};
@@ -1179,7 +1186,7 @@ bool GraphicsPipeline::ConfigureDelta(bool is_indexed) {
         }
         {
             Profile::Scope scope{Profile::Zone::BindStageBuffers};
-            buffer_cache.BindHostStageBuffers(stage);
+            WithHeapTexels(stage, [&] { buffer_cache.BindHostStageBuffers(stage); });
         }
         {
             Profile::Scope scope{Profile::Zone::PushDescriptors};
@@ -1358,9 +1365,11 @@ GraphicsPipeline::RecipeResult GraphicsPipeline::ConfigureRecipe(
         {
             Profile::Scope scope{Profile::Zone::BindStageBuffers};
             if (buffers_replayed) {
-                buffer_cache.ReplayHostStageBuffers(stage, recipe.buffers, *memo);
+                WithHeapTexels(stage, [&] {
+                    buffer_cache.ReplayHostStageBuffers(stage, recipe.buffers, *memo);
+                });
             } else {
-                buffer_cache.BindHostStageBuffers(stage);
+                WithHeapTexels(stage, [&] { buffer_cache.BindHostStageBuffers(stage); });
             }
         }
         {

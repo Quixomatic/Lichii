@@ -10,6 +10,12 @@ namespace {
 Id Image(EmitContext& ctx, IR::TextureInstInfo info) {
     if (info.type == TextureType::Buffer) {
         const ImageBufferDefinition def{ctx.image_buffers.at(info.descriptor_index)};
+        if (def.heap) [[unlikely]] {
+            // EDEN_NX2_V2_HEAP_TEXEL: a pointer to element 0's heap storage texel buffer.
+            const Id word{ctx.HeapWord(def.heap_word, IR::Value{u32{0}}, false)};
+            const Id element{ctx.OpBitwiseAnd(ctx.U32[1], word, ctx.Const(0xffffu))};
+            return ctx.OpAccessChain(def.pointer_type, def.id, element);
+        }
         return def.id;
     } else {
         const ImageDefinition def{ctx.images.at(info.descriptor_index)};

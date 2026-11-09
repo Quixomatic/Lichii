@@ -396,6 +396,10 @@ struct Info {
     /// exactly as before.
     u64 heap_texture_mask{};
     u64 heap_image_mask{};
+    /// P5a (EDEN_NX2_V2_HEAP_TEXEL): texture buffer and image buffer descriptors (by index) read
+    /// from the heap's texel buffer arrays.
+    u64 heap_texel_mask{};
+    u64 heap_image_buffer_mask{};
     u32 heap_word_base{};
     /// Why descriptors of this stage were left out of the heap (host bits, for the stats).
     u32 heap_block_reasons{};

@@ -7,6 +7,7 @@
 #pragma once
 
 #include <limits>
+#include <utility>
 
 #include <boost/container/small_vector.hpp>
 
@@ -78,11 +79,35 @@ public:
     }
 
 private:
+    /// P5a (EDEN_NX2_V2_HEAP_TEXEL): frees a view's bindless heap slot when the view is destroyed
+    /// (with its buffer, which the cache destroys once the GPU is done with it). Moved-from
+    /// holders forget nothing, so vector growth and buffer moves keep the slot.
+    struct HeapSlotOwner {
+        VkBufferView view{};
+        HeapSlotOwner() = default;
+        explicit HeapSlotOwner(VkBufferView view_) noexcept : view{view_} {}
+        HeapSlotOwner(HeapSlotOwner&& other) noexcept : view{std::exchange(other.view, {})} {}
+        HeapSlotOwner& operator=(HeapSlotOwner&& other) noexcept {
+            if (this != &other) {
+                Forget();
+                view = std::exchange(other.view, {});
+            }
+            return *this;
+        }
+        HeapSlotOwner(const HeapSlotOwner&) = delete;
+        HeapSlotOwner& operator=(const HeapSlotOwner&) = delete;
+        ~HeapSlotOwner() {
+            Forget();
+        }
+        void Forget() noexcept;
+    };
+
     struct BufferView {
         u32 offset;
         u32 size;
         VideoCore::Surface::PixelFormat format;
         vk::BufferView handle;
+        HeapSlotOwner heap_slot; ///< destroyed before the handle
     };
 
     const Device* device{};
@@ -281,9 +306,33 @@ public:
         if (format == VideoCore::Surface::PixelFormat::Invalid) {
             format = VideoCore::Surface::PixelFormat::R8_UNORM;
         }
+        if (heap_texel_words != nullptr) [[unlikely]] {
+            // EDEN_NX2_V2_HEAP_TEXEL: a heap element instead of a descriptor (bindless_heap.h).
+            const u32 index = heap_texel_index++;
+            if (index < 64 && ((heap_texel_mask >> index) & 1) != 0) {
+                BindHeapTexelBuffer(buffer, offset, size, format, index);
+                return;
+            }
+        }
         guest_descriptor_queue.AddTexelBuffer(buffer.View(offset, size, format),
                                               buffer.DeviceAddress(), offset, size,
                                               TexelBufferFormat(format));
+    }
+
+    /// P5a (EDEN_NX2_V2_HEAP_TEXEL): the texture buffers bound until EndHeapTexels (one stage, in
+    /// binding index order) whose bit is in `heap` push a heap word to `words` instead of a
+    /// descriptor; `storage` marks image buffers (storage texel buffers), `integer` their type.
+    void BeginHeapTexels(std::vector<u32>& words, u64 heap, u64 storage, u64 integer,
+                         bool verify) noexcept {
+        heap_texel_words = &words;
+        heap_texel_mask = heap;
+        heap_texel_storage = storage;
+        heap_texel_integer = integer;
+        heap_texel_verify = verify;
+        heap_texel_index = 0;
+    }
+    void EndHeapTexels() noexcept {
+        heap_texel_words = nullptr;
     }
 
     bool ShouldLimitDynamicStorageBuffers() const {
@@ -295,6 +344,16 @@ public:
     }
 
 private:
+    void BindHeapTexelBuffer(Buffer& buffer, u32 offset, u32 size,
+                             VideoCore::Surface::PixelFormat format, u32 index);
+
+    std::vector<u32>* heap_texel_words{};
+    u64 heap_texel_mask{};
+    u64 heap_texel_storage{};
+    u64 heap_texel_integer{};
+    u32 heap_texel_index{};
+    bool heap_texel_verify{};
+
     void BindBuffer(const Buffer& buffer, u32 offset, u32 size) {
         const VkBuffer handle = buffer.Handle();
         if (handle == VK_NULL_HANDLE) {

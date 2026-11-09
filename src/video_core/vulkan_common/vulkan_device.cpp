@@ -728,9 +728,14 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
     // Descriptors feature list
     {
         auto& descriptor_indexing = features.descriptor_indexing;
+        // EDEN_NX2_V2_HEAP_TEXEL (with BINDLESS) keeps what texel buffers in the heap need.
+        const bool texel_heap = VideoCommon::V2::On(VideoCommon::V2::Switch::Bindless) &&
+                                VideoCommon::V2::On(VideoCommon::V2::Switch::HeapTexel);
         descriptor_indexing.shaderInputAttachmentArrayDynamicIndexing = false;
-        descriptor_indexing.shaderUniformTexelBufferArrayDynamicIndexing = false;
-        descriptor_indexing.shaderStorageTexelBufferArrayDynamicIndexing = false;
+        descriptor_indexing.shaderUniformTexelBufferArrayDynamicIndexing =
+            texel_heap && descriptor_indexing.shaderUniformTexelBufferArrayDynamicIndexing;
+        descriptor_indexing.shaderStorageTexelBufferArrayDynamicIndexing =
+            texel_heap && descriptor_indexing.shaderStorageTexelBufferArrayDynamicIndexing;
         descriptor_indexing.shaderUniformBufferArrayNonUniformIndexing = false;
         descriptor_indexing.shaderStorageBufferArrayNonUniformIndexing = false;
         descriptor_indexing.shaderInputAttachmentArrayNonUniformIndexing = false;
@@ -742,8 +747,10 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
         descriptor_indexing.descriptorBindingStorageImageUpdateAfterBind =
             bindless_heap && descriptor_indexing.descriptorBindingStorageImageUpdateAfterBind;
         descriptor_indexing.descriptorBindingStorageBufferUpdateAfterBind = false;
-        descriptor_indexing.descriptorBindingUniformTexelBufferUpdateAfterBind = false;
-        descriptor_indexing.descriptorBindingStorageTexelBufferUpdateAfterBind = false;
+        descriptor_indexing.descriptorBindingUniformTexelBufferUpdateAfterBind =
+            texel_heap && descriptor_indexing.descriptorBindingUniformTexelBufferUpdateAfterBind;
+        descriptor_indexing.descriptorBindingStorageTexelBufferUpdateAfterBind =
+            texel_heap && descriptor_indexing.descriptorBindingStorageTexelBufferUpdateAfterBind;
         descriptor_indexing.descriptorBindingUpdateUnusedWhilePending =
             bindless_heap && descriptor_indexing.descriptorBindingUpdateUnusedWhilePending;
         descriptor_indexing.descriptorBindingVariableDescriptorCount = false;

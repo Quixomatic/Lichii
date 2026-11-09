@@ -540,6 +540,18 @@ void SetupCapabilities(const Profile& profile, const Info& info, EmitContext& ct
     ctx.AddCapability(spv::Capability::ImageGatherExtended);
     ctx.AddCapability(spv::Capability::ImageQuery);
     ctx.AddCapability(spv::Capability::SampledBuffer);
+    if (ctx.uses_heap_uniform_texel || ctx.uses_heap_storage_texel) {
+        // EDEN_NX2_V2_HEAP_TEXEL: texel buffer arrays indexed by a (dynamically uniform) word.
+        if (ctx.profile.supported_spirv < 0x00010500) {
+            ctx.AddExtension("SPV_EXT_descriptor_indexing");
+        }
+        if (ctx.uses_heap_uniform_texel) {
+            ctx.AddCapability(spv::Capability::UniformTexelBufferArrayDynamicIndexing);
+        }
+        if (ctx.uses_heap_storage_texel) {
+            ctx.AddCapability(spv::Capability::StorageTexelBufferArrayDynamicIndexing);
+        }
+    }
     if (!ctx.non_uniform_ids.empty()) {
         if (ctx.profile.supported_spirv < 0x00010500)
             ctx.AddExtension("SPV_EXT_descriptor_indexing");

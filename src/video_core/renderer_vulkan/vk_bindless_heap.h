@@ -32,19 +32,41 @@ public:
     static constexpr u32 NumBindings = Shader::Backend::SPIRV::NUM_HEAP_BINDINGS;
     static constexpr u32 SampledBindings = Shader::Backend::SPIRV::NUM_HEAP_IMAGE_CLASSES * 2;
     static constexpr u32 StorageBindings = Shader::Backend::SPIRV::NUM_HEAP_STORAGE_CLASSES * 2;
+    static constexpr u32 TexelBindings =
+        Shader::Backend::SPIRV::NUM_HEAP_BINDINGS - Shader::Backend::SPIRV::HEAP_UNIFORM_TEXEL_BINDING;
+
+    /// Whether a heap binding holds texel buffers (P5a).
+    [[nodiscard]] static constexpr bool IsTexelBinding(u32 binding) {
+        return binding >= Shader::Backend::SPIRV::HEAP_UNIFORM_TEXEL_BINDING;
+    }
+    /// Whether a heap binding holds storage images.
+    [[nodiscard]] static constexpr bool IsStorageImageBinding(u32 binding) {
+        return binding >= Shader::Backend::SPIRV::HEAP_FIRST_STORAGE_BINDING &&
+               !IsTexelBinding(binding);
+    }
 
     /// The descriptor type of a heap binding.
     [[nodiscard]] static constexpr VkDescriptorType DescriptorType(u32 binding) {
-        return binding == Shader::Backend::SPIRV::HEAP_SAMPLER_BINDING
-                   ? VK_DESCRIPTOR_TYPE_SAMPLER
-               : binding >= Shader::Backend::SPIRV::HEAP_FIRST_STORAGE_BINDING
-                   ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE
-                   : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+        if (binding == Shader::Backend::SPIRV::HEAP_SAMPLER_BINDING) {
+            return VK_DESCRIPTOR_TYPE_SAMPLER;
+        }
+        if (binding == Shader::Backend::SPIRV::HEAP_UNIFORM_TEXEL_BINDING) {
+            return VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER;
+        }
+        if (IsTexelBinding(binding)) {
+            return VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER;
+        }
+        return IsStorageImageBinding(binding) ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE
+                                              : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
     }
 
     /// Whether storage images can live in the heap on this device.
     [[nodiscard]] bool StorageImages() const noexcept {
         return storage_images;
+    }
+    /// Whether texel buffers can live in the heap (EDEN_NX2_V2_HEAP_TEXEL and device support).
+    [[nodiscard]] bool TexelBuffers() const noexcept {
+        return texel_buffers;
     }
 
     /// The heap, or null when the device lacks update-after-bind sampled images, partially bound
@@ -74,20 +96,26 @@ public:
     [[nodiscard]] u32 ImageSlot(u32 binding, VkImageView view);
     /// The element of `sampler` in the sampler binding, written when new.
     [[nodiscard]] u32 SamplerSlot(VkSampler sampler);
+    /// P5a: the element of texel buffer `view` in texel binding `binding`, written when new.
+    [[nodiscard]] u32 TexelSlot(u32 binding, VkBufferView view);
 
     /// What element `slot` of `binding` holds (verify).
     [[nodiscard]] VkImageView ImageAt(u32 binding, u32 slot) const;
     [[nodiscard]] VkSampler SamplerAt(u32 slot) const;
+    [[nodiscard]] VkBufferView TexelAt(u32 binding, u32 slot) const;
 
     /// The view or sampler is destroyed: its slots are free (the GPU is done with it).
     void ForgetImageView(VkImageView view);
     void ForgetSampler(VkSampler sampler);
+    /// P5a: the buffer cache destroyed a texel buffer view (its buffer died, the GPU is done).
+    void ForgetBufferView(VkBufferView view);
 
     /// Slot writes since the last call.
     [[nodiscard]] u64 TakeWrites() noexcept;
 
 private:
-    BindlessHeap(const Device& device, Scheduler& scheduler, bool storage_images);
+    BindlessHeap(const Device& device, Scheduler& scheduler, bool storage_images,
+                 bool texel_buffers);
 
     struct Space {
         std::unordered_map<u64, u32> slots; ///< handle -> slot
@@ -112,6 +140,7 @@ private:
     std::mutex mutex;
     u64 writes{};
     bool storage_images{};
+    bool texel_buffers{};
 };
 
 } // namespace Vulkan

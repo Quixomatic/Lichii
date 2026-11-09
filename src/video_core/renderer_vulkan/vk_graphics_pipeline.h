@@ -513,6 +513,21 @@ private:
     /// EDEN_NX2_V2_BINDLESS: some textures or storage images read the heap (set 1, word table).
     bool heap_pipeline{false};
     HeapPushConstant heap_push{};
+    /// P5a (EDEN_NX2_V2_HEAP_TEXEL): per stage, the texel buffer bindings that read the heap.
+    std::array<HeapTexelMasks, NUM_STAGES> heap_texels{};
+    /// Runs a stage's buffer binds; heap texel buffers push heap words instead of descriptors.
+    template <typename Func>
+    void WithHeapTexels(size_t stage, Func&& func) {
+        const HeapTexelMasks& masks = heap_texels[stage];
+        if (masks.heap == 0) [[likely]] {
+            func();
+            return;
+        }
+        buffer_cache.runtime.BeginHeapTexels(heap_push.words, masks.heap, masks.storage,
+                                             masks.integer, heap_push.verify);
+        func();
+        buffer_cache.runtime.EndHeapTexels();
+    }
     u32 heap_reasons{}; ///< HeapReason bits of descriptors left out
     u32 heap_words{};
     std::vector<u32> last_heap_words;
