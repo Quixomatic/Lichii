@@ -124,12 +124,10 @@ private:
     /// captured (crosses a page, memory moved under it).
     [[nodiscard]] bool FillFromCapture(Recipe& recipe, bool compute, Tegra::MemoryManager& memory,
                                        TextureCache& texture_cache);
-    void Drop(const Recipe& recipe);
     /// Builds into the table, or aside and compares (verify).
     void Store(VideoCommon::V2::DrawCache::RecipeTable& table, u64 key, Recipe& built,
                const Decision& decision, bool compute);
 
-    Tegra::MaxwellDeviceMemoryManager& device_memory;
     VideoCommon::V2::DrawCache::RecipeTable graphics_table;
     VideoCommon::V2::DrawCache::RecipeTable compute_table;
     VideoCommon::V2::DrawCache::ShapeTable graphics_shapes;
@@ -138,7 +136,6 @@ private:
     VideoCommon::V2::DrawCache::SeenFilter compute_seen;
     const VideoCommon::V2::Resolve::PreDraw* parallel_pre{}; ///< EDEN_NX2_V2_PARALLEL: the shard record TakeParallelDraw took
     VideoCommon::V2::Versions::EpochMemo memo;
-    VideoCommon::V2::Versions::PageWatch watch;
     VideoCommon::V2::DrawCache::VerifySampler graphics_sampler;
     VideoCommon::V2::DrawCache::VerifySampler compute_sampler;
     Pending pending_draw;

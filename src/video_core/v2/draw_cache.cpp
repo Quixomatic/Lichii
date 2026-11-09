@@ -15,26 +15,10 @@
 
 namespace VideoCommon::V2::DrawCache {
 
-void CapturedInputs::SealPages() {
-    pages.clear();
-    for (const Capture& capture : words) {
-        if (capture.size == 0) {
-            continue;
-        }
-        const u64 first = capture.device >> Versions::PageVersions::PageBits;
-        const u64 last = (capture.device + capture.size - 1) >> Versions::PageVersions::PageBits;
-        for (u64 page = first; page <= last; ++page) {
-            pages.push_back(page);
-        }
-    }
-    std::ranges::sort(pages);
-    pages.erase(std::unique(pages.begin(), pages.end()), pages.end());
-}
-
 Miss ValidateInputs(CapturedInputs& inputs, Versions::EpochMemo& memo,
                     Versions::PageVersions& versions, bool use_memo, bool* restamped,
                     bool* buffers_changed) {
-    constexpr u64 page_size = u64{1} << Versions::PageVersions::PageBits;
+    static_cast<void>(restamped);
     const auto unchanged = [&](const ContentRange& range) {
         return use_memo ? memo.Unchanged(range.device, range.size, inputs.stamp)
                         : versions.Unchanged(range.device, range.size, inputs.stamp);
@@ -51,36 +35,14 @@ Miss ValidateInputs(CapturedInputs& inputs, Versions::EpochMemo& memo,
             *buffers_changed = true;
         }
     }
-    bool vouched = true;
-    for (const u64 page : inputs.pages) {
-        // One page each: never memoised (a probe would cost what the check does).
-        if (!versions.Unchanged(page * page_size, page_size, inputs.stamp)) {
-            vouched = false;
-            break;
-        }
-    }
-    if (vouched) {
-        return Miss::Count;
-    }
-    // Written behind: compare the words themselves. The new stamp is taken first, so a write
-    // during the compare is newer than it.
-    const u64 stamp = versions.Stamp();
+    // The words are compared with memory every time (AnyPS5's validated inputs): a guest CPU
+    // write is seen with no page kept in the write tracking (no protection changes, no trapped
+    // guest accesses). A few dozen bytes per draw, what the texture memo compares too.
     for (const Capture& capture : inputs.words) {
         if (capture.host == nullptr ||
             std::memcmp(capture.host, capture.bytes.data(), capture.size) != 0) {
             return MissFor(capture.what);
         }
-    }
-    // The content again, without the memo: a write between the first check and the new stamp
-    // (or one the memo deferred to the next epoch) would otherwise hide behind the new stamp.
-    for (const ContentRange& range : inputs.content) {
-        if (range.image && !versions.Unchanged(range.device, range.size, inputs.stamp)) {
-            return Miss::ImagePages;
-        }
-    }
-    inputs.stamp = stamp;
-    if (restamped != nullptr) {
-        *restamped = true;
     }
     return Miss::Count;
 }

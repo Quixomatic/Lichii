@@ -189,7 +189,7 @@ TEST_CASE("V2 P4: generations invalidate weak handles", "[video_core][v2_p4]") {
     REQUIRE(gens.GetEpoch(Versions::Epoch::Pipelines) == epoch + 1);
 }
 
-TEST_CASE("V2 P4: captured inputs are vouched, compared and restamped", "[video_core][v2_p4]") {
+TEST_CASE("V2 P4: captured words are compared with memory on every check", "[video_core][v2_p4]") {
     PageVersions versions;
     Versions::StreamLog log;
     Versions::CollectEpoch epoch;
@@ -213,33 +213,23 @@ TEST_CASE("V2 P4: captured inputs are vouched, compared and restamped", "[video_
     inputs.words.push_back(header);
     inputs.content.push_back({0x400000, 16 * Page, true});
     inputs.content.push_back({0x800000, Page, false});
-    inputs.SealPages();
-    REQUIRE(inputs.pages.size() == 2);
 
-    // Nothing written: vouched.
+    // Nothing written: the words compare equal.
     REQUIRE(DC::ValidateInputs(inputs, memo, versions) == DC::Miss::Count);
 
-    // Per-draw uniforms written on the handle's page, the handle itself untouched: compared
-    // equal and restamped.
-    const u64 old_stamp = inputs.stamp;
+    // Per-draw uniforms written on the handle page, the handle itself untouched: still equal.
     versions.Note(0x10020, 16, Source::Inline);
     log.Note(0x10020, 0x10030);
-    bool restamped = false;
-    REQUIRE(DC::ValidateInputs(inputs, memo, versions, true, &restamped) == DC::Miss::Count);
-    REQUIRE(restamped);
-    REQUIRE(inputs.stamp > old_stamp);
+    REQUIRE(DC::ValidateInputs(inputs, memo, versions) == DC::Miss::Count);
 
-    // The handle rewritten: a handle miss.
+    // The handle rewritten by a write no page version saw (an untrapped CPU write): a miss.
     const u32 other = 0x5678;
     std::memcpy(&cbuf[16], &other, 4);
-    versions.Note(0x10010, 4, Source::Inline);
-    log.Note(0x10010, 0x10014);
     REQUIRE(DC::ValidateInputs(inputs, memo, versions) == DC::Miss::Handle);
     std::memcpy(&cbuf[16], &handle, 4);
 
-    // A texture header changed behind a CPU write.
+    // A texture header changed the same way.
     tic[3] = 0;
-    versions.NoteCpuWrite(0x20000, 4);
     REQUIRE(DC::ValidateInputs(inputs, memo, versions) == DC::Miss::Tic);
     tic[3] = 0xab;
     REQUIRE(DC::ValidateInputs(inputs, memo, versions) == DC::Miss::Count);
@@ -256,6 +246,23 @@ TEST_CASE("V2 P4: captured inputs are vouched, compared and restamped", "[video_
     versions.Note(0x400000 + 3 * Page, 64, Source::Dma);
     log.Note(0x400000 + 3 * Page, 0x400000 + 3 * Page + 64);
     REQUIRE(DC::ValidateInputs(inputs, memo, versions) == DC::Miss::ImagePages);
+}
+
+TEST_CASE("V2 P4: a key gets a recipe on its second sighting", "[video_core][v2_p4]") {
+    DC::SeenFilter seen;
+    REQUIRE(!seen.Admit(0x1234));
+    REQUIRE(seen.Admit(0x1234));
+    REQUIRE(seen.Admit(0x1234));
+    // Many unique keys never get in.
+    u32 admitted = 0;
+    for (u64 key = 1; key <= 100000; ++key) {
+        admitted += seen.Admit(key * 0x9e3779b97f4a7c15ULL) ? 1 : 0;
+    }
+    REQUIRE(admitted == 0);
+    seen.Clear();
+    REQUIRE(!seen.Admit(0x1234));
+    REQUIRE(!seen.Admit(0));
+    REQUIRE(seen.Admit(0));
 }
 
 TEST_CASE("V2 P4: recipe table keys, LRU eviction and drops", "[video_core][v2_p4]") {

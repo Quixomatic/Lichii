@@ -38,7 +38,6 @@
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/host1x/host1x.h"
 #include "video_core/rasterizer_download_area.h"
-#include "video_core/v2/cbuf_version.h"
 #include "video_core/v2/v2_switches.h"
 #include "video_core/v2/versions.h"
 
@@ -947,11 +946,6 @@ struct Memory::Impl {
             }
         };
         gpu_device_memory->ApplyOpOnPointer(p, scratch_buffers[core], [&](DAddr address) {
-            if (VideoCommon::V2::On(VideoCommon::V2::Switch::CbufVer)) [[unlikely]] {
-                // Every write, before the per-core page shortcut below: a constant buffer version
-                // on this page must not outlive it (video_core/v2/cbuf_version.h).
-                VideoCommon::V2::CbufVer::Log().NoteCpuWrite(address, size);
-            }
             // EDEN_NX2_V2_DRAWCACHE: every trapped write moves its page's version.
             VideoCommon::V2::Versions::HookCpuWrite(address, size);
             auto& current_area = rasterizer_write_areas[core];

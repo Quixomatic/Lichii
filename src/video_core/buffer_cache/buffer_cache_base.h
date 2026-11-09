@@ -988,6 +988,7 @@ private:
     void V2NoteUsage(Buffer& buffer, u32 offset, u64 size);
     Common::ScratchBuffer<u8> tmp_buffer;
     std::vector<u8> verify_scratch; ///< EDEN_NX2_V2_CBUFVER=verify
+    std::vector<u8> version_scratch; ///< EDEN_NX2_V2_CBUFVER: guest bytes of a bind
 
     /// A command list page (Nx2CopyListPages): the GPU writes noted to it and the last copy.
     using Nx2Staging = decltype(std::declval<Runtime&>().DownloadStagingBuffer(size_t{}, true));

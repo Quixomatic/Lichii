@@ -145,17 +145,13 @@ struct ContentRange {
 struct CapturedInputs {
     u64 stamp{};
     std::vector<Capture> words;
-    std::vector<u64> pages; ///< distinct device pages of `words`
     std::vector<ContentRange> content;
 
     void Clear() {
         stamp = 0;
         words.clear();
-        pages.clear();
         content.clear();
     }
-    /// Builds `pages` from `words` (call once the words are in).
-    void SealPages();
 };
 
 /// Why a lookup did not replay.
@@ -196,14 +192,11 @@ inline constexpr std::array<const char*, NumMisses> miss_names{
     }
 }
 
-/// Validates captured inputs. Pages unchanged since the stamp vouch for every word on them;
-/// otherwise the words are compared with memory. When all words still compare equal behind changed
-/// pages, the inputs are restamped (with a stamp taken before the compare), so the next check is
-/// vouched for again. Content ranges are checked by version only.
-/// Returns Miss::Count when the inputs hold.
-/// `restamped` (optional) is set when the inputs were restamped. Without `use_memo` every range
-/// is walked (verify). Buffer content ranges never fail it: with `buffers_changed` they are checked
-/// and reported (the buffer cache synchronizes them on the replay).
+/// Validates captured inputs: content ranges by version since the stamp (through the epoch memo;
+/// without `use_memo` every range is walked, verify), the words by comparing them with memory.
+/// Returns Miss::Count when the inputs hold. Buffer content ranges never fail it: with
+/// `buffers_changed` they are checked and reported (the buffer cache synchronizes them on the
+/// replay). `restamped` is kept for callers and never set (words need no stamp).
 [[nodiscard]] Miss ValidateInputs(CapturedInputs& inputs, Versions::EpochMemo& memo,
                                   Versions::PageVersions& versions, bool use_memo = true,
                                   bool* restamped = nullptr, bool* buffers_changed = nullptr);

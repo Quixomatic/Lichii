@@ -163,25 +163,16 @@ DC::Counters& ComputeCounters() {
 
 } // Anonymous namespace
 
-DrawCacheGlue::DrawCacheGlue(Tegra::MaxwellDeviceMemoryManager& device_memory_)
-    : device_memory{device_memory_}, graphics_table{GraphicsSets}, compute_table{ComputeSets},
+DrawCacheGlue::DrawCacheGlue(Tegra::MaxwellDeviceMemoryManager&)
+    : graphics_table{GraphicsSets}, compute_table{ComputeSets},
       memo{Versions::Pages(), Versions::Stream(), Versions::Epochs()},
       graphics_sampler{DC::VerifyN()}, compute_sampler{DC::VerifyN()} {
     // EDEN_NX2_V2_PARALLEL: the shards compute shapes and keys with the same code.
     V2::Resolve::g_shard_key = &ShardKeyOf;
     V2::Resolve::ClearShapes();
-    // Guest CPU writes to the words recipes captured must trap (and move their pages' versions):
-    // their pages stay in the device memory's write tracking while a recipe holds them.
-    watch.SetTracker([this](DAddr address, u64 size, s32 delta) {
-        device_memory.UpdatePagesCachedCount(address, size, delta);
-    });
 }
 
-DrawCacheGlue::~DrawCacheGlue() {
-    graphics_table.Clear();
-    compute_table.Clear();
-    watch.Clear();
-}
+DrawCacheGlue::~DrawCacheGlue() = default;
 
 u64 DrawCacheGlue::GraphicsShape(const GraphicsPipeline& pipeline, bool is_indexed,
                                  const Tegra::Engines::Maxwell3D& maxwell3d,
@@ -442,13 +433,10 @@ bool DrawCacheGlue::FillFromCapture(Recipe& recipe, bool compute, Tegra::MemoryM
     if (capture.ineligible) {
         return false;
     }
-    // Every word's page goes into the write tracking before its bytes are checked against what
-    // the resolve read: a guest CPU write after the check traps (and moves the page's version),
-    // one before it shows in the bytes. On failure the pages held so far are let go.
+    // Every word must still hold what the resolve read (a hit compares them with memory again).
     bool ok = false;
     SCOPE_EXIT {
         if (!ok) {
-            Drop(recipe);
             recipe.inputs.words.clear();
         }
     };
@@ -469,7 +457,6 @@ bool DrawCacheGlue::FillFromCapture(Recipe& recipe, bool compute, Tegra::MemoryM
             .what = read.what,
         };
         std::memcpy(word.bytes.data(), read.bytes.data(), read.size);
-        watch.Hold(word.device, word.size);
         recipe.inputs.words.push_back(word);
         // Memory must still hold what the resolve read.
         return std::memcmp(host, read.bytes.data(), read.size) == 0;
@@ -494,7 +481,6 @@ bool DrawCacheGlue::FillFromCapture(Recipe& recipe, bool compute, Tegra::MemoryM
             return false;
         }
         word.device = *device;
-        watch.Hold(word.device, word.size);
         recipe.inputs.words.push_back(word);
         return std::memcmp(word.host, word.bytes.data(), word.size) == 0;
     };
@@ -520,15 +506,8 @@ bool DrawCacheGlue::FillFromCapture(Recipe& recipe, bool compute, Tegra::MemoryM
     recipe.push = capture.push;
     recipe.push_words = capture.push_words;
     recipe.heap_words = capture.heap_words;
-    recipe.inputs.SealPages();
     ok = true;
     return true;
-}
-
-void DrawCacheGlue::Drop(const Recipe& recipe) {
-    for (const DC::Capture& word : recipe.inputs.words) {
-        watch.Drop(word.device, word.size);
-    }
 }
 
 void DrawCacheGlue::Store(DC::RecipeTable& table, u64 key, Recipe& recipe,
@@ -552,14 +531,13 @@ void DrawCacheGlue::Store(DC::RecipeTable& table, u64 key, Recipe& recipe,
         }
     }
     bool evicted = false;
-    Recipe& slot = table.Insert(key, evicted, [this](const Recipe& old) { Drop(old); });
+    Recipe& slot = table.Insert(key, evicted);
     counters.evictions += evicted ? 1 : 0;
     ++counters.inserts;
     // The slot takes the built recipe over (a swap: the builder keeps the cleared slot's
     // storage for the next build, no deep copy).
     std::swap(slot, recipe);
     slot.key = key;
-    counters.watched_pages = watch.Pages();
 }
 
 void DrawCacheGlue::FinishDrawCapture(GraphicsPipeline& pipeline, const Decision& decision,

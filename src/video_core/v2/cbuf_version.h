@@ -6,9 +6,6 @@
 #include <array>
 #include <atomic>
 #include <cstring>
-#include <functional>
-#include <unordered_map>
-#include <unordered_set>
 #include <vector>
 
 #include "common/common_types.h"
@@ -23,11 +20,12 @@
 // - inline constant buffer data and inline-to-memory uploads (the GPU's cached writes, flushed
 //   by MemoryManager::FlushCaching before a draw resolves): exact device ranges, in order, in a
 //   write log (NoteInline);
-// - guest CPU writes: the pages of every version stay in the rasterizer's write tracking (cached
-//   count) while the table holds them, so every CPU write to them takes the trapped path, which
-//   bumps the pages' counters (NoteCpuWrite, from Core::Memory's rasterizer write handler);
-// - other host writes the rasterizer is told about from any thread (invalidations): the same
-//   per-page counters (NoteHost);
+// - other host writes the rasterizer is told about from any thread (invalidations): per-page
+//   counters (NoteHost);
+// - guest CPU writes: every version keeps a copy of its bytes, and a lookup compares the range's
+//   bytes in guest memory with it. A CPU write that changed any byte ends the version at its next
+//   lookup, with no page kept in the write tracking: no protection changes, no trapped guest
+//   reads or writes (the copy is what the shader reads, so equal bytes are the same version);
 // - GPU writes (shaders, DMA): the caller only takes this path for ranges the buffer cache does
 //   not hold GPU-modified.
 // Versions live for one scheduler tick, as the stream buffer allocation they reference.
@@ -46,22 +44,9 @@ public:
     void NoteInline(DAddr begin, DAddr end);
     /// A host write of [address, address + size) (any thread).
     void NoteHost(DAddr address, u64 size);
-    /// A guest CPU write to a rasterizer-tracked page (any thread): counted for watched pages.
-    void NoteCpuWrite(DAddr address, u64 size) {
-        const u64 page = address >> PageBits;
-        if (watch[page % PageBuckets].load(std::memory_order_relaxed) == 0 &&
-            ((address + size - 1) >> PageBits) == page) [[likely]] {
-            return;
-        }
-        NoteHost(address, size);
-    }
     /// Everything before is unknown.
     void NoteBoundary() {
         boundary.fetch_add(1, std::memory_order_release);
-    }
-    /// A version's table starts or stops watching `page` (a page index).
-    void Watch(u64 page, s32 delta) {
-        watch[page % PageBuckets].fetch_add(static_cast<u32>(delta), std::memory_order_acq_rel);
     }
 
     [[nodiscard]] u64 Sequence() const {
@@ -87,58 +72,37 @@ private:
     std::atomic<u64> sequence{};
     std::atomic<u64> boundary{};
     std::array<std::atomic<u32>, PageBuckets> pages{};
-    std::array<std::atomic<u32>, PageBuckets> watch{};
 };
 
 /// The process-wide write log (one GPU, one drawing thread).
 [[nodiscard]] WriteLog& Log();
 
-/// Versions by {device address, size}, direct mapped. Every entry keeps its pages in the
-/// rasterizer's write tracking (through the tracker, the device memory's cached page counts) so
-/// CPU writes to them always trap; pages no entry holds any more are let go once more than
-/// MaxIdlePages pile up.
+/// Versions by {device address, size}, direct mapped. Each entry keeps the bytes it was made
+/// from; Find compares them with what guest memory holds now.
 template <typename Ref>
 class VersionTable {
 public:
     static constexpr size_t NumEntries = 1024;
-    static constexpr size_t MaxIdlePages = 1024;
-    /// Changes the cached count of the device pages of [address, address + size) by delta.
-    using Tracker = std::function<void(DAddr address, u64 size, s32 delta)>;
 
     explicit VersionTable(WriteLog& log_) : log{&log_} {}
 
-    /// A new owner (buffer cache): forgets every entry and page without the old tracker (its
-    /// memory is gone) and uses `tracker` from now on.
-    void Reset(Tracker tracker_) {
-        for (const auto& [page, refs] : page_refs) {
-            log->Watch(page, -1);
-        }
-        page_refs.clear();
-        idle.clear();
+    /// A new owner (buffer cache): forgets every entry.
+    void Reset() {
         for (Entry& entry : entries) {
             entry = Entry{};
         }
-        tracker = std::move(tracker_);
     }
 
-    /// Starts watching the pages of [address, address + size) for a version about to be made, and
-    /// returns their write counters' sum: take it before reading the bytes.
-    [[nodiscard]] u64 Track(DAddr address, u32 size) {
-        ForEachPage(address, size, [&](u64 page) {
-            if (page_refs.try_emplace(page, 0).second) {
-                // Into the write tracking before the sum is read: a later write traps.
-                if (tracker) {
-                    tracker(page << WriteLog::PageBits, WriteLog::PageSize, 1);
-                }
-                log->Watch(page, 1);
-                idle.insert(page);
-            }
-        });
+    /// The host write counters' sum of [address, address + size) for a version about to be made:
+    /// take it before reading the bytes.
+    [[nodiscard]] u64 Begin(DAddr address, u32 size) const {
         return log->PageSum(address, size);
     }
 
-    /// The version of [address, address + size) made in `tick`, if nothing wrote it since.
-    [[nodiscard]] const Ref* Find(DAddr address, u32 size, u64 tick) {
+    /// The version of [address, address + size) made in `tick`, if nothing wrote it since:
+    /// no inline or host write logged over it, and `current` (what guest memory holds now, `size`
+    /// bytes) equal to its bytes.
+    [[nodiscard]] const Ref* Find(DAddr address, u32 size, u64 tick, const u8* current) {
         Entry& entry = entries[Slot(address, size)];
         if (!entry.valid || entry.address != address || entry.size != size ||
             entry.tick != tick || entry.boundary != log->Boundary()) {
@@ -156,20 +120,19 @@ public:
             entry.valid = false;
             return nullptr;
         }
+        if (current == nullptr || entry.bytes.size() != size ||
+            std::memcmp(entry.bytes.data(), current, size) != 0) {
+            // Written behind (a guest CPU write): a new version replaces it.
+            return nullptr;
+        }
         return &entry.ref;
     }
 
-    /// Records a new version whose pages Track took (`page_sum` its result); `bytes` (verify
-    /// only) are what it holds.
+    /// Records a new version made from `bytes` (`size` of them) after Begin returned `page_sum`.
     void Insert(DAddr address, u32 size, u64 tick, const Ref& ref, u64 page_sum,
-                const u8* bytes = nullptr) {
+                const u8* bytes) {
         Entry& entry = entries[Slot(address, size)];
-        Hold(address, size);
-        if (entry.holds) {
-            Drop(entry.address, entry.size);
-        }
         entry.valid = true;
-        entry.holds = true;
         entry.address = address;
         entry.size = size;
         entry.tick = tick;
@@ -177,38 +140,24 @@ public:
         entry.sequence = log->Sequence();
         entry.page_sum = page_sum;
         entry.ref = ref;
-        if (bytes != nullptr) {
-            entry.bytes.assign(bytes, bytes + size);
-        } else {
-            entry.bytes.clear();
-        }
+        entry.bytes.assign(bytes, bytes + size);
     }
 
-    /// The bytes Insert was given for the version Find returned (verify).
+    /// The bytes of the version of [address, address + size) (verify).
     [[nodiscard]] const std::vector<u8>& Bytes(DAddr address, u32 size) const {
         return entries[Slot(address, size)].bytes;
     }
 
-    /// Drops every entry and stops watching every page (through the tracker).
+    /// Drops every entry.
     void Clear() {
         for (Entry& entry : entries) {
-            if (entry.holds) {
-                Drop(entry.address, entry.size);
-            }
-            entry = Entry{};
+            entry.valid = false;
         }
-        ReleaseIdle();
-    }
-
-    /// Pages kept in the write tracking now (tests, stats).
-    [[nodiscard]] size_t TrackedPages() const {
-        return page_refs.size();
     }
 
 private:
     struct Entry {
         bool valid{};
-        bool holds{}; ///< its pages count in page_refs
         DAddr address{};
         u32 size{};
         u64 tick{};
@@ -219,50 +168,6 @@ private:
         std::vector<u8> bytes;
     };
 
-    template <typename Func>
-    static void ForEachPage(DAddr address, u32 size, Func&& func) {
-        if (size == 0) {
-            return;
-        }
-        const u64 first = address >> WriteLog::PageBits;
-        const u64 last = (address + size - 1) >> WriteLog::PageBits;
-        for (u64 page = first; page <= last; ++page) {
-            func(page);
-        }
-    }
-
-    void Hold(DAddr address, u32 size) {
-        ForEachPage(address, size, [&](u64 page) {
-            u32& refs = page_refs[page];
-            if (refs++ == 0) {
-                idle.erase(page);
-            }
-        });
-    }
-
-    void Drop(DAddr address, u32 size) {
-        ForEachPage(address, size, [&](u64 page) {
-            const auto it = page_refs.find(page);
-            if (it != page_refs.end() && it->second != 0 && --it->second == 0) {
-                idle.insert(page);
-            }
-        });
-        if (idle.size() > MaxIdlePages) {
-            ReleaseIdle();
-        }
-    }
-
-    void ReleaseIdle() {
-        for (const u64 page : idle) {
-            page_refs.erase(page);
-            if (tracker) {
-                tracker(page << WriteLog::PageBits, WriteLog::PageSize, -1);
-            }
-            log->Watch(page, -1);
-        }
-        idle.clear();
-    }
-
     static size_t Slot(DAddr address, u32 size) {
         u64 key = (address >> 4) ^ (static_cast<u64>(size) << 40);
         key ^= key >> 29;
@@ -272,10 +177,7 @@ private:
     }
 
     WriteLog* log;
-    Tracker tracker;
     std::array<Entry, NumEntries> entries{};
-    std::unordered_map<u64, u32> page_refs; ///< tracked page -> entries holding it
-    std::unordered_set<u64> idle;           ///< tracked pages no entry holds
 };
 
 /// The table of a buffer cache runtime's stream references (one buffer cache at a time).

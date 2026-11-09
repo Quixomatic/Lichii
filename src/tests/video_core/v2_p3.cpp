@@ -363,102 +363,82 @@ TEST_CASE("V2 P3 constant buffer versions", "[video_core][v2_p3]") {
     constexpr DAddr A = 0x10'0000;
     constexpr DAddr B = 0x10'0400;
     constexpr DAddr Far = 0x80'0000;
-    table->Insert(A, 0x100, 7, 1, table->Track(A, 0x100));
-    table->Insert(B, 0x200, 7, 2, table->Track(B, 0x200));
-    REQUIRE(*table->Find(A, 0x100, 7) == 1);
-    REQUIRE(*table->Find(B, 0x200, 7) == 2);
+    // Guest memory stand-ins for A and B.
+    std::vector<u8> a(0x100, 0x11);
+    std::vector<u8> b(0x200, 0x22);
+    table->Insert(A, 0x100, 7, 1, table->Begin(A, 0x100), a.data());
+    table->Insert(B, 0x200, 7, 2, table->Begin(B, 0x200), b.data());
+    REQUIRE(*table->Find(A, 0x100, 7, a.data()) == 1);
+    REQUIRE(*table->Find(B, 0x200, 7, b.data()) == 2);
     // Another tick (the stream allocation may be gone) or size: no version.
-    REQUIRE(table->Find(A, 0x100, 8) == nullptr);
-    REQUIRE(table->Find(A, 0x80, 7) == nullptr);
+    REQUIRE(table->Find(A, 0x100, 8, a.data()) == nullptr);
+    REQUIRE(table->Find(A, 0x80, 7, a.data()) == nullptr);
     // An inline write next to A but inside B ends B's version only.
     log->NoteInline(A + 0x100, A + 0x500);
-    REQUIRE(*table->Find(A, 0x100, 7) == 1);
-    REQUIRE(table->Find(B, 0x200, 7) == nullptr);
+    REQUIRE(*table->Find(A, 0x100, 7, a.data()) == 1);
+    REQUIRE(table->Find(B, 0x200, 7, b.data()) == nullptr);
     // Writes elsewhere keep A, even many of them, as long as the log still holds them.
     for (int i = 0; i < 100; ++i) {
         log->NoteInline(Far + i * 16, Far + i * 16 + 16);
-        REQUIRE(table->Find(A, 0x100, 7) != nullptr);
+        REQUIRE(table->Find(A, 0x100, 7, a.data()) != nullptr);
     }
     // Past the log's size without a lookup: unknown, so the version ends.
-    table->Insert(B, 0x200, 7, 3, table->Track(B, 0x200));
+    table->Insert(B, 0x200, 7, 3, table->Begin(B, 0x200), b.data());
     for (size_t i = 0; i < WriteLog::LogSize + 1; ++i) {
         log->NoteInline(Far, Far + 4);
     }
-    REQUIRE(table->Find(B, 0x200, 7) == nullptr);
+    REQUIRE(table->Find(B, 0x200, 7, b.data()) == nullptr);
     // A host write to A's page ends it; one to another page doesn't.
-    table->Insert(A, 0x100, 7, 4, table->Track(A, 0x100));
+    table->Insert(A, 0x100, 7, 4, table->Begin(A, 0x100), a.data());
     log->NoteHost(Far, 4);
-    REQUIRE(*table->Find(A, 0x100, 7) == 4);
+    REQUIRE(*table->Find(A, 0x100, 7, a.data()) == 4);
     log->NoteHost(A + 0x800, 4);
-    REQUIRE(table->Find(A, 0x100, 7) == nullptr);
-    // A command list boundary ends every version; a long host write too.
-    table->Insert(A, 0x100, 7, 5, table->Track(A, 0x100));
-    REQUIRE(table->Find(A, 0x100, 7) != nullptr);
+    REQUIRE(table->Find(A, 0x100, 7, a.data()) == nullptr);
+    // A boundary ends every version; a long host write too.
+    table->Insert(A, 0x100, 7, 5, table->Begin(A, 0x100), a.data());
+    REQUIRE(table->Find(A, 0x100, 7, a.data()) != nullptr);
     log->NoteBoundary();
-    REQUIRE(table->Find(A, 0x100, 7) == nullptr);
-    table->Insert(A, 0x100, 7, 6, table->Track(A, 0x100));
+    REQUIRE(table->Find(A, 0x100, 7, a.data()) == nullptr);
+    table->Insert(A, 0x100, 7, 6, table->Begin(A, 0x100), a.data());
     log->NoteHost(Far, (WriteLog::MaxHostPages + 1) << WriteLog::PageBits);
-    REQUIRE(table->Find(A, 0x100, 7) == nullptr);
-    // Verify keeps the bytes of a version.
+    REQUIRE(table->Find(A, 0x100, 7, a.data()) == nullptr);
+    // A version keeps its bytes; without the current bytes nothing is found.
     const std::array<u8, 4> bytes{1, 2, 3, 4};
-    table->Insert(A, 4, 9, 7, table->Track(A, 4), bytes.data());
+    table->Insert(A, 4, 9, 7, table->Begin(A, 4), bytes.data());
     REQUIRE(table->Bytes(A, 4) == std::vector<u8>{1, 2, 3, 4});
+    REQUIRE(table->Find(A, 4, 9, nullptr) == nullptr);
     table->Clear();
-    REQUIRE(table->Find(A, 4, 9) == nullptr);
+    REQUIRE(table->Find(A, 4, 9, bytes.data()) == nullptr);
 }
 
-TEST_CASE("V2 P3 constant buffer version pages stay in the write tracking",
+TEST_CASE("V2 P3 constant buffer versions see guest CPU writes through their bytes",
           "[video_core][v2_p3]") {
     using namespace VideoCommon::V2::CbufVer;
     auto log = std::make_unique<WriteLog>();
     auto table = std::make_unique<VersionTable<int>>(*log);
-    std::vector<std::pair<DAddr, s32>> calls;
-    table->Reset([&](DAddr address, u64 size, s32 delta) {
-        REQUIRE(size == WriteLog::PageSize);
-        calls.emplace_back(address, delta);
-    });
     constexpr DAddr A = 0x10'0f80; // straddles two pages
-    table->Insert(A, 0x100, 1, 1, table->Track(A, 0x100));
-    REQUIRE(calls.size() == 2);
-    REQUIRE(calls[0] == std::pair<DAddr, s32>{0x10'0000, 1});
-    REQUIRE(calls[1] == std::pair<DAddr, s32>{0x10'1000, 1});
-    REQUIRE(table->TrackedPages() == 2);
-    // A second version on the same pages tracks nothing new.
-    table->Insert(A + 0x20, 0x40, 1, 2, table->Track(A + 0x20, 0x40));
-    REQUIRE(calls.size() == 2);
-    // Every CPU write to a watched page ends the versions there, even repeated ones; writes to
-    // pages no version watches don't touch the counters.
-    REQUIRE(table->Find(A, 0x100, 1) != nullptr);
-    log->NoteCpuWrite(0x80'0000, 4);
-    REQUIRE(table->Find(A, 0x100, 1) != nullptr);
-    log->NoteCpuWrite(0x10'1004, 4);
-    REQUIRE(table->Find(A, 0x100, 1) == nullptr);
-    table->Insert(A, 0x100, 1, 3, table->Track(A, 0x100));
-    REQUIRE(table->Find(A, 0x100, 1) != nullptr);
-    log->NoteCpuWrite(0x10'1004, 4);
-    REQUIRE(table->Find(A, 0x100, 1) == nullptr);
-    // Clear lets every page go through the tracker.
-    table->Clear();
-    REQUIRE(table->TrackedPages() == 0);
-    s32 balance = 0;
-    for (const auto& [address, delta] : calls) {
-        balance += delta;
+    std::vector<u8> guest(0x100);
+    for (size_t i = 0; i < guest.size(); ++i) {
+        guest[i] = static_cast<u8>(i);
     }
-    REQUIRE(balance == 0);
-    // Pages of replaced versions are let go once more than MaxIdlePages are idle.
-    calls.clear();
-    for (u64 i = 0; i < VersionTable<int>::MaxIdlePages + 8; ++i) {
-        const DAddr address = 0x100'0000 + i * WriteLog::PageSize;
-        table->Insert(address, 0x40, 2, 4, table->Track(address, 0x40));
-    }
-    REQUIRE(table->TrackedPages() <=
-            VersionTable<int>::NumEntries + VersionTable<int>::MaxIdlePages + 1);
-    table->Clear();
-    balance = 0;
-    for (const auto& [address, delta] : calls) {
-        balance += delta;
-    }
-    REQUIRE(balance == 0);
+    table->Insert(A, 0x100, 1, 1, table->Begin(A, 0x100), guest.data());
+    REQUIRE(table->Find(A, 0x100, 1, guest.data()) != nullptr);
+    // A CPU write nobody was told about (no trap, no log entry) that changes a byte ends the
+    // version at the next lookup; one that writes the same value does not.
+    guest[0x90] = 0xff;
+    REQUIRE(table->Find(A, 0x100, 1, guest.data()) == nullptr);
+    guest[0x90] = 0x90;
+    table->Insert(A, 0x100, 1, 2, table->Begin(A, 0x100), guest.data());
+    guest[0x10] = 0x10;
+    REQUIRE(*table->Find(A, 0x100, 1, guest.data()) == 2);
+    // The last byte counts too.
+    guest[0xff] ^= 1;
+    REQUIRE(table->Find(A, 0x100, 1, guest.data()) == nullptr);
+    // Reset forgets everything (a new buffer cache).
+    guest[0xff] ^= 1;
+    table->Insert(A, 0x100, 1, 3, table->Begin(A, 0x100), guest.data());
+    table->Reset();
+    REQUIRE(table->Find(A, 0x100, 1, guest.data()) == nullptr);
 }
 
 namespace {
