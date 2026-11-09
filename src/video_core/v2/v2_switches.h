@@ -42,6 +42,10 @@ enum class Switch : u32 {
     MarkDirty, ///< EDEN_NX2_V2_MARKDIRTY: a submit only marks command buffer state dirty (P3)
     LeanDraw,  ///< EDEN_NX2_V2_LEANDRAW: per-draw debug hooks behind one cached gate (P3)
     DrawCache, ///< EDEN_NX2_V2_DRAWCACHE: fingerprint -> recipe draw/dispatch cache (P4)
+    Commit,    ///< EDEN_NX2_V2_COMMIT: pure cache lookups + serial commit stage, no global lock
+    CommitLocked, ///< EDEN_NX2_V2_COMMIT_LOCKED: with COMMIT=1, keep the global cache locks
+    Writeback, ///< EDEN_NX2_V2_WRITEBACK: deferred GPU->guest writebacks queued in commit (P5a)
+    HeapTexel, ///< EDEN_NX2_V2_HEAP_TEXEL: texel buffers in the bindless heap (P5a)
     Count,
 };
 
@@ -65,6 +69,10 @@ inline constexpr std::array<const char*, static_cast<size_t>(Switch::Count)> swi
     "MARKDIRTY",
     "LEANDRAW",
     "DRAWCACHE",
+    "COMMIT",
+    "COMMIT_LOCKED",
+    "WRITEBACK",
+    "HEAP_TEXEL",
 };
 
 namespace Detail {

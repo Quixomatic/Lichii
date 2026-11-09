@@ -128,6 +128,9 @@ add_library(video_core STATIC
     v2/hazard.h
     v2/ir.h
     v2/cbuf_version.cpp
+    v2/commit.cpp
+    v2/commit.h
+    v2/epoch_publish.h
     v2/cbuf_version.h
     v2/continued_draw.h
     v2/desc_cache.h
@@ -155,6 +158,7 @@ add_library(video_core STATIC
     v2/v2_stats.h
     v2/v2_switches.cpp
     v2/v2_switches.h
+    v2/va_map.h
     v2/versions.cpp
     v2/versions.h
     pending_maps.h
