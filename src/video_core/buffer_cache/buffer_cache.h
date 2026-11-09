@@ -1167,6 +1167,7 @@ void BufferCache<P>::RecordGraphicsBuffers(VideoCommon::V2::DrawCache::BufferRec
         }
         recipe.stamp = stamp;
         recipe.valid = true;
+        recipe.MergeRanges();
     } else {
         static_cast<void>(is_indexed);
         static_cast<void>(stamp);
@@ -1200,13 +1201,15 @@ bool BufferCache<P>::ReplayGraphicsBuffers(const VideoCommon::V2::DrawCache::Buf
             return false;
         }
         const Versions::Generations& gens = Versions::Gens();
+        // F2-07: one check of the recipe's merged ranges, not one memo query per binding.
+        replay_all_unchanged = recipe.AllUnchanged(memo, Versions::Pages());
         // A recorded buffer still bindable for [address, address + size): alive, the range within
         // the recorded one and unchanged since the recipe's stamp.
         const auto usable = [&](const DC::BufferBind* bind, DAddr address, u64 size) {
             return bind != nullptr && bind->Contains(address, size) &&
                    gens.Get(Versions::Kind::Buffer, bind->buffer_id) == bind->generation &&
                    slot_buffers.contains(BufferId{bind->buffer_id}) &&
-                   memo.Unchanged(address, size, recipe.stamp);
+                   (replay_all_unchanged || memo.Unchanged(address, size, recipe.stamp));
         };
         auto& flags = maxwell3d->dirty.flags;
         graphics_segments.clear();
@@ -1442,7 +1445,7 @@ void BufferCache<P>::ReplayHostStageBuffers(size_t stage,
                   VideoCommon::StreamUniformReusable<Runtime>) {
         const u32 stage_index = static_cast<u32>(stage);
         const auto unchanged = [&](DAddr address, u64 size) {
-            return memo.Unchanged(address, size, recipe.stamp);
+            return replay_all_unchanged || memo.Unchanged(address, size, recipe.stamp);
         };
         // The binding still uses the recorded buffer object (same slot and generation) for a
         // range within the recorded one, unchanged since the recipe's stamp.

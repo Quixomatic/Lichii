@@ -23,12 +23,16 @@ Miss ValidateInputs(CapturedInputs& inputs, Versions::EpochMemo& memo,
         return use_memo ? memo.Unchanged(range.device, range.size, inputs.stamp)
                         : versions.Unchanged(range.device, range.size, inputs.stamp);
     };
-    // Content first: a written image page is a miss whatever the words say. Buffer pages are not
-    // inputs of anything a replay skips (the buffer cache synchronizes every bound range on the
-    // replay as on a resolve): they are only reported.
+    // Content ranges are not inputs of anything a hit skips. Buffer pages: the buffer cache
+    // synchronizes every bound range the versions can't vouch for on the replay, as a resolve
+    // does. Image pages (F2-00/F2-09, O(1) per hit): the replay prepares its views exactly as a
+    // resolve prepares the same views (uploads, alias copies) whenever the texture cache's
+    // prepare epoch moved, which every CPU-modified mark and newer alias moves; the views
+    // themselves follow from the handle words and descriptors compared below. Verify
+    // (use_memo = false) still walks the image pages to tell deferred CPU writes apart.
     for (const ContentRange& range : inputs.content) {
         if (range.image) {
-            if (!unchanged(range)) {
+            if (!use_memo && !unchanged(range)) {
                 return Miss::ImagePages;
             }
         } else if (buffers_changed != nullptr && !*buffers_changed && !unchanged(range)) {

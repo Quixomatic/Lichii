@@ -3,8 +3,10 @@
 
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <cstring>
+#include <utility>
 #include <span>
 #include <string>
 #include <vector>
@@ -307,6 +309,12 @@ struct BufferRecipe {
     std::vector<BufferBind> uniform; ///< stage, index = constant buffer slot
     std::vector<BufferBind> storage; ///< stage, index = storage buffer slot
     std::vector<BufferBind> texture; ///< stage, index = texture buffer slot
+    /// F2-07 (§5.3.2, one validation per recipe): the recorded ranges merged, and the write
+    /// sequence before the last check that found all of them unchanged since `stamp` (while no
+    /// write reached their buckets since, they still are: no walk, no per-binding query).
+    std::vector<std::pair<DAddr, DAddr>> merged;
+    mutable u64 checked_sequence{};
+    mutable bool checked{};
 
     void Clear() {
         valid = false;
@@ -317,6 +325,63 @@ struct BufferRecipe {
         uniform.clear();
         storage.clear();
         texture.clear();
+        merged.clear();
+        checked = false;
+        checked_sequence = 0;
+    }
+    /// Builds `merged` from the bindings (after recording them).
+    void MergeRanges() {
+        merged.clear();
+        const auto add = [&](const BufferBind& bind) {
+            if (bind.size != 0) {
+                merged.emplace_back(bind.device_addr, bind.device_addr + bind.size);
+            }
+        };
+        if (has_index) {
+            add(index);
+        }
+        for (const auto* list : {&vertex, &uniform, &storage, &texture}) {
+            for (const BufferBind& bind : *list) {
+                add(bind);
+            }
+        }
+        std::sort(merged.begin(), merged.end());
+        size_t out = 0;
+        for (size_t i = 0; i < merged.size(); ++i) {
+            if (out != 0 && merged[i].first <= merged[out - 1].second) {
+                merged[out - 1].second = (std::max)(merged[out - 1].second, merged[i].second);
+            } else {
+                merged[out++] = merged[i];
+            }
+        }
+        merged.resize(out);
+    }
+    /// Whether every recorded range is unchanged since `stamp` (one check per recipe while
+    /// nothing wrote their buckets; else one memo query per merged range).
+    [[nodiscard]] bool AllUnchanged(Versions::EpochMemo& memo,
+                                    const Versions::PageVersions& versions) const {
+        if (checked) {
+            bool written = false;
+            for (const auto& [begin, end] : merged) {
+                if (versions.WrittenSince(checked_sequence, begin, end)) {
+                    written = true;
+                    break;
+                }
+            }
+            if (!written) {
+                return true;
+            }
+        }
+        const u64 sequence = versions.Sequence();
+        for (const auto& [begin, end] : merged) {
+            if (!memo.Unchanged(begin, end - begin, stamp)) {
+                checked = false;
+                return false;
+            }
+        }
+        checked = true;
+        checked_sequence = sequence;
+        return true;
     }
     [[nodiscard]] static const BufferBind* Find(const std::vector<BufferBind>& binds, u32 stage,
                                                 u32 index) {

@@ -580,6 +580,7 @@ public:
     u32 replay_binds_synced{};
     u32 replay_skip_vertex_mask{};
     bool replay_skip_index{};
+    bool replay_all_unchanged{}; ///< F2-07: this replay's recipe ranges are all unchanged
     bool any_buffer_uploaded = false;
     /// Indirectly read banks of native programs already uploaded this frame.
     std::unordered_set<DAddr> native_indirect_uniforms_this_frame;

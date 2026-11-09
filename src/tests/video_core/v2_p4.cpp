@@ -294,9 +294,12 @@ TEST_CASE("V2 P4: captured words are compared with memory on every check", "[vid
             DC::Miss::Count);
     REQUIRE(buffers);
 
-    // A sampled image's pages written: a miss whatever the words say.
+    // A sampled image's pages written: no miss on the hit path (F2-00/F2-09: the replay prepares
+    // its views by the texture cache's prepare epoch, as a resolve would), a miss for verify's
+    // walk, which tells deferred CPU writes apart.
     versions.Note(0x400000 + 3 * Page, 64, Source::Dma);
-    REQUIRE(DC::ValidateInputs(inputs, memo, versions) == DC::Miss::ImagePages);
+    REQUIRE(DC::ValidateInputs(inputs, memo, versions) == DC::Miss::Count);
+    REQUIRE(DC::ValidateInputs(inputs, memo, versions, false) == DC::Miss::ImagePages);
 }
 
 TEST_CASE("V2 P4: a key gets a recipe on its second sighting", "[video_core][v2_p4]") {
