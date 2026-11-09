@@ -47,7 +47,9 @@
 #include "video_core/nx2_download_trace.h"
 #include "video_core/surface.h"
 #include "video_core/texture_cache/types.h"
+#include "video_core/v2/commit.h"
 #include "video_core/v2/draw_cache.h"
+#include "video_core/v2/va_map.h"
 
 namespace VideoCommon {
 
@@ -549,6 +551,16 @@ public:
     }
 
     Common::SpinRecursiveMutex mutex;
+
+    /// Pipeline v2 P5a (EDEN_NX2_V2_COMMIT): the renderer's commit state (null: old path). Builds
+    /// the lock-free page map from the page table.
+    void SetCommit(V2::Commit::Context* context);
+
+    /// P5a pure lookup: the registered buffer covering [device_addr, device_addr + size) from
+    /// the lock-free page map (NULL_BUFFER_ID when none does; any thread reads it, P6 shards
+    /// validate the slot by its generation).
+    [[nodiscard]] BufferId LookupBuffer(DAddr device_addr, u32 size) const;
+
     Runtime& runtime;
     // EDEN_NX2_V2_DRAWCACHE buffer replay (ReplayGraphicsBuffers): bindings bound from the recipe
     // or synced, and the vertex buffers that skip their synchronization in this replay.
@@ -918,6 +930,9 @@ private:
 
     // Covers the device address space (MaxwellDeviceTraits::device_virtual_bits).
     std::array<BufferId, ((1ULL << 36) >> CACHING_PAGEBITS)> page_table;
+    /// P5a: page_table published for lock-free readers (written with it by the commit owner).
+    V2::Commit::Context* commit = nullptr;
+    std::unique_ptr<V2::VaMap<CACHING_PAGEBITS, 36>> v2_pages;
     Common::ScratchBuffer<u8> tmp_buffer;
     std::vector<u8> verify_scratch; ///< EDEN_NX2_V2_CBUFVER=verify
 

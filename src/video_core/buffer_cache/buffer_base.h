@@ -129,6 +129,10 @@ public:
         write_tick = write_tick_;
     }
 
+    /// Pipeline v2 P5a (EDEN_NX2_V2_COMMIT, commit owner only): the last submission (scheduler
+    /// tick) that used the buffer (DXVK's track id).
+    u64 v2_track_id = 0;
+
 private:
     VAddr cpu_addr = 0;
     BufferFlagBits flags{};

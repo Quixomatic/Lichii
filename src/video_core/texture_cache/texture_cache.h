@@ -627,6 +627,16 @@ bool TextureCache<P>::PublishComputeCollisionImage(u32 index) {
 
 template <class P>
 void TextureCache<P>::FillImageViews(std::span<ImageViewInOut> views, bool compute, bool blacklist) {
+    if (commit != nullptr) [[unlikely]] {
+        if (!commit->verify) {
+            FillImageViewsCommit(views, compute, blacklist);
+            return;
+        }
+        // COMMIT=verify: what the lookups would request, then the old path, compared.
+        commit->BeginSegment();
+        PredictImageViews(views, compute, blacklist);
+        BeginVerify();
+    }
     bool has_blacklisted = false;
     do {
         has_deleted_images = false;
@@ -637,6 +647,10 @@ void TextureCache<P>::FillImageViews(std::span<ImageViewInOut> views, bool compu
             view.id = VisitImageView(view.index, compute);
             if (blacklist) {
                 if (view.blacklist && view.id != NULL_IMAGE_VIEW_ID) {
+                    if (commit != nullptr) [[unlikely]] {
+                        V2::Commit::LogStep(V2::Commit::Kind::Rescale,
+                                            V2::Commit::Resource::ImageView, view.id.index);
+                    }
                     const ImageViewBase& image_view = slot_image_views[view.id];
                     if (image_view.image_id == NULL_IMAGE_ID) {
                         continue;
@@ -648,6 +662,9 @@ void TextureCache<P>::FillImageViews(std::span<ImageViewInOut> views, bool compu
             }
         }
     } while (has_deleted_images || (blacklist && has_blacklisted));
+    if (commit != nullptr) [[unlikely]] {
+        FinishVerify("image views");
+    }
 }
 
 template <class P>
@@ -680,11 +697,40 @@ bool TextureCache<P>::ResolveMemoizedTextures(SampledTextureMemo& memo,
         }
     }
     has_deleted_images = false;
+    if (commit != nullptr && !commit->verify) [[unlikely]] {
+        // COMMIT=1: the same prepares, as requests applied by one commit.
+        for (size_t i = 0; i < handle_addresses.size(); ++i) {
+            const SampledTextureMemo::Entry& entry = memo.entries[i];
+            views[i] =
+                ImageViewInOut{.index = entry.view_index, .blacklist = false, .id = entry.view};
+            samplers[i] = entry.sampler;
+        }
+        if (!PrepareViewsCommit(views)) {
+            memo.valid = false;
+            return false;
+        }
+        return true;
+    }
+    if (commit != nullptr) [[unlikely]] {
+        commit->BeginSegment();
+        v2_prepared.clear();
+        for (size_t i = 0; i < handle_addresses.size(); ++i) {
+            PushPrepareRequest(memo.entries[i].view);
+        }
+        BeginVerify();
+    }
     for (size_t i = 0; i < handle_addresses.size(); ++i) {
         const SampledTextureMemo::Entry& entry = memo.entries[i];
         views[i] = ImageViewInOut{.index = entry.view_index, .blacklist = false, .id = entry.view};
         samplers[i] = entry.sampler;
+        if (commit != nullptr && PreparesImage(slot_image_views, entry.view)) [[unlikely]] {
+            V2::Commit::LogStep(V2::Commit::Kind::ImagePrepare, V2::Commit::Resource::ImageView,
+                                entry.view.index);
+        }
         PrepareImageView(entry.view, false, false);
+    }
+    if (commit != nullptr) [[unlikely]] {
+        FinishVerify("memoized views");
     }
     if (has_deleted_images) {
         // Preparing an image deleted others: the full path resolves the views again.
@@ -696,12 +742,33 @@ bool TextureCache<P>::ResolveMemoizedTextures(SampledTextureMemo& memo,
 
 template <class P>
 bool TextureCache<P>::PrepareRecipeViews(std::span<const ImageViewInOut> views) {
+    if (commit != nullptr && !commit->verify) [[unlikely]] {
+        // COMMIT=1: pure checks of the recipe's views into prepare requests, one commit.
+        return PrepareViewsCommit(views);
+    }
+    if (commit != nullptr) [[unlikely]] {
+        commit->BeginSegment();
+        v2_prepared.clear();
+        for (const ImageViewInOut& view : views) {
+            if (view.id) {
+                PushPrepareRequest(view.id);
+            }
+        }
+        BeginVerify();
+    }
     has_deleted_images = false;
     for (const ImageViewInOut& view : views) {
         if (!view.id) {
             continue;
         }
+        if (commit != nullptr && PreparesImage(slot_image_views, view.id)) [[unlikely]] {
+            V2::Commit::LogStep(V2::Commit::Kind::ImagePrepare, V2::Commit::Resource::ImageView,
+                                view.id.index);
+        }
         PrepareImageView(view.id, false, false);
+    }
+    if (commit != nullptr) [[unlikely]] {
+        FinishVerify("recipe views");
     }
     return !has_deleted_images;
 }
@@ -926,6 +993,24 @@ typename P::Sampler* TextureCache<P>::GetSampler(u32 index, bool compute) {
 
 template <class P>
 SamplerId TextureCache<P>::GetSamplerId(u32 index, bool compute) {
+    CommitSamplerLookup lookup{};
+    if (commit != nullptr) [[unlikely]] {
+        // EDEN_NX2_V2_COMMIT: a pure lookup; only a changed table entry or a new sampler is a
+        // request, committed on demand (the pipeline needs the id at once).
+        lookup = LookupSampler(index, compute);
+        auto& stats = V2::Commit::Stats::Get();
+        if (!lookup.request) {
+            if (commit->stats) {
+                V2::Commit::Stats::Count(stats.lookup_hits);
+            }
+            if (!commit->verify) {
+                return lookup.id;
+            }
+        } else if (commit->stats) {
+            V2::Commit::Stats::Count(stats.lookup_misses);
+            V2::Commit::Stats::Count(stats.requests[static_cast<size_t>(lookup.kind)]);
+        }
+    }
     auto& table = compute ? channel_state->compute_sampler_table : channel_state->graphics_sampler_table;
     if (index > table.current_limit) {
         LOG_TRACE(HW_GPU, "Invalid sampler index={}", index);
@@ -933,9 +1018,16 @@ SamplerId TextureCache<P>::GetSamplerId(u32 index, bool compute) {
     }
     auto const [descriptor, is_new] = table.Read(*gpu_memory, index);
     if (is_new) {
+        const size_t samplers_before = slot_samplers.size();
         auto const id = FindSampler(descriptor, compute);
         table.bound_ids[index] = id;
+        if (commit != nullptr && commit->verify) [[unlikely]] {
+            VerifySamplerLookup(index, lookup, id, slot_samplers.size() != samplers_before);
+        }
         return id;
+    }
+    if (commit != nullptr && commit->verify) [[unlikely]] {
+        VerifySamplerLookup(index, lookup, table.bound_ids[index], false);
     }
     return table.bound_ids[index];
 }
@@ -1077,6 +1169,23 @@ bool TextureCache<P>::RescaleRenderTargets() {
 
 template <class P>
 void TextureCache<P>::UpdateRenderTargets(bool is_clear) {
+    if (commit != nullptr) [[unlikely]] {
+        if (!commit->verify) {
+            UpdateRenderTargetsCommit(is_clear);
+            return;
+        }
+        commit->BeginSegment();
+        PushRenderTargetRequests(is_clear);
+        BeginVerify();
+        UpdateRenderTargetsImpl(is_clear);
+        FinishVerify("render targets");
+        return;
+    }
+    UpdateRenderTargetsImpl(is_clear);
+}
+
+template <class P>
+void TextureCache<P>::UpdateRenderTargetsImpl(bool is_clear) {
     using namespace VideoCommon::Dirty;
     struct ClearingScope {
         bool& flag;
@@ -1089,11 +1198,24 @@ void TextureCache<P>::UpdateRenderTargets(bool is_clear) {
     if (!flags[Dirty::RenderTargets]) {
         for (size_t index = 0; index < NUM_RT; ++index) {
             ImageViewId& color_buffer_id = render_targets.color_buffer_ids[index];
+            if (commit != nullptr && PreparesImage(slot_image_views, color_buffer_id))
+                [[unlikely]] {
+                V2::Commit::LogStep(V2::Commit::Kind::RenderTargetPrepare,
+                                    V2::Commit::Resource::ImageView, color_buffer_id.index);
+            }
             PrepareImageView(color_buffer_id, true, is_clear && IsFullClear(color_buffer_id));
         }
         const ImageViewId depth_buffer_id = render_targets.depth_buffer_id;
+        if (commit != nullptr && PreparesImage(slot_image_views, depth_buffer_id)) [[unlikely]] {
+            V2::Commit::LogStep(V2::Commit::Kind::RenderTargetPrepare,
+                                V2::Commit::Resource::ImageView, depth_buffer_id.index);
+        }
         PrepareImageView(depth_buffer_id, true, is_clear && IsFullClear(depth_buffer_id));
         return;
+    }
+    if (commit != nullptr) [[unlikely]] {
+        V2::Commit::LogStep(V2::Commit::Kind::RenderTargets, V2::Commit::Resource::RenderTargets,
+                            0);
     }
 
     const VideoCommon::RenderTargets previous_render_targets = render_targets;
@@ -1173,6 +1295,12 @@ ImageViewId TextureCache<P>::VisitImageView(u32 index, bool compute) {
     if (is_new) {
         if (IsValidEntry(*gpu_memory, descriptor)) {
             const auto [pair, is_new_tc] = channel_state->image_views.try_emplace(descriptor);
+            if (commit != nullptr) [[unlikely]] {
+                V2::Commit::LogStep(is_new_tc ? V2::Commit::Kind::ViewCreate
+                                              : V2::Commit::Kind::ViewBind,
+                                    V2::Commit::Resource::ImageView,
+                                    is_new_tc ? V2::Commit::InvalidSlot : pair->second.index);
+            }
             if (is_new_tc) {
                 const auto failed_images = [&]() -> u32 {
                     if constexpr (requires { runtime.FailedImages(); }) {
@@ -1193,18 +1321,34 @@ ImageViewId TextureCache<P>::VisitImageView(u32 index, bool compute) {
                 if (pair->second != NULL_IMAGE_VIEW_ID) {
                     image_view_descriptors[pair->second].emplace_back(current_channel_id,
                                                                       descriptor);
+                    if (commit != nullptr) [[unlikely]] {
+                        channel_state->v2_views.Insert(descriptor,
+                                                       std::hash<TICEntry>{}(descriptor),
+                                                       pair->second.index);
+                        V2::Commit::NoteEffect(commit, V2::Commit::EffectCreate);
+                        V2::Commit::LogSlot(pair->second.index);
+                    }
                 }
             }
             PrepareImageView(pair->second, false, false);
             table.bound_ids[index] = pair->second;
             return pair->second;
         }
+        if (commit != nullptr) [[unlikely]] {
+            V2::Commit::LogStep(V2::Commit::Kind::ViewBind, V2::Commit::Resource::ImageView,
+                                NULL_IMAGE_VIEW_ID.index);
+        }
         table.bound_ids[index] = NULL_IMAGE_VIEW_ID;
         return NULL_IMAGE_VIEW_ID;
     }
     const auto id = table.bound_ids[index];
-    if (id != NULL_IMAGE_VIEW_ID)
+    if (id != NULL_IMAGE_VIEW_ID) {
+        if (commit != nullptr) [[unlikely]] {
+            V2::Commit::LogStep(V2::Commit::Kind::ImagePrepare, V2::Commit::Resource::ImageView,
+                                id.index);
+        }
         PrepareImageView(id, false, false);
+    }
     return id;
 }
 
@@ -2051,6 +2195,13 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::TextureUpload};
     VideoCommon::V2::Stats::CountMutation(VideoCommon::V2::Stats::Mutation::TextureRefresh,
                                           image.guest_size_bytes);
+    if (commit != nullptr) [[unlikely]] {
+        V2::Commit::NoteEffect(commit, V2::Commit::EffectUpload);
+        if (commit->stats && image.v2_track_id < commit->submission) {
+            // Unused by this submission so far: P5b can hoist it ahead (transfer queue).
+            V2::Commit::Stats::Count(V2::Commit::Stats::Get().hoistable);
+        }
+    }
 
     image.flags &= ~ImageFlagBits::CpuModified;
 
@@ -2862,6 +3013,9 @@ bool TextureCache<P>::ScaleUp(Image& image) {
         return false;
     }
     VideoCommon::V2::Stats::CountMutation(VideoCommon::V2::Stats::Mutation::Rescale);
+    if (commit != nullptr) [[unlikely]] {
+        V2::Commit::NoteEffect(commit, V2::Commit::EffectRescale);
+    }
     InvalidateScale(image);
     return true;
 }
@@ -2873,6 +3027,9 @@ bool TextureCache<P>::ScaleDown(Image& image) {
         return false;
     }
     VideoCommon::V2::Stats::CountMutation(VideoCommon::V2::Stats::Mutation::Rescale);
+    if (commit != nullptr) [[unlikely]] {
+        V2::Commit::NoteEffect(commit, V2::Commit::EffectRescale);
+    }
     InvalidateScale(image);
     return true;
 }
@@ -3251,6 +3408,7 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
             }
             CopyImage(new_image_id, aliased->id, aliased->copies);
             SetModificationTick(slot_images, new_image, overlap.modification_tick);
+            v2_sole_newest = nullptr;
             continue;
         }
         if (True(overlap.flags & ImageFlagBits::GpuModified)) {
@@ -3266,6 +3424,7 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
                 runtime.CopyImage(new_image, overlap, copies);
             }
             SetModificationTick(slot_images, new_image, overlap.modification_tick);
+            v2_sole_newest = nullptr;
         }
         if (True(overlap.flags & ImageFlagBits::Tracked)) {
             UntrackImage(overlap, copy_object.id);
@@ -3442,6 +3601,11 @@ SamplerId TextureCache<P>::FindSampler(const TSCEntry& config, bool compute) {
     const auto [pair, is_new] = channel_state->samplers.try_emplace(config);
     if (is_new) {
         pair->second = slot_samplers.insert(runtime, config);
+        if (commit != nullptr) [[unlikely]] {
+            channel_state->v2_samplers.Insert(config, std::hash<TSCEntry>{}(config),
+                                              pair->second.index);
+            V2::Commit::NoteEffect(commit, V2::Commit::EffectCreate);
+        }
     }
     return pair->second;
 }
@@ -3932,6 +4096,12 @@ void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
     ImageBase& image = slot_images[image_id];
     ++images_deleted;
     VideoCommon::V2::Stats::CountMutation(VideoCommon::V2::Stats::Mutation::ImageDelete);
+    if (commit != nullptr) [[unlikely]] {
+        V2::Commit::NoteEffect(commit, V2::Commit::EffectDelete);
+        if (v2_sole_newest == &image) {
+            v2_sole_newest = nullptr;
+        }
+    }
     VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Invalidation);
     // Drop every decode still queued for it, whatever IsDecoding says: an image re-decoded while
     // a decode was in flight has two, and the first to finish clears the flag. A decode left
@@ -4061,6 +4231,10 @@ void TextureCache<P>::RemoveImageViewReferences(std::span<const ImageViewId> rem
             if (const auto it = image_views.find(descriptor);
                 it != image_views.end() && it->second == removed) {
                 image_views.erase(it);
+                if (commit != nullptr) [[unlikely]] {
+                    channel_storage[channel].v2_views.Erase(descriptor,
+                                                            std::hash<TICEntry>{}(descriptor));
+                }
             }
         }
         image_view_descriptors.erase(refs);
@@ -4097,6 +4271,10 @@ void TextureCache<P>::MarkModification(ImageBase& image) noexcept {
     }
     image.flags |= ImageFlagBits::GpuModified;
     SetModificationTick(slot_images, image, ++modification_tick);
+    if (commit != nullptr) [[unlikely]] {
+        v2_sole_newest = &image;
+        V2::Commit::NoteEffect(commit, V2::Commit::EffectModify);
+    }
 }
 
 template <class P>
@@ -4130,6 +4308,9 @@ void TextureCache<P>::SynchronizeAliases(ImageId image_id) {
     }
     VideoCommon::V2::Stats::CountMutation(VideoCommon::V2::Stats::Mutation::AliasSync,
                                           aliased_images.size());
+    if (commit != nullptr) [[unlikely]] {
+        V2::Commit::NoteEffect(commit, V2::Commit::EffectAlias);
+    }
     const bool can_rescale = ImageCanRescale(image);
     if (any_rescaled) {
         if (can_rescale) {
@@ -4139,6 +4320,7 @@ void TextureCache<P>::SynchronizeAliases(ImageId image_id) {
         }
     }
     SetModificationTick(slot_images, image, most_recent_tick);
+    v2_sole_newest = nullptr;
     image.newest_alias_tick = most_recent_tick;
     if (any_modified) {
         image.flags |= ImageFlagBits::GpuModified;
@@ -4223,6 +4405,10 @@ void TextureCache<P>::PrepareImage(ImageId image_id, bool is_modification, bool 
         MarkModification(image);
     }
     lru_cache.Touch(image.lru_index, frame_tick);
+    if (commit != nullptr) [[unlikely]] {
+        image.v2_track_id = (std::max)(image.v2_track_id, commit->submission);
+        image.v2_touched_frame = frame_tick;
+    }
 }
 
 template <class P>
@@ -4436,6 +4622,423 @@ template <class P>
 void TextureCache<P>::OnGPUASRegister([[maybe_unused]] size_t map_id) {
     gpu_page_table_storage.emplace_back();
     gpu_page_table_storage.emplace_back();
+}
+
+// Pipeline v2 P5a (EDEN_NX2_V2_COMMIT): pure lookups, requests and their appliers.
+
+template <class P>
+auto TextureCache<P>::LookupImageView(u32 index, bool compute) const -> CommitViewLookup {
+    const auto& table =
+        compute ? channel_state->compute_image_table : channel_state->graphics_image_table;
+    index = Tegra::Texture::TextureHeaderIndex(index, table.current_limit,
+                                               gpu_memory->UsesNativeTiling());
+    if (index > table.current_limit) {
+        return {NULL_IMAGE_VIEW_ID, V2::Commit::Kind::ImagePrepare, false};
+    }
+    const auto [descriptor, is_new] = table.Peek(*gpu_memory, index);
+    if (!is_new) {
+        const ImageViewId id = table.bound_ids[index];
+        return {id, V2::Commit::Kind::ImagePrepare, id != NULL_IMAGE_VIEW_ID};
+    }
+    if (!IsValidEntry(*gpu_memory, descriptor)) {
+        // The table entry becomes the null view: a table update.
+        return {NULL_IMAGE_VIEW_ID, V2::Commit::Kind::ViewBind, true};
+    }
+    const u32 found = channel_state->v2_views.Find(descriptor, std::hash<TICEntry>{}(descriptor));
+    if (found != V2::PublishedMap<TICEntry>::Missing) {
+        return {ImageViewId{found}, V2::Commit::Kind::ViewBind, true};
+    }
+    return {ImageViewId{V2::Commit::InvalidSlot}, V2::Commit::Kind::ViewCreate, true};
+}
+
+template <class P>
+u32 TextureCache<P>::PredictPrepare(ImageViewId id, bool is_modification, bool invalidate) const {
+    if (!PreparesImage(slot_image_views, id)) {
+        return V2::Commit::EffectNone;
+    }
+    const ImageBase& image = slot_images[slot_image_views[id].image_id];
+    bool newer_alias = false;
+    if (!image.aliased_images.empty() && image.newest_alias_tick > image.modification_tick) {
+        newer_alias = std::ranges::any_of(image.aliased_images, [&](const AliasedImage& alias) {
+            return slot_images[alias.id].modification_tick > image.modification_tick;
+        });
+    }
+    return V2::Commit::PredictPrepare({
+        .prepares = true,
+        .cpu_modified = True(image.flags & ImageFlagBits::CpuModified),
+        .newer_alias = newer_alias,
+        .modification = is_modification,
+        .invalidate = invalidate,
+    });
+}
+
+template <class P>
+u32 TextureCache<P>::PredictSegmentPrepare(ImageViewId id, bool is_modification,
+                                           bool invalidate) {
+    if (!PreparesImage(slot_image_views, id)) {
+        return V2::Commit::EffectNone;
+    }
+    const ImageId image_id = slot_image_views[id].image_id;
+    u32 effects = PredictPrepare(id, is_modification, invalidate);
+    if (std::ranges::find(v2_prepared, image_id) != v2_prepared.end()) {
+        effects &= ~(V2::Commit::EffectUpload | V2::Commit::EffectAlias);
+    } else {
+        v2_prepared.push_back(image_id);
+    }
+    return effects;
+}
+
+template <class P>
+auto TextureCache<P>::LookupSampler(u32 index, bool compute) const -> CommitSamplerLookup {
+    const auto& table =
+        compute ? channel_state->compute_sampler_table : channel_state->graphics_sampler_table;
+    if (index > table.current_limit) {
+        return {NULL_SAMPLER_ID, V2::Commit::Kind::SamplerBind, false};
+    }
+    const auto [descriptor, is_new] = table.Peek(*gpu_memory, index);
+    if (!is_new) {
+        return {table.bound_ids[index], V2::Commit::Kind::SamplerBind, false};
+    }
+    if (std::ranges::all_of(descriptor.raw, [](u64 value) { return value == 0; })) {
+        return {NULL_SAMPLER_ID, V2::Commit::Kind::SamplerBind, true};
+    }
+    const u32 found =
+        channel_state->v2_samplers.Find(descriptor, std::hash<TSCEntry>{}(descriptor));
+    if (found != V2::PublishedMap<TSCEntry>::Missing) {
+        return {SamplerId{found}, V2::Commit::Kind::SamplerBind, true};
+    }
+    return {SamplerId{V2::Commit::InvalidSlot}, V2::Commit::Kind::SamplerCreate, true};
+}
+
+template <class P>
+void TextureCache<P>::VerifySamplerLookup(u32 index, const CommitSamplerLookup& lookup,
+                                          SamplerId result, bool created) {
+    const bool expected_create = lookup.request && lookup.kind == V2::Commit::Kind::SamplerCreate;
+    const bool same = created == expected_create && (created || lookup.id == result);
+    auto& stats = V2::Commit::Stats::Get();
+    V2::Commit::Stats::Count(stats.verify_draws);
+    if (same) {
+        return;
+    }
+    V2::Commit::Stats::Count(stats.verify_mismatches);
+    static std::atomic<u32> logged{};
+    if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+        LOG_WARNING(HW_GPU,
+                    "V2 commit verify: sampler index {}: the lookup said {} (sampler {}), the "
+                    "old path {} sampler {}",
+                    index,
+                    lookup.request ? V2::Commit::kind_names[static_cast<size_t>(lookup.kind)]
+                                   : "ready",
+                    lookup.id.index, created ? "created" : "used", result.index);
+    }
+}
+
+template <class P>
+void TextureCache<P>::PredictImageViews(std::span<const ImageViewInOut> views, bool compute,
+                                        bool blacklist) {
+    namespace C = V2::Commit;
+    const auto& table =
+        compute ? channel_state->compute_image_table : channel_state->graphics_image_table;
+    v2_view_ids.resize(views.size());
+    v2_prepared.clear();
+    u64 hits = 0;
+    u64 misses = 0;
+    for (size_t index = 0; index < views.size(); ++index) {
+        const ImageViewInOut& view = views[index];
+        const CommitViewLookup lookup = LookupImageView(view.index, compute);
+        if (!lookup.request) {
+            v2_view_ids[index] = lookup.id.index;
+            ++hits;
+            continue;
+        }
+        C::Request request{};
+        request.kind = lookup.kind;
+        request.resource = C::Resource::ImageView;
+        request.address = view.index;
+        request.size = table.changes;
+        request.arg = compute ? C::ArgCompute : 0;
+        request.slot = lookup.id.index;
+        if (lookup.kind != C::Kind::ViewCreate && lookup.id != NULL_IMAGE_VIEW_ID) {
+            request.effects = PredictSegmentPrepare(lookup.id, false, false);
+        }
+        if (lookup.kind == C::Kind::ImagePrepare) {
+            ++hits;
+        } else {
+            ++misses;
+        }
+        const u32 proxy = commit->list.Push(request, true);
+        v2_view_ids[index] = proxy;
+        if (blacklist && view.blacklist &&
+            !(lookup.kind == C::Kind::ViewBind && lookup.id == NULL_IMAGE_VIEW_ID)) {
+            C::Request rescale{};
+            rescale.kind = C::Kind::Rescale;
+            rescale.resource = C::Resource::ImageView;
+            rescale.slot = proxy;
+            rescale.arg = C::ArgBlacklist;
+            commit->list.Push(rescale);
+        }
+    }
+    if (commit->stats) {
+        auto& stats = C::Stats::Get();
+        C::Stats::Count(stats.lookup_hits, hits);
+        C::Stats::Count(stats.lookup_misses, misses);
+    }
+}
+
+template <class P>
+void TextureCache<P>::FillImageViewsCommit(std::span<ImageViewInOut> views, bool compute,
+                                           bool blacklist) {
+    const u64 start = commit->stats ? Nx2Profile::Now() : 0;
+    bool has_blacklisted = false;
+    do {
+        has_deleted_images = false;
+        has_blacklisted = false;
+        commit->BeginSegment();
+        PredictImageViews(views, compute, blacklist);
+        commit->stage.Apply(commit->list, [&](const V2::Commit::Request& request) {
+            return ApplyTextureRequest(request, has_blacklisted);
+        });
+        for (size_t index = 0; index < views.size(); ++index) {
+            views[index].id = ImageViewId{commit->list.Resolve(v2_view_ids[index])};
+        }
+    } while (has_deleted_images || (blacklist && has_blacklisted));
+    NoteCommitTime(start);
+}
+
+template <class P>
+void TextureCache<P>::PushPrepareRequest(ImageViewId id) {
+    if (!PreparesImage(slot_image_views, id)) {
+        return;
+    }
+    V2::Commit::Request request{};
+    request.kind = V2::Commit::Kind::ImagePrepare;
+    request.resource = V2::Commit::Resource::ImageView;
+    request.slot = id.index;
+    request.arg = V2::Commit::ArgDirect;
+    request.effects = PredictSegmentPrepare(id, false, false);
+    commit->list.Push(request);
+}
+
+template <class P>
+bool TextureCache<P>::PrepareViewsCommit(std::span<const ImageViewInOut> views) {
+    const u64 start = commit->stats ? Nx2Profile::Now() : 0;
+    commit->BeginSegment();
+    v2_prepared.clear();
+    for (const ImageViewInOut& view : views) {
+        if (view.id) {
+            PushPrepareRequest(view.id);
+        }
+    }
+    if (commit->stats) {
+        auto& stats = V2::Commit::Stats::Get();
+        // A recipe's view needing nothing but the LRU touch is a lock-free hit.
+        u64 hits = 0;
+        for (const V2::Commit::Request& request : commit->list.Requests()) {
+            hits += request.effects == 0 ? 1 : 0;
+        }
+        V2::Commit::Stats::Count(stats.lookup_hits, hits);
+        V2::Commit::Stats::Count(stats.lookup_misses, commit->list.Requests().size() - hits);
+    }
+    has_deleted_images = false;
+    bool unused = false;
+    commit->stage.Apply(commit->list, [&](const V2::Commit::Request& request) {
+        return ApplyTextureRequest(request, unused);
+    });
+    NoteCommitTime(start);
+    return !has_deleted_images;
+}
+
+template <class P>
+void TextureCache<P>::PushRenderTargetRequests(bool is_clear) {
+    namespace C = V2::Commit;
+    auto& flags = maxwell3d->dirty.flags;
+    if (flags[Dirty::RenderTargets]) {
+        C::Request request{};
+        request.kind = C::Kind::RenderTargets;
+        request.resource = C::Resource::RenderTargets;
+        request.address = is_clear ? 1 : 0;
+        request.slot = 0;
+        commit->list.Push(request);
+        return;
+    }
+    // Clean render target registers: the bound views stay (a deletion or rescale of one dirties
+    // them), so only what drawing into them does is left to decide.
+    v2_prepared.clear();
+    const bool skip = !commit->verify;
+    for (size_t index = 0; index <= NUM_RT; ++index) {
+        const ImageViewId id = index < NUM_RT ? render_targets.color_buffer_ids[index]
+                                              : render_targets.depth_buffer_id;
+        if (!PreparesImage(slot_image_views, id)) {
+            continue;
+        }
+        const bool invalidate = is_clear && IsFullClear(id);
+        if (skip && !invalidate) {
+            // P5a item 4: an image already GPU-modified and the sole holder of the newest
+            // modification tick, touched this frame, with nothing to upload or copy in, needs no
+            // request at all (the old path's re-mark changed no ordering decision).
+            const ImageBase& image = slot_images[slot_image_views[id].image_id];
+            const bool alone_newest =
+                v2_sole_newest == &image && image.modification_tick == modification_tick;
+            constexpr ImageFlagBits special = ImageFlagBits::SparseTiles |
+                                              ImageFlagBits::SparseLayers |
+                                              ImageFlagBits::UnwrittenSparse;
+            const C::RenderTargetState state{
+                .generation_matches = true,
+                .cpu_modified = True(image.flags & ImageFlagBits::CpuModified),
+                .newer_alias = (PredictPrepare(id, false, false) & C::EffectAlias) != 0,
+                .gpu_modified = True(image.flags & ImageFlagBits::GpuModified),
+                .newest_modification = alone_newest,
+                .special = True(image.flags & special),
+                .touched_this_frame = image.v2_touched_frame == frame_tick,
+            };
+            if (!C::RenderTargetNeedsPrepare(state)) {
+                if (commit->stats) {
+                    C::Stats::Count(recipe_render_targets ? C::Stats::Get().rt_skipped
+                                                          : C::Stats::Get().lookup_hits);
+                }
+                continue;
+            }
+        }
+        C::Request request{};
+        request.kind = C::Kind::RenderTargetPrepare;
+        request.resource = C::Resource::ImageView;
+        request.slot = id.index;
+        request.arg = C::ArgModification | (invalidate ? C::ArgInvalidate : 0);
+        request.effects = PredictSegmentPrepare(id, true, invalidate);
+        commit->list.Push(request);
+    }
+}
+
+template <class P>
+void TextureCache<P>::UpdateRenderTargetsCommit(bool is_clear) {
+    const u64 start = commit->stats ? Nx2Profile::Now() : 0;
+    commit->BeginSegment();
+    PushRenderTargetRequests(is_clear);
+    if (commit->stats && recipe_render_targets) {
+        V2::Commit::Stats::Count(V2::Commit::Stats::Get().rt_requests,
+                                 commit->list.Requests().size());
+    }
+    recipe_render_targets = false;
+    bool unused = false;
+    commit->stage.Apply(commit->list, [&](const V2::Commit::Request& request) {
+        return ApplyTextureRequest(request, unused);
+    });
+    NoteCommitTime(start);
+}
+
+template <class P>
+u32 TextureCache<P>::ApplyTextureRequest(const V2::Commit::Request& request,
+                                         bool& has_blacklisted) {
+    namespace C = V2::Commit;
+    const bool compute = (request.arg & C::ArgCompute) != 0;
+    switch (request.kind) {
+    case C::Kind::ViewCreate:
+    case C::Kind::ViewBind:
+        return VisitImageView(static_cast<u32>(request.address), compute).index;
+    case C::Kind::ImagePrepare: {
+        const ImageViewId id{request.slot};
+        if ((request.arg & C::ArgDirect) != 0) {
+            PrepareImageView(id, false, false);
+            return request.slot;
+        }
+        // The lookup's view is still what VisitImageView finds while no image was deleted and
+        // the table didn't change since the lookups (the old path's !is_new case): prepare it.
+        const auto& table =
+            compute ? channel_state->compute_image_table : channel_state->graphics_image_table;
+        if (!has_deleted_images && table.changes == request.size) {
+            PrepareImageView(id, false, false);
+            return request.slot;
+        }
+        return VisitImageView(static_cast<u32>(request.address), compute).index;
+    }
+    case C::Kind::Rescale: {
+        const ImageViewId id{request.slot};
+        if (request.slot == C::InvalidSlot || id == NULL_IMAGE_VIEW_ID) {
+            return request.slot;
+        }
+        V2::Commit::LogStep(C::Kind::Rescale, C::Resource::ImageView, request.slot);
+        const ImageViewBase& image_view = slot_image_views[id];
+        if (image_view.image_id == NULL_IMAGE_ID) {
+            return request.slot;
+        }
+        auto& image = slot_images[image_view.image_id];
+        has_blacklisted |= ScaleDown(image);
+        image.scale_rating = 0;
+        return request.slot;
+    }
+    case C::Kind::RenderTargets:
+        UpdateRenderTargetsImpl(request.address != 0);
+        return 0;
+    case C::Kind::RenderTargetPrepare:
+        PrepareImageView(ImageViewId{request.slot}, true, (request.arg & C::ArgInvalidate) != 0);
+        return request.slot;
+    default:
+        return request.slot;
+    }
+}
+
+template <class P>
+void TextureCache<P>::BeginVerify() {
+    commit->log.Begin();
+    V2::Commit::g_log = &commit->log;
+}
+
+template <class P>
+void TextureCache<P>::FinishVerify(const char* what) {
+    namespace C = V2::Commit;
+    C::g_log = nullptr;
+    const C::CompareResult result = C::Compare(commit->list.Requests(), commit->log.Entries());
+    auto& stats = C::Stats::Get();
+    C::Stats::Count(stats.verify_draws);
+    C::Stats::Count(stats.verify_dependent, result.dependent);
+    if (result.mismatches == 0) {
+        return;
+    }
+    C::Stats::Count(stats.verify_mismatches, result.mismatches);
+    static std::atomic<u32> logged{};
+    if (logged.fetch_add(1, std::memory_order_relaxed) >= 32) {
+        return;
+    }
+    const auto requests = commit->list.Requests();
+    const auto entries = commit->log.Entries();
+    const size_t at = result.first_mismatch;
+    static constexpr std::array<const char*, 5> fields{"none", "count", "kind", "resource",
+                                                       "effects"};
+    std::string want = "none";
+    std::string got = "none";
+    if (at < requests.size()) {
+        want = fmt::format("{} {:#x} effects {:#x}",
+                           C::kind_names[static_cast<size_t>(requests[at].kind)], requests[at].slot,
+                           requests[at].effects);
+    }
+    if (at < entries.size()) {
+        got = fmt::format("{} {:#x} effects {:#x}",
+                          C::kind_names[static_cast<size_t>(entries[at].kind)], entries[at].slot,
+                          entries[at].effects);
+    }
+    LOG_WARNING(HW_GPU,
+                "V2 commit verify: {}: {} predicted requests, the old path made {} steps; first "
+                "difference at {} ({}): predicted {}, old path {}",
+                what, requests.size(), entries.size(), at,
+                fields[static_cast<size_t>(result.field)], want, got);
+}
+
+template <class P>
+void TextureCache<P>::NoteCommitTime(u64 start_ns) {
+    if (!commit->stats) {
+        return;
+    }
+    namespace C = V2::Commit;
+    auto& stats = C::Stats::Get();
+    const auto counters = commit->stage.TakeCounters();
+    for (size_t kind = 0; kind < C::NumKinds; ++kind) {
+        if (counters.requests[kind] != 0) {
+            C::Stats::Count(stats.requests[kind], counters.requests[kind]);
+        }
+    }
+    C::Stats::Count(stats.proxies_patched, counters.proxies_patched);
+    C::Stats::Count(stats.commits);
+    C::Stats::Count(stats.commit_ns, Nx2Profile::Now() - start_ns);
 }
 
 } // namespace VideoCommon

@@ -439,6 +439,23 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
     if (VideoCommon::V2::On(VideoCommon::V2::Switch::Bindless)) [[unlikely]] {
         bindless_heap = BindlessHeap::Create(device, scheduler);
     }
+    if (VideoCommon::V2::On(VideoCommon::V2::Switch::Commit)) [[unlikely]] {
+        namespace V2 = VideoCommon::V2;
+        if (!Settings::values.use_asynchronous_gpu_emulation.GetValue()) {
+            // Synchronous GPU emulation draws on whichever guest thread submits: no single owner.
+            LOG_WARNING(Render_Vulkan,
+                        "EDEN_NX2_V2_COMMIT needs asynchronous GPU emulation; it stays off");
+        } else {
+            commit = std::make_unique<V2::Commit::Context>();
+            commit->verify = V2::Verify(V2::Switch::Commit);
+            commit->stats = V2::Stats::Enabled();
+            texture_cache.SetCommit(commit.get());
+            buffer_cache.SetCommit(commit.get());
+            LOG_INFO(Render_Vulkan, "EDEN_NX2_V2_COMMIT: {}",
+                     commit->verify ? "verify (the old path runs, predictions compared)"
+                                    : "pure lookups and a commit stage");
+        }
+    }
 }
 
 RasterizerVulkan::~RasterizerVulkan() {

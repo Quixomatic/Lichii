@@ -50,6 +50,7 @@
 #include "video_core/texture_cache/types.h"
 #include "video_core/textures/texture.h"
 #include "video_core/textures/unswizzle_worker.h"
+#include "video_core/v2/commit.h"
 
 namespace Tegra {
 namespace Control {
@@ -130,6 +131,11 @@ public:
     // TODO: still relies on bad iterators :(
     std::unordered_map<TICEntry, ImageViewId> image_views;
     std::unordered_map<TSCEntry, SamplerId> samplers;
+
+    /// Pipeline v2 P5a (EDEN_NX2_V2_COMMIT): lock-free published copies of image_views and
+    /// samplers, written by the commit owner, read by pure lookups (P6: from shard threads).
+    V2::PublishedMap<TICEntry> v2_views{V2::Commit::Epochs()};
+    V2::PublishedMap<TSCEntry> v2_samplers{V2::Commit::Epochs()};
 
     TextureCacheGPUMap* gpu_page_table = nullptr;
     TextureCacheGPUMap* sparse_page_table = nullptr;
@@ -435,7 +441,75 @@ public:
 
     Common::SpinRecursiveMutex mutex;
 
+    // Pipeline v2 P5a (EDEN_NX2_V2_COMMIT): pure lookups and the commit stage's appliers.
+    /// Sets the renderer's commit state (null: the old in-lookup mutations).
+    void SetCommit(V2::Commit::Context* context) noexcept {
+        commit = context;
+    }
+
+    /// What VisitImageView(index) would do, without doing it: the view (or none) and whether
+    /// it needs a request (a table update, a creation, or a prepare). Pure.
+    struct CommitViewLookup {
+        ImageViewId id{};
+        V2::Commit::Kind kind = V2::Commit::Kind::ImagePrepare;
+        bool request = false;
+    };
+    [[nodiscard]] CommitViewLookup LookupImageView(u32 index, bool compute) const;
+
+    /// The effects PrepareImageView(id, ...) would have. Pure.
+    [[nodiscard]] u32 PredictPrepare(ImageViewId id, bool is_modification, bool invalidate) const;
+
+    /// What GetSamplerId(index) would do: the sampler and whether it needs a request. Pure.
+    struct CommitSamplerLookup {
+        SamplerId id{};
+        V2::Commit::Kind kind = V2::Commit::Kind::SamplerBind;
+        bool request = false;
+    };
+    [[nodiscard]] CommitSamplerLookup LookupSampler(u32 index, bool compute) const;
+
+    /// P5a item 4: the next UpdateRenderTargets comes from a recipe replay (stats only).
+    void NoteRecipeRenderTargets() noexcept {
+        recipe_render_targets = true;
+    }
+
 private:
+    /// FillImageViews with COMMIT=1: pure lookups into requests, then one commit.
+    void FillImageViewsCommit(std::span<ImageViewInOut> views, bool compute, bool blacklist);
+    /// COMMIT=verify: the lookups' requests for these views (into commit->list), unapplied.
+    void PredictImageViews(std::span<const ImageViewInOut> views, bool compute, bool blacklist);
+    /// UpdateRenderTargets with COMMIT=1, and its requests (pure).
+    void UpdateRenderTargetsCommit(bool is_clear);
+    void PushRenderTargetRequests(bool is_clear);
+    /// The old UpdateRenderTargets body.
+    void UpdateRenderTargetsImpl(bool is_clear);
+    /// Prepares views through requests and one commit (memo hits, recipe replays). False when
+    /// preparing deleted images.
+    bool PrepareViewsCommit(std::span<const ImageViewInOut> views);
+    /// Pushes a direct prepare request for a view (pure; skips views that prepare nothing).
+    void PushPrepareRequest(ImageViewId id);
+    /// The effects of preparing `id` (sampled), with images an earlier request of the open
+    /// segment prepares counted as having nothing left to upload or copy in.
+    u32 PredictSegmentPrepare(ImageViewId id, bool is_modification, bool invalidate);
+    /// COMMIT=verify: checks GetSamplerId's lookup against what the old path did.
+    void VerifySamplerLookup(u32 index, const CommitSamplerLookup& lookup, SamplerId result,
+                             bool created);
+    /// Applies one texture request; returns the slot it resolved.
+    u32 ApplyTextureRequest(const V2::Commit::Request& request, bool& has_blacklisted);
+    /// Compares commit->list (the predictions) with the verify log, counts and logs.
+    void FinishVerify(const char* what);
+    /// Starts recording the old path's steps (verify).
+    void BeginVerify();
+    /// The commit stats' timing of one commit.
+    void NoteCommitTime(u64 start_ns);
+
+    V2::Commit::Context* commit = nullptr;
+    std::vector<u32> v2_view_ids;                            ///< FillImageViewsCommit's ids
+    boost::container::small_vector<ImageId, 16> v2_prepared; ///< images the segment prepares
+    /// The image the last MarkModification marked, while it holds the newest modification tick
+    /// alone (P5a item 4: re-marking it changes nothing).
+    const ImageBase* v2_sole_newest = nullptr;
+    bool recipe_render_targets = false;
+
     /// Iterate over all page indices in a range
     template <typename Func>
     static void ForEachCPUPage(DAddr addr, size_t size, Func&& func) {

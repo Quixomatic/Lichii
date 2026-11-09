@@ -74,6 +74,25 @@ public:
         return result;
     }
 
+    /// Pipeline v2 P5a: what Read would return, without caching anything (a pure lookup).
+    template <class MemoryManager>
+    [[nodiscard]] std::pair<T, bool> Peek(const MemoryManager& gpu_memory, u32 index) const noexcept {
+        const GPUVAddr gpu_addr = current_gpu_addr + index * sizeof(T);
+        std::pair<T, bool> result;
+        const bool one_page =
+            (gpu_addr & Core::Memory::YUZU_PAGEMASK) + sizeof(T) <= Core::Memory::YUZU_PAGESIZE;
+        if (const u8* const host = one_page ? gpu_memory.GetPointer(gpu_addr) : nullptr) {
+            std::memcpy(std::addressof(result.first), host, sizeof(T));
+        } else {
+            gpu_memory.ReadBlockUnsafe(gpu_addr, std::addressof(result.first), sizeof(T));
+        }
+        const bool known =
+            !invalidated && index / 64 < read_descriptors.size() &&
+            (read_descriptors[index / 64] & (1ULL << (index % 64))) != 0;
+        result.second = !known || result.first != descriptors[index];
+        return result;
+    }
+
     void Refresh(GPUVAddr gpu_addr, u32 limit) noexcept {
         current_gpu_addr = gpu_addr;
         current_limit = limit;

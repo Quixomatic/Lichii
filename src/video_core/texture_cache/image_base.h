@@ -135,6 +135,10 @@ struct ImageBase {
     /// set or an alias is added): SynchronizeAliases has nothing to do while it is not newer.
     u64 newest_alias_tick = 0;
     size_t lru_index = SIZE_MAX;
+    /// Pipeline v2 P5a (EDEN_NX2_V2_COMMIT, commit owner only): the last submission (scheduler
+    /// tick) that used the image (DXVK's track id) and the frame its LRU entry was last touched.
+    u64 v2_track_id = 0;
+    u64 v2_touched_frame = 0;
 
     std::array<u32, MAX_MIP_LEVELS> mip_level_offsets{};
 

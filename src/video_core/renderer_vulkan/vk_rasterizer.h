@@ -27,6 +27,7 @@
 #include "video_core/renderer_vulkan/vk_descriptor_buffer.h"
 #include "video_core/renderer_vulkan/vk_descriptor_pool.h"
 #include "video_core/renderer_vulkan/vk_draw_cache.h"
+#include "video_core/v2/commit.h"
 #include "video_core/renderer_vulkan/vk_fence_manager.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_query_cache.h"
@@ -178,6 +179,9 @@ public:
                                                             u32 pixel_stride);
 
 private:
+    // Pipeline v2 P5a (EDEN_NX2_V2_COMMIT): the commit stage. Null when off.
+    std::unique_ptr<VideoCommon::V2::Commit::Context> commit;
+
     static constexpr const u64 NEEDS_D24[] = {
         0x01006A800016E000ULL, // SSBU
         0x0100E95004038000ULL, // XC2

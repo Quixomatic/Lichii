@@ -725,6 +725,8 @@ bool BufferCache<P>::DMACopy(GPUVAddr src_address, GPUVAddr dest_address, u64 am
         if (Tegra::g_nx2_ampere.load(std::memory_order_relaxed)) {
             Tegra::Nx2MarkGpuWritten(pair.first, pair.second);
             Nx2NoteListWrite(buffer_b, pair.first, pair.second);
+        } else if (commit != nullptr) [[unlikely]] {
+            Tegra::Nx2MarkGpuWritten(pair.first, pair.second);
         }
     }
     const auto& copy = copies[0];
@@ -3029,6 +3031,9 @@ void BufferCache<P>::MarkWrittenBuffer(BufferId buffer_id, DAddr device_addr, u3
     if (Tegra::g_nx2_ampere.load(std::memory_order_relaxed)) {
         Tegra::Nx2MarkGpuWritten(device_addr, size);
         Nx2NoteListWrite(buffer_id, device_addr, size);
+    } else if (commit != nullptr) [[unlikely]] {
+        // P5a: guest CPU write traps decide lock-free whether a write may meet GPU data.
+        Tegra::Nx2MarkGpuWritten(device_addr, size);
     }
 }
 
@@ -3275,6 +3280,50 @@ BufferId BufferCache<P>::FindBuffer(DAddr device_addr, u32 size, bool sparse_com
     if (device_addr == 0 || page >= page_table.size()) {
         return NULL_BUFFER_ID;
     }
+    if (commit != nullptr) [[unlikely]] {
+        // EDEN_NX2_V2_COMMIT: the pure lookup through the lock-free page map. A miss is a
+        // BufferCreate request, committed on demand: the caller binds the buffer at once.
+        const BufferId found = LookupBuffer(device_addr, size);
+        const bool usable = [&] {
+            if (!found || !slot_buffers[found].IsInBounds(device_addr, size)) {
+                return false;
+            }
+            if constexpr (requires { slot_buffers[found].IsSparseCompatible(); }) {
+                if (sparse_compatible && !slot_buffers[found].IsSparseCompatible()) {
+                    return false;
+                }
+            }
+            return true;
+        }();
+        auto& stats = V2::Commit::Stats::Get();
+        if (commit->stats) {
+            V2::Commit::Stats::Count(usable ? stats.lookup_hits : stats.lookup_misses);
+            if (!usable) {
+                V2::Commit::Stats::Count(
+                    stats.requests[static_cast<size_t>(V2::Commit::Kind::BufferCreate)]);
+            }
+        }
+        if (commit->verify) {
+            // The published map must agree with the page table, and predict the old path.
+            const BufferId table_id = page_table[page];
+            V2::Commit::Stats::Count(stats.verify_draws);
+            if (found && found != table_id) {
+                V2::Commit::Stats::Count(stats.verify_mismatches);
+                static std::atomic<u32> logged{};
+                if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+                    LOG_WARNING(HW_GPU,
+                                "V2 commit verify: buffer page map says {} at {:#x}, the page "
+                                "table {}",
+                                found.index, device_addr, table_id.index);
+                }
+            }
+        } else if (usable) {
+            if (Settings::IsGPUFenceBehaviorAccurate()) {
+                SynchronizeBufferWrites(slot_buffers[found]);
+            }
+            return found;
+        }
+    }
     const BufferId buffer_id = page_table[page];
     if (buffer_id) {
         Buffer& buffer = slot_buffers[buffer_id];
@@ -3428,6 +3477,9 @@ BufferId BufferCache<P>::CreateBuffer(DAddr device_addr, u32 wanted_size,
     }
     Register(new_buffer_id);
     TouchBuffer(new_buffer, new_buffer_id);
+    if (commit != nullptr) [[unlikely]] {
+        V2::Commit::NoteEffect(commit, V2::Commit::EffectCreate);
+    }
     return new_buffer_id;
 }
 
@@ -3466,12 +3518,48 @@ void BufferCache<P>::ChangeRegister(BufferId buffer_id) {
             page_table[page] = BufferId{};
         }
     }
+    if (v2_pages) [[unlikely]] {
+        v2_pages->Store(device_addr_begin, device_addr_end, insert ? buffer_id.index : 0U);
+    }
+}
+
+template <class P>
+void BufferCache<P>::SetCommit(V2::Commit::Context* context) {
+    commit = context;
+    if (commit == nullptr) {
+        v2_pages.reset();
+        return;
+    }
+    v2_pages = std::make_unique<V2::VaMap<CACHING_PAGEBITS, 36>>();
+    for (u64 page = 0; page < page_table.size(); ++page) {
+        if (page_table[page]) {
+            v2_pages->Store(page << CACHING_PAGEBITS, (page + 1) << CACHING_PAGEBITS,
+                            page_table[page].index);
+        }
+    }
+}
+
+template <class P>
+BufferId BufferCache<P>::LookupBuffer(DAddr device_addr, u32 size) const {
+    if (!v2_pages || device_addr == 0) {
+        return NULL_BUFFER_ID;
+    }
+    // A buffer registers every page it spans: the first page's buffer covers the range exactly
+    // when its bounds hold it (the caller checks, as FindBuffer does).
+    const u32 slot = v2_pages->Load(device_addr);
+    if (slot == 0 || !slot_buffers[BufferId{slot}].IsInBounds(device_addr, size)) {
+        return NULL_BUFFER_ID;
+    }
+    return BufferId{slot};
 }
 
 template <class P>
 void BufferCache<P>::TouchBuffer(Buffer& buffer, BufferId buffer_id) noexcept {
     if (buffer_id != NULL_BUFFER_ID) {
         lru_cache.Touch(buffer.getLRUID(), frame_tick);
+        if (commit != nullptr) [[unlikely]] {
+            buffer.v2_track_id = (std::max)(buffer.v2_track_id, commit->submission);
+        }
     }
 }
 
@@ -3591,6 +3679,19 @@ void BufferCache<P>::UploadMemory(Buffer& buffer, u64 total_size_bytes, u64 larg
                                   std::span<BufferCopy> copies) {
     VideoCommon::V2::Stats::CountMutation(VideoCommon::V2::Stats::Mutation::BufferUpload,
                                           total_size_bytes);
+    if (commit != nullptr) [[unlikely]] {
+        // A BufferUpload request (committed on demand: SynchronizeBuffer's result and the
+        // tracker state it leaves decide the rest of the bind).
+        V2::Commit::NoteEffect(commit, V2::Commit::EffectUpload);
+        if (commit->stats) {
+            auto& stats = V2::Commit::Stats::Get();
+            V2::Commit::Stats::Count(
+                stats.requests[static_cast<size_t>(V2::Commit::Kind::BufferUpload)]);
+            if (buffer.v2_track_id < commit->submission) {
+                V2::Commit::Stats::Count(stats.hoistable);
+            }
+        }
+    }
     if constexpr (USE_MEMORY_MAPS_FOR_UPLOADS) {
         MappedUploadMemory(buffer, total_size_bytes, copies);
     } else {
@@ -3821,6 +3922,9 @@ template <class P>
 void BufferCache<P>::DeleteBuffer(BufferId buffer_id, bool do_not_mark) {
     ++buffer_deletions;
     VideoCommon::V2::Stats::CountMutation(VideoCommon::V2::Stats::Mutation::BufferDelete);
+    if (commit != nullptr) [[unlikely]] {
+        V2::Commit::NoteEffect(commit, V2::Commit::EffectDelete);
+    }
     if constexpr (requires { runtime.OnBufferDeleted(slot_buffers[buffer_id]); }) {
         runtime.OnBufferDeleted(slot_buffers[buffer_id]);
     }
