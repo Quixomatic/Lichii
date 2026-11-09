@@ -147,23 +147,26 @@ public:
     }
     /// Front, TracksWrites: the write just sent (its record ends at the write position) stores
     /// `size` known bytes, or unknown bytes, at a device address; or a range it can't bound.
+    /// An open StateRun stays open: its record is already in the ring, so the write position is
+    /// its end, the back stores `consumed` only after the whole run and tags every method of it
+    /// with that end (Landing::tag). Waiting for the position covers the write (and at most the
+    /// rest of the run). Only writes that can land at a fence cut the run, so that each one has
+    /// its own landing position (NoteUnlandedWrite retires by landing).
     void NoteKnownWrite(u64 device_address, const void* bytes, u32 size, V2::Producer producer) {
-        IrCut();
+        CutForLanding(producer);
         PrepareHazardNote();
         hazards.NoteKnown(device_address, bytes, size, write_position, producer);
     }
     void NoteRangeWrite(u64 device_address, u64 size, V2::Producer producer) {
-        IrCut();
+        CutForLanding(producer);
         PrepareHazardNote();
         hazards.NoteRange(device_address, size, write_position, producer);
     }
     void NoteUnboundedWrite(V2::Producer producer) {
-        IrCut();
         hazards.NoteUnbounded(producer, write_position);
     }
     /// Front: the draw just sent writes these device ranges (render and depth targets).
     void NoteDrawTargets(std::span<const std::pair<u64, u64>> ranges) {
-        IrCut();
         hazards.NoteDrawTargets(ranges, write_position);
     }
     /// Front: the queued writes to a device range that `filter` orders against (V2::HazardTable).
@@ -421,7 +424,6 @@ public:
 
     /// Compute or copy work was just sent: what can write GPU-written command lists.
     void NoteWriter() {
-        IrCut();
         last_writer_position = write_position;
     }
     /// Waits until the back executed the compute and copy work sent so far (not what came after).
@@ -431,7 +433,6 @@ public:
     /// bit; semaphore acquires drain): the guest's GPU work before it is complete before the
     /// commands after it are fetched.
     void NoteSync() {
-        IrCut();
         last_sync_position = write_position;
         if (transfer_join_hook != nullptr) [[unlikely]] {
             // EDEN_NX2_V2_XFERQ (MASTER_PLAN §6, multi-queue caveat): class B ordered work by the
@@ -566,6 +567,13 @@ private:
     void IrCut() {
         if (ir_run != nullptr) [[unlikely]] {
             IrCloseRun();
+        }
+    }
+    /// Releases and reports may land only when their fence runs (v2/landing.h): the methods
+    /// after one start a new record, so a later landing never retires it early.
+    void CutForLanding(V2::Producer producer) {
+        if (producer == V2::Producer::Release || producer == V2::Producer::Report) {
+            IrCut();
         }
     }
     /// Closes the open run and reserves a record of `words` with its header and sequence

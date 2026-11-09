@@ -1612,3 +1612,37 @@ TEST_CASE("V2 IR: a write noted for the hazard table ends its StateRun at the no
     CHECK(f.fast.regs.vertex_buffer.count == 22);
     CHECK(Access::IrBadRecords(split) == 0);
 }
+
+TEST_CASE("V2 IR: constant buffer and other non-landing notes keep the StateRun open",
+          "[video_core][gpu_split_dispatch][v2_ir]") {
+    using Access = VideoCommon::GpuSplitTestAccess;
+    using VideoCommon::V2::Producer;
+    Fixture f;
+    f.system.Initialize();
+    VideoCommon::GpuSplit split;
+    Access::Initialize(split, f.system);
+    Access::SetIr(split, true);
+    constexpr u32 first = MAXWELL3D_REG_INDEX(vertex_buffer.first);
+    constexpr u32 count = MAXWELL3D_REG_INDEX(vertex_buffer.count);
+    split.Method(&f.fast, first, 11, true, nullptr);
+    split.NoteRangeWrite(0x2000, 4, Producer::CbData);
+    split.NoteUnboundedWrite(Producer::Upload);
+    split.NoteWriter();
+    split.NoteSync();
+    const u64 noted = split.WritePosition();
+    split.Method(&f.fast, count, 12, true, nullptr);
+    split.NoteRangeWrite(0x2004, 4, Producer::CbData);
+    // Both methods are one run: the write position (the run record's end) did not move, so the
+    // noted position covers the write and the rest of the run.
+    CHECK(split.WritePosition() == noted);
+    split.Publish();
+    CHECK(Access::End(split) == noted);
+    u64 read = 0;
+    while (read < noted) {
+        read = Access::Execute(split, read, Access::End(split));
+    }
+    CHECK(read == noted);
+    CHECK(f.fast.regs.vertex_buffer.first == 11);
+    CHECK(f.fast.regs.vertex_buffer.count == 12);
+    CHECK(Access::IrBadRecords(split) == 0);
+}

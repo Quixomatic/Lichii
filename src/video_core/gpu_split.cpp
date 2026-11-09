@@ -687,8 +687,8 @@ size_t GpuSplit::ExecuteIr(const u64* entry) {
         break;
     }
     case V2::Ir::Kind::StateRun: {
-        // Every method of the run ends at the record's end (the front notes its writes there:
-        // a noted write closes the run, GpuSplit::IrCut).
+        // Every method of the run ends at the record's end (the front notes its writes there;
+        // releases and reports close the run, GpuSplit::CutForLanding).
         const u64* it = arena.At(payload.index);
         const u64* const end = it + payload.words;
         while (it < end) {
