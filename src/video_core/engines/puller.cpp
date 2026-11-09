@@ -76,7 +76,7 @@ void OnBackRelease(DmaPusher& dma_pusher, GPUVAddr address, u32 payload, u32 byt
             .payload = payload,
             .bytes = bytes,
             .op = VideoCommon::V2::Ir::ReleaseOp::Payload,
-            .address_space = dma_pusher.memory_manager.GetID(),
+            .address_space = static_cast<u32>(dma_pusher.memory_manager.GetID()),
         };
         split.DeferTyped(VideoCommon::V2::Ir::Kind::Release, body, func);
         if (split.TracksWrites()) [[unlikely]] {

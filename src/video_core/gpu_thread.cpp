@@ -149,7 +149,9 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                     }
                 } else if (const auto* flush = std::get_if<FlushRegionCommand>(&next.data)) {
                     split.DeferTyped(VideoCommon::V2::Ir::Kind::Readback,
-                                     VideoCommon::V2::Ir::ReadbackBody{flush->addr, flush->size},
+                                     VideoCommon::V2::Ir::ReadbackBody{.op = VideoCommon::V2::Ir::ReadbackOp::Flush,
+                                                                       .address = flush->addr,
+                                                                       .bytes = flush->size},
                                      [rasterizer_ptr, addr = flush->addr, size = flush->size] {
                         rasterizer_ptr->FlushRegion(addr, size);
                     });

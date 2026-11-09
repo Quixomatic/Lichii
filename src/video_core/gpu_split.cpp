@@ -133,6 +133,9 @@ void GpuSplit::MaybeStart(Core::System& system_) {
     // Fixed until the next start: the back decodes both encodings, the front writes one.
     ir = V2::On(V2::Switch::Ir);
     ir_verify = V2::Verify(V2::Switch::Ir);
+    if (ir) {
+        AllocateIr();
+    }
     if (V2::On(V2::Switch::CpuLane)) {
         SetCpuLaneHook([](void* gpu) { static_cast<Tegra::GPU*>(gpu)->TickCpuLane(); },
                        &system->GPU());
@@ -189,6 +192,11 @@ void GpuSplit::Stop() {
     ir_sequence = 0;
     ir_run = nullptr;
     ir_run_words = 0;
+    ir_run_index = 0;
+    unpublished_words = 0;
+    sent_words = 0;
+    arena.Release();
+    objects.reset();
     tracks_writes = false;
     feed_idle_back = false;
     spin_window = false;
@@ -249,6 +257,7 @@ void GpuSplit::Publish() {
         return;
     }
     published_local = write_position;
+    unpublished_words = 0;
     publish_every = std::min<size_t>(publish_every * 2, PublishEvery);
     published.store(write_position, std::memory_order_seq_cst);
     if (back_waiting.load(std::memory_order_seq_cst)) {
@@ -270,6 +279,10 @@ void GpuSplit::Drain(DrainSite site) {
         consumed_cache = consumed.load(std::memory_order_acquire);
         if (consumed_cache == write_position) {
             publish_every = 8;
+            if (objects && objects->Size() > V2::Ir::ObjectTable::Capacity * 3 / 4) [[unlikely]] {
+                // The back ran every record that names an object: start the table over.
+                objects->Clear();
+            }
             Nx2Profile::AddDrain(site, start);
             if (v2_stats) [[unlikely]] {
                 V2::Stats::NoteDrain(site, start);
@@ -351,9 +364,18 @@ void GpuSplit::Backoff(u32 spins, u64 target) {
 void GpuSplit::SwitchEngine(Tegra::Engines::EngineInterface* engine) {
     front_engine = engine;
     if (ir) {
+        V2::Ir::ObjectRef ref = IrRef(engine);
+        if (ref == V2::Ir::NoObject) [[unlikely]] {
+            // The table is full: once the back ran every record, it starts over.
+            ir_ref_failed = false;
+            Drain();
+            objects->Clear();
+            ref = IrRef(engine);
+        }
         constexpr size_t words = V2::Ir::HeaderWords + V2::Ir::BodyWordsOf<V2::Ir::EngineBody>;
         u64* const record = IrBegin(V2::Ir::Kind::Engine, 1, words, 0);
-        record[V2::Ir::HeaderWords] = reinterpret_cast<u64>(engine);
+        const V2::Ir::EngineBody body{ref, 0};
+        std::memcpy(record + V2::Ir::HeaderWords, &body, sizeof(body));
         Commit(words);
         return;
     }
@@ -363,38 +385,94 @@ void GpuSplit::SwitchEngine(Tegra::Engines::EngineInterface* engine) {
     Commit(2);
 }
 
-void GpuSplit::IrOpenRun(u64 word, const GPUVAddr* segment) {
-    const size_t words = V2::Ir::HeaderWords + (segment != nullptr ? 2 : 1);
-    u64* const record = IrBegin(V2::Ir::Kind::StateRun, 0, words, 0);
-    record[2] = word;
-    if (segment != nullptr) {
-        record[3] = *segment;
+void GpuSplit::AllocateIr() {
+    if (!arena.Allocated()) {
+        arena.Allocate(ArenaWords, ArenaMarks);
     }
+    arena.Clear();
+    if (!objects) {
+        objects = std::make_unique<V2::Ir::ObjectTable>();
+    }
+    objects->Clear();
+}
+
+V2::Ir::ObjectRef GpuSplit::IrRef(const void* object) {
+    const u32 index = objects->Intern(object);
+    if (index == V2::Ir::ObjectTable::None) [[unlikely]] {
+        ir_ref_failed = true;
+        return V2::Ir::NoObject;
+    }
+    return index;
+}
+
+u64* GpuSplit::ArenaBegin(size_t words, u64 sequence, u64 position) {
+    if (u64* const span = arena.Begin(words, sequence, position)) [[likely]] {
+        return span;
+    }
+    arena.Retire(ExecutedSequence());
+    for (;;) {
+        if (u64* const span = arena.Begin(words, sequence, position)) {
+            return span;
+        }
+        // Full: wait for the back to run the oldest record with a payload.
+        WaitFor(std::min(arena.Oldest().position, write_position), DrainSite::Other);
+        arena.Retire(ExecutedSequence());
+    }
+}
+
+u64* GpuSplit::IrPayloadBegin(V2::Ir::Kind kind, const void* body, size_t body_words,
+                              size_t payload_words, u64 flags) {
+    const size_t words = V2::Ir::HeaderWords + 1 + body_words;
+    u64* const record = IrBegin(kind, body_words, words, flags | V2::Ir::HasPayload);
+    u64* const span = ArenaBegin(payload_words, ir_sequence, write_position + words);
+    record[V2::Ir::HeaderWords] =
+        V2::Ir::PackRef(arena.IndexOf(span), static_cast<u32>(payload_words));
+    if (body_words != 0) {
+        std::memcpy(record + V2::Ir::HeaderWords + 1, body, body_words * sizeof(u64));
+    }
+    ir_pending_words = words;
+    ir_pending_payload = payload_words;
+    return span;
+}
+
+void GpuSplit::IrOpenRun(u64 word, const GPUVAddr* segment) {
+    const size_t entry_words = segment != nullptr ? 2 : 1;
+    constexpr size_t words = V2::Ir::HeaderWords + 1;
+    u64* const record = IrBegin(V2::Ir::Kind::StateRun, 0, words, V2::Ir::HasPayload);
+    u64* const entries = ArenaBegin(entry_words, ir_sequence, write_position + words);
+    entries[0] = word;
+    if (segment != nullptr) {
+        entries[1] = *segment;
+    }
+    ir_run_index = arena.IndexOf(entries);
+    record[V2::Ir::HeaderWords] = V2::Ir::PackRef(ir_run_index, 0);
     ir_run = record;
-    ir_run_words = words;
-    Commit(words);
+    ir_run_words = entry_words;
+    Commit(words); // A publish here closes the run with its first entry.
+    Advance(entry_words);
 }
 
 void GpuSplit::MultiMethod(Tegra::Engines::EngineInterface* engine, u32 method, const u32* words,
                            u32 amount, u32 methods_pending, const GPUVAddr* segment) {
     SelectEngine(engine);
     if (ir) {
-        // MethodData records, in pieces as below.
+        // MethodData records, in pieces as below; the words go to the payload arena.
         while (amount > 0) {
             const u32 piece = std::min(amount, MaxMultiWords);
-            const size_t body = segment != nullptr ? 3 : 2;
-            const size_t head = V2::Ir::HeaderWords + body;
-            const size_t size = head + (piece + 1) / 2;
-            u64* const record = IrBegin(V2::Ir::Kind::MethodData, body, size,
-                                        segment != nullptr ? V2::Ir::HasSegment : 0);
-            const V2::Ir::MethodDataBody data{method & 0xffff, piece, methods_pending, 0};
-            std::memcpy(record + V2::Ir::HeaderWords, &data, sizeof(data));
-            if (segment != nullptr) {
-                record[V2::Ir::HeaderWords + 2] = *segment;
-            }
-            record[size - 1] = 0;
-            std::memcpy(record + head, words, size_t{piece} * sizeof(u32));
-            Commit(size);
+            const size_t payload = (piece + 1) / 2;
+            const V2::Ir::MethodDataBody data{
+                .method = method & 0xffff,
+                .amount = piece,
+                .methods_pending = methods_pending,
+                .reserved = 0,
+                .segment = segment != nullptr ? *segment : 0,
+            };
+            u64* const span = IrPayloadBegin(
+                V2::Ir::Kind::MethodData, &data, V2::Ir::BodyWordsOf<V2::Ir::MethodDataBody>,
+                payload, segment != nullptr ? V2::Ir::HasSegment : 0);
+            span[payload - 1] = 0;
+            std::memcpy(span, words, size_t{piece} * sizeof(u32));
+            IrPayloadCommit();
             words += piece;
             amount -= piece;
             methods_pending -= piece;
@@ -507,9 +585,13 @@ SPLIT_FORCE_INLINE size_t GpuSplit::ExecuteMethod(const u64* entry, size_t words
 void GpuSplit::CheckIrRecord(const u64* entry) {
     // EDEN_NX2_V2_IR=verify: sequence numbers go up by one, kinds and sizes are sane.
     const V2::Ir::RecordView record = V2::Ir::Decode(entry);
-    const bool bad = record.sequence != back_sequence + 1 || record.kind == V2::Ir::Kind::Invalid ||
-                     record.kind >= V2::Ir::Kind::Count || record.words < V2::Ir::HeaderWords ||
-                     record.body_words > record.words - V2::Ir::HeaderWords;
+    const size_t ref_words = record.has_payload ? 1 : 0;
+    const bool bad =
+        record.sequence != back_sequence + 1 || record.kind == V2::Ir::Kind::Invalid ||
+        record.kind >= V2::Ir::Kind::Count || record.words < V2::Ir::HeaderWords + ref_words ||
+        record.body_words + ref_words != record.words - V2::Ir::HeaderWords ||
+        (record.has_payload &&
+         u64{record.payload.index} + record.payload.words > arena.Capacity());
     if (bad && ir_bad_records++ < 16) {
         LOG_ERROR(HW_GPU, "V2 IR record check: kind {} sequence {} (expected {}) size {} body {}",
                   static_cast<u32>(record.kind), record.sequence, back_sequence + 1, record.words,
@@ -527,26 +609,30 @@ size_t GpuSplit::ExecuteIr(const u64* entry) {
         CheckIrRecord(entry);
     }
     back_sequence = entry[1];
+    const V2::Ir::PayloadRef payload = (head & V2::Ir::HasPayload) != 0
+                                           ? V2::Ir::UnpackRef(entry[V2::Ir::HeaderWords])
+                                           : V2::Ir::PayloadRef{};
+    const u64* const body = entry + V2::Ir::HeaderWords + V2::Ir::RefWords(head);
     switch (V2::Ir::KindOf(head)) {
-    case V2::Ir::Kind::Engine:
-        back_engine = reinterpret_cast<Tegra::Engines::EngineInterface*>(entry[2]);
+    case V2::Ir::Kind::Engine: {
+        V2::Ir::EngineBody engine;
+        std::memcpy(&engine, body, sizeof(engine));
+        back_engine = objects->As<Tegra::Engines::EngineInterface>(engine.engine);
         break;
+    }
     case V2::Ir::Kind::StateRun: {
-        const u64* it = entry + V2::Ir::HeaderWords;
-        const u64* const end = entry + size;
+        // Every method of the run ends at the record's end (the front notes its writes there:
+        // a noted write closes the run, GpuSplit::IrCut).
+        const u64* it = arena.At(payload.index);
+        const u64* const end = it + payload.words;
         while (it < end) {
-            if (tracks_writes) [[unlikely]] {
-                // Each method's own end position: what the front noted its writes at.
-                V2::Landing::tag = back_entry_position + static_cast<u64>(it - entry) +
-                                   ((*it & HasSegment) != 0 ? 2 : 1);
-            }
             it += ExecuteMethod(it, static_cast<size_t>(end - it));
         }
         break;
     }
     case V2::Ir::Kind::MethodData: {
         V2::Ir::MethodDataBody data;
-        std::memcpy(&data, entry + V2::Ir::HeaderWords, sizeof(data));
+        std::memcpy(&data, body, sizeof(data));
         auto* const engine = back_engine;
         if (!engine->reports_fast_draw_breaks) {
             Nx2FastDraw::Break(Nx2FastDraw::Reason::OtherEngine);
@@ -554,12 +640,11 @@ size_t GpuSplit::ExecuteIr(const u64* entry) {
         Nx2Profile::Scope method_scope{Nx2Profile::Zone::Method};
         engine->ConsumeSink(*system);
         if ((head & V2::Ir::HasSegment) != 0) {
-            engine->current_dma_segment = entry[V2::Ir::HeaderWords + 2];
+            engine->current_dma_segment = data.segment;
         }
-        engine->CallMultiMethod(
-            *system, data.method,
-            reinterpret_cast<const u32*>(entry + V2::Ir::HeaderWords + V2::Ir::BodyWords(head)),
-            data.amount, data.methods_pending);
+        engine->CallMultiMethod(*system, data.method,
+                                reinterpret_cast<const u32*>(arena.At(payload.index)),
+                                data.amount, data.methods_pending);
         break;
     }
     default:
@@ -568,9 +653,8 @@ size_t GpuSplit::ExecuteIr(const u64* entry) {
             if ((head & FastDrawNeutral) == 0) {
                 Nx2FastDraw::Break(Nx2FastDraw::Reason::Call);
             }
-            const size_t body = V2::Ir::BodyWords(head);
-            reinterpret_cast<void (*)(const u64*)>(entry[V2::Ir::HeaderWords + body])(
-                entry + V2::Ir::HeaderWords + body + 1);
+            const u64* const thunk = arena.At(payload.index);
+            reinterpret_cast<void (*)(const u64*)>(thunk[0])(thunk + 1);
         }
         break;
     }

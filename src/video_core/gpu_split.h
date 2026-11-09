@@ -15,6 +15,7 @@
 #include "common/common_types.h"
 #include "video_core/v2/hazard.h"
 #include "video_core/v2/ir.h"
+#include "video_core/v2/ir_arena.h"
 #include "video_core/v2/landing.h"
 #include "video_core/v2/v2_switches.h"
 
@@ -83,6 +84,11 @@ public:
     [[nodiscard]] u64 ConsumedPosition() const {
         return consumed.load(std::memory_order_relaxed);
     }
+    /// Front thread: ring and payload words sent so far (grows with every method sent; the
+    /// write position does not when a method joins an open IR StateRun).
+    [[nodiscard]] u64 SentWords() const {
+        return sent_words;
+    }
     /// Whether the ring carries typed IR records (EDEN_NX2_V2_IR, fixed at each start).
     [[nodiscard]] bool TypedIr() const {
         return ir;
@@ -121,18 +127,22 @@ public:
     /// Front, TracksWrites: the write just sent (its record ends at the write position) stores
     /// `size` known bytes, or unknown bytes, at a device address; or a range it can't bound.
     void NoteKnownWrite(u64 device_address, const void* bytes, u32 size, V2::Producer producer) {
+        IrCut();
         PrepareHazardNote();
         hazards.NoteKnown(device_address, bytes, size, write_position, producer);
     }
     void NoteRangeWrite(u64 device_address, u64 size, V2::Producer producer) {
+        IrCut();
         PrepareHazardNote();
         hazards.NoteRange(device_address, size, write_position, producer);
     }
     void NoteUnboundedWrite(V2::Producer producer) {
+        IrCut();
         hazards.NoteUnbounded(producer, write_position);
     }
     /// Front: the draw just sent writes these device ranges (render and depth targets).
     void NoteDrawTargets(std::span<const std::pair<u64, u64>> ranges) {
+        IrCut();
         hazards.NoteDrawTargets(ranges, write_position);
     }
     /// Front: the queued writes to a device range that `filter` orders against (V2::HazardTable).
@@ -168,6 +178,7 @@ public:
     /// Front: a fence-flagged release of known bytes was just sent. It is in memory only once
     /// its fence ran (v2/landing.h); until then FindUnlanded forwards it.
     void NoteUnlandedWrite(u64 device_address, const void* bytes, u32 size) {
+        IrCut();
         if (unlanded.Size() == V2::HazardTable::Capacity) [[unlikely]] {
             unlanded.Retire(V2::Landing::landed.load(std::memory_order_acquire));
         }
@@ -274,13 +285,12 @@ public:
         constexpr size_t payload = (sizeof(Func) + sizeof(u64) - 1) / sizeof(u64);
         if (ir) {
             const auto hint = static_cast<V2::Ir::Kind>((flags >> 32) & 0xff);
-            constexpr size_t words = V2::Ir::HeaderWords + 1 + payload;
-            u64* const record =
-                IrBegin(hint != V2::Ir::Kind::Invalid ? hint : V2::Ir::Kind::Callback, 0, words,
-                        V2::Ir::HasThunk | (flags & FastDrawNeutral));
-            record[V2::Ir::HeaderWords] = reinterpret_cast<u64>(&CallThunk<Func>);
-            std::memcpy(record + V2::Ir::HeaderWords + 1, &func, sizeof(Func));
-            Commit(words);
+            u64* const span = IrPayloadBegin(
+                hint != V2::Ir::Kind::Invalid ? hint : V2::Ir::Kind::Callback, nullptr, 0,
+                1 + payload, V2::Ir::HasThunk | (flags & FastDrawNeutral));
+            span[0] = reinterpret_cast<u64>(&CallThunk<Func>);
+            std::memcpy(span + 1, &func, sizeof(Func));
+            IrPayloadCommit();
             return;
         }
         u64* const entry = Reserve(2 + payload);
@@ -299,15 +309,12 @@ public:
         }
         static_assert(V2::Ir::IsBody<Body>);
         static_assert(std::is_trivially_copyable_v<Func> && alignof(Func) <= alignof(u64));
-        constexpr size_t body_words = V2::Ir::BodyWordsOf<Body>;
         constexpr size_t payload = (sizeof(Func) + sizeof(u64) - 1) / sizeof(u64);
-        constexpr size_t words = V2::Ir::HeaderWords + body_words + 1 + payload;
-        u64* const record =
-            IrBegin(kind, body_words, words, V2::Ir::HasThunk | (flags & FastDrawNeutral));
-        std::memcpy(record + V2::Ir::HeaderWords, &body, sizeof(Body));
-        record[V2::Ir::HeaderWords + body_words] = reinterpret_cast<u64>(&CallThunk<Func>);
-        std::memcpy(record + V2::Ir::HeaderWords + body_words + 1, &func, sizeof(Func));
-        Commit(words);
+        u64* const span = IrPayloadBegin(kind, &body, V2::Ir::BodyWordsOf<Body>, 1 + payload,
+                                         V2::Ir::HasThunk | (flags & FastDrawNeutral));
+        span[0] = reinterpret_cast<u64>(&CallThunk<Func>);
+        std::memcpy(span + 1, &func, sizeof(Func));
+        IrPayloadCommit();
     }
     void DeferFunction(std::function<void()>&& func);
     /// Runs `func` on the back and waits for it: for work on back-owned state, such as a buffer
@@ -335,6 +342,7 @@ public:
 
     /// Compute or copy work was just sent: what can write GPU-written command lists.
     void NoteWriter() {
+        IrCut();
         last_writer_position = write_position;
     }
     /// Waits until the back executed the compute and copy work sent so far (not what came after).
@@ -344,6 +352,7 @@ public:
     /// bit; semaphore acquires drain): the guest's GPU work before it is complete before the
     /// commands after it are fetched.
     void NoteSync() {
+        IrCut();
         last_sync_position = write_position;
         if (tracks_writes) [[unlikely]] {
             hazards.NoteSync(write_position);
@@ -382,6 +391,8 @@ private:
     static constexpr size_t PublishAfterWait = 8;
     /// Most words in one IR StateRun (each publish closes the open run earlier).
     static constexpr size_t MaxRunWords = 1024;
+    static constexpr size_t ArenaWords = size_t{1} << 20; // 8 MiB
+    static constexpr size_t ArenaMarks = size_t{1} << 16;
 
     template <typename Func>
     static void CallThunk(const u64* payload) {
@@ -400,14 +411,19 @@ private:
     u64* ReserveSlow(size_t words);
     void Commit(size_t words) {
         write_position += words;
-        const u64 unpublished = write_position - published_local;
-        if (unpublished >= publish_every) {
+        Advance(words);
+    }
+    /// `words` more were written (ring or payload arena): publishes every publish_every.
+    void Advance(size_t words) {
+        unpublished_words += words;
+        sent_words += words;
+        if (unpublished_words >= publish_every) {
             Publish();
             return;
         }
         // EDEN_NX2_V2_ACQUIRE: the back waits for work at the last position published: it gets
         // these words after a few (drains used to restart it like that; acquires no longer drain).
-        if (feed_idle_back && unpublished >= PublishAfterWait &&
+        if (feed_idle_back && unpublished_words >= PublishAfterWait &&
             back_idle_at.load(std::memory_order_relaxed) == published_local) [[unlikely]] {
             Publish();
         }
@@ -427,31 +443,36 @@ private:
     bool WaitFor(u64 target, DrainSite site);
 
     // Typed IR (front). A StateRun stays open while method writes to one engine follow each
-    // other: each appends its entry, and the run's header gets its size when it closes, which
-    // happens before any other record and before every publish (the back never sees an open
-    // run).
+    // other: its record (header + payload reference) is in the ring, its entries go to the
+    // payload arena, and the reference gets their count when it closes, which happens before
+    // any other record and before every publish (the back never sees an open run).
     void IrMethod(Tegra::Engines::EngineInterface* engine, u64 word, const GPUVAddr* segment) {
         SelectEngine(engine);
         const size_t words = segment != nullptr ? 2 : 1;
-        const size_t index = write_position & RingMask;
-        if (ir_run != nullptr && ir_run_words + words <= MaxRunWords &&
-            index + words <= RingWords && write_position + words - consumed_cache <= RingWords)
-            [[likely]] {
-            u64* const entry = &ring[index];
-            entry[0] = word;
-            if (segment != nullptr) {
-                entry[1] = *segment;
+        if (ir_run != nullptr && ir_run_words + words <= MaxRunWords) [[likely]] {
+            if (u64* const entry = arena.Extend(words)) [[likely]] {
+                entry[0] = word;
+                if (segment != nullptr) {
+                    entry[1] = *segment;
+                }
+                ir_run_words += words;
+                Advance(words);
+                return;
             }
-            ir_run_words += words;
-            Commit(words);
-            return;
         }
         IrOpenRun(word, segment);
     }
     void IrOpenRun(u64 word, const GPUVAddr* segment);
     void IrCloseRun() {
-        ir_run[0] = V2::Ir::MakeHeader(V2::Ir::Kind::StateRun, 0, ir_run_words, 0);
+        ir_run[V2::Ir::HeaderWords] = V2::Ir::PackRef(ir_run_index, static_cast<u32>(ir_run_words));
         ir_run = nullptr;
+    }
+    /// Closes the open StateRun (P2 notes a write at the position after it: the next method
+    /// starts a new record, so every noted write ends its record).
+    void IrCut() {
+        if (ir_run != nullptr) [[unlikely]] {
+            IrCloseRun();
+        }
     }
     /// Closes the open run and reserves a record of `words` with its header and sequence
     /// number written. The caller fills in the rest and commits `words`.
@@ -464,6 +485,20 @@ private:
         record[1] = ++ir_sequence;
         return record;
     }
+    /// A record of `kind` with `body` (body_words, may be null) and a payload of
+    /// `payload_words` in the arena; returns the payload span to fill in before
+    /// IrPayloadCommit makes both visible.
+    u64* IrPayloadBegin(V2::Ir::Kind kind, const void* body, size_t body_words,
+                        size_t payload_words, u64 flags);
+    void IrPayloadCommit() {
+        Commit(ir_pending_words);
+        Advance(ir_pending_payload);
+    }
+    /// Room in the payload arena for the record `sequence` ending at ring `position`; retires
+    /// what the back executed and waits for it when the arena is full.
+    u64* ArenaBegin(size_t words, u64 sequence, u64 position);
+    /// The object table index of `object` (Engine records).
+    V2::Ir::ObjectRef IrRef(const void* object);
 
     /// One step of a front wait for the back to consume `target`.
     void Backoff(u32 spins, u64 target);
@@ -494,6 +529,7 @@ private:
     size_t ExecuteMethod(const u64* entry, size_t words);
     size_t ExecuteIr(const u64* entry);
     void CheckIrRecord(const u64* entry);
+    void AllocateIr();
 
     Core::System* system{};
     bool active{};
@@ -515,6 +551,14 @@ private:
     u64 ir_sequence{};
     u64* ir_run{}; ///< Header of the open StateRun
     size_t ir_run_words{};
+    u32 ir_run_index{}; ///< Arena index of the open StateRun's entries
+    size_t ir_pending_words{};   ///< IrPayloadBegin's record, until IrPayloadCommit
+    size_t ir_pending_payload{};
+    bool ir_ref_failed{};        ///< IrRef found the object table full
+    size_t unpublished_words{}; ///< Ring and payload words since the last publish
+    u64 sent_words{};           ///< Ring and payload words sent since the start
+    V2::Ir::PayloadArena arena;  ///< Variable record data (EDEN_NX2_V2_IR)
+    std::unique_ptr<V2::Ir::ObjectTable> objects; ///< Object references (EDEN_NX2_V2_IR)
     // Pipeline v2 P2 (fixed at each start).
     bool tracks_writes{};
     bool feed_idle_back{};

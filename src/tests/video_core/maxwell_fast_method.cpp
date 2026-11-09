@@ -59,6 +59,9 @@ struct GpuSplitTestAccess {
     static void SetIr(GpuSplit& split, bool ir) {
         split.ir = ir;
         split.ir_verify = ir;
+        if (ir) {
+            split.AllocateIr();
+        }
     }
 
     static const u64* Ring(const GpuSplit& split) {

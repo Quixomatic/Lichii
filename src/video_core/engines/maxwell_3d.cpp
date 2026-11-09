@@ -1308,9 +1308,9 @@ void Maxwell3D::FrontWriteRegSem(VideoCommon::GpuSplit& split, FrontState& fs, u
     const RegSem::Table3D& table = RegSem::GetTable3D();
     if (fs.v2->mode == VideoCommon::V2::Mode::Verify) {
         // The hand-written mirror decides; the table-driven copy follows and is compared.
-        const u64 before = split.WritePosition();
+        const u64 before = split.SentWords();
         FrontWriteV1(split, fs, method, argument, is_last_call, from_macro);
-        const bool sent = split.WritePosition() != before;
+        const bool sent = split.SentWords() != before;
         const bool table_sent =
             RegSem::Write3D(*fs.v2->mirror, table, method, argument, from_macro,
                             [](RegSem::Effect, u32, u32) { return true; });
