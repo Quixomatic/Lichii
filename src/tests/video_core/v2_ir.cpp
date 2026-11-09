@@ -216,3 +216,32 @@ TEST_CASE("V2 compute register groups: compare-on-write and incremental fingerpr
     REQUIRE(mirror->v2_groups.dirty == 0);
     REQUIRE(mirror->v2_groups.draw_dirty != 0);
 }
+
+// Fix pass 1 (Ocarina of Time: "compute group hashes drifted from the registers, groups 0x4"):
+// the inline QMD launch points 0xad (Launch) at the QMD for one dispatch and restores it.
+TEST_CASE("V2 compute register groups: the inline QMD launch's address swap",
+          "[video_core][v2_regsem]") {
+    namespace RegSem = VideoCommon::V2::RegSem;
+    using VideoCommon::V2::ComputeGroup;
+    using VideoCommon::V2::ComputeGroupBit;
+    std::array<u32, 0x1000> registers{};
+    registers[0xad] = 0x1234;
+    VideoCommon::V2::ComputeGroupTracker tracker;
+    RegSem::RehashCompute(tracker, registers.data());
+    // A swap the tracker doesn't see: a hash check during the dispatch rehashes from the swapped
+    // registers, which leaves the hash wrong once the address is restored.
+    VideoCommon::V2::ComputeGroupTracker unnoted = tracker;
+    registers[0xad] = 0x5678;
+    RegSem::RehashCompute(unnoted, registers.data());
+    registers[0xad] = 0x1234;
+    REQUIRE(RegSem::RehashCompute(unnoted, registers.data()) ==
+            ComputeGroupBit(ComputeGroup::Launch));
+    // Noted both ways (KeplerCompute's inline QMD launch now): no drift at either point.
+    RegSem::NoteWriteCompute(tracker, 0xad, 0x1234, 0x5678);
+    registers[0xad] = 0x5678;
+    VideoCommon::V2::ComputeGroupTracker during = tracker;
+    REQUIRE(RegSem::RehashCompute(during, registers.data()) == 0);
+    RegSem::NoteWriteCompute(tracker, 0xad, 0x5678, 0x1234);
+    registers[0xad] = 0x1234;
+    REQUIRE(RegSem::RehashCompute(tracker, registers.data()) == 0);
+}

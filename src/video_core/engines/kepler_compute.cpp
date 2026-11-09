@@ -338,8 +338,19 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
             std::span<const u8>{reinterpret_cast<const u8*>(native_registers.data() + 0xc8), 256});
         if ((control & (1U << 24)) || !(native_registers[0xcc] & (1U << 12))) {
             const u32 previous = native_registers[0xad];
-            native_registers[0xad] = static_cast<u32>(address >> 8);
+            const u32 inline_qmd = static_cast<u32>(address >> 8);
+            // EDEN_NX2_V2_REGSEM: the launch group's hash follows the temporary QMD address (the
+            // dispatch's fingerprint and hash check see it), and its restore (Fix pass 1: the
+            // unnoted swap left group 0x4 drifted after every inline launch's hash check).
+            const bool regsem = VideoCommon::V2::On(VideoCommon::V2::Switch::RegSem);
+            if (regsem) [[unlikely]] {
+                VideoCommon::V2::RegSem::NoteWriteCompute(v2_groups, 0xad, previous, inline_qmd);
+            }
+            native_registers[0xad] = inline_qmd;
             ProcessNativeMethod(system, 0xb0, 3, true);
+            if (regsem) [[unlikely]] {
+                VideoCommon::V2::RegSem::NoteWriteCompute(v2_groups, 0xad, inline_qmd, previous);
+            }
             native_registers[0xad] = previous;
         }
         return true;
@@ -1548,20 +1559,31 @@ void KeplerCompute::VerifyComputeWrite(Core::System& system, u32 method, u32 arg
             copy.compute_uploaded = native_compute_uploaded;
         }
     }
+    if ((RegSem::TableCompute()[method] & RegSem::ComputeInlineQmd) != 0) {
+        // The inline QMD's launch runs the engine's 0xb0 method, which stores its signal there
+        // (not a write of the command stream; the table doesn't model it).
+        copy.registers[0xb0] = native_registers[0xb0];
+    }
     bool same = copy.registers[method] == native_registers[method] &&
                 copy.compute_uploaded == native_compute_uploaded &&
                 copy.bind_pointer == native_bind_pointer;
+    // The register that differs: the one written, or the first one the full compare finds.
+    u32 differs = method;
     if (same && (++v2_compute_writes & 4095) == 0) {
-        same = copy.registers == native_registers;
+        const auto [table_it, engine_it] = std::ranges::mismatch(copy.registers, native_registers);
+        if (table_it != copy.registers.end()) {
+            same = false;
+            differs = static_cast<u32>(table_it - copy.registers.begin());
+        }
     }
     if (!same) {
         if (RegSem::ReportMismatch()) {
             LOG_WARNING(HW_GPU,
-                        "V2 regsem compute back write {:#x} = {:#x}: register table {:#x} engine "
-                        "{:#x}, uploaded {} / {}, bind pointer {} / {}",
-                        method, argument, copy.registers[method], native_registers[method],
-                        copy.compute_uploaded, native_compute_uploaded, copy.bind_pointer,
-                        native_bind_pointer);
+                        "V2 regsem compute back write {:#x} = {:#x}: register {:#x} differs, "
+                        "register table {:#x} engine {:#x}, uploaded {} / {}, bind pointer {} / {}",
+                        method, argument, differs, copy.registers[differs],
+                        native_registers[differs], copy.compute_uploaded, native_compute_uploaded,
+                        copy.bind_pointer, native_bind_pointer);
         }
         copy.registers = native_registers;
         copy.compute_uploaded = native_compute_uploaded;
