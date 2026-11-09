@@ -29,6 +29,7 @@
 #include "video_core/nx2_fast_draw.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/textures/texture.h"
+#include "video_core/v2/ir.h"
 #include "video_core/v2/macro_hle.h"
 #include "video_core/v2/regsem.h"
 #include "video_core/v2/v2_stats.h"
@@ -44,6 +45,9 @@ class MemoryManager;
 
 namespace VideoCommon {
 class GpuSplit;
+namespace V2 {
+struct DrawOutput;
+}
 }
 
 namespace VideoCore {
@@ -3125,6 +3129,9 @@ public:
         void UpdateTopology(Maxwell3D& maxwell3d);
         void ProcessDraw(Maxwell3D& maxwell3d, bool draw_indexed, u32 instance_count);
         void ProcessDrawIndirect(Maxwell3D& maxwell3d);
+        /// EDEN_NX2_V2_IR_DRAWS=verify: hands the draw about to happen to V2::IrCheck.
+        void NoteV2DrawCheck(Maxwell3D& maxwell3d, VideoCommon::V2::Ir::DrawKind kind,
+                             u32 instance_count);
         State draw_state{};
         DrawTextureState draw_texture_state{};
         IndirectParams indirect_state{};
@@ -3449,6 +3456,22 @@ private:
     bool FrontRegSemEffect(VideoCommon::V2::RegSem::Effect effect, u32 a, u32 b);
 
     void FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split, FrontState& state);
+    // EDEN_NX2_V2_IR_DRAWS: Draw records for what the back's draw manager will do.
+    /// Before the front mirror takes a write (`value` after the shadow RAM): a deferred batch
+    /// the write ends.
+    void FrontDrawPre(VideoCommon::GpuSplit& split, FrontState& state, u32 method, u32 value);
+    /// After the mirror took a sent write, before it is sent: the draws the method triggers.
+    void FrontDrawPost(VideoCommon::GpuSplit& split, FrontState& state, u32 method, u32 value);
+    /// Before a multi-method run is applied and sent.
+    void FrontDrawMulti(VideoCommon::GpuSplit& split, FrontState& state, u32 method,
+                        const u32* base_start, u32 amount);
+    void FrontEmitDraws(VideoCommon::GpuSplit& split, FrontState& state, u32 method, u32 value,
+                        const VideoCommon::V2::DrawOutput& out,
+                        const VideoCommon::V2::GroupTracker* hashes);
+    void FrontFillDraw(FrontState& state, VideoCommon::V2::Ir::DrawBody& body, u32 method,
+                       u32 value, const VideoCommon::V2::DrawOutput& out, u32 first,
+                       const VideoCommon::V2::GroupTracker* hashes);
+    VideoCommon::V2::GroupTracker* FrontDrawGroups(FrontState& state);
     /// Sends the end of a front macro that may leave a deferred draw (a MacroEnd Draw record).
     void FrontEmitMacroEnd(Core::System& system, VideoCommon::GpuSplit& split, FrontState& state);
     /// Sends a macro HLE host indirect draw (a HostIndirect Draw record).

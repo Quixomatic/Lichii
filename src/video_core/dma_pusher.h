@@ -202,6 +202,8 @@ private:
     bool WaitForListWriters(GPUVAddr address, size_t size, bool cpu_written = true);
     /// EDEN_NX2_V2_ACQUIRE/HAZARD: records the guest memory writes of an engine method just sent
     /// to the split's back (GpuSplit::TracksWrites). `writer`: IsMemoryWriter.
+    /// EDEN_NX2_V2_IR_DRAWS: Copy records for copy engine launches and 2D blits being sent.
+    void NoteCopyRecord(Engines::EngineTypes type, u32 method, const u32* arguments, u32 amount);
     void NoteTrackedWrite(Engines::EngineInterface& engine, Engines::EngineTypes type, u32 method,
                           u32 argument, bool writer);
     static bool IsMemoryWriter(const Engines::EngineInterface& engine, Engines::EngineTypes type,
@@ -315,6 +317,7 @@ public:
 
     std::array<Engines::EngineInterface*, max_subchannels> subchannels{};
     /// The copy engine's registers its launches read, as sent (NoteTrackedWrite).
+    VideoCommon::V2::CopyRecordTracker copy_records; ///< EDEN_NX2_V2_IR_DRAWS
     VideoCommon::V2::DmaWriteTracker dma_writes;
     /// The inline-to-memory engine's upload registers, as sent (NoteTrackedWrite).
     VideoCommon::V2::UploadWriteTracker i2m_writes;

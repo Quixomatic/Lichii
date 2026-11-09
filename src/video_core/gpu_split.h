@@ -108,6 +108,11 @@ public:
     [[nodiscard]] bool FrontMacros() const {
         return front_macros;
     }
+    /// Whether the front sends Draw/Dispatch records before the methods that draw or launch
+    /// compute work (EDEN_NX2_V2_IR_DRAWS with the typed IR and front macros; fixed per start).
+    [[nodiscard]] bool DrawRecords() const {
+        return draw_records;
+    }
 
     // Pipeline v2 P2 (fixed at each start): EDEN_NX2_V2_ACQUIRE, EDEN_NX2_V2_HAZARD.
     /// Whether the front records the guest memory writes it sends (either switch on).
@@ -584,6 +589,8 @@ private:
     bool front_macros{};
     bool ir{};        ///< EDEN_NX2_V2_IR on at this start
     bool ir_verify{}; ///< EDEN_NX2_V2_IR=verify: the back checks every record header
+    bool draw_records{}; ///< EDEN_NX2_V2_IR_DRAWS (DrawRecords)
+    bool draw_verify{};  ///< EDEN_NX2_V2_IR_DRAWS=verify: the back checks draws (V2::IrCheck)
     std::unique_ptr<u64[]> ring;
 
     // Front side.

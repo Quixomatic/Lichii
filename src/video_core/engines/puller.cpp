@@ -102,6 +102,21 @@ void OnBackRelease(DmaPusher& dma_pusher, GPUVAddr address, u32 payload, u32 byt
     }
 }
 
+// EDEN_NX2_V2_IR_DRAWS: an Acquire record of what the front decided (informational).
+void NoteAcquireRecord(DmaPusher& dma_pusher, GPUVAddr address, u32 value, u32 operation,
+                       u32 verdict) {
+    if (auto& split = VideoCommon::GpuSplit::Get(); split.DrawRecords()) [[unlikely]] {
+        split.Note(VideoCommon::V2::Ir::Kind::Acquire,
+                   VideoCommon::V2::Ir::AcquireBody{
+                       .address = address,
+                       .address_space = static_cast<u32>(dma_pusher.memory_manager.GetID()),
+                       .value = value,
+                       .op = operation,
+                       .verdict = verdict,
+                   });
+    }
+}
+
 void DrainBack() {
     VideoCommon::GpuSplit::Get().Drain(VideoCommon::DrainSite::Acquire);
 }
@@ -579,6 +594,8 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
                 }
                 OnBackBarrier(dma_pusher, VideoCommon::V2::Ir::BarrierOp::ReleaseFences,
                               [rasterizer = dma_pusher.rasterizer] { rasterizer->ReleaseFences(); });
+                NoteAcquireRecord(dma_pusher, acquire.address, acquire.value, acquire.operation,
+                                  static_cast<u32>(view.verdict));
                 pending_acquire = acquire;
                 dma_pusher.suspensions.fetch_add(1, std::memory_order_release);
                 VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AcquireWaits, 1);
@@ -591,9 +608,12 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
                     // the release (GpuSplit::NoteSync).
                     split.NoteSync();
                 }
+                NoteAcquireRecord(dma_pusher, acquire.address, acquire.value, acquire.operation,
+                                  static_cast<u32>(view.verdict));
                 return;
             }
         }
+        NoteAcquireRecord(dma_pusher, acquire.address, acquire.value, acquire.operation, ~0U);
         // Verify: a pass of the view must be one of the old path too (no suspension).
         const auto verify_result = [&](bool old_passed) {
             if (view_passes) [[unlikely]] {

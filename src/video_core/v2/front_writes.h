@@ -10,6 +10,7 @@
 
 #include "common/common_types.h"
 #include "video_core/v2/hazard.h"
+#include "video_core/v2/ir.h"
 
 namespace Tegra {
 class MemoryManager;
@@ -93,6 +94,19 @@ struct DmaWriteTracker {
 
     /// A copy engine method was sent.
     void Note(GpuSplit& split, const Tegra::MemoryManager& memory, u32 method, u32 argument);
+};
+
+/// EDEN_NX2_V2_IR_DRAWS: Copy records (informational) for copy engine launches and 2D blits,
+/// from the registers the front saw sent.
+struct CopyRecordTracker {
+    std::array<u32, 8> dma{};  ///< MaxwellDMA 0x100-0x107: offsets in/out, pitches, line size
+    std::array<u32, 4> blit{}; ///< Fermi2D destination and source surface addresses
+    u32 remap_components{};
+
+    /// A copy engine method was sent: true and the body for a launch.
+    bool NoteDma(u32 method, u32 argument, Ir::CopyBody& body);
+    /// A 2D engine method was sent: true and the body for a blit.
+    bool NoteBlit(u32 method, u32 argument, Ir::CopyBody& body);
 };
 
 } // namespace VideoCommon::V2

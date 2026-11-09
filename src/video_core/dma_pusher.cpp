@@ -552,6 +552,9 @@ void DmaPusher::CallMethod(u32 argument) {
                     }
                 }
             }
+            if (split.DrawRecords()) [[unlikely]] {
+                NoteCopyRecord(engine_type, dma_state.method, &argument, 1);
+            }
             split.Method(subchannel, dma_state.method, argument, dma_state.is_last_call,
                          WantsSegment() ? &segment : nullptr);
             return;
@@ -615,6 +618,9 @@ void DmaPusher::CallMultiMethod(const u32* base_start, u32 num_methods) {
                         return;
                     }
                 }
+            }
+            if (split.DrawRecords()) [[unlikely]] {
+                NoteCopyRecord(engine_type, dma_state.method, base_start, num_methods);
             }
             split.MultiMethod(subchannel, dma_state.method, base_start, num_methods,
                               dma_state.method_count, WantsSegment() ? &segment : nullptr);
@@ -702,6 +708,23 @@ bool DmaPusher::WaitForListWriters(GPUVAddr address, size_t size, bool cpu_writt
         }
     }
     return waited || waited_old;
+}
+
+void DmaPusher::NoteCopyRecord(Engines::EngineTypes type, u32 method, const u32* arguments,
+                               u32 amount) {
+    for (u32 i = 0; i < amount; ++i) {
+        const u32 current = method; // Engines run a multi-method run as one method
+        VideoCommon::V2::Ir::CopyBody body{};
+        bool launch = false;
+        if (type == Engines::EngineTypes::MaxwellDMA) {
+            launch = copy_records.NoteDma(current, arguments[i], body);
+        } else if (type == Engines::EngineTypes::Fermi2D) {
+            launch = copy_records.NoteBlit(current, arguments[i], body);
+        }
+        if (launch) {
+            VideoCommon::GpuSplit::Get().Note(VideoCommon::V2::Ir::Kind::Copy, body);
+        }
+    }
 }
 
 void DmaPusher::NoteTrackedWrite(Engines::EngineInterface& engine, Engines::EngineTypes type,

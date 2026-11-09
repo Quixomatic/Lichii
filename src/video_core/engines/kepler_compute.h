@@ -289,6 +289,9 @@ private:
     void FrontNoteWrites(VideoCommon::GpuSplit& split, FrontState& state, u32 method,
                          u32 argument);
     /// An inline QMD (0x107) was sent: the QMD it stores and, if it launches, what it writes.
+    /// EDEN_NX2_V2_IR_DRAWS: a Dispatch record before writes that can launch compute work.
+    void FrontDispatchRecord(VideoCommon::GpuSplit& split, FrontState& state, u32 method,
+                             const u32* arguments, u32 amount);
     void FrontNoteInlineQmd(VideoCommon::GpuSplit& split, FrontState& state);
     std::unique_ptr<FrontState> front;
     bool front_macros{}; ///< The front owns the macro code and bindings (the back skips them)

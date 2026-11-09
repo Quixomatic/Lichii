@@ -35,6 +35,7 @@
 #include "video_core/textures/texture.h"
 #include "video_core/texture_cache/image_info.h"
 #include "video_core/texture_cache/util.h"
+#include "video_core/v2/draw_model.h"
 #include "video_core/v2/front_writes.h"
 #include "video_core/v2/ir_exec.h"
 #include "video_core/v2/regsem_3d.h"
@@ -1192,6 +1193,9 @@ struct Maxwell3D::FrontState {
     /// the table-driven copy compared with them (verify).
     VideoCommon::V2::GroupTracker v2_groups;
     std::unique_ptr<VideoCommon::V2::RegSem::Front3D> v2;
+    /// EDEN_NX2_V2_IR_DRAWS: the back's draw manager as the front predicts it (Draw records).
+    VideoCommon::V2::DrawModel v2_draw_model;
+    bool back_skip_same{}; ///< SkipSameValueWrites(): the back stores only changed state writes
 };
 
 namespace {
@@ -1268,6 +1272,24 @@ Maxwell3D::FrontState& Maxwell3D::Front(Core::System& system, VideoCommon::GpuSp
         front->skip_same = SkipSameValueWrites() && FrontSkipSame();
         front->split_start = split.Starts();
         front->executing_macro = executing_macro;
+        front->back_skip_same = SkipSameValueWrites();
+        {
+            // The draw manager's state as the back left it (it is idle).
+            auto& model = front->v2_draw_model.state;
+            const auto& draw = draw_manager.draw_state;
+            model.mode = static_cast<u8>(draw.draw_mode);
+            model.topology = static_cast<u8>(draw.topology);
+            model.draw_indexed = draw.draw_indexed;
+            model.instance_count = draw.instance_count;
+            model.drawn_instances = draw.drawn_instances;
+            model.base_index = draw.base_index;
+            model.base_instance = draw.base_instance;
+            model.inline_bytes = static_cast<u32>(draw.inline_index_draw_indexes.size());
+            model.vertex_first = draw.vertex_buffer.first;
+            model.vertex_count = draw.vertex_buffer.count;
+            model.index_first = draw.index_buffer.first;
+            model.index_count = draw.index_buffer.count;
+        }
         front->parameters = std::move(macro_params);
         macro_params.clear();
         executing_macro = 0;
@@ -1325,6 +1347,11 @@ void Maxwell3D::FrontWriteRegSem(VideoCommon::GpuSplit& split, FrontState& fs, u
         fs.control_writes[fs.control_count++ % fs.control_writes.size()] = {
             argument, static_cast<u32>(fs.control), from_macro ? 2U : 1U};
     }
+    const bool v2_draws = split.DrawRecords();
+    if (v2_draws) [[unlikely]] {
+        FrontDrawPre(split, fs, method,
+                     fs.control == Regs::ShadowRamControl::Replay ? fs.shadow[method] : argument);
+    }
     if (!RegSem::Write3D(fs, table, method, argument, from_macro,
                          [this](RegSem::Effect effect, u32 a, u32 b) {
                              return FrontRegSemEffect(effect, a, b);
@@ -1333,6 +1360,9 @@ void Maxwell3D::FrontWriteRegSem(VideoCommon::GpuSplit& split, FrontState& fs, u
             Profile::Add(Profile::Counter::SameValueWrites, 1);
         }
         return;
+    }
+    if (v2_draws) [[unlikely]] {
+        FrontDrawPost(split, fs, method, fs.regs[method]);
     }
     if (from_macro) {
         split.MacroWrite(this, method, argument);
@@ -1420,6 +1450,10 @@ void Maxwell3D::FrontWriteV1(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
         fs.control_writes[fs.control_count++ % fs.control_writes.size()] = {
             argument, static_cast<u32>(fs.control), from_macro ? 2U : 1U};
     }
+    const bool v2_draws = split.DrawRecords();
+    if (v2_draws) [[unlikely]] {
+        FrontDrawPre(split, fs, method, value);
+    }
     if (execution_mask[method] && FrontSkipsLoopWrite(fs, method, value, shadow_kept)) {
         if (Profile::Enabled()) [[unlikely]] {
             Profile::Add(Profile::Counter::SameValueWrites, 1);
@@ -1473,6 +1507,9 @@ void Maxwell3D::FrontWriteV1(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
             break;
         }
     }
+    if (v2_draws) [[unlikely]] {
+        FrontDrawPost(split, fs, method, value);
+    }
     if (from_macro) {
         // Direct writes consume the sink first.
         split.MacroWrite(this, method, argument);
@@ -1519,6 +1556,9 @@ void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit
             FrontRunMacro(system, split, fs);
         }
         return;
+    }
+    if (split.DrawRecords()) [[unlikely]] {
+        FrontDrawMulti(split, fs, method, base_start, amount);
     }
     if (fs.v2 != nullptr && fs.v2->mode == VideoCommon::V2::Mode::On) [[unlikely]] {
         FrontMultiRegSem(fs, method, base_start, amount, true);
@@ -1845,16 +1885,163 @@ void Maxwell3D::RunMacroHleDraw(Core::System& system, const VideoCommon::V2::Mac
     }
 }
 
+VideoCommon::V2::GroupTracker* Maxwell3D::FrontDrawGroups(FrontState& fs) {
+    if (fs.v2 == nullptr) {
+        return nullptr;
+    }
+    if (fs.v2->mode == VideoCommon::V2::Mode::On) {
+        return &fs.v2_groups;
+    }
+    return fs.v2->mirror ? &fs.v2->mirror->v2_groups : nullptr;
+}
+
+void Maxwell3D::FrontFillDraw(FrontState& fs, VideoCommon::V2::Ir::DrawBody& body, u32 method,
+                              u32 value, const VideoCommon::V2::DrawOutput& out, u32 first,
+                              const VideoCommon::V2::GroupTracker* hashes) {
+    namespace V2 = VideoCommon::V2;
+    body.method = method;
+    body.argument = value;
+    body.num_draws =
+        static_cast<u8>(std::min<u32>(out.count - first, V2::Ir::MaxPredictedDraws));
+    for (u32 i = 0; i < body.num_draws; ++i) {
+        body.draws[i] = out.draws[first + i];
+    }
+    // The register groups changed since the previous Draw record, and their hashes as the back
+    // will have them at the draw (`hashes` when the mirror's are not those yet).
+    V2::GroupTracker* const groups = FrontDrawGroups(fs);
+    if (groups == nullptr || !groups->valid) {
+        return;
+    }
+    const V2::GroupTracker& source = hashes != nullptr ? *hashes : *groups;
+    body.flags |= V2::Ir::DrawHasGroups;
+    body.dirty_groups = groups->dirty;
+    size_t slot = 0;
+    for (u32 bits = V2::HashedGroups; bits != 0; bits &= bits - 1) {
+        body.group_hashes[slot++] = source.hashes[std::countr_zero(bits)];
+    }
+    body.fingerprint = source.Fingerprint(V2::HashedGroups);
+    groups->BeginDraw();
+}
+
+void Maxwell3D::FrontEmitDraws(VideoCommon::GpuSplit& split, FrontState& fs, u32 method, u32 value,
+                               const VideoCommon::V2::DrawOutput& out,
+                               const VideoCommon::V2::GroupTracker* hashes) {
+    // Draw records go before the method that makes the back draw (it consumes them in order).
+    for (u32 first = 0; first < out.count; first += VideoCommon::V2::Ir::MaxPredictedDraws) {
+        VideoCommon::V2::Ir::DrawBody body{};
+        body.op = VideoCommon::V2::Ir::DrawOp::Predicted;
+        body.engine = split.Ref(this);
+        FrontFillDraw(fs, body, method, value, out, first, hashes);
+        split.Note(VideoCommon::V2::Ir::Kind::Draw, body);
+    }
+}
+
+void Maxwell3D::FrontDrawPre(VideoCommon::GpuSplit& split, FrontState& fs, u32 method, u32 value) {
+    // A write the back stores (ProcessDirtyRegisters) ends a deferred instanced batch first.
+    if (!fs.v2_draw_model.HasDeferredDraw() ||
+        VideoCommon::V2::DrawModel::IsInstanceLoopMethod(method)) {
+        return;
+    }
+    if (!execution_mask[method] && fs.back_skip_same && fs.regs[method] == value) {
+        return;
+    }
+    VideoCommon::V2::DrawOutput out;
+    fs.v2_draw_model.OnStore(method, fs.regs.data(), out);
+    FrontEmitDraws(split, fs, method, value, out, nullptr);
+}
+
+void Maxwell3D::FrontDrawPost(VideoCommon::GpuSplit& split, FrontState& fs, u32 method,
+                              u32 value) {
+    namespace V2 = VideoCommon::V2;
+    if (!execution_mask[method] || !V2::DrawModel::IsDrawMethod(method)) {
+        return;
+    }
+    V2::DrawOutput out;
+    fs.v2_draw_model.OnExecute(method, value, fs.regs.data(), out);
+    if (out.count == 0) {
+        return;
+    }
+    // REGSEM=verify: the table copy takes this write only after the hand-written mirror.
+    V2::GroupTracker pending;
+    const V2::GroupTracker* hashes = nullptr;
+    if (fs.v2 != nullptr && fs.v2->mode == V2::Mode::Verify && fs.v2->mirror) {
+        pending = fs.v2->mirror->v2_groups;
+        const u32 old_value = fs.v2->mirror->regs[method];
+        if (old_value != value) {
+            pending.Change(V2::RegSem::GetTable3D().groups[method], method, old_value, value);
+        }
+        hashes = &pending;
+    }
+    FrontEmitDraws(split, fs, method, value, out, hashes);
+}
+
+void Maxwell3D::FrontDrawMulti(VideoCommon::GpuSplit& split, FrontState& fs, u32 method,
+                               const u32* base_start, u32 amount) {
+    // As CallMultiMethod on the back: a run of a method outside instance loops ends a deferred
+    // batch first, inline index runs append, other runs are a CallMethod per word.
+    namespace V2 = VideoCommon::V2;
+    V2::DrawModel& model = fs.v2_draw_model;
+    V2::DrawOutput out;
+    if (!V2::DrawModel::IsInstanceLoopMethod(method)) {
+        model.OnMultiStart(method, fs.regs.data(), out);
+        FrontEmitDraws(split, fs, method, amount != 0 ? base_start[0] : 0, out, nullptr);
+    }
+    const bool replay = fs.control == Regs::ShadowRamControl::Replay;
+    constexpr u32 cb_data = MAXWELL3D_REG_INDEX(const_buffer.buffer);
+    const bool inline_index = method == MAXWELL3D_REG_INDEX(draw_inline_index) ||
+                              method == MAXWELL3D_REG_INDEX(inline_index_2x16.even) ||
+                              method == MAXWELL3D_REG_INDEX(inline_index_4x8.index0);
+    if ((method >= cb_data && method < cb_data + 16) ||
+        method == MAXWELL3D_REG_INDEX(inline_data)) {
+        return;
+    }
+    if (inline_index && !replay) {
+        model.OnInlineIndex(method, amount);
+        return;
+    }
+    if (!V2::DrawModel::IsDrawMethod(method) && !model.HasDeferredDraw()) {
+        return;
+    }
+    // Word by word, with the hashes as the back has them at each draw.
+    V2::GroupTracker* const groups = FrontDrawGroups(fs);
+    V2::GroupTracker hashes = groups != nullptr ? *groups : V2::GroupTracker{};
+    const auto group = V2::RegSem::GetTable3D().groups[method];
+    const u32 saved = fs.regs[method];
+    for (u32 i = 0; i < amount; ++i) {
+        const u32 value = replay ? fs.shadow[method] : base_start[i];
+        out.count = 0;
+        if (model.HasDeferredDraw() && !V2::DrawModel::IsInstanceLoopMethod(method) &&
+            (execution_mask[method] || !fs.back_skip_same || fs.regs[method] != value)) {
+            model.OnStore(method, fs.regs.data(), out);
+            FrontEmitDraws(split, fs, method, value, out, &hashes);
+            out.count = 0;
+        }
+        if (fs.regs[method] != value) {
+            hashes.Change(group, method, fs.regs[method], value);
+        }
+        fs.regs[method] = value;
+        if (execution_mask[method]) {
+            model.OnExecute(method, value, fs.regs.data(), out);
+            FrontEmitDraws(split, fs, method, value, out, &hashes);
+        }
+    }
+    fs.regs[method] = saved; // The mirror applies the run itself after this.
+}
+
 void Maxwell3D::FrontEmitMacroEnd(Core::System& system, VideoCommon::GpuSplit& split,
                                   FrontState& fs) {
     // The back consumes its sink and issues the deferred instanced draw (FinishFrontMacro).
     VideoCommon::V2::Ir::DrawBody body{};
     body.op = VideoCommon::V2::Ir::DrawOp::MacroEnd;
+    if (split.DrawRecords()) [[unlikely]] {
+        VideoCommon::V2::DrawOutput out;
+        fs.v2_draw_model.OnMacroEnd(fs.regs.data(), out);
+        FrontFillDraw(fs, body, 0, 0, out, 0, nullptr);
+    }
     body.engine = split.Ref(this);
     split.Emit(VideoCommon::V2::Ir::Kind::Draw, body,
                [this, system_ptr = &system] { FinishFrontMacro(*system_ptr); },
                VideoCommon::GpuSplit::FastDrawNeutral);
-    (void)fs;
 }
 
 void Maxwell3D::FrontEmitHostIndirect(Core::System& system, VideoCommon::GpuSplit& split,
@@ -1873,10 +2060,16 @@ void Maxwell3D::FrontEmitHostIndirect(Core::System& system, VideoCommon::GpuSpli
         .base_vertex_attribute = draw.base_vertex_attribute ? 1U : 0U,
         .reserved = 0,
     };
+    if (split.DrawRecords()) [[unlikely]] {
+        VideoCommon::V2::DrawOutput out;
+        fs.v2_draw_model.OnIndirect(draw.kind != VideoCommon::V2::MacroHle::Kind::DrawArraysIndirect,
+                                    draw.topology, fs.regs.data(), out);
+        FrontFillDraw(fs, body, 0, 0, out, 0, nullptr);
+    }
+    body.engine = split.Ref(this);
     split.Emit(VideoCommon::V2::Ir::Kind::Draw, body, [this, system_ptr = &system, draw] {
         RunMacroHleDraw(*system_ptr, draw);
     });
-    (void)fs;
 }
 
 void Maxwell3D::FrontTrackInstanceLoop(FrontState& fs, u32 method, u32 value) {

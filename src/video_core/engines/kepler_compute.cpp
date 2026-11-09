@@ -41,6 +41,7 @@
 #include "video_core/v2/front_writes.h"
 #include "common/scope_exit.h"
 #include "video_core/v2/shader_writes.h"
+#include "video_core/v2/ir_check.h"
 #include "video_core/v2/regsem_3d.h"
 
 namespace Tegra::Engines {
@@ -1411,6 +1412,10 @@ bool KeplerCompute::TryFireEmblemUpscale(bool allow_history) {
 }
 
 void KeplerCompute::NoteV2Dispatch(bool native) {
+    if (VideoCommon::V2::IrCheck::g_active) [[unlikely]] {
+        VideoCommon::V2::IrCheck::NoteDispatch(
+            native ? (GPUVAddr{native_registers[0xad]} << 8) : 0);
+    }
     if (VideoCommon::V2::On(VideoCommon::V2::Switch::RegSem)) [[unlikely]] {
         if (native) {
             VideoCommon::V2::RegSem::NoteDispatchCompute(v2_groups, native_registers.data(),
@@ -1641,10 +1646,76 @@ void KeplerCompute::FrontCallMethod(Core::System& system, VideoCommon::GpuSplit&
         return;
     }
     FrontApply(fs, method, argument);
+    if (split.DrawRecords()) [[unlikely]] {
+        FrontDispatchRecord(split, fs, method, &argument, 1);
+    }
     split.Method(this, method, argument, is_last_call, segment);
     if (split.TracksWrites()) [[unlikely]] {
         FrontNoteWrites(split, fs, method, argument);
     }
+}
+
+void KeplerCompute::FrontDispatchRecord(VideoCommon::GpuSplit& split, FrontState& fs, u32 method,
+                                        const u32* arguments, u32 amount) {
+    // As ProcessNativeMethod: which writes can launch QMDs (EDEN_NX2_V2_IR_DRAWS). The inline
+    // QMD (0x107) launches at once unless it waits for a dependency; QMD signals (0xaf, 0xb0)
+    // may launch it and the QMDs that depend on it, a number only the back's scheduler knows.
+    namespace Ir = VideoCommon::V2::Ir;
+    const u32* const r = fs.registers.data();
+    Ir::DispatchBody body{};
+    body.method = method;
+    body.max_dispatches = 0;
+    for (u32 i = 0; i < amount; ++i) {
+        const u32 argument = arguments[i];
+        body.argument = argument;
+        switch (method) {
+        case 0x107:
+            if ((r[0xa7] & (1U << 24)) == 0 && (r[0xcc] & (1U << 12)) != 0) {
+                continue; // Waits for a dependency: launched by a later signal
+            }
+            body.qmd_address = ((GPUVAddr{r[0xc6]} << 32) | r[0xc7]) << 8;
+            body.program = (GPUVAddr{r[0xc8 + 49] & 0x1ffff} << 32) | r[0xc8 + 48];
+            ++body.min_dispatches;
+            body.max_dispatches = ~0U;
+            break;
+        case 0xaf:
+            if ((argument & 2) == 0) {
+                continue;
+            }
+            body.qmd_address = GPUVAddr{r[0xad]} << 8;
+            body.max_dispatches = ~0U;
+            break;
+        case 0xb0:
+            if ((argument & 15) == 0 || (argument & 15) == 1) {
+                continue;
+            }
+            body.qmd_address = GPUVAddr{r[0xad]} << 8;
+            body.max_dispatches = ~0U;
+            break;
+        default:
+            continue;
+        }
+    }
+    if (body.max_dispatches == 0) {
+        return;
+    }
+    body.engine = split.Ref(this);
+    body.write_begin = Ir::Unknown;
+    body.write_end = Ir::Unknown;
+    VideoCommon::V2::ComputeGroupTracker* const groups =
+        fs.v2_mode == VideoCommon::V2::Mode::On
+            ? &fs.v2_groups
+            : (fs.v2_mirror ? &fs.v2_mirror->v2_groups : nullptr);
+    if (groups != nullptr && groups->valid) {
+        body.dirty_groups = groups->dirty;
+        size_t slot = 0;
+        for (u32 bits = VideoCommon::V2::HashedComputeGroups; bits != 0; bits &= bits - 1) {
+            body.group_hashes[slot++] = groups->hashes[std::countr_zero(bits)];
+        }
+        body.fingerprint = groups->Fingerprint(VideoCommon::V2::HashedComputeGroups);
+        groups->BeginDraw();
+    }
+    split.Note(Ir::Kind::Dispatch, body);
 }
 
 void KeplerCompute::FrontNoteWrites(VideoCommon::GpuSplit& split, FrontState& fs, u32 method,
@@ -1765,6 +1836,9 @@ void KeplerCompute::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuS
             FrontApply(fs, method, base_start[i]);
         }
     }
+    if (split.DrawRecords()) [[unlikely]] {
+        FrontDispatchRecord(split, fs, method, base_start, amount);
+    }
     split.MultiMethod(this, method, base_start, amount, methods_pending, segment);
     if (split.TracksWrites()) [[unlikely]] {
         for (u32 i = 0; i < amount; ++i) {
@@ -1810,6 +1884,9 @@ void KeplerCompute::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& s
             return false;
         }
         FrontApply(fs, address, value);
+        if (split.DrawRecords()) [[unlikely]] {
+            FrontDispatchRecord(split, fs, address, &value, 1);
+        }
         split.MacroWrite(this, address, value);
         if (dump_identity && observation.writes.size() < 64) [[unlikely]] {
             observation.writes.emplace_back(address, value);

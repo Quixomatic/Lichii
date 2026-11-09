@@ -6,6 +6,7 @@
 #include <cstring>
 
 #include "video_core/engines/maxwell_3d.h"
+#include "video_core/engines/fermi_2d.h"
 #include "video_core/engines/maxwell_dma.h"
 #include "video_core/gpu_split.h"
 #include "video_core/memory_manager.h"
@@ -246,6 +247,67 @@ void DmaWriteTracker::Note(GpuSplit& split, const Tegra::MemoryManager& memory, 
         NoteReleaseWrite(split, memory, address, semaphore[2],
                          type == LaunchDMA::SemaphoreType::RELEASE_ONE_WORD_SEMAPHORE ? 4 : 16,
                          true, Producer::Release, true);
+    }
+}
+
+bool CopyRecordTracker::NoteDma(u32 method, u32 argument, Ir::CopyBody& body) {
+    using Tegra::Engines::MaxwellDMA;
+    if (method >= 0x100 && method < 0x108) {
+        dma[method - 0x100] = argument;
+        return false;
+    }
+    if (method == 0x1c2) {
+        remap_components = argument;
+        return false;
+    }
+    if (method != DmaWriteTracker::LaunchMethod) {
+        return false;
+    }
+    MaxwellDMA::LaunchDMA launch;
+    std::memcpy(&launch, &argument, sizeof(launch));
+    using LaunchDMA = MaxwellDMA::LaunchDMA;
+    if (launch.data_transfer_type.Value() == LaunchDMA::DataTransferType::NONE) {
+        return false;
+    }
+    body.op = Ir::CopyOp::Dma;
+    body.source = MaxwellDMA::PackedGPUVAddr{dma[0], dma[1]};
+    body.destination = MaxwellDMA::PackedGPUVAddr{dma[2], dma[3]};
+    const bool pitch = launch.src_memory_layout.Value() == LaunchDMA::MemoryLayout::PITCH &&
+                       launch.dst_memory_layout.Value() == LaunchDMA::MemoryLayout::PITCH;
+    body.flags = launch.dst_memory_layout.Value() == LaunchDMA::MemoryLayout::PITCH ? 0 : 1;
+    if (pitch && launch.remap_enable == 0) {
+        const u64 lines = launch.multi_line_enable != 0 ? std::max<u32>(dma[7], 1) : 1;
+        body.bytes = (lines - 1) * static_cast<u64>(static_cast<s32>(dma[5])) + dma[6];
+    } else {
+        body.bytes = Ir::Unknown;
+    }
+    return true;
+}
+
+bool CopyRecordTracker::NoteBlit(u32 method, u32 argument, Ir::CopyBody& body) {
+    using Tegra::Engines::Fermi2D;
+    switch (method) {
+    case FERMI2D_REG_INDEX(dst.addr_upper):
+        blit[0] = argument;
+        return false;
+    case FERMI2D_REG_INDEX(dst.addr_lower):
+        blit[1] = argument;
+        return false;
+    case FERMI2D_REG_INDEX(src.addr_upper):
+        blit[2] = argument;
+        return false;
+    case FERMI2D_REG_INDEX(src.addr_lower):
+        blit[3] = argument;
+        return false;
+    case FERMI2D_REG_INDEX(pixels_from_memory.src_y0) + 1:
+        body.op = Ir::CopyOp::Blit2D;
+        body.flags = 1;
+        body.destination = (GPUVAddr{blit[0]} << 32) | blit[1];
+        body.source = (GPUVAddr{blit[2]} << 32) | blit[3];
+        body.bytes = Ir::Unknown;
+        return true;
+    default:
+        return false;
     }
 }
 

@@ -30,6 +30,7 @@
 #include "video_core/nx2.h"
 #include "video_core/nx2_fast_draw.h"
 #include "video_core/nx2_profile.h"
+#include "video_core/v2/ir_check.h"
 #include "video_core/v2/ir_exec.h"
 #include "video_core/v2/v2_stats.h"
 
@@ -137,6 +138,11 @@ void GpuSplit::MaybeStart(Core::System& system_) {
     if (ir) {
         AllocateIr();
     }
+    draw_records = ir && front_macros && V2::On(V2::Switch::IrDraws);
+    draw_verify = draw_records && V2::Verify(V2::Switch::IrDraws);
+    if (draw_verify) {
+        V2::IrCheck::Start();
+    }
     if (V2::On(V2::Switch::CpuLane)) {
         SetCpuLaneHook([](void* gpu) { static_cast<Tegra::GPU*>(gpu)->TickCpuLane(); },
                        &system->GPU());
@@ -160,9 +166,10 @@ void GpuSplit::MaybeStart(Core::System& system_) {
         LOG_INFO(HW_GPU, "GPU thread split: hand-off spin window {} us ({} logical CPUs)",
                  spin_window_ns / 1000, std::thread::hardware_concurrency());
     }
-    LOG_INFO(HW_GPU, "GPU thread split: engine methods run on a second thread{}{}",
+    LOG_INFO(HW_GPU, "GPU thread split: engine methods run on a second thread{}{}{}",
              front_macros ? ", macros on the first" : "",
-             ir ? (ir_verify ? ", typed IR (verified)" : ", typed IR") : "");
+             ir ? (ir_verify ? ", typed IR (verified)" : ", typed IR") : "",
+             draw_records ? (draw_verify ? ", draw records (checked)" : ", draw records") : "");
 }
 
 void GpuSplit::Stop() {
@@ -190,6 +197,9 @@ void GpuSplit::Stop() {
     front_macros = false;
     ir = false;
     ir_verify = false;
+    draw_records = false;
+    draw_verify = false;
+    V2::IrCheck::Stop();
     ir_sequence = 0;
     ir_run = nullptr;
     ir_run_words = 0;
@@ -600,6 +610,9 @@ size_t GpuSplit::ExecuteIr(const u64* entry) {
     const size_t size = V2::Ir::RecordWords(head);
     if (ir_verify) [[unlikely]] {
         CheckIrRecord(entry);
+    }
+    if (draw_verify) [[unlikely]] {
+        V2::IrCheck::OnRecord(V2::Ir::KindOf(head));
     }
     back_sequence = entry[1];
     const V2::Ir::PayloadRef payload = (head & V2::Ir::HasPayload) != 0

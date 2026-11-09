@@ -28,6 +28,8 @@
 #include "video_core/gpu_thread.h"
 #include "video_core/memory_manager.h"
 #include "video_core/renderer_null/null_rasterizer.h"
+#include "video_core/v2/draw_model.h"
+#include "video_core/v2/ir_check.h"
 #include "video_core/v2/regsem_3d.h"
 #include "video_core/v2/v2_switches.h"
 
@@ -67,6 +69,19 @@ struct GpuSplitTestAccess {
 
     static const u64* Ring(const GpuSplit& split) {
         return split.ring.get();
+    }
+
+    static void SetDrawRecords(GpuSplit& split, bool verify) {
+        split.front_macros = true;
+        split.draw_records = true;
+        split.draw_verify = verify;
+        if (verify) {
+            V2::IrCheck::Start();
+        }
+    }
+
+    static void SetBackThread(bool back) {
+        GpuSplit::on_back_thread = back;
     }
 
     static u64 IrBadRecords(const GpuSplit& split) {
@@ -1158,4 +1173,172 @@ TEST_CASE("V2 typed records run on the back without thunks, as their deferred ca
     unmap.op = Ir::MapOp::GmmuUnmap;
     f.gpu.ExecuteMap(unmap);
     REQUIRE(!f.memory.GpuToCpuAddress(0x4000'0000 + 0x1234));
+}
+
+TEST_CASE("V2 front Draw records predict every draw the back performs",
+          "[video_core][gpu_split_dispatch][v2_ir]") {
+    using Access = VideoCommon::GpuSplitTestAccess;
+    using VideoCommon::V2::Mode;
+    using VideoCommon::V2::Switch;
+    namespace IrCheck = VideoCommon::V2::IrCheck;
+    constexpr std::array<u32, 20> draw_methods{
+        DrawBegin,
+        DrawEnd,
+        MAXWELL3D_REG_INDEX(vertex_buffer.first),
+        MAXWELL3D_REG_INDEX(vertex_buffer.count),
+        MAXWELL3D_REG_INDEX(index_buffer.first),
+        MAXWELL3D_REG_INDEX(index_buffer.count),
+        MAXWELL3D_REG_INDEX(index_buffer32_first),
+        MAXWELL3D_REG_INDEX(index_buffer16_subsequent),
+        MAXWELL3D_REG_INDEX(draw_inline_index),
+        MAXWELL3D_REG_INDEX(inline_index_2x16.even),
+        MAXWELL3D_REG_INDEX(vertex_array_instance_first),
+        MAXWELL3D_REG_INDEX(vertex_array_instance_subsequent),
+        MAXWELL3D_REG_INDEX(global_base_vertex_index),
+        MAXWELL3D_REG_INDEX(global_base_instance_index),
+        MAXWELL3D_REG_INDEX(clear_surface),
+        MAXWELL3D_REG_INDEX(draw_texture.src_y0),
+        MAXWELL3D_REG_INDEX(topology_override),
+        MAXWELL3D_REG_INDEX(primitive_topology_control),
+        MAXWELL3D_REG_INDEX(bind_groups[0].raw_config),
+        ShadowControl,
+    };
+    for (const Mode regsem : {Mode::Off, Mode::On, Mode::Verify}) {
+        const V2SwitchScope scope{Switch::RegSem, regsem};
+        Fixture f;
+        f.system.Initialize();
+        VideoCommon::GpuSplit split;
+        Access::Initialize(split, f.system);
+        Access::SetIr(split, true);
+        Access::SetDrawRecords(split, true);
+        auto& engine = f.fast;
+        engine.SetNativeTuringMacroMode(true);
+        std::mt19937 rng{static_cast<u32>(regsem) + 21};
+        u64 read = 0;
+        for (u32 round = 0; round < 40; ++round) {
+            for (u32 i = 0; i < 400; ++i) {
+                const u32 choice = static_cast<u32>(rng() % 10);
+                if (choice < 3) {
+                    const u32 method = f.state_methods[rng() % f.state_methods.size()];
+                    engine.FrontCallMethod(f.system, split, method, rng() % 3 == 0 ? rng() : rng() % 4,
+                                           true);
+                    continue;
+                }
+                const u32 method = draw_methods[rng() % draw_methods.size()];
+                u32 argument = static_cast<u32>(rng() % 8);
+                if (method == DrawBegin) {
+                    argument = (static_cast<u32>(rng() % 3) << 26) | (rng() % 8);
+                } else if (method == ShadowControl) {
+                    argument = rng() % 8 == 0 ? static_cast<u32>(rng() % 4) : 0;
+                } else if (method == MAXWELL3D_REG_INDEX(index_buffer32_first) ||
+                           method == MAXWELL3D_REG_INDEX(index_buffer16_subsequent) ||
+                           method == MAXWELL3D_REG_INDEX(vertex_array_instance_first) ||
+                           method == MAXWELL3D_REG_INDEX(vertex_array_instance_subsequent)) {
+                    argument = static_cast<u32>(rng());
+                } else if (method == MAXWELL3D_REG_INDEX(primitive_topology_control)) {
+                    argument = rng() % 2;
+                }
+                if (choice == 9) {
+                    std::vector<u32> words(1 + rng() % 4);
+                    for (auto& word : words) {
+                        word = method == DrawBegin ? argument : static_cast<u32>(rng() % 8);
+                    }
+                    const u32 amount = static_cast<u32>(words.size());
+                    engine.FrontCallMultiMethod(f.system, split, method, words.data(), amount,
+                                                amount);
+                } else {
+                    engine.FrontCallMethod(f.system, split, method, argument, rng() % 4 != 0);
+                }
+            }
+            // The back runs what the front sent.
+            split.Publish();
+            Access::SetBackThread(true);
+            while (read != Access::End(split)) {
+                read = Access::Execute(split, read, Access::End(split));
+            }
+            Access::SetBackThread(false);
+        }
+        Access::SetBackThread(true);
+        engine.ConsumeSink(f.system);
+        Access::SetBackThread(false);
+        const IrCheck::Counters counters = IrCheck::GetCounters();
+        INFO("regsem mode " << static_cast<u32>(regsem));
+        CHECK(counters.draws_matched > 1000);
+        CHECK(counters.draws_mismatched == 0);
+        CHECK(counters.draws_unexpected == 0);
+        CHECK(counters.draws_missing == 0);
+        CHECK(IrCheck::PendingDraws() == 0);
+        if (regsem != Mode::Off) {
+            CHECK(counters.fingerprints_compared > 1000);
+            CHECK(counters.fingerprints_mismatched == 0);
+        }
+        CHECK(Access::IrBadRecords(split) == 0);
+        IrCheck::Stop();
+    }
+}
+
+TEST_CASE("V2 draw trigger table and the back's draw/dispatch checks",
+          "[video_core][v2_ir]") {
+    namespace Ir = VideoCommon::V2::Ir;
+    namespace IrCheck = VideoCommon::V2::IrCheck;
+    using VideoCommon::V2::DrawModel;
+    Fixture f; // Builds the register table.
+    const auto& table = VideoCommon::V2::RegSem::GetTable3D();
+    // Every method the model acts on is executable and handled by the draw manager, and every
+    // draw manager method that draws is in the model.
+    u32 draw_methods = 0;
+    for (u32 method = 0; method < Maxwell3D::Regs::NUM_REGS; ++method) {
+        if (DrawModel::IsDrawMethod(method)) {
+            ++draw_methods;
+            REQUIRE((table.flags[method] & VideoCommon::V2::RegSem::Exec) != 0);
+            REQUIRE((table.flags[method] & VideoCommon::V2::RegSem::DrawManager) != 0);
+        }
+    }
+    REQUIRE(draw_methods == 16);
+    REQUIRE(DrawModel::IsDrawMethod(DrawEnd));
+    REQUIRE(DrawModel::IsDrawMethod(MAXWELL3D_REG_INDEX(clear_surface)));
+    REQUIRE(DrawModel::IsInstanceLoopMethod(DrawBegin));
+    REQUIRE(!DrawModel::IsInstanceLoopMethod(MAXWELL3D_REG_INDEX(clear_surface)));
+    // Draw checks: in order, parameters compared, unexpected and missing draws counted.
+    IrCheck::Start();
+    Ir::DrawBody body{};
+    body.num_draws = 2;
+    body.draws[0] = {.kind = Ir::DrawKind::Array, .first = 1, .count = 3, .instances = 1};
+    body.draws[1] = {.kind = Ir::DrawKind::Clear, .first = 1};
+    IrCheck::OnRecord(Ir::Kind::Draw);
+    IrCheck::NoteDrawRecord(body);
+    IrCheck::NoteDraw(body.draws[0], nullptr);
+    IrCheck::NoteDraw({.kind = Ir::DrawKind::Clear, .first = 2}, nullptr); // a different clear
+    IrCheck::NoteDraw(body.draws[0], nullptr);                             // nothing predicted
+    IrCheck::NoteDrawRecord(body);
+    for (u32 i = 0; i < 300; ++i) {
+        IrCheck::OnRecord(Ir::Kind::StateRun);
+    }
+    auto counters = IrCheck::GetCounters();
+    CHECK(counters.draws_matched == 1);
+    CHECK(counters.draws_mismatched == 1);
+    CHECK(counters.draws_unexpected == 1);
+    CHECK(counters.draws_missing == 2);
+    // Dispatch windows: a record covers the method after it; engine records don't count.
+    Ir::DispatchBody dispatch{};
+    dispatch.min_dispatches = 1;
+    dispatch.max_dispatches = ~0U;
+    IrCheck::OnRecord(Ir::Kind::Dispatch);
+    IrCheck::NoteDispatchRecord(dispatch);
+    IrCheck::OnRecord(Ir::Kind::Engine);
+    IrCheck::OnRecord(Ir::Kind::StateRun);
+    IrCheck::NoteDispatch(0x1000);
+    IrCheck::NoteDispatch(0x2000);
+    IrCheck::OnRecord(Ir::Kind::StateRun); // closes the window: 2 dispatches, fine
+    IrCheck::NoteDispatch(0x3000);         // outside any window
+    IrCheck::OnRecord(Ir::Kind::Dispatch);
+    IrCheck::NoteDispatchRecord(dispatch);
+    IrCheck::OnRecord(Ir::Kind::StateRun);
+    IrCheck::OnRecord(Ir::Kind::StateRun); // closes it with none: below the minimum
+    counters = IrCheck::GetCounters();
+    CHECK(counters.dispatches == 3);
+    CHECK(counters.dispatch_windows == 2);
+    CHECK(counters.dispatches_unexpected == 1);
+    CHECK(counters.dispatch_count_mismatches == 1);
+    IrCheck::Stop();
 }

@@ -16,6 +16,7 @@
 #include "video_core/query_cache/types.h"
 #include "video_core/query_dma.h"
 #include "video_core/rasterizer_interface.h"
+#include "video_core/v2/ir_check.h"
 #include "video_core/v2/ir_exec.h"
 #include "video_core/v2/macro_hle.h"
 
@@ -126,12 +127,21 @@ void SyncPoint(const Ir::SyncPointBody& body, const Context& context) {
 void Draw(const Ir::RecordView& record, const Ir::DrawBody& body, const Context& context) {
     switch (body.op) {
     case Ir::DrawOp::Predicted:
+        if (IrCheck::g_active) {
+            IrCheck::NoteDrawRecord(body);
+        }
         return;
     case Ir::DrawOp::MacroEnd:
+        if (IrCheck::g_active) {
+            IrCheck::NoteDrawRecord(body);
+        }
         context.objects.As<Tegra::Engines::Maxwell3D>(body.engine)
             ->FinishFrontMacro(context.system);
         return;
     case Ir::DrawOp::HostIndirect: {
+        if (IrCheck::g_active) {
+            IrCheck::NoteDrawRecord(body);
+        }
         const MacroHle::Draw draw{
             .kind = static_cast<MacroHle::Kind>(body.hle.kind),
             .topology = body.hle.topology,
@@ -154,6 +164,10 @@ void Draw(const Ir::RecordView& record, const Ir::DrawBody& body, const Context&
 bool IsInformational(const Ir::RecordView& record) {
     switch (record.kind) {
     case Ir::Kind::Dispatch:
+        if (IrCheck::g_active) {
+            IrCheck::NoteDispatchRecord(record.As<Ir::DispatchBody>());
+        }
+        return true;
     case Ir::Kind::Copy:
     case Ir::Kind::Acquire:
         return true;
