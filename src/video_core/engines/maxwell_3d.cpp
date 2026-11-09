@@ -1016,8 +1016,13 @@ void Maxwell3D::ExecuteS1Run(const u64* it, const u64* const end) {
                 VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Register);
             }
             if ((word & S1::GroupsMethodBreak) != 0) {
-                VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Method,
-                                                S1::ValueOf(word));
+                // Clears and texture draws between draws change no state a draw resolves
+                // from: with CONTDRAW the groups decide (a register break), not an event.
+                VideoCommon::Nx2FastDraw::Break(
+                    VideoCommon::V2::On(VideoCommon::V2::Switch::ContDraw)
+                        ? VideoCommon::Nx2FastDraw::Reason::Register
+                        : VideoCommon::Nx2FastDraw::Reason::Method,
+                    S1::ValueOf(word));
             }
             break;
         }
@@ -1684,6 +1689,8 @@ struct Maxwell3D::FrontState {
     bool s1_check{};
     /// The register maps to a v1 dirty flag: an executable write sets it even when unchanged.
     std::array<bool, Regs::NUM_REGS> s1_touch{};
+    /// S1Hook* bits per register: what FrontS1Hooks does after a write (none: no call).
+    std::array<u8, Regs::NUM_REGS> s1_hooks{};
     /// Fast draw breaks for the next S1 Groups entry (V2::S1::Groups*Break) and the method.
     u64 s1_breaks{};
     u32 s1_break_method{};
@@ -1812,9 +1819,20 @@ Maxwell3D::FrontState& Maxwell3D::Front(Core::System& system, VideoCommon::GpuSp
             front->s1_exec = split.S1Exec() && front->v2_on;
             front->s1_check = split.S1Check();
             if (front->s1_exec || front->s1_check) {
+                const auto& table = VideoCommon::V2::RegSem::GetTable3D();
+                const bool profile = VideoCommon::Nx2Profile::Enabled();
+                const bool stats = VideoCommon::V2::Stats::Enabled();
                 for (u32 method = 0; method < Regs::NUM_REGS; ++method) {
                     front->s1_touch[method] =
                         dirty.tables[0][method] != 0 || dirty.tables[1][method] != 0;
+                    u8 hooks = profile ? S1HookProfile : 0;
+                    if (split.TracksWrites() && front->v2_note_writes[method]) {
+                        hooks |= S1HookNotes;
+                    }
+                    if (stats && (table.flags[method] & VideoCommon::V2::RegSem::ReportSemaphore)) {
+                        hooks |= S1HookStats;
+                    }
+                    front->s1_hooks[method] = hooks;
                 }
             }
             if (front->s1_exec) {
@@ -1941,13 +1959,12 @@ struct Maxwell3D::S1Sink {
 M3D_FORCE_INLINE void Maxwell3D::FrontWriteS1(VideoCommon::GpuSplit& split, FrontState& fs,
                                               u32 method, u32 argument, bool is_last_call,
                                               bool from_macro) {
-    namespace Profile = VideoCommon::Nx2Profile;
     namespace RegSem = VideoCommon::V2::RegSem;
     const RegSem::Table3D& table = *fs.v2_table;
     const u16 flags = table.flags[method];
-    if (Profile::Enabled()) [[unlikely]] {
-        Profile::Add(Profile::Counter::MethodWrites, 1);
-    }
+    // Profile counters, write notes and stats for this method, decided when the copy was made:
+    // one table load and one branch per write (F1-09).
+    const u8 hooks = fs.s1_hooks[method];
     if (fs.v2_draw_model.HasDeferredDraw()) [[unlikely]] {
         FrontDrawPre(split, fs, method,
                      fs.control == Regs::ShadowRamControl::Replay ? fs.shadow[method] : argument);
@@ -1958,8 +1975,8 @@ M3D_FORCE_INLINE void Maxwell3D::FrontWriteS1(VideoCommon::GpuSplit& split, Fron
                          [this](RegSem::Effect effect, u32 a, u32 b) {
                              return FrontRegSemEffect(effect, a, b);
                          })) {
-        if (Profile::Enabled()) [[unlikely]] {
-            Profile::Add(Profile::Counter::SameValueWrites, 1);
+        if (hooks != 0) [[unlikely]] {
+            FrontS1Hooks(split, fs, method, hooks, false);
         }
         return;
     }
@@ -1975,11 +1992,27 @@ M3D_FORCE_INLINE void Maxwell3D::FrontWriteS1(VideoCommon::GpuSplit& split, Fron
         }
         FrontDrawPost(split, fs, method, fs.regs[method]);
     }
-    if (split.TracksWrites() && fs.v2_note_writes[method]) [[unlikely]] {
+    if (hooks != 0) [[unlikely]] {
+        FrontS1Hooks(split, fs, method, hooks, true);
+    }
+}
+
+void Maxwell3D::FrontS1Hooks(VideoCommon::GpuSplit& split, FrontState& fs, u32 method, u8 hooks,
+                             bool sent) {
+    namespace Profile = VideoCommon::Nx2Profile;
+    if ((hooks & S1HookProfile) != 0) {
+        Profile::Add(Profile::Counter::MethodWrites, 1);
+        if (!sent) {
+            Profile::Add(Profile::Counter::SameValueWrites, 1);
+        }
+    }
+    if (!sent) {
+        return;
+    }
+    if ((hooks & S1HookNotes) != 0) {
         FrontNoteWrites(split, fs, method, 1);
     }
-    if ((flags & RegSem::ReportSemaphore) != 0 && VideoCommon::V2::Stats::Enabled())
-        [[unlikely]] {
+    if ((hooks & S1HookStats) != 0) {
         VideoCommon::V2::Stats::NoteReportSemaphore(memory_manager.GetID(), fs.regs.data());
     }
 }

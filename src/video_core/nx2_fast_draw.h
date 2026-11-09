@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstdlib>
@@ -188,6 +189,18 @@ inline void NoteBind(size_t stage, u32 slot) {
     }
 }
 
+/// A full range list: EDEN_NX2_V2_CONTDRAW widens its last range over [begin, end) (a superset:
+/// the handle checks see "cbuf data dirty" there) instead of breaking reuse as an event.
+inline void Overflow(std::array<u64, Delta::MaxWrites>& begins,
+                     std::array<u64, Delta::MaxWrites>& ends, u32 count, u64 begin, u64 end) {
+    if (!V2::On(V2::Switch::ContDraw)) {
+        Break(Reason::DeltaOverflow);
+        return;
+    }
+    begins[count - 1] = (std::min)(begins[count - 1], begin);
+    ends[count - 1] = (std::max)(ends[count - 1], end);
+}
+
 /// Inline constant buffer data written to GPU addresses [begin, end).
 inline void NoteConstantData(GPUVAddr begin, GPUVAddr end) {
     if (!Enabled()) {
@@ -195,7 +208,7 @@ inline void NoteConstantData(GPUVAddr begin, GPUVAddr end) {
     }
     Delta& delta = g_delta;
     if (!AppendRange(delta.write_begin, delta.write_end, delta.num_writes, begin, end)) {
-        Break(Reason::DeltaOverflow);
+        Overflow(delta.write_begin, delta.write_end, delta.num_writes, begin, end);
     }
 }
 
@@ -206,7 +219,7 @@ inline void NoteDeviceData(DAddr begin, DAddr end) {
     }
     Delta& delta = g_delta;
     if (!AppendRange(delta.device_begin, delta.device_end, delta.num_device_writes, begin, end)) {
-        Break(Reason::DeltaOverflow);
+        Overflow(delta.device_begin, delta.device_end, delta.num_device_writes, begin, end);
     }
 }
 

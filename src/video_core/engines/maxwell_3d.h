@@ -3521,6 +3521,11 @@ private:
                       bool is_last_call, bool from_macro);
     void FrontMultiS1(VideoCommon::GpuSplit& split, FrontState& state, u32 method,
                       const u32* base_start, u32 amount, u32 methods_pending);
+    static constexpr u8 S1HookProfile = 1 << 0; ///< Nx2Profile write counters
+    static constexpr u8 S1HookNotes = 1 << 1;   ///< FrontNoteWrites (GpuSplit::TracksWrites)
+    static constexpr u8 S1HookStats = 1 << 2;   ///< V2 stats report semaphores
+    void FrontS1Hooks(VideoCommon::GpuSplit& split, FrontState& state, u32 method, u8 hooks,
+                      bool sent);
     /// S1Check: the classified entries of a write the table-driven registers `regs` took.
     void FrontCheckS1(VideoCommon::GpuSplit& split, FrontState& fs, const u32* table_regs,
                       u32 method, u32 old_value, u32 old_offset, bool is_last_call);
