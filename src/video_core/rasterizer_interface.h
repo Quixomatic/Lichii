@@ -178,6 +178,10 @@ public:
     virtual void PrepareRegionWrite([[maybe_unused]] DAddr addr, [[maybe_unused]] u64 size,
                                     [[maybe_unused]] VideoCommon::CacheType which) {}
 
+    /// Pipeline v2 P5a (EDEN_NX2_V2_COMMIT): the caches' owner runs what other threads handed it
+    /// (its idle points: TickWork, the split's CPU lane hook, fence waits). Other threads: no-op.
+    virtual void ServeCommitRequests() {}
+
     virtual void InnerInvalidation(std::span<const std::pair<DAddr, std::size_t>> sequences) {
         // The skip keeps the texture cache: software engine writes reach images only here.
         const auto which = Settings::values.skip_cpu_inner_invalidation.GetValue()

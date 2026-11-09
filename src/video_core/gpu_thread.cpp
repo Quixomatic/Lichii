@@ -28,6 +28,7 @@
 #include "video_core/nx2_profile.h"
 #include "video_core/host1x/host1x.h"
 #include "video_core/renderer_base.h"
+#include "video_core/v2/commit.h"
 #include "video_core/v2/v2_stats.h"
 
 namespace VideoCommon::GPUThread {
@@ -53,6 +54,8 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
     thread = std::jthread([&](std::stop_token stop_token) {
         const Common::DkbCpuTrace::Registration cpu_trace{Common::DkbCpuTrace::Role::GpuCommand};
         Common::SetCurrentThreadName("GPU");
+        // Pipeline v2 P5a: this thread owns the caches while the split doesn't run.
+        VideoCommon::V2::Commit::t_gpu_thread = true;
 #ifdef __linux__
         // The pending-channel polls below sleep 50 us; the default timer slack adds up to 50 more.
         prctl(PR_SET_TIMERSLACK, 1UL, 0, 0, 0);

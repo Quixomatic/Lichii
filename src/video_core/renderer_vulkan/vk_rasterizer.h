@@ -178,9 +178,36 @@ public:
                                                             VAddr framebuffer_addr,
                                                             u32 pixel_stride);
 
+    void ServeCommitRequests() override;
+
 private:
     // Pipeline v2 P5a (EDEN_NX2_V2_COMMIT): the commit stage. Null when off.
     std::unique_ptr<VideoCommon::V2::Commit::Context> commit;
+    /// COMMIT=1 without COMMIT_LOCKED: the draw path takes no cache lock; other threads hand
+    /// their cache work to the owner (IMPLEMENTATION_LOG.md, P5a protocol).
+    bool commit_lock_free{};
+    /// GPU::CollectedCpuWrites as the owner last applied them.
+    u64 commit_collected{};
+    /// Whether the calling thread owns the caches: the split's back while it runs, else the GPU
+    /// thread.
+    [[nodiscard]] bool IsCacheOwner() const;
+    /// The owner's commit point (each draw, dispatch and clear): applies collected guest CPU
+    /// writes and handed-over work before any lookup.
+    void CommitPoint();
+    void ServeExternal();
+    void ApplyExternal(const VideoCommon::V2::Commit::ExternalOp& op);
+    /// Runs `func` on the caches: at once on the owner (or before any owner exists), else as a
+    /// synchronous owner call.
+    template <typename Func>
+    void WithCaches(Func&& func);
+    /// The same for work nobody waits on: posted to the owner when the caller isn't it.
+    template <typename Func>
+    void PostOrRun(const VideoCommon::V2::Commit::ExternalOp& op, Func&& func);
+    /// AccelerateDisplay's body, with the caches held.
+    std::optional<FramebufferTextureInfo> AccelerateDisplayImpl(
+        const Tegra::FramebufferConfig& config, DAddr framebuffer_addr, u32 pixel_stride);
+    /// The cache parts of InvalidateRegion and OnCacheInvalidation (no locks).
+    void InvalidateRegionCaches(DAddr addr, u64 size, VideoCommon::CacheType which);
 
     static constexpr const u64 NEEDS_D24[] = {
         0x01006A800016E000ULL, // SSBU

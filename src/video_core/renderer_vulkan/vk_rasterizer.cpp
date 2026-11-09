@@ -448,12 +448,18 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
         } else {
             commit = std::make_unique<V2::Commit::Context>();
             commit->verify = V2::Verify(V2::Switch::Commit);
+            commit->lock_free = !commit->verify && !V2::On(V2::Switch::CommitLocked);
             commit->stats = V2::Stats::Enabled();
+            commit_lock_free = commit->lock_free;
             texture_cache.SetCommit(commit.get());
             buffer_cache.SetCommit(commit.get());
-            LOG_INFO(Render_Vulkan, "EDEN_NX2_V2_COMMIT: {}",
-                     commit->verify ? "verify (the old path runs, predictions compared)"
-                                    : "pure lookups and a commit stage");
+            if (commit_lock_free) {
+                fence_manager.SetCommitBacklog(true, [this] { gpu.WakeCacheOwner(); });
+            }
+            LOG_INFO(Render_Vulkan, "EDEN_NX2_V2_COMMIT: {}, {}",
+                     commit->verify ? "verify (the old locked path runs, predictions compared)"
+                                    : "pure lookups and a commit stage",
+                     commit_lock_free ? "no cache locks in the draw path" : "cache locks kept");
         }
     }
 }
@@ -959,6 +965,9 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     SCOPE_EXIT {
         gpu.TickWork();
     };
+    if (commit_lock_free) [[unlikely]] {
+        CommitPoint();
+    }
     bool submitted = false;
     SCOPE_EXIT {
         auto& native = maxwell3d->GetNativeMacroEngine();
@@ -1270,7 +1279,11 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         mesh_emulation_groups = groups;
         mesh_emulation_vertices_per_group = pipeline->MeshEmulationVerticesPerGroup();
     }
-    std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
+    // EDEN_NX2_V2_COMMIT=1: no lock, the owner is the caches' only writer (CommitPoint above).
+    std::optional<std::scoped_lock<Common::SpinRecursiveMutex, Common::SpinRecursiveMutex>> lock;
+    if (!commit_lock_free) [[likely]] {
+        lock.emplace(buffer_cache.mutex, texture_cache.mutex);
+    }
     // What the next draw's TakeReusableDraw compares with, read once the caches are locked: a
     // break from here on, this draw's own resolve included, ends the delta chain.
     const u64 draw_serial = FastDraw::Serial();
@@ -2153,9 +2166,15 @@ void RasterizerVulkan::DrawTexture() {
     SCOPE_EXIT {
         gpu.TickWork();
     };
+    if (commit_lock_free) [[unlikely]] {
+        CommitPoint();
+    }
     FlushWork();
 
-    std::scoped_lock l{texture_cache.mutex};
+    std::optional<std::scoped_lock<Common::SpinRecursiveMutex>> l;
+    if (!commit_lock_free) [[likely]] {
+        l.emplace(texture_cache.mutex);
+    }
     texture_cache.SynchronizeDescriptors(false);
     texture_cache.UpdateRenderTargets(false);
 
@@ -2208,6 +2227,9 @@ void RasterizerVulkan::Clear(u32 layer_count) {
                  regs.clear_color[1], regs.clear_color[2], regs.clear_color[3]);
     }
     TraceWindowTarget(*maxwell3d, *gpu_memory, "clear", layer_count);
+    if (commit_lock_free) [[unlikely]] {
+        CommitPoint();
+    }
     FlushWork();
     gpu_memory->FlushCaching();
 
@@ -2220,7 +2242,10 @@ void RasterizerVulkan::Clear(u32 layer_count) {
         return;
     }
 
-    std::scoped_lock lock{texture_cache.mutex};
+    std::optional<std::scoped_lock<Common::SpinRecursiveMutex>> lock;
+    if (!commit_lock_free) [[likely]] {
+        lock.emplace(texture_cache.mutex);
+    }
     texture_cache.UpdateRenderTargets(true);
     const Framebuffer* const framebuffer = texture_cache.GetFramebuffer();
     if (frame_dump.Capturing()) {
@@ -2425,6 +2450,9 @@ void RasterizerVulkan::Clear(u32 layer_count) {
 
 void RasterizerVulkan::DispatchCompute() {
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Compute};
+    if (commit_lock_free) [[unlikely]] {
+        CommitPoint();
+    }
     FlushWork();
     gpu_memory->FlushCaching();
     if (frame_dump.Capturing()) {
@@ -2460,7 +2488,10 @@ void RasterizerVulkan::DispatchCompute() {
         VideoCommon::V2::ShaderWrites::Record(pipeline_cache.ComputeDeviceAddress(),
                                               pipeline->ShaderInfo());
     }
-    std::scoped_lock lock{texture_cache.mutex, buffer_cache.mutex};
+    std::optional<std::scoped_lock<Common::SpinRecursiveMutex, Common::SpinRecursiveMutex>> lock;
+    if (!commit_lock_free) [[likely]] {
+        lock.emplace(texture_cache.mutex, buffer_cache.mutex);
+    }
     std::optional<ByteAddressedShadow> byte_addressed_shadow;
     buffer_cache.Nx2CollectListCopies(true);
     SCOPE_EXIT {
@@ -2758,6 +2789,10 @@ void RasterizerVulkan::NoteGpuWrittenCommandListSynced(DAddr page) {
 
 void RasterizerVulkan::FlushGpuWrittenCommandListPages(std::span<const DAddr> pages) {
     gpu.InvalidateGPUCache();
+    if (commit_lock_free) [[unlikely]] {
+        WithCaches([&] { buffer_cache.Nx2FlushListPages(pages); });
+        return;
+    }
     std::scoped_lock lock{buffer_cache.mutex};
     buffer_cache.Nx2FlushListPages(pages);
 }
@@ -2773,13 +2808,24 @@ void RasterizerVulkan::FlushRegion(DAddr addr, u64 size, VideoCommon::CacheType 
         // title menu or background read as zeros once the shader cache's read flushed it.
         gpu.InvalidateGPUCache();
     }
-    if (True(which & VideoCommon::CacheType::TextureCache)) {
-        std::scoped_lock lock{texture_cache.mutex};
-        texture_cache.DownloadMemory(addr, size);
-    }
-    if ((True(which & VideoCommon::CacheType::BufferCache))) {
-        std::scoped_lock lock{buffer_cache.mutex};
-        buffer_cache.DownloadMemory(addr, size);
+    if (commit_lock_free) [[unlikely]] {
+        WithCaches([&] {
+            if (True(which & VideoCommon::CacheType::TextureCache)) {
+                texture_cache.DownloadMemory(addr, size);
+            }
+            if (True(which & VideoCommon::CacheType::BufferCache)) {
+                buffer_cache.DownloadMemory(addr, size);
+            }
+        });
+    } else {
+        if (True(which & VideoCommon::CacheType::TextureCache)) {
+            std::scoped_lock lock{texture_cache.mutex};
+            texture_cache.DownloadMemory(addr, size);
+        }
+        if ((True(which & VideoCommon::CacheType::BufferCache))) {
+            std::scoped_lock lock{buffer_cache.mutex};
+            buffer_cache.DownloadMemory(addr, size);
+        }
     }
     if ((True(which & VideoCommon::CacheType::QueryCache))) {
         query_cache.FlushRegion(addr, size);
@@ -2794,11 +2840,25 @@ bool RasterizerVulkan::FlushRegionForRead(DAddr addr, u64 size, std::function<vo
         return false;
     }
     gpu.InvalidateGPUCache();
+    bool submitted = false;
+    if (commit_lock_free) [[unlikely]] {
+        WithCaches([&] {
+            texture_cache.DownloadMemory(addr, size);
+            if (!HasPendingQueries(addr, size)) {
+                submitted = buffer_cache.DownloadMemoryAsync(
+                    addr, size, land, VideoCommon::V2::Verify(VideoCommon::V2::Switch::Readback));
+            }
+            if (!submitted) {
+                buffer_cache.DownloadMemory(addr, size);
+            }
+        });
+        query_cache.FlushRegion(addr, size);
+        return submitted;
+    }
     {
         std::scoped_lock lock{texture_cache.mutex};
         texture_cache.DownloadMemory(addr, size);
     }
-    bool submitted = false;
     {
         std::scoped_lock lock{buffer_cache.mutex};
         if (!HasPendingQueries(addr, size)) {
@@ -2814,6 +2874,24 @@ bool RasterizerVulkan::FlushRegionForRead(DAddr addr, u64 size, std::function<vo
 }
 
 bool RasterizerVulkan::MustFlushRegion(DAddr addr, u64 size, VideoCommon::CacheType which) {
+    if (commit_lock_free) [[unlikely]] {
+        // Lock-free pre-checks (every GPU-written page is marked with COMMIT on; images only
+        // exist where the page filter says), then the exact answer from the owner.
+        const bool buffer_maybe = True(which & VideoCommon::CacheType::BufferCache) &&
+                                  Tegra::Nx2MayBeGpuWritten(addr, size);
+        const bool texture_maybe = Settings::IsGPULevelHigh() &&
+                                   True(which & VideoCommon::CacheType::TextureCache) &&
+                                   texture_cache.page_filter.Any(addr, size);
+        if (!buffer_maybe && !texture_maybe) {
+            return false;
+        }
+        bool result = false;
+        WithCaches([&] {
+            result = (buffer_maybe && buffer_cache.IsRegionGpuModified(addr, size)) ||
+                     (texture_maybe && texture_cache.IsRegionGpuModified(addr, size));
+        });
+        return result;
+    }
     // The split's front asks this before each macro DMA read, and the back holds the buffer
     // cache's lock through each draw: pages the GPU never wrote need no look under it.
     if (True(which & VideoCommon::CacheType::BufferCache) &&
@@ -2839,6 +2917,28 @@ bool RasterizerVulkan::HasPendingQueries(DAddr addr, u64 size) {
 }
 
 VideoCore::RasterizerDownloadArea RasterizerVulkan::GetFlushArea(DAddr addr, u64 size) {
+    if (commit_lock_free) [[unlikely]] {
+        VideoCore::RasterizerDownloadArea result{
+            .start_address = Common::AlignDown(addr, Core::DEVICE_PAGESIZE),
+            .end_address = Common::AlignUp(addr + size, Core::DEVICE_PAGESIZE),
+            .preemtive = true,
+        };
+        WithCaches([&] {
+            if (const auto texture_area = texture_cache.GetFlushArea(addr, size)) {
+                buffer_cache.ForgetReadTraps(texture_area->start_address,
+                                             texture_area->end_address -
+                                                 texture_area->start_address);
+                result = *texture_area;
+                return;
+            }
+            if (buffer_cache.FlushesOnCpuRead()) {
+                if (const auto area = buffer_cache.GetFlushArea(addr, size)) {
+                    result = *area;
+                }
+            }
+        });
+        return result;
+    }
     std::optional<VideoCore::RasterizerDownloadArea> texture_area;
     {
         std::scoped_lock lock{texture_cache.mutex};
@@ -2872,6 +2972,11 @@ void RasterizerVulkan::PrepareRegionWrite(DAddr addr, u64 size, VideoCommon::Cac
     if (addr == 0 || size == 0 || False(which & VideoCommon::CacheType::BufferCache)) {
         return;
     }
+    if (commit_lock_free) [[unlikely]] {
+        // Synchronous: the write follows at once, and no download may land over it.
+        WithCaches([&] { buffer_cache.ClearDownload(addr, size); });
+        return;
+    }
     std::scoped_lock lock{buffer_cache.mutex};
     buffer_cache.ClearDownload(addr, size);
 }
@@ -2884,13 +2989,25 @@ void RasterizerVulkan::InvalidateRegion(DAddr addr, u64 size, VideoCommon::Cache
     if (VideoCommon::V2::On(VideoCommon::V2::Switch::CbufVer)) [[unlikely]] {
         VideoCommon::V2::CbufVer::Log().NoteHost(addr, size);
     }
-    if (True(which & VideoCommon::CacheType::TextureCache)) {
-        std::scoped_lock lock{texture_cache.mutex};
-        texture_cache.WriteMemory(addr, size);
-    }
-    if ((True(which & VideoCommon::CacheType::BufferCache))) {
-        std::scoped_lock lock{buffer_cache.mutex};
-        buffer_cache.WriteMemory(addr, size);
+    if (commit_lock_free) [[unlikely]] {
+        // Nobody waits on it: the owner applies it before its next lookup.
+        PostOrRun(
+            VideoCommon::V2::Commit::ExternalOp{
+                .address = addr,
+                .size = size,
+                .kind = VideoCommon::V2::Commit::ExternalKind::Invalidate,
+                .arg = static_cast<u32>(which),
+            },
+            [&] { InvalidateRegionCaches(addr, size, which); });
+    } else {
+        if (True(which & VideoCommon::CacheType::TextureCache)) {
+            std::scoped_lock lock{texture_cache.mutex};
+            texture_cache.WriteMemory(addr, size);
+        }
+        if ((True(which & VideoCommon::CacheType::BufferCache))) {
+            std::scoped_lock lock{buffer_cache.mutex};
+            buffer_cache.WriteMemory(addr, size);
+        }
     }
     if ((True(which & VideoCommon::CacheType::QueryCache))) {
         query_cache.InvalidateRegion(addr, size);
@@ -2925,16 +3042,34 @@ void RasterizerVulkan::InnerInvalidation(std::span<const std::pair<DAddr, std::s
     };
     // Even with skip_cpu_inner_invalidation: engines writing images in software (DMA pitch to
     // block linear copies of decoded video frames) reach the texture cache only through here.
-    if (any(texture_cache.page_filter)) {
-        std::scoped_lock lock{texture_cache.mutex};
-        for (const auto& [addr, size] : sequences) {
-            texture_cache.WriteMemory(addr, size);
+    const bool skip_buffers = Settings::values.skip_cpu_inner_invalidation.GetValue();
+    if (commit_lock_free) [[unlikely]] {
+        const bool textures = any(texture_cache.page_filter);
+        WithCaches([&] {
+            for (const auto& [addr, size] : sequences) {
+                if (textures) {
+                    texture_cache.WriteMemory(addr, size);
+                }
+            }
+            if (!skip_buffers) {
+                for (const auto& [addr, size] : sequences) {
+                    buffer_cache.WriteMemory(addr, size);
+                }
+            }
+        });
+        if (skip_buffers) {
+            return;
         }
-    }
-    if (Settings::values.skip_cpu_inner_invalidation.GetValue()) {
-        return;
-    }
-    {
+    } else {
+        if (any(texture_cache.page_filter)) {
+            std::scoped_lock lock{texture_cache.mutex};
+            for (const auto& [addr, size] : sequences) {
+                texture_cache.WriteMemory(addr, size);
+            }
+        }
+        if (skip_buffers) {
+            return;
+        }
         std::scoped_lock lock{buffer_cache.mutex};
         for (const auto& [addr, size] : sequences) {
             buffer_cache.WriteMemory(addr, size);
@@ -2956,6 +3091,27 @@ bool RasterizerVulkan::OnCPUWrite(DAddr addr, u64 size) {
     if (VideoCommon::V2::On(VideoCommon::V2::Switch::CbufVer)) [[unlikely]] {
         VideoCommon::V2::CbufVer::Log().NoteHost(addr, size);
     }
+    if (commit_lock_free) [[unlikely]] {
+        if (IsCacheOwner() || !commit->owner.HasOwner()) {
+            bool collect = false;
+            WithCaches([&] {
+                collect = buffer_cache.OnCPUWrite(addr, size);
+                if (!collect) {
+                    texture_cache.WriteMemory(addr, size);
+                }
+            });
+            if (collect) {
+                return true;
+            }
+            pipeline_cache.InvalidateRegion(addr, size);
+            return false;
+        }
+        // A guest CPU thread: the caches stay untouched. The write is collected (the existing
+        // GPU dirty memory path, exact bytes) and the owner applies it at its next commit point,
+        // before any lookup; shader code is invalidated at once, as before.
+        pipeline_cache.InvalidateRegion(addr, size);
+        return true;
+    }
     {
         std::scoped_lock lock{buffer_cache.mutex};
         if (buffer_cache.OnCPUWrite(addr, size)) {
@@ -2971,6 +3127,33 @@ bool RasterizerVulkan::OnCPUWrite(DAddr addr, u64 size) {
 }
 
 void RasterizerVulkan::OnCacheInvalidations(std::span<const std::pair<DAddr, u64>> ranges) {
+    if (commit_lock_free) [[unlikely]] {
+        for (const auto& [addr, size] : ranges) {
+            if (addr == 0 || size == 0) {
+                continue;
+            }
+            VideoCommon::V2::Versions::HookWrite(addr, size,
+                                                 VideoCommon::V2::Versions::Source::Host);
+            if (VideoCommon::V2::On(VideoCommon::V2::Switch::CbufVer)) [[unlikely]] {
+                VideoCommon::V2::CbufVer::Log().NoteHost(addr, size);
+            }
+        }
+        // The claim and the writes keep their order: one owner call.
+        WithCaches([&] {
+            buffer_cache.ClaimCpuWrites(ranges);
+            for (const auto& [addr, size] : ranges) {
+                if (addr != 0 && size != 0) {
+                    InvalidateRegionCaches(addr, size, VideoCommon::CacheType::All);
+                }
+            }
+        });
+        for (const auto& [addr, size] : ranges) {
+            if (addr != 0 && size != 0) {
+                pipeline_cache.InvalidateRegion(addr, size);
+            }
+        }
+        return;
+    }
     // Out of the GPU-written ranges first: applying one write downloads the GPU's bytes elsewhere
     // on its pages (WriteMemory), which would write over the next collected write.
     {
@@ -2990,6 +3173,17 @@ void RasterizerVulkan::OnCacheInvalidation(DAddr addr, u64 size) {
     if (VideoCommon::V2::On(VideoCommon::V2::Switch::CbufVer)) [[unlikely]] {
         VideoCommon::V2::CbufVer::Log().NoteHost(addr, size);
     }
+    if (commit_lock_free) [[unlikely]] {
+        PostOrRun(
+            VideoCommon::V2::Commit::ExternalOp{
+                .address = addr,
+                .size = size,
+                .kind = VideoCommon::V2::Commit::ExternalKind::CacheInvalidate,
+            },
+            [&] { InvalidateRegionCaches(addr, size, VideoCommon::CacheType::All); });
+        pipeline_cache.InvalidateRegion(addr, size);
+        return;
+    }
 
     {
         std::scoped_lock lock{texture_cache.mutex};
@@ -3007,6 +3201,39 @@ bool RasterizerVulkan::TryCacheInvalidation(DAddr addr, u64 size) {
     VideoCommon::V2::Versions::HookWrite(addr, size, VideoCommon::V2::Versions::Source::Host);
     if (VideoCommon::V2::On(VideoCommon::V2::Switch::CbufVer)) [[unlikely]] {
         VideoCommon::V2::CbufVer::Log().NoteHost(addr, size);
+    }
+    if (commit_lock_free) [[unlikely]] {
+        const DAddr page_begin = Common::AlignDown(addr, Core::DEVICE_PAGESIZE);
+        const DAddr page_end = Common::AlignUp(addr + size, Core::DEVICE_PAGESIZE);
+        if (IsCacheOwner() || !commit->owner.HasOwner()) {
+            bool done = true;
+            WithCaches([&] {
+                if (buffer_cache.IsRegionGpuModified(page_begin, page_end - page_begin)) {
+                    done = false;
+                    return;
+                }
+                texture_cache.WriteMemory(addr, size);
+                buffer_cache.WriteMemory(addr, size);
+            });
+            if (done) {
+                pipeline_cache.InvalidateRegion(addr, size);
+            }
+            return done;
+        }
+        // Pages the GPU may have written take the fallback (the owner keeps their GPU bytes);
+        // the rest is a cache invalidation nobody waits on.
+        if (Tegra::Nx2MayBeGpuWritten(page_begin, page_end - page_begin)) {
+            return false;
+        }
+        PostOrRun(
+            VideoCommon::V2::Commit::ExternalOp{
+                .address = addr,
+                .size = size,
+                .kind = VideoCommon::V2::Commit::ExternalKind::CacheInvalidate,
+            },
+            [&] { InvalidateRegionCaches(addr, size, VideoCommon::CacheType::All); });
+        pipeline_cache.InvalidateRegion(addr, size);
+        return true;
     }
     {
         std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
@@ -3028,6 +3255,15 @@ void RasterizerVulkan::InvalidateGPUCache() {
 
 void RasterizerVulkan::UnmapMemory(DAddr addr, u64 size) {
     VideoCommon::V2::Versions::HookWrite(addr, size, VideoCommon::V2::Versions::Source::Host);
+    if (commit_lock_free) [[unlikely]] {
+        // Synchronous: the memory is reused once this returns.
+        WithCaches([&] {
+            texture_cache.UnmapMemory(addr, size);
+            buffer_cache.WriteMemory(addr, size, false);
+        });
+        pipeline_cache.OnCacheInvalidation(addr, size);
+        return;
+    }
     {
         std::scoped_lock lock{texture_cache.mutex};
         texture_cache.UnmapMemory(addr, size);
@@ -3040,6 +3276,13 @@ void RasterizerVulkan::UnmapMemory(DAddr addr, u64 size) {
 }
 
 void RasterizerVulkan::ModifyGPUMemory(size_t as_id, GPUVAddr addr, u64 size) {
+    if (commit_lock_free) [[unlikely]] {
+        WithCaches([&] {
+            texture_cache.UnmapGPUMemory(as_id, addr, size);
+            buffer_cache.UnmapGPUMemory(as_id, addr, size);
+        });
+        return;
+    }
     {
         std::scoped_lock lock{texture_cache.mutex};
         texture_cache.UnmapGPUMemory(as_id, addr, size);
@@ -3695,6 +3938,13 @@ void RasterizerVulkan::TickFrame() {
     descriptor_buffer_ring.TickFrame();
     fence_manager.TickFrame();
     staging_pool.TickFrame();
+    if (commit_lock_free) [[unlikely]] {
+        WithCaches([&] {
+            texture_cache.TickFrame();
+            buffer_cache.TickFrame();
+        });
+        return;
+    }
     {
         std::scoped_lock lock{texture_cache.mutex};
         texture_cache.TickFrame();
@@ -3717,6 +3967,11 @@ bool RasterizerVulkan::HasDrawTransformFeedback() {
 bool RasterizerVulkan::AccelerateSurfaceCopy(const Tegra::Engines::Fermi2D::Surface& src,
                                              const Tegra::Engines::Fermi2D::Surface& dst,
                                              const Tegra::Engines::Fermi2D::Config& copy_config) {
+    if (commit_lock_free) [[unlikely]] {
+        bool result = false;
+        WithCaches([&] { result = texture_cache.BlitImage(dst, src, copy_config); });
+        return result;
+    }
     std::scoped_lock lock{texture_cache.mutex};
     return texture_cache.BlitImage(dst, src, copy_config);
 }
@@ -3732,6 +3987,11 @@ bool RasterizerVulkan::SupportsGameDlssNetwork() const {
 
 std::optional<VideoCore::GameDlssProbe> RasterizerVulkan::ProbeGameDlssOutput(
     const Tegra::Engines::Fermi2D::Surface& src, const Tegra::Engines::Fermi2D::Surface& dst) {
+    if (commit_lock_free) [[unlikely]] {
+        std::optional<VideoCore::GameDlssProbe> result;
+        WithCaches([&] { result = texture_cache.ProbeGameDlssOutput(dst, src); });
+        return result;
+    }
     std::scoped_lock lock{texture_cache.mutex};
     return texture_cache.ProbeGameDlssOutput(dst, src);
 }
@@ -3740,6 +4000,14 @@ bool RasterizerVulkan::AccelerateTemporalUpscale(
     const Tegra::Engines::Fermi2D::Surface& src, const Tegra::Engines::Fermi2D::Surface& dst,
     const Tegra::Engines::Fermi2D::Surface& motion_vectors, const Tegra::Texture::TICEntry* depth,
     std::array<f32, 2> jitter, std::array<f32, 2> motion_scale, bool use_history) {
+    if (commit_lock_free) [[unlikely]] {
+        bool result = false;
+        WithCaches([&] {
+            result = texture_cache.TemporalUpscale(dst, src, motion_vectors, depth, jitter,
+                                                   motion_scale, use_history);
+        });
+        return result;
+    }
     std::scoped_lock lock{texture_cache.mutex};
     return texture_cache.TemporalUpscale(dst, src, motion_vectors, depth, jitter, motion_scale,
                                           use_history);
@@ -3781,7 +4049,11 @@ void RasterizerVulkan::AccelerateInlineToMemory(GPUVAddr address, size_t copy_si
     // fencing thread and CPU write traps holding one of them most of the time.
     bool uploaded;
     {
-        std::scoped_lock lock{buffer_cache.mutex};
+        // COMMIT=1: an engine method on the owner: no lock.
+        std::optional<std::scoped_lock<Common::SpinRecursiveMutex>> lock;
+        if (!commit_lock_free) [[likely]] {
+            lock.emplace(buffer_cache.mutex);
+        }
         // Guest memory has the words now: a command list copy of the page no longer does.
         buffer_cache.Nx2NoteListHostWrite(*cpu_addr, copy_size);
         uploaded = buffer_cache.InlineMemory(*cpu_addr, copy_size, memory);
@@ -3801,7 +4073,10 @@ void RasterizerVulkan::AccelerateInlineToMemory(GPUVAddr address, size_t copy_si
         return;
     }
     {
-        std::scoped_lock lock{texture_cache.mutex};
+        std::optional<std::scoped_lock<Common::SpinRecursiveMutex>> lock;
+        if (!commit_lock_free) [[likely]] {
+            lock.emplace(texture_cache.mutex);
+        }
         texture_cache.WriteMemory(*cpu_addr, copy_size);
     }
     pipeline_cache.InvalidateRegion(*cpu_addr, copy_size);
@@ -3812,7 +4087,18 @@ std::optional<FramebufferTextureInfo> RasterizerVulkan::AccelerateDisplay(
     if (!framebuffer_addr) {
         return {};
     }
+    if (commit_lock_free) [[unlikely]] {
+        // Composites can run where a guest syncpoint increments: on the owner, or handed to it.
+        std::optional<FramebufferTextureInfo> result;
+        WithCaches([&] { result = AccelerateDisplayImpl(config, framebuffer_addr, pixel_stride); });
+        return result;
+    }
     std::scoped_lock lock{texture_cache.mutex};
+    return AccelerateDisplayImpl(config, framebuffer_addr, pixel_stride);
+}
+
+std::optional<FramebufferTextureInfo> RasterizerVulkan::AccelerateDisplayImpl(
+    const Tegra::FramebufferConfig& config, DAddr framebuffer_addr, u32 pixel_stride) {
     const auto [image_view, scaled] =
         texture_cache.TryFindFramebufferImageView(config, framebuffer_addr);
     static u32 display_trace_count{};
@@ -4890,7 +5176,12 @@ void RasterizerVulkan::UpdateVertexInput(Tegra::Engines::Maxwell3D::Regs& regs) 
 
 void RasterizerVulkan::InitializeChannel(Tegra::Control::ChannelState& channel) {
     CreateChannel(channel);
-    {
+    if (commit_lock_free) [[unlikely]] {
+        WithCaches([&] {
+            texture_cache.CreateChannel(channel);
+            buffer_cache.CreateChannel(channel);
+        });
+    } else {
         std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
         texture_cache.CreateChannel(channel);
         buffer_cache.CreateChannel(channel);
@@ -4903,7 +5194,12 @@ void RasterizerVulkan::InitializeChannel(Tegra::Control::ChannelState& channel) 
 void RasterizerVulkan::BindChannel(Tegra::Control::ChannelState& channel) {
     const s32 channel_id = channel.bind_id;
     BindToChannel(channel_id);
-    {
+    if (commit_lock_free) [[unlikely]] {
+        WithCaches([&] {
+            texture_cache.BindToChannel(channel_id);
+            buffer_cache.BindToChannel(channel_id);
+        });
+    } else {
         std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
         texture_cache.BindToChannel(channel_id);
         buffer_cache.BindToChannel(channel_id);
@@ -4916,13 +5212,168 @@ void RasterizerVulkan::BindChannel(Tegra::Control::ChannelState& channel) {
 
 void RasterizerVulkan::ReleaseChannel(s32 channel_id) {
     EraseChannel(channel_id);
-    {
+    if (commit_lock_free) [[unlikely]] {
+        WithCaches([&] {
+            texture_cache.EraseChannel(channel_id);
+            buffer_cache.EraseChannel(channel_id);
+        });
+    } else {
         std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
         texture_cache.EraseChannel(channel_id);
         buffer_cache.EraseChannel(channel_id);
     }
     pipeline_cache.EraseChannel(channel_id);
     query_cache.EraseChannel(channel_id);
+}
+
+// Pipeline v2 P5a (EDEN_NX2_V2_COMMIT): the owner protocol (IMPLEMENTATION_LOG.md, P5a).
+
+bool RasterizerVulkan::IsCacheOwner() const {
+    // Ownership moves only where the split starts or stops, which are quiescent hand-offs.
+    if (VideoCommon::GpuSplit::Get().BackRunning()) {
+        return VideoCommon::GpuSplit::OnBackThread();
+    }
+    return VideoCommon::V2::Commit::t_gpu_thread;
+}
+
+template <typename Func>
+void RasterizerVulkan::WithCaches(Func&& func) {
+    namespace C = VideoCommon::V2::Commit;
+    if (IsCacheOwner()) {
+        commit->owner.Claim();
+        func();
+        return;
+    }
+    if (commit->owner.BeginDirect()) {
+        // Boot, before the owner's first cache access: nothing runs concurrently with this.
+        SCOPE_EXIT {
+            commit->owner.EndDirect();
+        };
+        C::Stats::Count(C::Stats::Get().external_direct);
+        func();
+        return;
+    }
+    C::OwnerCall call;
+    call.function = [](void* context) { (*static_cast<std::remove_reference_t<Func>*>(context))(); };
+    call.context = const_cast<void*>(static_cast<const void*>(std::addressof(func)));
+    const C::ExternalOp op{
+        .address = reinterpret_cast<u64>(&call),
+        .size = 0,
+        .kind = C::ExternalKind::Call,
+        .arg = 0,
+    };
+    while (!commit->external.TryPush(op)) {
+        gpu.WakeCacheOwner();
+        std::this_thread::yield();
+    }
+    C::Stats::Count(C::Stats::Get().owner_calls);
+    gpu.WakeCacheOwner();
+    std::unique_lock lock{call.mutex};
+    while (!call.cv.wait_for(lock, std::chrono::milliseconds(2), [&call] { return call.done; })) {
+        // The owner may have gone idle between the wake and the push being seen: wake again.
+        lock.unlock();
+        gpu.WakeCacheOwner();
+        lock.lock();
+    }
+}
+
+template <typename Func>
+void RasterizerVulkan::PostOrRun(const VideoCommon::V2::Commit::ExternalOp& op, Func&& func) {
+    namespace C = VideoCommon::V2::Commit;
+    if (IsCacheOwner()) {
+        commit->owner.Claim();
+        func();
+        return;
+    }
+    if (commit->owner.BeginDirect()) {
+        SCOPE_EXIT {
+            commit->owner.EndDirect();
+        };
+        C::Stats::Count(C::Stats::Get().external_direct);
+        func();
+        return;
+    }
+    // No wake: nothing waits on it, and the owner drains the queue before its next lookup.
+    while (!commit->external.TryPush(op)) {
+        gpu.WakeCacheOwner();
+        std::this_thread::yield();
+    }
+}
+
+void RasterizerVulkan::InvalidateRegionCaches(DAddr addr, u64 size, VideoCommon::CacheType which) {
+    if (True(which & VideoCommon::CacheType::TextureCache)) {
+        texture_cache.WriteMemory(addr, size);
+    }
+    if (True(which & VideoCommon::CacheType::BufferCache)) {
+        buffer_cache.WriteMemory(addr, size);
+    }
+}
+
+void RasterizerVulkan::CommitPoint() {
+    auto& context = *commit;
+    context.owner.Claim();
+    context.submission = scheduler.CurrentTick();
+    // Guest CPU writes collected since the last commit point (exact bytes, per core), applied
+    // before any lookup: a few relaxed loads when there are none.
+    if (const u64 collected = gpu.CollectedCpuWrites(); collected != commit_collected)
+        [[unlikely]] {
+        commit_collected = collected;
+        gpu.InvalidateGPUCache();
+    }
+    if (!context.external.Empty() || fence_manager.BacklogPending()) [[unlikely]] {
+        ServeExternal();
+    }
+}
+
+void RasterizerVulkan::ServeCommitRequests() {
+    if (!commit_lock_free || !IsCacheOwner()) {
+        return;
+    }
+    commit->owner.Claim();
+    if (!commit->external.Empty() || fence_manager.BacklogPending()) {
+        ServeExternal();
+    }
+}
+
+void RasterizerVulkan::ServeExternal() {
+    namespace C = VideoCommon::V2::Commit;
+    auto& stats = C::Stats::Get();
+    commit->external.Drain([&](const C::ExternalOp& op) {
+        if (commit->stats) {
+            C::Stats::Count(stats.external[static_cast<size_t>(op.kind)]);
+        }
+        ApplyExternal(op);
+    });
+    u64 address = 0;
+    u64 size = 0;
+    if (commit->external.TakeFlood(address, size)) {
+        C::Stats::Count(stats.floods);
+        InvalidateRegionCaches(address, size, VideoCommon::CacheType::All);
+    }
+    if (fence_manager.BacklogPending()) {
+        if (commit->stats) {
+            C::Stats::Count(stats.fence_backlog);
+        }
+        fence_manager.ServeBacklog();
+    }
+}
+
+void RasterizerVulkan::ApplyExternal(const VideoCommon::V2::Commit::ExternalOp& op) {
+    namespace C = VideoCommon::V2::Commit;
+    switch (op.kind) {
+    case C::ExternalKind::Invalidate:
+        InvalidateRegionCaches(op.address, op.size, static_cast<VideoCommon::CacheType>(op.arg));
+        break;
+    case C::ExternalKind::CacheInvalidate:
+        InvalidateRegionCaches(op.address, op.size, VideoCommon::CacheType::All);
+        break;
+    case C::ExternalKind::Call:
+        reinterpret_cast<C::OwnerCall*>(op.address)->Run();
+        break;
+    default:
+        // The other kinds are synchronous calls in this renderer.
+        break;
+    }
 }
 
 } // namespace Vulkan

@@ -35,6 +35,7 @@ public:
                     std::scoped_lock lk(guard);
                     back_buffer.emplace_back(tmp);
                     current.exchange(t, std::memory_order_relaxed);
+                    collected.fetch_add(1, std::memory_order_release);
                     return;
                 }
                 tmp.address = t.address;
@@ -46,6 +47,13 @@ public:
             tmp.mask |= t.mask;
         } while (!current.compare_exchange_weak(original, tmp, std::memory_order_release,
                                                 std::memory_order_relaxed));
+        collected.fetch_add(1, std::memory_order_release);
+    }
+
+    /// Counts collects that added something (Pipeline v2 P5a: the caches' owner gathers when it
+    /// moved, instead of taking the locks to look). Any thread.
+    [[nodiscard]] u64 Collected() const {
+        return collected.load(std::memory_order_acquire);
     }
 
     /// Calls `callback` for each write collected and not yet applied, without consuming them: those
@@ -142,6 +150,7 @@ private:
     constexpr static size_t align_size = 1U << align_bits;
     constexpr static size_t align_mask = align_size - 1;
     constexpr static TransformAddress default_transform = {.address = ~0U, .mask = 0U};
+    std::atomic<u64> collected{0};
 
     bool IsValid(PAddr address) {
         return address < (1ULL << 39);

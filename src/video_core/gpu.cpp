@@ -158,6 +158,14 @@ struct GPU::Impl {
         }
     }
 
+    [[nodiscard]] u64 CollectedCpuWrites() const {
+        u64 total = 0;
+        for (const auto& manager : system.GetGPUDirtyMemoryManager()) {
+            total += manager.Collected();
+        }
+        return total;
+    }
+
     void ForEachPendingCpuWrite(const std::function<void(DAddr, size_t)>& callback) {
         for (auto& manager : system.GetGPUDirtyMemoryManager()) {
             manager.ForEachPending(callback);
@@ -254,6 +262,8 @@ struct GPU::Impl {
     }
 
     void TickCpuLane() {
+        // EDEN_NX2_V2_COMMIT: the lane hook also serves work handed to the caches' owner.
+        renderer->ReadRasterizer()->ServeCommitRequests();
         if (!lane_pending.load(std::memory_order_acquire)) {
             return;
         }
@@ -277,8 +287,21 @@ struct GPU::Impl {
         WaitForSyncOperation(fence);
     }
 
+    /// Gets the caches' owner to serve handed-over work: the split's back through its CPU lane
+    /// hook (served after its current entry, or at once when it waits for work), else the GPU
+    /// thread through a Tick (TickWork serves it).
+    void WakeCacheOwner() {
+        auto& split = VideoCommon::GpuSplit::Get();
+        if (split.BackRunning()) {
+            split.RequestCpuLane();
+            return;
+        }
+        gpu_thread.TickGPU(is_async);
+    }
+
     /// Tick pending requests within the GPU.
     void TickWork() {
+        renderer->ReadRasterizer()->ServeCommitRequests();
         if (lane_used) [[unlikely]] {
             TickCpuLane();
         }
@@ -736,6 +759,14 @@ void GPU::TickWork() {
 
 void GPU::TickCpuLane() {
     impl->TickCpuLane();
+}
+
+void GPU::WakeCacheOwner() {
+    impl->WakeCacheOwner();
+}
+
+u64 GPU::CollectedCpuWrites() const {
+    return impl->CollectedCpuWrites();
 }
 
 /// Gets a mutable reference to the Host1x interface

@@ -191,6 +191,14 @@ public:
     /// split's back calls it after its current entry).
     void TickCpuLane();
 
+    /// Pipeline v2 P5a: the guest CPU writes collected so far (a count; it moves on every new
+    /// collected write). Any thread.
+    [[nodiscard]] u64 CollectedCpuWrites() const;
+
+    /// Pipeline v2 P5a: gets the caches' owner (the split's back, or the GPU thread) to serve
+    /// handed-over cache work soon, even when it is idle. Any thread, never blocks.
+    void WakeCacheOwner();
+
     /// Gets a mutable reference to the Host1x interface
     [[nodiscard]] Host1x::Host1x& Host1x();
 

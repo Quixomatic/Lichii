@@ -155,6 +155,55 @@ public:
         SignalFence(std::move(func));
     }
 
+    /// Pipeline v2 P5a (EDEN_NX2_V2_COMMIT without the cache locks): the fencing thread no longer
+    /// pops the caches' async flushes. A released batch that has pops, and every batch after it
+    /// until the owner caught up (fence order), goes to the caches' owner, which pops and runs
+    /// the operations at its next commit point; `wake` gets an idle owner there.
+    void SetCommitBacklog(bool on, std::function<void()> wake) {
+        commit_backlog = on;
+        wake_owner = std::move(wake);
+    }
+
+    /// One relaxed load: whether the owner has fence work waiting.
+    [[nodiscard]] bool BacklogPending() const {
+        return backlog_pending.load(std::memory_order_acquire);
+    }
+
+    /// The caches' owner only: pops and runs, in fence order, what the fencing thread handed
+    /// over (deferred writebacks land here, before the operations that make them guest-visible).
+    void ServeBacklog() {
+        if (!backlog_pending.load(std::memory_order_acquire)) {
+            return;
+        }
+        for (;;) {
+            std::deque<BacklogEntry> taken;
+            {
+                std::scoped_lock lock{backlog_mutex};
+                if (backlog.empty()) {
+                    backlog_inflight = false;
+                    backlog_pending.store(false, std::memory_order_release);
+                    return;
+                }
+                taken.swap(backlog);
+                backlog_inflight = true;
+            }
+            VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Fence);
+            for (BacklogEntry& entry : taken) {
+                if ((entry.flushes & TextureFlushes) != 0) {
+                    texture_cache.PopAsyncFlushes();
+                }
+                if ((entry.flushes & BufferFlushes) != 0) {
+                    buffer_cache.PopAsyncFlushes();
+                }
+                query_cache.PopAsyncFlushes();
+                for (auto& operation : entry.operations) {
+                    operation();
+                }
+            }
+            VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Fence);
+        }
+    }
+
     void WaitPendingFences([[maybe_unused]] bool force) {
         if constexpr (!can_async_check) {
             TryReleasePendingFences<true>();
@@ -176,6 +225,17 @@ public:
             // so waiting here without submitting deadlocks (Ocarina of Time entering gameplay).
             SubmitDeferredWork();
             std::unique_lock lk(wait_mutex);
+            if (commit_backlog) [[unlikely]] {
+                // The fence's operation may be in the owner's backlog, and this is the owner.
+                while (!wait_cv.wait_for(lk, std::chrono::milliseconds(1), [&wait_finished] {
+                    return wait_finished.load(std::memory_order_relaxed);
+                })) {
+                    lk.unlock();
+                    rasterizer.ServeCommitRequests();
+                    lk.lock();
+                }
+                return;
+            }
             wait_cv.wait(
                 lk, [&wait_finished] { return wait_finished.load(std::memory_order_relaxed); });
         }
@@ -303,6 +363,35 @@ private:
             for (const Released& released : batch) {
                 texture_pops += (released.flushes & TextureFlushes) != 0 ? 1 : 0;
                 buffer_pops += (released.flushes & BufferFlushes) != 0 ? 1 : 0;
+            }
+            if (commit_backlog) [[unlikely]] {
+                // P5a: this thread touches no cache. Batches with pops go to the owner, and so
+                // does everything after them until it caught up (operations keep fence order).
+                bool handed = false;
+                bool wake = false;
+                {
+                    std::scoped_lock lock{backlog_mutex};
+                    if (texture_pops != 0 || buffer_pops != 0 || !backlog.empty() ||
+                        backlog_inflight) {
+                        for (Released& released : batch) {
+                            backlog.push_back(
+                                BacklogEntry{std::move(released.operations), released.flushes});
+                        }
+                        handed = true;
+                        wake = !backlog_pending.exchange(true, std::memory_order_acq_rel);
+                    }
+                }
+                if (handed) {
+                    if (wake && wake_owner) {
+                        wake_owner();
+                    }
+                    std::unique_lock lock(ring_guard);
+                    for (Released& released : batch) {
+                        delayed_destruction_ring.Push(std::move(released.fence));
+                    }
+                    batch.clear();
+                    continue;
+                }
             }
             if (texture_pops != 0) {
                 std::scoped_lock lock{texture_cache.mutex};
@@ -464,6 +553,18 @@ private:
     std::mutex guard;
     std::mutex ring_guard;
     std::mutex uncommitted_guard; ///< Guards uncommitted_operations
+
+    /// P5a: fence work handed to the caches' owner (SetCommitBacklog).
+    struct BacklogEntry {
+        OperationList operations;
+        u8 flushes;
+    };
+    bool commit_backlog = false;
+    std::function<void()> wake_owner;
+    std::mutex backlog_mutex;
+    std::deque<BacklogEntry> backlog;     ///< Under backlog_mutex
+    bool backlog_inflight = false;        ///< Under backlog_mutex: the owner runs taken entries
+    std::atomic<bool> backlog_pending{false};
     std::condition_variable cv;
 
     std::jthread fence_thread;

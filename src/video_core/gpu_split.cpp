@@ -144,7 +144,9 @@ void GpuSplit::MaybeStart(Core::System& system_) {
     if (draw_verify) {
         V2::IrCheck::Start();
     }
-    if (V2::On(V2::Switch::CpuLane)) {
+    // P5a: with COMMIT=1 lock-free, the hook also serves work handed to the caches' owner.
+    if (V2::On(V2::Switch::CpuLane) ||
+        (V2::Get(V2::Switch::Commit) == V2::Mode::On && !V2::On(V2::Switch::CommitLocked))) {
         SetCpuLaneHook([](void* gpu) { static_cast<Tegra::GPU*>(gpu)->TickCpuLane(); },
                        &system->GPU());
     }
