@@ -343,6 +343,18 @@ bool Scheduler::TryHoistTransfer(u64 track) {
     return true;
 }
 
+bool Scheduler::TryHoistBufferUpload() {
+    if (!transfer_queue) {
+        return false;
+    }
+    if (!timeline_join.CanHoistUnordered()) {
+        VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::TransferFallbacks);
+        return false;
+    }
+    timeline_join.HoistUnordered();
+    return true;
+}
+
 void Scheduler::NoteAcquireJoin() {
     if (transfer_queue) {
         timeline_join.NoteAcquire(master_semaphore->CurrentTick());
@@ -367,6 +379,16 @@ vk::CommandBuffer Scheduler::WorkerTransferCmdbuf() {
             .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
             .pInheritanceInfo = nullptr,
         });
+        // Perf fix C: batches of unused-region uploads wait for no graphics tick; earlier batches
+        // on this queue are ordered by this barrier instead (its first scope covers them).
+        static constexpr VkMemoryBarrier TRANSFER_ORDER{
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .pNext = nullptr,
+            .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+        };
+        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+                               TRANSFER_ORDER);
     }
     return cmdbuf;
 }

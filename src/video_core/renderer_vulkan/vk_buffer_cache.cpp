@@ -605,8 +605,16 @@ bool BufferCacheRuntime::CanReorderUpload(const Buffer& buffer,
     // EDEN_NX2_V2_XFERQ: regions no in-flight work uses (the condition above) can be copied on
     // the transfer queue: no graphics tick to wait for, and the open submission waits for the
     // transfer batch. TryHoistTransfer refuses after a class B join in this submission.
+    // Perf fix C: small uploads stay in the upload command buffer (inline on graphics, already out
+    // of passes): a transfer batch costs a copy-engine launch and two cross-queue signals, more
+    // than ~18 KiB of copies. Large ones go to the transfer queue with no graphics wait.
+    static constexpr u64 TransferMinBytes = 64 * 1024;
     if (can_use_upload_cmdbuf && scheduler.HasTransferQueue()) [[unlikely]] {
-        reorder_to_transfer = scheduler.TryHoistTransfer(0);
+        u64 bytes = 0;
+        for (const VideoCommon::BufferCopy& copy : copies) {
+            bytes += copy.size;
+        }
+        reorder_to_transfer = bytes >= TransferMinBytes && scheduler.TryHoistBufferUpload();
     }
     return can_use_upload_cmdbuf;
 }

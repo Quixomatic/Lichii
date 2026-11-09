@@ -610,3 +610,24 @@ TEST_CASE("V2 P5b GPU untile math matches UnswizzleTexture", "[video_core][v2_p5
         }
     }
 }
+
+TEST_CASE("V2 P5b unused-region uploads join the transfer batch without a graphics wait",
+          "[video_core][v2_p5b]") {
+    TimelineJoin join;
+    join.NoteAcquire(10); // class-B floor at the open tick
+    REQUIRE_FALSE(join.CanHoist(3, 10));
+    REQUIRE(join.CanHoistUnordered());
+    join.HoistUnordered();
+    auto batch = join.Close(10);
+    REQUIRE(batch.transfer);
+    REQUIRE(batch.transfer_wait == 0);
+    REQUIRE(batch.graphics_waits_transfer);
+    // A track-ordered op in the same batch still sets the wait.
+    join.HoistUnordered();
+    join.Hoist(11, 12);
+    batch = join.Close(12);
+    REQUIRE(batch.transfer_wait == 11);
+    // A blocked batch takes nothing.
+    join.BlockHoisting();
+    REQUIRE_FALSE(join.CanHoistUnordered());
+}

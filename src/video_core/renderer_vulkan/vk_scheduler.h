@@ -279,6 +279,10 @@ public:
     /// may run on the transfer queue ahead of the open submission (DXVK's rule). When true the
     /// op must be recorded with RecordTransfer before the next Flush.
     bool TryHoistTransfer(u64 track);
+    /// Perf fix C: a buffer upload into a region no in-flight work uses: it reads no GPU data
+    /// and writes nothing queued work touches, so its batch waits for no graphics tick (no
+    /// class-B floor) and runs while earlier submissions execute.
+    bool TryHoistBufferUpload();
 
     /// Records a closure into the open submission's transfer command buffer (worker thread).
     template <typename T>

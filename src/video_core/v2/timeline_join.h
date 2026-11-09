@@ -61,6 +61,17 @@ public:
         (void)open_tick;
     }
 
+    /// Perf fix C: an op that reads no GPU-produced data and writes nothing queued work uses (a
+    /// buffer upload into an unused region) joins the batch without any graphics wait, so the
+    /// batch overlaps earlier submissions. Only a blocked batch (an ownership release recorded
+    /// in it) refuses.
+    [[nodiscard]] bool CanHoistUnordered() const noexcept {
+        return !blocked;
+    }
+    void HoistUnordered() noexcept {
+        has_transfer = true;
+    }
+
     /// An acquire's position executed on the back during open tick `open_tick` (class A/B with
     /// the transfer queue on): later transfer work waits for every graphics tick up to it.
     void NoteAcquire(u64 open_tick) noexcept {
