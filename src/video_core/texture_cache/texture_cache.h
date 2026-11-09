@@ -27,6 +27,7 @@
 #include "video_core/control/channel_state.h"
 #include "video_core/dirty_flags.h"
 #include "video_core/nx2_fast_draw.h"
+#include "video_core/v2/v2_stats.h"
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/guest_memory.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
@@ -1980,6 +1981,8 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
         return;
     }
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::TextureUpload};
+    VideoCommon::V2::Stats::CountMutation(VideoCommon::V2::Stats::Mutation::TextureRefresh,
+                                          image.guest_size_bytes);
 
     image.flags &= ~ImageFlagBits::CpuModified;
 
@@ -2786,6 +2789,7 @@ bool TextureCache<P>::ScaleUp(Image& image) {
     if (!rescaled) {
         return false;
     }
+    VideoCommon::V2::Stats::CountMutation(VideoCommon::V2::Stats::Mutation::Rescale);
     InvalidateScale(image);
     return true;
 }
@@ -2796,6 +2800,7 @@ bool TextureCache<P>::ScaleDown(Image& image) {
     if (!rescaled) {
         return false;
     }
+    VideoCommon::V2::Stats::CountMutation(VideoCommon::V2::Stats::Mutation::Rescale);
     InvalidateScale(image);
     return true;
 }
@@ -3853,6 +3858,7 @@ template <class P>
 void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
     ImageBase& image = slot_images[image_id];
     ++images_deleted;
+    VideoCommon::V2::Stats::CountMutation(VideoCommon::V2::Stats::Mutation::ImageDelete);
     VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Invalidation);
     // Drop every decode still queued for it, whatever IsDecoding says: an image re-decoded while
     // a decode was in flight has two, and the first to finish clears the flag. A decode left
@@ -4042,6 +4048,8 @@ void TextureCache<P>::SynchronizeAliases(ImageId image_id) {
         image.newest_alias_tick = image.modification_tick;
         return;
     }
+    VideoCommon::V2::Stats::CountMutation(VideoCommon::V2::Stats::Mutation::AliasSync,
+                                          aliased_images.size());
     const bool can_rescale = ImageCanRescale(image);
     if (any_rescaled) {
         if (can_rescale) {

@@ -28,6 +28,7 @@
 #include "video_core/nx2_profile.h"
 #include "video_core/host1x/host1x.h"
 #include "video_core/renderer_base.h"
+#include "video_core/v2/v2_stats.h"
 
 namespace VideoCommon::GPUThread {
 
@@ -76,6 +77,7 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
         auto& split = VideoCommon::GpuSplit::Get();
         while (!stop_token.stop_requested()) {
             Profile::Report();
+            V2::Stats::Report("GPU thread");
             split.MaybeStart(system);
             if (scheduler.HasPendingChannels()) {
                 // Suspended channels wait on semaphores the CPU releases: poll them meanwhile.

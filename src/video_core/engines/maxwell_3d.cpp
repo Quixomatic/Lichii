@@ -362,6 +362,10 @@ void Maxwell3D::ProcessDirtyRegisters(u32 method, u32 argument) {
         !IsFastDrawParameter(method)) {
         VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Register, method);
     }
+    if (VideoCommon::V2::Stats::Enabled()) [[unlikely]] {
+        VideoCommon::V2::Stats::NoteWrite(v2_draw_tracker, method, regs.reg_array[method],
+                                          argument);
+    }
     regs.reg_array[method] = argument;
     for (auto const& table : dirty.tables)
         dirty.flags[table[method]] = true;
@@ -1061,6 +1065,9 @@ void Maxwell3D::NoteFastDrawConstantData(GPUVAddr begin, GPUVAddr end) {
 }
 
 void Maxwell3D::ProcessCBMultiData(const u32* start_base, u32 amount) {
+    if (VideoCommon::V2::Stats::Enabled()) [[unlikely]] {
+        VideoCommon::V2::Stats::NoteConstantData(v2_draw_tracker);
+    }
     // Write the input value to the current const buffer at the current position.
     const GPUVAddr buffer_address = regs.const_buffer.Address();
     ASSERT(buffer_address != 0);
@@ -1333,6 +1340,10 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
     } else {
         split.Method(this, method, argument, is_last_call, nullptr);
         fs.sink_pending = !execution_mask[method];
+    }
+    if (method == MAXWELL3D_REG_INDEX(report_semaphore.query) &&
+        VideoCommon::V2::Stats::Enabled()) [[unlikely]] {
+        VideoCommon::V2::Stats::NoteReportSemaphore(memory_manager.GetID(), fs.regs.data());
     }
 }
 

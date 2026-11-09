@@ -29,6 +29,7 @@
 #include "video_core/nx2_fast_draw.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/textures/texture.h"
+#include "video_core/v2/v2_stats.h"
 #include "video_core/engines/maxwell_3d.h"
 
 namespace Core {
@@ -3162,6 +3163,9 @@ public:
     };
 
     State state{};
+
+    /// EDEN_NX2_V2_STATS: register groups changed since the last draw, state hashes.
+    VideoCommon::V2::Stats::DrawTracker v2_draw_tracker;
 
     /// Reads a register value located at the input method address
     u32 GetRegisterValue(u32 method) const;

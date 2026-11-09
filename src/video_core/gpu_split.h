@@ -71,6 +71,13 @@ public:
     [[nodiscard]] u32 Starts() const {
         return starts;
     }
+    /// Front thread: ring words sent so far, and executed by the back (v2 stats).
+    [[nodiscard]] u64 WritePosition() const {
+        return write_position;
+    }
+    [[nodiscard]] u64 ConsumedPosition() const {
+        return consumed.load(std::memory_order_relaxed);
+    }
     /// Whether the front runs the engines' macros (EDEN_NX2_SPLIT=2).
     [[nodiscard]] bool FrontMacros() const {
         return front_macros;

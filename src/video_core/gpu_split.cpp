@@ -29,6 +29,7 @@
 #include "video_core/nx2.h"
 #include "video_core/nx2_fast_draw.h"
 #include "video_core/nx2_profile.h"
+#include "video_core/v2/v2_stats.h"
 
 namespace VideoCommon {
 
@@ -208,12 +209,16 @@ void GpuSplit::Drain(DrainSite site) {
     }
     Publish();
     Nx2Profile::Scope scope{Nx2Profile::Zone::SplitDrain};
-    const u64 start = Nx2Profile::Enabled() ? Nx2Profile::Ticks() : 0;
+    const bool v2_stats = V2::Stats::Enabled();
+    const u64 start = Nx2Profile::Enabled() || v2_stats ? Nx2Profile::Ticks() : 0;
     for (u32 spins = 0;; ++spins) {
         consumed_cache = consumed.load(std::memory_order_acquire);
         if (consumed_cache == write_position) {
             publish_every = 8;
             Nx2Profile::AddDrain(site, start);
+            if (v2_stats) [[unlikely]] {
+                V2::Stats::NoteDrain(site, start);
+            }
             return;
         }
         Backoff(spins, write_position);
@@ -236,12 +241,16 @@ bool GpuSplit::WaitFor(u64 target, DrainSite site) {
     Nx2Profile::Scope scope{Nx2Profile::Zone::WriterWait};
     wait_target.store(target, std::memory_order_seq_cst);
     Publish();
-    const u64 start = Nx2Profile::Enabled() ? Nx2Profile::Ticks() : 0;
+    const bool v2_stats = V2::Stats::Enabled();
+    const u64 start = Nx2Profile::Enabled() || v2_stats ? Nx2Profile::Ticks() : 0;
     for (u32 spins = 0;; ++spins) {
         consumed_cache = consumed.load(std::memory_order_acquire);
         if (consumed_cache >= target) {
             wait_target.store(~u64{0}, std::memory_order_relaxed);
             Nx2Profile::AddDrain(site, start);
+            if (v2_stats) [[unlikely]] {
+                V2::Stats::NoteDrain(site, start);
+            }
             return true;
         }
         Backoff(spins, target);
@@ -433,6 +442,7 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
     u64 read_position = 0;
     while (!stop_token.stop_requested()) {
         Nx2Profile::Report("GPU back thread");
+        V2::Stats::Report("GPU back thread");
         u64 available = published.load(std::memory_order_acquire);
         if (available == read_position) {
             Nx2Profile::Scope scope{Nx2Profile::Zone::SplitWait};

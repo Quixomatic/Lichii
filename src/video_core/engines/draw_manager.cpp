@@ -13,6 +13,7 @@
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/render_trace.h"
+#include "video_core/v2/v2_stats.h"
 
 namespace Tegra::Engines {
 namespace {
@@ -343,6 +344,12 @@ void Maxwell3D::DrawManager::ProcessDraw(Maxwell3D& maxwell3d, bool draw_indexed
     LOG_TRACE(HW_GPU, "called, topology={}, count={}", draw_state.topology, draw_indexed ? draw_state.index_buffer.count : draw_state.vertex_buffer.count);
     UpdateTopology(maxwell3d);
     if (maxwell3d.ShouldExecute()) {
+        const bool v2_stats = VideoCommon::V2::Stats::Enabled();
+        if (v2_stats) [[unlikely]] {
+            VideoCommon::V2::Stats::NoteDraw(maxwell3d, static_cast<u32>(draw_state.topology),
+                                             draw_indexed, false);
+        }
+        const VideoCommon::V2::Stats::DrawScope v2_scope{v2_stats};
         maxwell3d.rasterizer->Draw(draw_indexed, instance_count);
     } else {
         TraceSuppressedDraw(maxwell3d, false);
@@ -354,6 +361,12 @@ void Maxwell3D::DrawManager::ProcessDrawIndirect(Maxwell3D& maxwell3d) {
     LOG_TRACE(HW_GPU, "called, topology={}, is_indexed={}, includes_count={}, buffer_size={}, max_draw_count={}", draw_state.topology, indirect_state.is_indexed, indirect_state.include_count, indirect_state.buffer_size, indirect_state.max_draw_counts);
     UpdateTopology(maxwell3d);
     if (maxwell3d.ShouldExecute()) {
+        const bool v2_stats = VideoCommon::V2::Stats::Enabled();
+        if (v2_stats) [[unlikely]] {
+            VideoCommon::V2::Stats::NoteDraw(maxwell3d, static_cast<u32>(draw_state.topology),
+                                             indirect_state.is_indexed, true);
+        }
+        const VideoCommon::V2::Stats::DrawScope v2_scope{v2_stats};
         maxwell3d.rasterizer->DrawIndirect();
     } else {
         TraceSuppressedDraw(maxwell3d, true);

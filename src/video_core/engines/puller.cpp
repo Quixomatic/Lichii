@@ -26,6 +26,7 @@
 #include "video_core/nx2.h"
 #include "video_core/nx2_fast_draw.h"
 #include "video_core/rasterizer_interface.h"
+#include "video_core/v2/v2_stats.h"
 
 namespace Tegra::Engines {
 
@@ -71,6 +72,20 @@ void ReleaseFences(DmaPusher& dma_pusher) {
         VideoCommon::DrainSite::FenceRelease);
 }
 
+namespace V2Stats = VideoCommon::V2::Stats;
+
+/// A PendingAcquire's operation (GpuSemaphoreOperation: 1 equal, 4 greater or equal, 8 mask).
+V2Stats::AcquireOp StatsAcquireOp(u32 operation) {
+    switch (operation) {
+    case 0x1:
+        return V2Stats::AcquireOp::Equal;
+    case 0x8:
+        return V2Stats::AcquireOp::Mask;
+    default:
+        return V2Stats::AcquireOp::Gequal;
+    }
+}
+
 } // Anonymous namespace
 
 bool Puller::PendingAcquire::Matches(u32 current) const {
@@ -87,6 +102,19 @@ bool Puller::PendingAcquire::Matches(u32 current) const {
 }
 
 bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
+    if (!pending_acquire || !V2Stats::Enabled()) [[likely]] {
+        return PollAcquire(dma_pusher);
+    }
+    const V2Stats::SyncClass sync_class = V2Stats::ClassifyAcquire(
+        dma_pusher.memory_manager.GetID(), pending_acquire->address, pending_acquire->value,
+        StatsAcquireOp(pending_acquire->operation));
+    const V2Stats::AcquireContext context{sync_class};
+    const bool met = PollAcquire(dma_pusher);
+    V2Stats::NoteAcquire(sync_class, true, met);
+    return met;
+}
+
+bool Puller::PollAcquire(DmaPusher& dma_pusher) {
     if (!pending_acquire) {
         return true;
     }
@@ -255,6 +283,10 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
         OnBack([rasterizer = dma_pusher.rasterizer, sequence_address, properties, payload] {
             rasterizer->Query(sequence_address, VideoCommon::QueryType::Payload, properties, payload, 0);
         });
+        if (V2Stats::Enabled()) [[unlikely]] {
+            V2Stats::NoteRelease(dma_pusher.memory_manager.GetID(), sequence_address, payload,
+                                 V2Stats::ReleaseKind::Literal);
+        }
     } else if (g_nx2_ampere) {
         // Switch 2 waits on semaphores the CPU (or another channel) releases, e.g. once it has
         // written the commands this channel runs next: suspend the channel until the value is
@@ -273,8 +305,18 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
             return;
         }
         VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AcquireChecks, 1);
+        const bool v2_stats = V2Stats::Enabled();
+        const V2Stats::SyncClass sync_class =
+            v2_stats ? V2Stats::ClassifyAcquire(dma_pusher.memory_manager.GetID(), acquire.address,
+                                                acquire.value, StatsAcquireOp(acquire.operation))
+                     : V2Stats::SyncClass::Count;
+        const V2Stats::AcquireContext context{sync_class};
         DrainBack();
-        if (acquire.Matches(ReadSemaphoreWord(dma_pusher, acquire.address))) {
+        const bool met = acquire.Matches(ReadSemaphoreWord(dma_pusher, acquire.address));
+        if (v2_stats) [[unlikely]] {
+            V2Stats::NoteAcquire(sync_class, false, met);
+        }
+        if (met) {
             return;
         }
         // Registered before the fences run, so a release among them that meets the value counts
@@ -330,6 +372,10 @@ void Puller::ProcessSemaphoreRelease(DmaPusher& dma_pusher) {
         rasterizer->Query(sequence_address, VideoCommon::QueryType::Payload,
                           VideoCommon::QueryPropertiesFlags::IsAFence, payload, 0);
     });
+    if (V2Stats::Enabled()) [[unlikely]] {
+        V2Stats::NoteRelease(dma_pusher.memory_manager.GetID(), sequence_address, payload,
+                             V2Stats::ReleaseKind::Literal);
+    }
 }
 
 void Puller::ProcessSemaphoreAcquire(DmaPusher& dma_pusher) {
@@ -361,9 +407,26 @@ void Puller::ProcessSemaphoreExecute(DmaPusher& dma_pusher, u32 argument) {
             rasterizer->Query(address, VideoCommon::QueryType::Payload,
                               VideoCommon::QueryPropertiesFlags::IsAFence, payload, 0);
         });
+        if (V2Stats::Enabled()) [[unlikely]] {
+            V2Stats::NoteRelease(dma_pusher.memory_manager.GetID(), address, payload,
+                                 V2Stats::ReleaseKind::Literal);
+        }
         return;
     }
     // Acquires: check once after flushing pending fences; never block the GPU thread on them.
+    const bool v2_stats = V2Stats::Enabled();
+    // By operation, as `ready` below (1 is the release).
+    static constexpr std::array<V2Stats::AcquireOp, 6> v2_ops{
+        V2Stats::AcquireOp::Equal, V2Stats::AcquireOp::Equal,
+        V2Stats::AcquireOp::Gequal, V2Stats::AcquireOp::CircularGequal,
+        V2Stats::AcquireOp::Mask, V2Stats::AcquireOp::MaskZero,
+    };
+    const V2Stats::SyncClass sync_class =
+        v2_stats && operation < v2_ops.size() && operation != 1
+            ? V2Stats::ClassifyAcquire(dma_pusher.memory_manager.GetID(), address, payload,
+                                       v2_ops[operation])
+            : V2Stats::SyncClass::Count;
+    const V2Stats::AcquireContext context{sync_class};
     DrainBack();
     VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Fence);
     ReleaseFences(dma_pusher);
@@ -374,6 +437,9 @@ void Puller::ProcessSemaphoreExecute(DmaPusher& dma_pusher, u32 argument) {
                        : operation == 4 ? (word & payload) != 0
                        : operation == 5 ? (word & payload) == 0
                                         : true;
+    if (sync_class != V2Stats::SyncClass::Count) [[unlikely]] {
+        V2Stats::NoteAcquire(sync_class, false, ready);
+    }
     if (!ready) {
         static std::atomic<u32> reported{};
         if (reported.fetch_add(1) < 8) {

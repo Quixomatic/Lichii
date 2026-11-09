@@ -28,6 +28,7 @@
 #include "video_core/nx2_perf.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/texture_cache/util.h"
+#include "video_core/v2/v2_stats.h"
 
 namespace VideoCommon {
 
@@ -2717,6 +2718,8 @@ void BufferCache<P>::SynchronizeGeometryBuffer(u32 slot, BufferId buffer_id, DAd
 template <class P>
 void BufferCache<P>::UploadMemory(Buffer& buffer, u64 total_size_bytes, u64 largest_copy,
                                   std::span<BufferCopy> copies) {
+    VideoCommon::V2::Stats::CountMutation(VideoCommon::V2::Stats::Mutation::BufferUpload,
+                                          total_size_bytes);
     if constexpr (USE_MEMORY_MAPS_FOR_UPLOADS) {
         MappedUploadMemory(buffer, total_size_bytes, copies);
     } else {
@@ -2945,6 +2948,7 @@ void BufferCache<P>::DownloadBufferMemory(Buffer& buffer, DAddr device_addr, u64
 template <class P>
 void BufferCache<P>::DeleteBuffer(BufferId buffer_id, bool do_not_mark) {
     ++buffer_deletions;
+    VideoCommon::V2::Stats::CountMutation(VideoCommon::V2::Stats::Mutation::BufferDelete);
     if constexpr (requires { runtime.OnBufferDeleted(slot_buffers[buffer_id]); }) {
         runtime.OnBufferDeleted(slot_buffers[buffer_id]);
     }
