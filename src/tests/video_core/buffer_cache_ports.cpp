@@ -747,6 +747,20 @@ TEST_CASE("Draw cache buffer replay binds unchanged cached uniforms without sync
     // Verify's byte check: CPU-modified behind unchanged versions is counted as stale.
     Access::MarkCpuModifiedSilently(*f.cache, 0x20000, 0x1000);
     REQUIRE(f.cache->CountStaleRecipeRanges(recipe, memo) == 1);
+
+    // Fix pass 1 (Ocarina of Time, ~79% of sampled hits "CPU-modified behind unchanged
+    // versions"): bindings the replay doesn't take from the host buffer are no stale ranges.
+    // A constant buffer version (or a stream copy) reads guest memory and never syncs the
+    // buffer, so its CPU-modified bits stay set by design.
+    V2::DrawCache::BufferRecipe versioned = recipe;
+    versioned.uniform[0].kind = V2::DrawCache::BufferBind::Kind::Version;
+    REQUIRE(f.cache->CountStaleRecipeRanges(versioned, memo) == 0);
+    versioned.uniform[0].kind = V2::DrawCache::BufferBind::Kind::Normal;
+    REQUIRE(f.cache->CountStaleRecipeRanges(versioned, memo) == 0);
+    // A recipe whose buffer slot moved on (generation) is never replayed.
+    V2::DrawCache::BufferRecipe moved = recipe;
+    ++moved.uniform[0].generation;
+    REQUIRE(f.cache->CountStaleRecipeRanges(moved, memo) == 0);
 }
 
 namespace {

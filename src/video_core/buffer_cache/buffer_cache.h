@@ -1558,9 +1558,16 @@ u32 BufferCache<P>::CountStaleRecipeRanges(const VideoCommon::V2::DrawCache::Buf
         return 0;
     }
     u32 stale = 0;
+    using BindKind = VideoCommon::V2::DrawCache::BufferBind::Kind;
+    const auto& gens = VideoCommon::V2::Versions::Gens();
     const auto check = [&](const VideoCommon::V2::DrawCache::BufferBind& bind) {
-        if (bind.kind == VideoCommon::V2::DrawCache::BufferBind::Kind::Normal || bind.size == 0 ||
-            !slot_buffers.contains(BufferId{bind.buffer_id})) {
+        // Only bindings the replay takes from the host buffer: stream copies (Normal) and
+        // constant buffer versions (Version) read guest memory, never sync the buffer, and keep
+        // its CPU-modified bits set by design. A binding whose buffer slot moved on (generation)
+        // is never replayed.
+        if (bind.kind == BindKind::Normal || bind.kind == BindKind::Version || bind.size == 0 ||
+            !slot_buffers.contains(BufferId{bind.buffer_id}) ||
+            gens.Get(VideoCommon::V2::Versions::Kind::Buffer, bind.buffer_id) != bind.generation) {
             return;
         }
         if (memo.Unchanged(bind.device_addr, bind.size, recipe.stamp) &&
@@ -4450,6 +4457,8 @@ void BufferCache<P>::DeleteBuffer(BufferId buffer_id, bool do_not_mark) {
     // Mark the whole buffer as CPU written to stop tracking CPU writes
     if (!do_not_mark) {
         Buffer& buffer = slot_buffers[buffer_id];
+        // Every CPU-modified mark moves the versions (EDEN_NX2_V2_DRAWCACHE buffer replay).
+        V2::Versions::HookWrite(buffer.CpuAddr(), buffer.SizeBytes(), V2::Versions::Source::Host);
         memory_tracker.MarkRegionAsCpuModified(buffer.CpuAddr(), buffer.SizeBytes());
     }
 
