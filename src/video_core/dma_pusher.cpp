@@ -724,7 +724,8 @@ void DmaPusher::NoteCopyRecord(Engines::EngineTypes type, u32 method, const u32*
         } else if (type == Engines::EngineTypes::Fermi2D) {
             launch = copy_records.NoteBlit(current, arguments[i], body);
         }
-        if (launch) {
+        // Only the parallel resolve's segmenter and the draw check read Copy records.
+        if (launch && VideoCommon::GpuSplit::Get().FullDrawRecords()) {
             VideoCommon::GpuSplit::Get().Note(VideoCommon::V2::Ir::Kind::Copy, body);
         }
     }

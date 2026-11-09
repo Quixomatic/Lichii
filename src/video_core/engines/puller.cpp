@@ -107,10 +107,11 @@ void OnBackRelease(DmaPusher& dma_pusher, GPUVAddr address, u32 payload, u32 byt
     }
 }
 
-// EDEN_NX2_V2_IR_DRAWS: an Acquire record of what the front decided (informational).
+// EDEN_NX2_V2_IR_DRAWS: an Acquire record of what the front decided (informational: emitted only
+// when the full records are read, IR_DRAWS=verify or PARALLEL).
 void NoteAcquireRecord(DmaPusher& dma_pusher, GPUVAddr address, u32 value, u32 operation,
                        u32 verdict) {
-    if (auto& split = VideoCommon::GpuSplit::Get(); split.DrawRecords()) [[unlikely]] {
+    if (auto& split = VideoCommon::GpuSplit::Get(); split.FullDrawRecords()) [[unlikely]] {
         split.Note(VideoCommon::V2::Ir::Kind::Acquire,
                    VideoCommon::V2::Ir::AcquireBody{
                        .address = address,
