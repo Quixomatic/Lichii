@@ -1731,3 +1731,28 @@ TEST_CASE("V2 IR: without a consumer, draw records are compact and run the same"
     // 5 ring words per compact record instead of 27.
     CHECK(compact.words + 64 * 20 <= full.words);
 }
+
+TEST_CASE("V2 hazard: unknown reports block reads of their bytes until they land, not their page",
+          "[video_core][gpu_split_dispatch][v2_hazard]") {
+    using Access = VideoCommon::GpuSplitTestAccess;
+    namespace V2 = VideoCommon::V2;
+    Fixture f;
+    f.system.Initialize();
+    VideoCommon::GpuSplit split;
+    Access::Initialize(split, f.system, 100);
+    V2::Landing::landed.store(0);
+    constexpr u64 report = 0x5'0000'0010;
+    split.NoteUnlandedRange(report, 8);
+    std::array<u8, 8> bytes{};
+    CHECK(split.FindUnlanded(report, 4, bytes.data()).kind == V2::HazardResult::Kind::Wait);
+    CHECK(split.FindUnlanded(report + 4, 4, bytes.data()).kind == V2::HazardResult::Kind::Wait);
+    // The rest of the page is not a report page for good.
+    CHECK(split.FindUnlanded(report + 0x40, 8, bytes.data()).kind ==
+          V2::HazardResult::Kind::Clear);
+    CHECK(split.FindUnlanded(report - 0x10, 8, bytes.data()).kind ==
+          V2::HazardResult::Kind::Clear);
+    // Its operation ran (landing at its position): memory has it.
+    V2::Landing::Note(Access::End(split));
+    CHECK(split.FindUnlanded(report, 8, bytes.data()).kind == V2::HazardResult::Kind::Clear);
+    V2::Landing::landed.store(0);
+}

@@ -5,6 +5,7 @@
 #include <array>
 #include <cstring>
 
+#include "common/settings.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/engines/fermi_2d.h"
 #include "video_core/engines/maxwell_dma.h"
@@ -30,7 +31,9 @@ void NoteReleaseWrite(GpuSplit& split, const Tegra::MemoryManager& memory, GPUVA
         return; // The back drops it too (the query cache skips unmapped reports)
     }
     if (!known) {
+        // A counter or reduction: in memory when the query cache's operation runs.
         split.NoteRangeWrite(*device, bytes, producer);
+        split.NoteUnlandedRange(*device, bytes);
         return;
     }
     if (bytes <= 4) {
@@ -46,6 +49,11 @@ void NoteReleaseWrite(GpuSplit& split, const Tegra::MemoryManager& memory, GPUVA
     split.NoteRangeWrite(*device + 8, bytes - 8, producer);
     if (fenced) {
         split.NoteUnlandedWrite(*device, value.data(), sizeof(value));
+    }
+    if (fenced || Settings::IsGPULevelHigh()) {
+        // The timestamp is written by the query cache's operation (below High accuracy an
+        // unfenced payload report is written at once, when the back runs it).
+        split.NoteUnlandedRange(*device + 8, bytes - 8);
     }
 }
 

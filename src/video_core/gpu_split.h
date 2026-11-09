@@ -244,6 +244,16 @@ public:
         }
         unlanded.NoteKnown(device_address, bytes, size, write_position, V2::Producer::Release);
     }
+    /// Front: a report whose bytes the front can't tell (a counter, a timestamp) was just sent;
+    /// the query cache writes it when its operation runs (v2/landing.h). Until it lands,
+    /// FindUnlanded answers Wait for its range: reads of it take the back's flushes, reads of
+    /// the rest of its page don't (no sticky report pages).
+    void NoteUnlandedRange(u64 device_address, u64 size) {
+        if (unlanded.Size() == V2::HazardTable::Capacity) [[unlikely]] {
+            unlanded.Retire(V2::Landing::landed.load(std::memory_order_acquire));
+        }
+        unlanded.NoteRange(device_address, size, write_position, V2::Producer::Report);
+    }
     /// Front: the fence-flagged releases to a device range that are not in memory yet, queued
     /// or run by the back (Forward applies their bytes over `out`).
     [[nodiscard]] V2::HazardResult FindUnlanded(u64 device_address, u64 size, u8* out) {

@@ -2671,11 +2671,9 @@ bool Maxwell3D::FrontDmaReadHazard(VideoCommon::GpuSplit& split, GPUVAddr source
             return fall_back(Reason::Unmapped);
         }
     }
-    // Reports the query cache may still hold back, and words the buffer cache may hold newer
-    // than memory, need the back's flushes (the old path).
-    if (split.MayHoldReports(*device, bytes)) {
-        return fall_back(Reason::ReportPage);
-    }
+    // Reports the query cache may still hold back (FindUnlanded below: tracked per report until
+    // it lands, not by sticky pages), and words the buffer cache may hold newer than memory,
+    // need the back's flushes (the old path).
     // What can have written the words in command order (7429fba04e): methods that write memory
     // (ranged, or unbounded: dispatches, copies, uploads) and the work before the last
     // host-level wait. Draws after it are not visible to the 3D engine's reads before a wait.
