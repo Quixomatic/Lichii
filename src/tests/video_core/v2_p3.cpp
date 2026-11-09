@@ -363,8 +363,8 @@ TEST_CASE("V2 P3 constant buffer versions", "[video_core][v2_p3]") {
     constexpr DAddr A = 0x10'0000;
     constexpr DAddr B = 0x10'0400;
     constexpr DAddr Far = 0x80'0000;
-    table->Insert(A, 0x100, 7, 1);
-    table->Insert(B, 0x200, 7, 2);
+    table->Insert(A, 0x100, 7, 1, table->Track(A, 0x100));
+    table->Insert(B, 0x200, 7, 2, table->Track(B, 0x200));
     REQUIRE(*table->Find(A, 0x100, 7) == 1);
     REQUIRE(*table->Find(B, 0x200, 7) == 2);
     // Another tick (the stream allocation may be gone) or size: no version.
@@ -380,42 +380,100 @@ TEST_CASE("V2 P3 constant buffer versions", "[video_core][v2_p3]") {
         REQUIRE(table->Find(A, 0x100, 7) != nullptr);
     }
     // Past the log's size without a lookup: unknown, so the version ends.
-    table->Insert(B, 0x200, 7, 3);
+    table->Insert(B, 0x200, 7, 3, table->Track(B, 0x200));
     for (size_t i = 0; i < WriteLog::LogSize + 1; ++i) {
         log->NoteInline(Far, Far + 4);
     }
     REQUIRE(table->Find(B, 0x200, 7) == nullptr);
     // A host write to A's page ends it; one to another page doesn't.
-    table->Insert(A, 0x100, 7, 4);
+    table->Insert(A, 0x100, 7, 4, table->Track(A, 0x100));
     log->NoteHost(Far, 4);
     REQUIRE(*table->Find(A, 0x100, 7) == 4);
     log->NoteHost(A + 0x800, 4);
     REQUIRE(table->Find(A, 0x100, 7) == nullptr);
     // A command list boundary ends every version; a long host write too.
-    table->Insert(A, 0x100, 7, 5);
+    table->Insert(A, 0x100, 7, 5, table->Track(A, 0x100));
     REQUIRE(table->Find(A, 0x100, 7) != nullptr);
     log->NoteBoundary();
     REQUIRE(table->Find(A, 0x100, 7) == nullptr);
-    table->Insert(A, 0x100, 7, 6);
+    table->Insert(A, 0x100, 7, 6, table->Track(A, 0x100));
     log->NoteHost(Far, (WriteLog::MaxHostPages + 1) << WriteLog::PageBits);
     REQUIRE(table->Find(A, 0x100, 7) == nullptr);
     // Verify keeps the bytes of a version.
     const std::array<u8, 4> bytes{1, 2, 3, 4};
-    table->Insert(A, 4, 9, 7, bytes.data());
+    table->Insert(A, 4, 9, 7, table->Track(A, 4), bytes.data());
     REQUIRE(table->Bytes(A, 4) == std::vector<u8>{1, 2, 3, 4});
     table->Clear();
     REQUIRE(table->Find(A, 4, 9) == nullptr);
+}
+
+TEST_CASE("V2 P3 constant buffer version pages stay in the write tracking",
+          "[video_core][v2_p3]") {
+    using namespace VideoCommon::V2::CbufVer;
+    auto log = std::make_unique<WriteLog>();
+    auto table = std::make_unique<VersionTable<int>>(*log);
+    std::vector<std::pair<DAddr, s32>> calls;
+    table->Reset([&](DAddr address, u64 size, s32 delta) {
+        REQUIRE(size == WriteLog::PageSize);
+        calls.emplace_back(address, delta);
+    });
+    constexpr DAddr A = 0x10'0f80; // straddles two pages
+    table->Insert(A, 0x100, 1, 1, table->Track(A, 0x100));
+    REQUIRE(calls.size() == 2);
+    REQUIRE(calls[0] == std::pair<DAddr, s32>{0x10'0000, 1});
+    REQUIRE(calls[1] == std::pair<DAddr, s32>{0x10'1000, 1});
+    REQUIRE(table->TrackedPages() == 2);
+    // A second version on the same pages tracks nothing new.
+    table->Insert(A + 0x20, 0x40, 1, 2, table->Track(A + 0x20, 0x40));
+    REQUIRE(calls.size() == 2);
+    // Every CPU write to a watched page ends the versions there, even repeated ones; writes to
+    // pages no version watches don't touch the counters.
+    REQUIRE(table->Find(A, 0x100, 1) != nullptr);
+    log->NoteCpuWrite(0x80'0000, 4);
+    REQUIRE(table->Find(A, 0x100, 1) != nullptr);
+    log->NoteCpuWrite(0x10'1004, 4);
+    REQUIRE(table->Find(A, 0x100, 1) == nullptr);
+    table->Insert(A, 0x100, 1, 3, table->Track(A, 0x100));
+    REQUIRE(table->Find(A, 0x100, 1) != nullptr);
+    log->NoteCpuWrite(0x10'1004, 4);
+    REQUIRE(table->Find(A, 0x100, 1) == nullptr);
+    // Clear lets every page go through the tracker.
+    table->Clear();
+    REQUIRE(table->TrackedPages() == 0);
+    s32 balance = 0;
+    for (const auto& [address, delta] : calls) {
+        balance += delta;
+    }
+    REQUIRE(balance == 0);
+    // Pages of replaced versions are let go once more than MaxIdlePages are idle.
+    calls.clear();
+    for (u64 i = 0; i < VersionTable<int>::MaxIdlePages + 8; ++i) {
+        const DAddr address = 0x100'0000 + i * WriteLog::PageSize;
+        table->Insert(address, 0x40, 2, 4, table->Track(address, 0x40));
+    }
+    REQUIRE(table->TrackedPages() <=
+            VersionTable<int>::NumEntries + VersionTable<int>::MaxIdlePages + 1);
+    table->Clear();
+    balance = 0;
+    for (const auto& [address, delta] : calls) {
+        balance += delta;
+    }
+    REQUIRE(balance == 0);
 }
 
 namespace {
 struct HeapModule {
     u32 set1_decorations{};
     u32 set0_decorations{};
+    bool words_binding{};
     bool sampled_image{};
-    bool offset_48{};
+    bool non_uniform{};
 };
 
-HeapModule EmitTextureSample(u64 heap_mask) {
+/// A fragment program sampling texture 0 (with `texture_count` elements, read with a dynamic
+/// element index when above 1) and, with `image`, reading storage image 0.
+HeapModule EmitHeapProgram(u64 texture_mask, u64 image_mask, u32 texture_count, bool image,
+                           const char* name) {
     using namespace Shader;
     ObjectPool<IR::Inst> pool;
     IR::Block block{pool};
@@ -427,14 +485,17 @@ HeapModule EmitTextureSample(u64 heap_mask) {
                            {{}, IR::AbstractSyntaxNode::Type::Return}};
     IR::IREmitter ir{block};
     IR::TextureInstInfo flags{};
-    flags.type.Assign(TextureType::Color2D);
+    flags.type.Assign(TextureType::ColorArray2D);
     flags.descriptor_index.Assign(0);
-    const auto coords = ir.CompositeConstruct(ir.Imm32(0.0f), ir.Imm32(0.0f));
-    const IR::Value sample{ir.ImageSampleExplicitLod(ir.Imm32(0), coords, ir.Imm32(0.0f), {}, flags)};
+    const auto coords = ir.CompositeConstruct(ir.Imm32(0.0f), ir.Imm32(0.0f), ir.Imm32(0.0f));
+    // A dynamic element index: a constant buffer word.
+    const IR::Value element{texture_count > 1 ? IR::Value{ir.GetCbuf(ir.Imm32(0), ir.Imm32(0))}
+                                              : IR::Value{ir.Imm32(0)}};
+    const IR::Value sample{ir.ImageSampleExplicitLod(element, coords, ir.Imm32(0.0f), {}, flags)};
     // What the texture pass makes of the bound sample once the descriptor is known.
     sample.InstRecursive()->ReplaceOpcode(IR::Opcode::ImageSampleExplicitLod);
     program.info.texture_descriptors.push_back(TextureDescriptor{
-        .type = TextureType::Color2D,
+        .type = TextureType::ColorArray2D,
         .is_depth = false,
         .is_multisample = false,
         .is_integer = false,
@@ -445,21 +506,47 @@ HeapModule EmitTextureSample(u64 heap_mask) {
         .secondary_cbuf_index = 0,
         .secondary_cbuf_offset = 0,
         .secondary_shift_left = 0,
-        .count = 1,
-        .size_shift = 0,
+        .count = texture_count,
+        .size_shift = 2,
     });
-    program.info.heap_texture_mask = heap_mask;
-    program.info.heap_push_base = 3;
+    if (texture_count > 1) {
+        program.info.constant_buffer_mask = 1;
+        program.info.constant_buffer_descriptors.push_back({.index = 0, .count = 1});
+        program.info.constant_buffer_used_sizes[0] = 16;
+        program.info.used_constant_buffer_types = IR::Type::U32;
+    }
+    if (image) {
+        IR::TextureInstInfo image_flags{};
+        image_flags.type.Assign(TextureType::Color2D);
+        image_flags.descriptor_index.Assign(0);
+        const IR::Value read{
+            ir.ImageRead(ir.Imm32(0), ir.CompositeConstruct(ir.Imm32(0), ir.Imm32(0)),
+                         image_flags)};
+        read.InstRecursive()->ReplaceOpcode(IR::Opcode::ImageRead);
+        program.info.image_descriptors.push_back(ImageDescriptor{
+            .type = TextureType::Color2D,
+            .format = ImageFormat::R32_UINT,
+            .is_written = false,
+            .is_read = true,
+            .is_integer = true,
+            .cbuf_index = 2,
+            .cbuf_offset = 0x40,
+            .count = 1,
+            .size_shift = 0,
+        });
+    }
+    program.info.heap_texture_mask = texture_mask;
+    program.info.heap_image_mask = image_mask;
+    program.info.heap_word_base = 3;
     Profile profile;
     profile.supported_spirv = 0x00010500;
     profile.unified_descriptor_binding = true;
+    profile.support_sampled_image_array_nonuniform_indexing = true;
     const std::vector<u32> code = Backend::SPIRV::EmitSPIRV(profile, program);
     // EDEN_V2_HEAP_TEST_OUTPUT=<dir>: write the modules for spirv-val.
     if (const char* directory = std::getenv("EDEN_V2_HEAP_TEST_OUTPUT")) {
         std::filesystem::create_directories(directory);
-        std::ofstream file{std::filesystem::path{directory} /
-                               (heap_mask != 0 ? "heap.spv" : "plain.spv"),
-                           std::ios::binary};
+        std::ofstream file{std::filesystem::path{directory} / name, std::ios::binary};
         file.write(reinterpret_cast<const char*>(code.data()),
                    static_cast<std::streamsize>(code.size() * sizeof(u32)));
     }
@@ -471,8 +558,11 @@ HeapModule EmitTextureSample(u64 heap_mask) {
         if (opcode == 71 && words >= 4 && code[i + 2] == 34) { // OpDecorate DescriptorSet
             ++(code[i + 3] == 1 ? module.set1_decorations : module.set0_decorations);
         }
-        if (opcode == 72 && words >= 5 && code[i + 3] == 35 && code[i + 4] == 48) {
-            module.offset_48 = true; // OpMemberDecorate Offset 48
+        if (opcode == 71 && words >= 4 && code[i + 2] == 33 && code[i + 3] == 1023) {
+            module.words_binding = true; // OpDecorate Binding 1023
+        }
+        if (opcode == 71 && words >= 3 && code[i + 2] == 5300) { // NonUniform
+            module.non_uniform = true;
         }
         if (opcode == 86) { // OpSampledImage
             module.sampled_image = true;
@@ -483,10 +573,11 @@ HeapModule EmitTextureSample(u64 heap_mask) {
 }
 } // Anonymous namespace
 
-TEST_CASE("V2 P3 heap textures index the bindless heap through pushed words",
+TEST_CASE("V2 P3 heap descriptors index the bindless heap through the word table",
           "[video_core][v2_p3]") {
     namespace SPIRV = Shader::Backend::SPIRV;
-    // Bindings: one per image class and component type, after the sampler array, all distinct.
+    // Bindings: one per image class and component type after the sampler array, then the
+    // storage image arrays, all distinct.
     std::vector<u32> bindings;
     for (const auto type : {Shader::TextureType::Color1D, Shader::TextureType::ColorArray1D,
                             Shader::TextureType::Color2D, Shader::TextureType::ColorArray2D,
@@ -494,6 +585,9 @@ TEST_CASE("V2 P3 heap textures index the bindless heap through pushed words",
                             Shader::TextureType::ColorArrayCube}) {
         for (const bool integer : {false, true}) {
             bindings.push_back(SPIRV::HeapImageBinding(type, false, integer));
+            if (SPIRV::HeapStorageType(type)) {
+                bindings.push_back(SPIRV::HeapStorageBinding(type, integer));
+            }
         }
     }
     for (const bool integer : {false, true}) {
@@ -505,29 +599,50 @@ TEST_CASE("V2 P3 heap textures index the bindless heap through pushed words",
     REQUIRE(std::ranges::adjacent_find(bindings) == bindings.end());
     REQUIRE(bindings.front() == SPIRV::HEAP_SAMPLER_BINDING + 1);
     REQUIRE(bindings.back() == SPIRV::NUM_HEAP_BINDINGS - 1);
+    REQUIRE(bindings.size() == SPIRV::NUM_HEAP_BINDINGS - 1);
     REQUIRE(SPIRV::HeapImageBinding(Shader::TextureType::Color2DRect, false, false) ==
             SPIRV::HeapImageBinding(Shader::TextureType::Color2D, false, false));
-    // Push words: the base plus the heap descriptors before it.
+    REQUIRE_FALSE(SPIRV::HeapStorageType(Shader::TextureType::ColorCube));
+    // Words: the stage base, heap textures' elements in order, then heap images' elements.
     Shader::Info info;
-    info.heap_texture_mask = 0b10110;
-    info.heap_push_base = 5;
+    for (const u32 count : {1U, 4U, 2U}) {
+        Shader::TextureDescriptor texture{};
+        texture.type = Shader::TextureType::Color2D;
+        texture.count = count;
+        info.texture_descriptors.push_back(texture);
+    }
+    for (const u32 count : {1U, 3U}) {
+        Shader::ImageDescriptor image{};
+        image.type = Shader::TextureType::Color2D;
+        image.count = count;
+        info.image_descriptors.push_back(image);
+    }
+    info.heap_texture_mask = 0b110; // textures 1 and 2
+    info.heap_image_mask = 0b11;
+    info.heap_word_base = 5;
     REQUIRE_FALSE(SPIRV::UsesHeap(info, 0));
-    REQUIRE(SPIRV::UsesHeap(info, 1));
-    REQUIRE(SPIRV::HeapPushIndex(info, 1) == 5);
-    REQUIRE(SPIRV::HeapPushIndex(info, 2) == 6);
-    REQUIRE(SPIRV::HeapPushIndex(info, 4) == 7);
+    REQUIRE(SPIRV::HeapTextureWord(info, 1) == 5);
+    REQUIRE(SPIRV::HeapTextureWord(info, 2) == 9);
+    REQUIRE(SPIRV::HeapImageWord(info, 0) == 11);
+    REQUIRE(SPIRV::HeapImageWord(info, 1) == 12);
+    REQUIRE(SPIRV::HeapWordCount(info) == 10);
     REQUIRE_FALSE(SPIRV::UsesHeap(info, 64));
-    REQUIRE(SPIRV::HEAP_PUSH_OFFSET + SPIRV::HEAP_PUSH_SIZE <= 128);
-    // Emission: without the mask the texture is a set 0 binding as before; with it, the heap
-    // arrays of set 1, a sampled image made in the shader and the heap words at offset 48.
-    const HeapModule plain = EmitTextureSample(0);
+    // Emission: without the masks the descriptors are set 0 bindings as before; with them, the
+    // heap arrays of set 1 and the word table at set 0, binding 1023.
+    const HeapModule plain = EmitHeapProgram(0, 0, 1, true, "plain.spv");
     REQUIRE(plain.set1_decorations == 0);
-    REQUIRE(plain.set0_decorations == 1);
+    REQUIRE(plain.set0_decorations == 2);
+    REQUIRE_FALSE(plain.words_binding);
     REQUIRE_FALSE(plain.sampled_image);
-    REQUIRE_FALSE(plain.offset_48);
-    const HeapModule heap = EmitTextureSample(1);
-    REQUIRE(heap.set1_decorations == 2);
-    REQUIRE(heap.set0_decorations == 0);
+    const HeapModule heap = EmitHeapProgram(1, 1, 1, true, "heap.spv");
+    REQUIRE(heap.set1_decorations == 3); // sampled images, samplers, storage images
+    REQUIRE(heap.set0_decorations == 1); // the word table
+    REQUIRE(heap.words_binding);
     REQUIRE(heap.sampled_image);
-    REQUIRE(heap.offset_48);
+    REQUIRE_FALSE(heap.non_uniform);
+    // An array read with a dynamic element index: its heap accesses are NonUniform.
+    const HeapModule array = EmitHeapProgram(1, 0, 4, false, "heap_array.spv");
+    REQUIRE(array.words_binding);
+    REQUIRE(array.non_uniform);
+    REQUIRE(array.set1_decorations == 2);
 }

@@ -43,7 +43,11 @@ BufferCache<P>::BufferCache(Tegra::MaxwellDeviceMemoryManager& device_memory_, R
     // stream uniform reuse remembers refers to the old ones. Before the early return below.
     VideoCommon::ResetUniformStreamReuse<Runtime>();
     if constexpr (VideoCommon::StreamUniformReusable<Runtime>) {
-        VideoCommon::V2::CbufVer::Table<typename Runtime::StreamUniformRef>().Clear();
+        // EDEN_NX2_V2_CBUFVER: versions keep their pages in this device memory's write tracking.
+        VideoCommon::V2::CbufVer::Table<typename Runtime::StreamUniformRef>().Reset(
+            [this](DAddr address, u64 size, s32 delta) {
+                device_memory.UpdatePagesCachedCount(address, size, delta);
+            });
     }
     // Ensure the first slot is used for the null buffer
     void(slot_buffers.insert(runtime, NullBufferParams{}));
@@ -73,7 +77,14 @@ BufferCache<P>::BufferCache(Tegra::MaxwellDeviceMemoryManager& device_memory_, R
 }
 
 template <class P>
-BufferCache<P>::~BufferCache() = default;
+BufferCache<P>::~BufferCache() {
+    if constexpr (VideoCommon::StreamUniformReusable<Runtime>) {
+        // Let the version pages go while the device memory still exists.
+        auto& table = VideoCommon::V2::CbufVer::Table<typename Runtime::StreamUniformRef>();
+        table.Clear();
+        table.Reset({});
+    }
+}
 
 template <class P>
 void BufferCache<P>::RunGarbageCollector(bool aggressive_gc) {
@@ -1835,7 +1846,9 @@ bool BufferCache<P>::BindUniformVersion(size_t stage, u32 index, u32 binding_ind
                 return true;
             }
         }
-        // A new version: copied (or found byte-equal by the stream reuse) and remembered.
+        // A new version: its pages enter the write tracking before the bytes are read, then
+        // they are copied (or found byte-equal by the stream reuse) and remembered.
+        const u64 page_sum = table.Track(device_addr, size);
         Ref used{};
         bool reused = false;
         if (VideoCommon::UniformStreamReuseEnabled()) {
@@ -1855,7 +1868,7 @@ bool BufferCache<P>::BindUniformVersion(size_t stage, u32 index, u32 binding_ind
             device_memory.ReadBlockUnsafe(device_addr, verify_scratch.data(), size);
             bytes = verify_scratch.data();
         }
-        table.Insert(device_addr, size, tick, used, verify ? bytes : nullptr);
+        table.Insert(device_addr, size, tick, used, page_sum, verify ? bytes : nullptr);
         if (stats) {
             ++V2::P3Stats::Get().cbuf_copies;
         }

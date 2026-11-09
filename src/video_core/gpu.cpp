@@ -46,7 +46,6 @@
 #include "video_core/renderer_base.h"
 #include "video_core/shader_notify.h"
 #include "video_core/gpu_split.h"
-#include "video_core/v2/cbuf_version.h"
 #include "video_core/v2/v2_switches.h"
 
 namespace Tegra {
@@ -167,10 +166,6 @@ struct GPU::Impl {
 
     /// Signal the ending of command list.
     void OnCommandListEnd() {
-        if (VideoCommon::V2::On(VideoCommon::V2::Switch::CbufVer)) [[unlikely]] {
-            // The guest CPU may write memory that no longer traps before the next command list.
-            VideoCommon::V2::CbufVer::Log().NoteBoundary();
-        }
         renderer->ReadRasterizer()->ReleaseFences(false);
         Settings::UpdateGPUAccuracy();
     }
