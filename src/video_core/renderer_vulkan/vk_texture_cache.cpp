@@ -1368,6 +1368,10 @@ void TextureCacheRuntime::NoteImageUse(const Image& image) {
     scheduler.NoteImageRead(image.Handle(), image.gpu_addr, image.gpu_addr + image.guest_size_bytes);
 }
 
+u64 TextureCacheRuntime::ReadHazardSerial() const noexcept {
+    return scheduler.ReadHazardSerial();
+}
+
 bool TextureCacheRuntime::GpuDecodeAvailable(const Image& image) const noexcept {
     using VideoCommon::ImageFlagBits;
     return linear_unswizzle_pass.has_value() && image.info.num_samples == 1 &&

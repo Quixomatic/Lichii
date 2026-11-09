@@ -320,9 +320,7 @@ public:
     /// need a barrier first).
     void NoteImageUse(const Image& image);
     /// F2-09: what NoteImageUse could still find (0: nothing).
-    [[nodiscard]] u64 ReadHazardSerial() const noexcept {
-        return scheduler.ReadHazardSerial();
-    }
+    [[nodiscard]] u64 ReadHazardSerial() const noexcept;
 
     /// EDEN_NX2_V2_GPUDECODE: whether `image` can be untiled by the compute path.
     [[nodiscard]] bool GpuDecodeAvailable(const Image& image) const noexcept;
