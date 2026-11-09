@@ -189,9 +189,10 @@ BindlessHeap::BindlessHeap(const Device& device_, Scheduler& scheduler_, bool st
     set = sets[0];
     for (u32 binding = 0; binding < NumBindings; ++binding) {
         Space& space = spaces[binding];
-        space.handles.assign(Capacity, 0);
-        space.last_use.assign(Capacity, 0);
-        space.slots.reserve(1024);
+        space.slots = std::make_unique<VideoCommon::V2::PublishedMap<u64>>(
+            VideoCommon::V2::Commit::Epochs(), 1024);
+        space.handles = std::make_unique<std::atomic<u64>[]>(Capacity);
+        space.last_use = std::make_unique<std::atomic<u64>[]>(Capacity);
         if (binding != SPIRV::HEAP_SAMPLER_BINDING) {
             // A null view (devices with null descriptors) is element 0 of every image array.
             space.next = 1;
@@ -209,43 +210,128 @@ BindlessHeap::~BindlessHeap() {
     g_active.compare_exchange_strong(expected, nullptr, std::memory_order_acq_rel);
 }
 
-u32 BindlessHeap::Acquire(Space& space, u64 handle) {
-    // Image slot 0 is the null view's (VK_NULL_HANDLE never reaches here).
+namespace {
+u64 HandleHash(u64 handle) {
+    handle ^= handle >> 33;
+    handle *= 0xff51afd7ed558ccdULL;
+    return handle ^ (handle >> 29);
+}
+
+/// The reservations this thread made since the heap's last commit (a handle a draw uses twice
+/// gets one slot).
+struct Recent {
+    const void* heap{};
+    u64 generation{};
+    u64 handle{};
+    u32 binding{};
+    u32 slot{};
+};
+thread_local std::array<Recent, 32> t_recent{};
+thread_local u32 t_recent_count{};
+} // Anonymous namespace
+
+u32 BindlessHeap::Slot(u32 binding, u64 handle) {
+    Space& space = spaces[binding];
     const u64 tick = scheduler.CurrentTick();
-    if (const auto it = space.slots.find(handle); it != space.slots.end()) {
-        space.last_use[it->second] = tick;
-        return it->second;
+    if (const u32 slot = space.slots->Find(handle, HandleHash(handle));
+        slot != VideoCommon::V2::PublishedMap<u64>::Missing) {
+        space.last_use[slot].store(tick, std::memory_order_relaxed);
+        return slot;
     }
+    const u64 current = generation.load(std::memory_order_acquire);
+    for (u32 index = 0; index < t_recent_count; ++index) {
+        const Recent& recent = t_recent[index];
+        if (recent.heap == this && recent.generation == current && recent.binding == binding &&
+            recent.handle == handle) {
+            return recent.slot;
+        }
+    }
+    // Reserve lock-free: a freed slot, else the next never used one; a full binding recycles.
     u32 slot = Capacity;
-    if (!space.free.empty()) {
-        slot = space.free.back();
-        space.free.pop_back();
-    } else if (space.next < Capacity) {
-        slot = space.next++;
-    } else {
-        // Full: the least recently used slot no pending draw reads any more.
-        u64 oldest = ~u64{};
-        for (u32 candidate = 0; candidate < Capacity; ++candidate) {
-            const u64 used = space.last_use[candidate];
-            if (used < oldest && used != tick && scheduler.IsFree(used)) {
-                oldest = used;
-                slot = candidate;
-            }
+    if (!space.free.TryPop(slot)) {
+        u32 next = space.next.load(std::memory_order_relaxed);
+        while (next < Capacity &&
+               !space.next.compare_exchange_weak(next, next + 1, std::memory_order_relaxed)) {
         }
-        if (slot == Capacity) {
-            static std::atomic<u32> logged{};
-            if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
-                LOG_ERROR(Render_Vulkan,
-                          "EDEN_NX2_V2_BINDLESS: every heap slot is used by pending draws");
-            }
-            slot = 0;
-        }
-        space.slots.erase(space.handles[slot]);
+        slot = next < Capacity ? next : Recycle(space);
     }
-    space.slots[handle] = slot;
-    space.handles[slot] = handle;
-    space.last_use[slot] = tick;
+    space.handles[slot].store(handle, std::memory_order_release);
+    space.last_use[slot].store(tick, std::memory_order_relaxed);
+    const VideoCommon::V2::Commit::ExternalOp op{
+        .address = handle,
+        .size = slot,
+        .kind = VideoCommon::V2::Commit::ExternalKind::Call,
+        .arg = binding,
+    };
+    while (!pending.TryPush(op)) {
+        Commit(); // full: the owner (this thread in P5a) writes what is queued
+    }
+    if (t_recent_count == t_recent.size() || (t_recent_count != 0 &&
+                                              (t_recent[0].heap != this ||
+                                               t_recent[0].generation != current))) {
+        t_recent_count = 0;
+    }
+    t_recent[t_recent_count++] = Recent{this, current, handle, binding, slot};
+    if (VideoCommon::V2::P3Stats::Enabled()) {
+        auto& stats = VideoCommon::V2::Commit::Stats::Get();
+        VideoCommon::V2::Commit::Stats::Count(
+            stats.requests[static_cast<size_t>(VideoCommon::V2::Commit::Kind::HeapSlot)]);
+    }
     return slot;
+}
+
+u32 BindlessHeap::Recycle(Space& space) {
+    std::scoped_lock lock{mutex};
+    const u64 tick = scheduler.CurrentTick();
+    u32 slot = Capacity;
+    u64 oldest = ~u64{};
+    for (u32 candidate = 1; candidate < Capacity; ++candidate) {
+        const u64 used = space.last_use[candidate].load(std::memory_order_relaxed);
+        if (used < oldest && used != tick && scheduler.IsFree(used)) {
+            oldest = used;
+            slot = candidate;
+        }
+    }
+    if (slot == Capacity) {
+        static std::atomic<u32> logged{};
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+            LOG_ERROR(Render_Vulkan,
+                      "EDEN_NX2_V2_BINDLESS: every heap slot is used by pending draws");
+        }
+        return 0;
+    }
+    const u64 old = space.handles[slot].exchange(0, std::memory_order_acq_rel);
+    if (old != 0) {
+        if (space.slots->Find(old, HandleHash(old)) == slot) {
+            space.slots->Erase(old, HandleHash(old));
+        }
+        std::erase_if(space.extra, [&](const auto& entry) { return entry.second == slot; });
+    }
+    return slot;
+}
+
+void BindlessHeap::Commit() {
+    if (pending.Empty()) {
+        return;
+    }
+    std::scoped_lock lock{mutex};
+    pending.Drain([&](const VideoCommon::V2::Commit::ExternalOp& op) {
+        const u32 binding = op.arg;
+        const u32 slot = static_cast<u32>(op.size);
+        const u64 handle = op.address;
+        Space& space = spaces[binding];
+        if (space.handles[slot].load(std::memory_order_acquire) != handle) {
+            return; // recycled since
+        }
+        const u32 existing = space.slots->Find(handle, HandleHash(handle));
+        if (existing == VideoCommon::V2::PublishedMap<u64>::Missing) {
+            space.slots->Insert(handle, HandleHash(handle), slot);
+        } else if (existing != slot) {
+            space.extra.emplace_back(handle, slot);
+        }
+        Write(binding, slot, handle);
+    });
+    generation.fetch_add(1, std::memory_order_acq_rel);
 }
 
 void BindlessHeap::Write(u32 binding, u32 slot, u64 handle) {
@@ -284,54 +370,20 @@ void BindlessHeap::Write(u32 binding, u32 slot, u64 handle) {
 
 u32 BindlessHeap::ImageSlot(u32 binding, VkImageView view) {
     const u64 handle = ToHandle(view);
-    if (handle == 0) {
-        return 0;
-    }
-    std::scoped_lock lock{mutex};
-    Space& space = spaces[binding];
-    const auto it = space.slots.find(handle);
-    if (it != space.slots.end()) {
-        space.last_use[it->second] = scheduler.CurrentTick();
-        return it->second;
-    }
-    const u32 slot = Acquire(space, handle);
-    Write(binding, slot, handle);
-    return slot;
+    return handle == 0 ? 0 : Slot(binding, handle);
 }
 
 u32 BindlessHeap::SamplerSlot(VkSampler sampler) {
-    const u64 handle = ToHandle(sampler);
-    std::scoped_lock lock{mutex};
-    Space& space = spaces[SPIRV::HEAP_SAMPLER_BINDING];
-    const auto it = space.slots.find(handle);
-    if (it != space.slots.end()) {
-        space.last_use[it->second] = scheduler.CurrentTick();
-        return it->second;
-    }
-    const u32 slot = Acquire(space, handle);
-    Write(SPIRV::HEAP_SAMPLER_BINDING, slot, handle);
-    return slot;
+    return Slot(SPIRV::HEAP_SAMPLER_BINDING, ToHandle(sampler));
 }
 
 u32 BindlessHeap::TexelSlot(u32 binding, VkBufferView view) {
     const u64 handle = ToHandle(view);
-    if (handle == 0) {
-        return 0;
-    }
-    std::scoped_lock lock{mutex};
-    Space& space = spaces[binding];
-    const auto it = space.slots.find(handle);
-    if (it != space.slots.end()) {
-        space.last_use[it->second] = scheduler.CurrentTick();
-        return it->second;
-    }
-    const u32 slot = Acquire(space, handle);
-    Write(binding, slot, handle);
-    return slot;
+    return handle == 0 ? 0 : Slot(binding, handle);
 }
 
 VkBufferView BindlessHeap::TexelAt(u32 binding, u32 slot) const {
-    return FromHandle<VkBufferView>(spaces[binding].handles[slot]);
+    return FromHandle<VkBufferView>(spaces[binding].handles[slot].load(std::memory_order_acquire));
 }
 
 void BindlessHeap::ForgetBufferView(VkBufferView view) {
@@ -346,22 +398,29 @@ void BindlessHeap::ForgetBufferView(VkBufferView view) {
 }
 
 VkImageView BindlessHeap::ImageAt(u32 binding, u32 slot) const {
-    return FromHandle<VkImageView>(spaces[binding].handles[slot]);
+    return FromHandle<VkImageView>(spaces[binding].handles[slot].load(std::memory_order_acquire));
 }
 
 VkSampler BindlessHeap::SamplerAt(u32 slot) const {
-    return FromHandle<VkSampler>(spaces[SPIRV::HEAP_SAMPLER_BINDING].handles[slot]);
+    return FromHandle<VkSampler>(
+        spaces[SPIRV::HEAP_SAMPLER_BINDING].handles[slot].load(std::memory_order_acquire));
 }
 
 void BindlessHeap::Forget(Space& space, u64 handle) {
-    const auto it = space.slots.find(handle);
-    if (it == space.slots.end()) {
-        return;
+    const u32 slot = space.slots->Find(handle, HandleHash(handle));
+    if (slot != VideoCommon::V2::PublishedMap<u64>::Missing) {
+        space.slots->Erase(handle, HandleHash(handle));
+        space.handles[slot].store(0, std::memory_order_release);
+        static_cast<void>(space.free.TryPush(slot));
     }
-    const u32 slot = it->second;
-    space.slots.erase(it);
-    space.handles[slot] = 0;
-    space.free.push_back(slot);
+    std::erase_if(space.extra, [&](const auto& entry) {
+        if (entry.first != handle) {
+            return false;
+        }
+        space.handles[entry.second].store(0, std::memory_order_release);
+        static_cast<void>(space.free.TryPush(entry.second));
+        return true;
+    });
 }
 
 void BindlessHeap::ForgetImageView(VkImageView view) {

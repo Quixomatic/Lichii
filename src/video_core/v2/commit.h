@@ -449,6 +449,72 @@ private:
     std::atomic<u64> flood_end{0};
 };
 
+/// Bounded multi-producer multi-consumer queue (Vyukov) of trivially copyable values: lock-free
+/// slot allocators (P5a: the bindless heap's free slots, shared by lookup shards).
+template <typename T, size_t Capacity>
+class BoundedMpmc {
+    static_assert((Capacity & (Capacity - 1)) == 0);
+    static_assert(std::is_trivially_copyable_v<T>);
+
+public:
+    BoundedMpmc() : cells{std::make_unique<Cell[]>(Capacity)} {
+        for (size_t index = 0; index < Capacity; ++index) {
+            cells[index].sequence.store(index, std::memory_order_relaxed);
+        }
+    }
+
+    bool TryPush(const T& value) {
+        u64 position = tail.load(std::memory_order_relaxed);
+        for (;;) {
+            Cell& cell = cells[position & (Capacity - 1)];
+            const s64 difference = static_cast<s64>(cell.sequence.load(std::memory_order_acquire)) -
+                                   static_cast<s64>(position);
+            if (difference == 0) {
+                if (tail.compare_exchange_weak(position, position + 1,
+                                               std::memory_order_relaxed)) {
+                    cell.value = value;
+                    cell.sequence.store(position + 1, std::memory_order_release);
+                    return true;
+                }
+            } else if (difference < 0) {
+                return false;
+            } else {
+                position = tail.load(std::memory_order_relaxed);
+            }
+        }
+    }
+
+    bool TryPop(T& value) {
+        u64 position = head.load(std::memory_order_relaxed);
+        for (;;) {
+            Cell& cell = cells[position & (Capacity - 1)];
+            const s64 difference = static_cast<s64>(cell.sequence.load(std::memory_order_acquire)) -
+                                   static_cast<s64>(position + 1);
+            if (difference == 0) {
+                if (head.compare_exchange_weak(position, position + 1,
+                                               std::memory_order_relaxed)) {
+                    value = cell.value;
+                    cell.sequence.store(position + Capacity, std::memory_order_release);
+                    return true;
+                }
+            } else if (difference < 0) {
+                return false;
+            } else {
+                position = head.load(std::memory_order_relaxed);
+            }
+        }
+    }
+
+private:
+    struct alignas(64) Cell {
+        std::atomic<u64> sequence;
+        T value;
+    };
+    std::unique_ptr<Cell[]> cells;
+    alignas(64) std::atomic<u64> tail{0};
+    alignas(64) std::atomic<u64> head{0};
+};
+
 /// The GPU thread sets this at start: with the split stopped it executes GPU work and owns the
 /// caches; while the split runs, its back does (GpuSplit::OnBackThread). The rasterizer combines
 /// the two into "is the calling thread the owner".

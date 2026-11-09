@@ -730,6 +730,10 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         }
     }
     const bool resolve_in_full{!memo_hit || verify_memo};
+    if (resolve_in_full) {
+        // EDEN_NX2_V2_COMMIT: sampler lookups defer to FillImageViews' commit below.
+        texture_cache.BeginSamplerLookups();
+    }
 
     const auto config_stage{[&](size_t stage) LAMBDA_FORCEINLINE {
         const Shader::Info& info{stage_infos[stage]};
@@ -869,7 +873,8 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
             texture_cache.LogPrepares(&full_prepared, false);
         }
         texture_cache.FillImageViews(std::span(views.data(), views.size()), false,
-                                     Spec::has_images);
+                                     Spec::has_images,
+                                     std::span(samplers.data(), samplers.size()));
         if (memo_hit && verify_memo) {
             texture_cache.LogPrepares(nullptr, false);
         }
@@ -1117,6 +1122,10 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     }
     // EDEN_NX2_V2_COMMIT: the deferred buffer mutations land before the draw is encoded.
     buffer_cache.CommitBinds();
+    if (heap_pipeline) {
+        // The heap slots this configure reserved get their descriptors.
+        heap_push.heap->Commit();
+    }
     if (buffer_cache.any_buffer_uploaded) {
         buffer_cache.runtime.PostCopyBarrier();
         buffer_cache.any_buffer_uploaded = false;
@@ -1209,6 +1218,10 @@ bool GraphicsPipeline::ConfigureDelta(bool is_indexed) {
     }
     // EDEN_NX2_V2_COMMIT: the deferred buffer mutations land before the draw is encoded.
     buffer_cache.CommitBinds();
+    if (heap_pipeline) {
+        // The heap slots this configure reserved get their descriptors.
+        heap_push.heap->Commit();
+    }
     if (buffer_cache.any_buffer_uploaded) {
         buffer_cache.runtime.PostCopyBarrier();
         buffer_cache.any_buffer_uploaded = false;
@@ -1395,6 +1408,10 @@ GraphicsPipeline::RecipeResult GraphicsPipeline::ConfigureRecipe(
     }
     // EDEN_NX2_V2_COMMIT: the deferred buffer mutations land before the draw is encoded.
     buffer_cache.CommitBinds();
+    if (heap_pipeline) {
+        // The heap slots this configure reserved get their descriptors.
+        heap_push.heap->Commit();
+    }
     if (buffer_cache.any_buffer_uploaded) {
         buffer_cache.runtime.PostCopyBarrier();
         buffer_cache.any_buffer_uploaded = false;

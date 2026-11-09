@@ -286,7 +286,19 @@ public:
     void MarkModification(ImageId id) noexcept;
 
     /// Fill image_view_ids with the graphics/compute images in indices
-    void FillImageViews(std::span<ImageViewInOut> views, bool compute, bool blacklist = true);
+    /// With COMMIT=1, `samplers` (the ids GetSamplerId returned since BeginSamplerLookups) get
+    /// their proxies patched: the sampler requests commit first, in order, as the old lookups ran.
+    void FillImageViews(std::span<ImageViewInOut> views, bool compute, bool blacklist = true,
+                        std::span<SamplerId> samplers = {});
+
+    /// P5a: the GetSamplerId calls until the next FillImageViews defer their table updates and
+    /// creations (a created sampler's id is a proxy until then).
+    void BeginSamplerLookups() noexcept {
+        v2_sampler_scope = commit != nullptr && !commit->verify;
+        if (v2_sampler_scope) {
+            v2_sampler_list.Reset(0);
+        }
+    }
 
     /// Fills views and samplers of a draw from the pipeline's memo when nothing they were
     /// resolved from has changed since (true), prepares the images as FillImageViews does.
@@ -514,6 +526,10 @@ private:
     void NoteCommitTime(u64 start_ns);
 
     V2::Commit::Context* commit = nullptr;
+    V2::Commit::RequestList v2_sampler_list; ///< deferred sampler table updates and creations
+    bool v2_sampler_scope = false;
+    /// Applies the deferred sampler requests and patches their proxies in `samplers`.
+    void CommitSamplerLookups(std::span<SamplerId> samplers);
     std::vector<u32> v2_view_ids;                            ///< FillImageViewsCommit's ids
     boost::container::small_vector<ImageId, 16> v2_prepared; ///< images the segment prepares
     /// The image the last MarkModification marked, while it holds the newest modification tick

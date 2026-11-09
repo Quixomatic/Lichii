@@ -626,9 +626,11 @@ bool TextureCache<P>::PublishComputeCollisionImage(u32 index) {
 }
 
 template <class P>
-void TextureCache<P>::FillImageViews(std::span<ImageViewInOut> views, bool compute, bool blacklist) {
+void TextureCache<P>::FillImageViews(std::span<ImageViewInOut> views, bool compute, bool blacklist,
+                                     std::span<SamplerId> samplers) {
     if (commit != nullptr) [[unlikely]] {
         if (!commit->verify) {
+            CommitSamplerLookups(samplers);
             FillImageViewsCommit(views, compute, blacklist);
             return;
         }
@@ -1008,7 +1010,19 @@ SamplerId TextureCache<P>::GetSamplerId(u32 index, bool compute) {
             }
         } else if (commit->stats) {
             V2::Commit::Stats::Count(stats.lookup_misses);
-            V2::Commit::Stats::Count(stats.requests[static_cast<size_t>(lookup.kind)]);
+        }
+        if (lookup.request && v2_sampler_scope) {
+            // A table update (known sampler) or a creation (proxy), committed in order with the
+            // draw's views.
+            V2::Commit::Request request{};
+            request.kind = lookup.kind;
+            request.resource = V2::Commit::Resource::Sampler;
+            request.address = index;
+            request.arg = compute ? V2::Commit::ArgCompute : 0;
+            request.slot = lookup.id.index;
+            const bool create = lookup.kind == V2::Commit::Kind::SamplerCreate;
+            const u32 proxy = v2_sampler_list.Push(request, create);
+            return create ? SamplerId{proxy} : lookup.id;
         }
     }
     auto& table = compute ? channel_state->compute_sampler_table : channel_state->graphics_sampler_table;
@@ -4714,6 +4728,33 @@ u32 TextureCache<P>::PredictSegmentPrepare(ImageViewId id, bool is_modification,
         v2_prepared.push_back(image_id);
     }
     return effects;
+}
+
+template <class P>
+void TextureCache<P>::CommitSamplerLookups(std::span<SamplerId> samplers) {
+    if (!v2_sampler_scope) {
+        return;
+    }
+    v2_sampler_scope = false;
+    if (v2_sampler_list.Empty()) {
+        return;
+    }
+    commit->stage.Apply(v2_sampler_list, [&](const V2::Commit::Request& request) {
+        return GetSamplerId(static_cast<u32>(request.address),
+                            (request.arg & V2::Commit::ArgCompute) != 0)
+            .index;
+    });
+    for (SamplerId& sampler : samplers) {
+        sampler = SamplerId{v2_sampler_list.Resolve(sampler.index)};
+    }
+    if (commit->stats) {
+        auto& stats = V2::Commit::Stats::Get();
+        const auto counters = commit->stage.TakeCounters();
+        for (size_t kind = 0; kind < V2::Commit::NumKinds; ++kind) {
+            V2::Commit::Stats::Count(stats.requests[kind], counters.requests[kind]);
+        }
+        V2::Commit::Stats::Count(stats.proxies_patched, counters.proxies_patched);
+    }
 }
 
 template <class P>

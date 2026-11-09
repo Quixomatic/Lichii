@@ -179,6 +179,48 @@ TEST_CASE("V2 P5: external queue keeps each producer's order and floods when ful
     REQUIRE(size == 0x4010);
 }
 
+TEST_CASE("V2 P5: the bounded MPMC slot queue hands every value out once",
+          "[video_core][v2_p5]") {
+    Commit::BoundedMpmc<u32, 1024> queue;
+    for (u32 slot = 0; slot < 1024; ++slot) {
+        REQUIRE(queue.TryPush(slot));
+    }
+    REQUIRE_FALSE(queue.TryPush(5000));
+    // Four threads take slots and give them back; every slot is held by one thread at a time.
+    std::vector<std::atomic<u32>> holders(1024);
+    std::atomic<u64> bad{0};
+    std::vector<std::thread> threads;
+    for (u32 index = 0; index < 4; ++index) {
+        threads.emplace_back([&] {
+            for (u32 round = 0; round < 50000; ++round) {
+                u32 slot = 0;
+                if (!queue.TryPop(slot)) {
+                    continue;
+                }
+                if (holders[slot].fetch_add(1) != 0) {
+                    bad.fetch_add(1);
+                }
+                holders[slot].fetch_sub(1);
+                while (!queue.TryPush(slot)) {
+                }
+            }
+        });
+    }
+    for (auto& thread : threads) {
+        thread.join();
+    }
+    REQUIRE(bad.load() == 0);
+    std::vector<bool> seen(1024);
+    u32 slot = 0;
+    u32 count = 0;
+    while (queue.TryPop(slot)) {
+        REQUIRE_FALSE(seen[slot]);
+        seen[slot] = true;
+        ++count;
+    }
+    REQUIRE(count == 1024);
+}
+
 TEST_CASE("V2 P5: the first owner claim waits for direct external users",
           "[video_core][v2_p5]") {
     Commit::Owner owner;

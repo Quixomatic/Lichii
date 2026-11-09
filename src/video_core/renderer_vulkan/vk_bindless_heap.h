@@ -11,6 +11,7 @@
 
 #include "common/common_types.h"
 #include "shader_recompiler/backend/spirv/bindless_heap.h"
+#include "video_core/v2/commit.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
 namespace Vulkan {
@@ -113,19 +114,31 @@ public:
     /// Slot writes since the last call.
     [[nodiscard]] u64 TakeWrites() noexcept;
 
+    /// P5a: writes the descriptors of slots reserved since the last call (lookups reserve slot
+    /// indices lock-free and only queue the write). Called before the draw or dispatch that uses
+    /// them is recorded, on the caches' owner.
+    void Commit();
+
 private:
     BindlessHeap(const Device& device, Scheduler& scheduler, bool storage_images,
                  bool texel_buffers);
 
+    /// P5a: a binding's slots. Lookups read the published handle -> slot map and reserve new
+    /// slots lock-free (free ring, then a bump index); only the commit (owner) writes the map and
+    /// the descriptors. A handle reserved twice before a commit keeps both slots (extra).
     struct Space {
-        std::unordered_map<u64, u32> slots; ///< handle -> slot
-        std::vector<u64> handles;           ///< slot -> handle, 0 when free
-        std::vector<u64> last_use;          ///< slot -> tick of its last draw
-        std::vector<u32> free;
-        u32 next{};
+        std::unique_ptr<VideoCommon::V2::PublishedMap<u64>> slots;
+        std::unique_ptr<std::atomic<u64>[]> handles;  ///< slot -> handle, 0 when free
+        std::unique_ptr<std::atomic<u64>[]> last_use; ///< slot -> tick of its last draw
+        VideoCommon::V2::Commit::BoundedMpmc<u32, Capacity> free;
+        std::atomic<u32> next{};
+        std::vector<std::pair<u64, u32>> extra; ///< duplicate reservations (owner)
     };
 
-    u32 Acquire(Space& space, u64 handle);
+    /// The slot of `handle` in `binding`: published, or reserved now (its write queued).
+    u32 Slot(u32 binding, u64 handle);
+    /// A full binding: the least recently used slot no pending draw reads (under the mutex).
+    u32 Recycle(Space& space);
     void Write(u32 binding, u32 slot, u64 handle);
     void Forget(Space& space, u64 handle);
 
@@ -137,7 +150,9 @@ private:
     vk::DescriptorSets sets;
     VkDescriptorSet set{};
     std::array<Space, NumBindings> spaces;
-    std::mutex mutex;
+    std::mutex mutex; ///< owner-side changes (commit, forget, recycle); lookups take none
+    VideoCommon::V2::Commit::ExternalQueue pending; ///< reserved slots to write (address = handle)
+    std::atomic<u64> generation{1};                 ///< moves at each Commit
     u64 writes{};
     bool storage_images{};
     bool texel_buffers{};

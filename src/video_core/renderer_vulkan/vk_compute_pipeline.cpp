@@ -543,6 +543,7 @@ bool ComputePipeline::ConfigureImpl(Tegra::Engines::KeplerCompute& kepler_comput
         for (const auto& desc : info.image_buffer_descriptors) {
             add_image(desc, false);
         }
+        texture_cache.BeginSamplerLookups();
         for (const auto& desc : info.texture_descriptors) {
             for (u32 index = 0; index < desc.count; ++index) {
                 const auto handle{VideoCommon::HandleIsStoragePointer(info, desc, index)
@@ -560,7 +561,8 @@ bool ComputePipeline::ConfigureImpl(Tegra::Engines::KeplerCompute& kepler_comput
         for (const auto& desc : info.image_descriptors) {
             add_image(desc, desc.is_written);
         }
-        texture_cache.FillImageViews(std::span(views.data(), views.size()), true);
+        texture_cache.FillImageViews(std::span(views.data(), views.size()), true, true,
+                                     std::span(samplers.data(), samplers.size()));
         if (Recipes && recipe_capture != nullptr) {
             for (const VideoCommon::ImageViewInOut& view : views) {
                 recipe_capture->views.push_back({
@@ -751,6 +753,8 @@ bool ComputePipeline::ConfigureImpl(Tegra::Engines::KeplerCompute& kepler_comput
         }
     }
     if (heap_pipeline) {
+        // The heap slots this configure reserved get their descriptors (P5a).
+        heap_push.heap->Commit();
         // EDEN_NX2_V2_BINDLESS: the dispatch's heap words, reused while unchanged in a tick.
         std::vector<u32>& words = heap_push.words;
         if (words.empty()) {
