@@ -364,12 +364,14 @@ void NoteDispatchCompute(ComputeGroupTracker& tracker, const u32* registers, u32
     } else if ((Verify(Switch::RegSem) || Stats::Enabled()) && (tracker.draws & 4095) == 4095)
         [[unlikely]] {
         static std::atomic<u32> logged{};
-        if (const u32 drifted = RehashCompute(tracker, registers, count);
-            drifted != 0 && logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+        if (const u32 drifted = RehashCompute(tracker, registers, count); drifted != 0) {
+            // Every drift counts; only the log is capped (Fix pass 1: the count stopped at 16).
             Stats::NoteHashDrift();
-            LOG_WARNING(HW_GPU, "V2 regsem: compute group hashes drifted from the registers, "
-                                "groups {:#x}",
-                        drifted);
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+                LOG_WARNING(HW_GPU, "V2 regsem: compute group hashes drifted from the registers, "
+                                    "groups {:#x}",
+                            drifted);
+            }
         }
     }
     tracker.BeginDraw();
