@@ -71,7 +71,12 @@ TEST_CASE("V2 P6: segmenter cuts at render passes, sizes and engine switches", "
         }
         CHECK(segmenter.OnDraw(Draw()) == CutReason::Size);
         CHECK(segmenter.OpenId() == 1);
-        // A render target change cuts (a render pass change) ...
+        // A render target change in a segment of fewer than min(16, K) draws joins it ...
+        CHECK(segmenter.OnDraw(Draw(V2::GroupBit(V2::RegGroup::RenderTargets))) ==
+              CutReason::None);
+        CHECK(segmenter.OnDraw(Draw()) == CutReason::None);
+        CHECK(segmenter.OnDraw(Draw()) == CutReason::None);
+        // ... and cuts a longer one (a render pass change) ...
         CHECK(segmenter.OnDraw(Draw(V2::GroupBit(V2::RegGroup::RenderTargets))) ==
               CutReason::RenderPass);
         CHECK(segmenter.OpenId() == 2);

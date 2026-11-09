@@ -74,6 +74,7 @@ struct Stats {
     std::atomic<u64> stolen_unsubmitted{}; ///< the commit reached a segment not submitted yet
     std::atomic<u64> stolen_queued{};      ///< the commit took a submitted segment no shard began
     std::atomic<u64> early_submits{};   ///< segments submitted before their end was published
+    std::atomic<u64> front_snapshot_ns{}; ///< the front's snapshot time at cuts (R0 gate)
     std::atomic<u64> early_abandoned{}; ///< ...whose shard the commit stopped waiting for
     std::atomic<u64> verify_segments{};
     std::atomic<u64> verify_mismatches{};

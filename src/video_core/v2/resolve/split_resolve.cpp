@@ -506,6 +506,7 @@ void SplitResolve::FrontDraw(const FrontView& view, const EngineInfo& engine,
         if (stats) {
             Count(GetStats().cuts[static_cast<size_t>(cut)]);
         }
+        const u64 snapshot_start = stats ? NowNs() : 0;
         ReclaimReleased();
         const u64 epoch = segmenter.OpenId(); // the id of the segment this snapshot starts
         FrontSnapshot* const snapshot = snapshot_pool.Allocate();
@@ -541,6 +542,9 @@ void SplitResolve::FrontDraw(const FrontView& view, const EngineInfo& engine,
                 last_cbuf_changes = view.cbufs->changes;
             }
             snapshot->cbufs = last_cbufs;
+        }
+        if (stats) {
+            Count(GetStats().front_snapshot_ns, NowNs() - snapshot_start);
         }
         snapshot->control = view.control;
         snapshot->instance_loop = view.instance_loop;

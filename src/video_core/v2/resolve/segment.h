@@ -116,6 +116,9 @@ enum class RecordClass : u8 {
 
 class Segmenter {
 public:
+    /// Draws a segment holds before a render target change may cut it.
+    static constexpr u32 MinPassDraws = 16;
+
     explicit Segmenter(SegmentPolicy policy_ = {}) : policy{policy_}, k{policy_.k} {}
 
     /// Before a draw: whether a segment starts at it (CutReason::None: the draw joins the open
@@ -128,7 +131,11 @@ public:
             cut = CutReason::Isolate;
         } else if (draw.engine != engine) {
             cut = CutReason::EngineSwitch;
-        } else if ((draw.dirty_groups & GroupBit(RegGroup::RenderTargets)) != 0 && draws != 0) {
+        } else if ((draw.dirty_groups & GroupBit(RegGroup::RenderTargets)) != 0 &&
+                   draws >= (std::min)(MinPassDraws, k)) {
+            // A pass boundary is a hint (the shards replay target changes as any register):
+            // small passes coalesce until the segment holds MinPassDraws (F1-36: 90% of cuts
+            // at Castle Town were passes of ~7 draws).
             cut = CutReason::RenderPass;
         } else if (draws >= k) {
             cut = CutReason::Size;

@@ -174,8 +174,10 @@ struct SegmentInput {
 /// in the producer's queue while the submitted ones hold this many (EDEN_NX2_V2_PARALLEL_DEPTH
 /// bounds the slots).
 inline constexpr u32 InFlightDraws = 128;
-/// Draws an open segment holds before it is submitted with only its start published.
-inline constexpr u32 EarlySubmitDraws = 8;
+/// Draws an open segment holds before it is submitted with only its start published (F1-36:
+/// the commit reached every serial segment before a shard started it; a shard that waits for
+/// the front costs an idle core, not the commit).
+inline constexpr u32 EarlySubmitDraws = 1;
 
 struct SplitTraits {
     using Input = SegmentInput;
