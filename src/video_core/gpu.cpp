@@ -72,6 +72,7 @@ struct SyncRequest {
     u64 size{};
     void* out{};
     VideoCommon::V2::Ir::PresentBody present{};
+    bool recorded{}; ///< A Present record marks its position (TakeQueuedPresents)
     std::function<void()> debug;
 };
 
@@ -591,28 +592,27 @@ struct GPU::Impl {
             present_slots[present.slot] = {std::move(layers), std::move(fences),
                                            current_request_counter};
         }
-        pending_composite_frame = present.frame;
         pending_composite_fence =
             RequestSyncOperation(SyncRequest{.op = SyncOp::Present, .present = present});
         gpu_thread.TickGPU(is_async);
     }
 
-    /// The queued composites, for Present records; each request stays as an Idle placeholder
-    /// so the sync fences keep counting in order (the record runs before the TickWork after it).
+    /// The queued composites not recorded yet, for Present records. The request stays queued:
+    /// the TickWork after the record composites it, exactly where and when it did without the
+    /// records (vi2's composite order and pacing are unchanged).
     std::vector<VideoCommon::V2::Ir::PresentBody> TakeQueuedPresents() {
         std::vector<VideoCommon::V2::Ir::PresentBody> presents;
         std::unique_lock lck{sync_request_mutex};
         for (SyncRequest& request : sync_requests) {
-            if (request.op == SyncOp::Present) {
+            if (request.op == SyncOp::Present && !request.recorded) {
                 presents.push_back(request.present);
-                request.op = SyncOp::Idle;
+                request.recorded = true;
             }
         }
         return presents;
     }
 
-    /// Runs a Present request (TickWork or a Present record): composites now, or once its
-    /// fences signal.
+    /// Runs a Present request (TickWork): composites now, or once its fences signal.
     void RunPresent(const VideoCommon::V2::Ir::PresentBody& present) {
         PresentSlot slot;
         {
@@ -621,16 +621,8 @@ struct GPU::Impl {
             present_slots[present.slot] = {};
             free_present_slots.push_back(present.slot);
         }
-        const auto finished = [this] {
-            {
-                std::unique_lock lck{sync_request_mutex};
-                ++presents_run;
-            }
-            sync_request_cv.notify_all();
-        };
         if (slot.fences.empty()) {
             renderer->Composite(slot.layers);
-            finished();
             return;
         }
         auto& syncpoint_manager = system.Host1x().GetSyncpointManager();
@@ -648,7 +640,6 @@ struct GPU::Impl {
         for (const auto& fence : slot.fences) {
             syncpoint_manager.RegisterGuestAction(fence.id, fence.value, executer);
         }
-        finished();
     }
 
     void WaitForComposite() {
@@ -661,13 +652,6 @@ struct GPU::Impl {
             return;
         }
         WaitForSyncOperation(fence);
-        // A composite taken out of the queue for a Present record runs at its ring position:
-        // its placeholder's fence may come first.
-        std::unique_lock lck{sync_request_mutex};
-        sync_request_cv.wait(lck, [this] {
-            return presents_run >= pending_composite_frame ||
-                   shutting_down.load(std::memory_order_relaxed);
-        });
     }
 
     std::vector<u8> GetAppletCaptureBuffer() {
@@ -742,8 +726,6 @@ struct GPU::Impl {
     std::vector<u32> free_present_slots;
     u64 present_count{};
     u64 pending_composite_fence{};
-    u64 pending_composite_frame{}; ///< PresentBody::frame of the last RequestComposite
-    u64 presents_run{};            ///< RunPresent calls finished (sync_request_mutex)
 };
 
 GPU::GPU(Core::System& system, bool is_async, bool use_nvdec)
@@ -896,10 +878,6 @@ void GPU::WaitForComposite() {
 
 std::vector<VideoCommon::V2::Ir::PresentBody> GPU::TakeQueuedPresents() {
     return impl->TakeQueuedPresents();
-}
-
-void GPU::RunPresent(const VideoCommon::V2::Ir::PresentBody& present) {
-    impl->RunPresent(present);
 }
 
 std::vector<u8> GPU::GetAppletCaptureBuffer() {

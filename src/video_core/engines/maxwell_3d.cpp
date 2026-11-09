@@ -1691,8 +1691,14 @@ struct Maxwell3D::FrontState {
     bool s1_check{};
     /// The register maps to a v1 dirty flag: an executable write sets it even when unchanged.
     std::array<bool, Regs::NUM_REGS> s1_touch{};
-    /// S1Hook* bits per register: what FrontS1Hooks does after a write (none: no call).
+    /// S1Hook* bits per register: what FrontS1Hooks does after a write (none: no call). Only the
+    /// registers with write notes or stats have any; the profile counts below need none.
     std::array<u8, Regs::NUM_REGS> s1_hooks{};
+    /// Nx2Profile write counters, counted here (no thread-local access per write) and added to
+    /// the profile at each draw.
+    u64 s1_writes{};
+    u64 s1_same_writes{};
+    bool s1_profile{};
     /// Fast draw breaks for the next S1 Groups entry (V2::S1::Groups*Break) and the method.
     u64 s1_breaks{};
     u32 s1_break_method{};
@@ -1822,12 +1828,12 @@ Maxwell3D::FrontState& Maxwell3D::Front(Core::System& system, VideoCommon::GpuSp
             front->s1_check = split.S1Check();
             if (front->s1_exec || front->s1_check) {
                 const auto& table = VideoCommon::V2::RegSem::GetTable3D();
-                const bool profile = VideoCommon::Nx2Profile::Enabled();
+                front->s1_profile = VideoCommon::Nx2Profile::Enabled();
                 const bool stats = VideoCommon::V2::Stats::Enabled();
                 for (u32 method = 0; method < Regs::NUM_REGS; ++method) {
                     front->s1_touch[method] =
                         dirty.tables[0][method] != 0 || dirty.tables[1][method] != 0;
-                    u8 hooks = profile ? S1HookProfile : 0;
+                    u8 hooks = 0;
                     if (split.TracksWrites() && front->v2_note_writes[method]) {
                         hooks |= S1HookNotes;
                     }
@@ -1967,6 +1973,7 @@ M3D_FORCE_INLINE void Maxwell3D::FrontWriteS1(VideoCommon::GpuSplit& split, Fron
     // Profile counters, write notes and stats for this method, decided when the copy was made:
     // one table load and one branch per write (F1-09).
     const u8 hooks = fs.s1_hooks[method];
+    ++fs.s1_writes;
     if (fs.v2_draw_model.HasDeferredDraw()) [[unlikely]] {
         FrontDrawPre(split, fs, method,
                      fs.control == Regs::ShadowRamControl::Replay ? fs.shadow[method] : argument);
@@ -1977,9 +1984,7 @@ M3D_FORCE_INLINE void Maxwell3D::FrontWriteS1(VideoCommon::GpuSplit& split, Fron
                          [this](RegSem::Effect effect, u32 a, u32 b) {
                              return FrontRegSemEffect(effect, a, b);
                          })) {
-        if (hooks != 0) [[unlikely]] {
-            FrontS1Hooks(split, fs, method, hooks, false);
-        }
+        ++fs.s1_same_writes; // the hooks only follow sent writes
         return;
     }
     S1Sink sink{split, this};
@@ -1995,22 +2000,12 @@ M3D_FORCE_INLINE void Maxwell3D::FrontWriteS1(VideoCommon::GpuSplit& split, Fron
         FrontDrawPost(split, fs, method, fs.regs[method]);
     }
     if (hooks != 0) [[unlikely]] {
-        FrontS1Hooks(split, fs, method, hooks, true);
+        FrontS1Hooks(split, fs, method, hooks);
     }
 }
 
-void Maxwell3D::FrontS1Hooks(VideoCommon::GpuSplit& split, FrontState& fs, u32 method, u8 hooks,
-                             bool sent) {
-    namespace Profile = VideoCommon::Nx2Profile;
-    if ((hooks & S1HookProfile) != 0) {
-        Profile::Add(Profile::Counter::MethodWrites, 1);
-        if (!sent) {
-            Profile::Add(Profile::Counter::SameValueWrites, 1);
-        }
-    }
-    if (!sent) {
-        return;
-    }
+void Maxwell3D::FrontS1Hooks(VideoCommon::GpuSplit& split, FrontState& fs, u32 method,
+                             u8 hooks) {
     if ((hooks & S1HookNotes) != 0) {
         FrontNoteWrites(split, fs, method, 1);
     }
@@ -2126,6 +2121,11 @@ void Maxwell3D::FrontS1Draws(VideoCommon::GpuSplit& split, FrontState& fs,
 void Maxwell3D::FrontS1Groups(VideoCommon::GpuSplit& split, FrontState& fs) {
     namespace V2 = VideoCommon::V2;
     namespace S1 = V2::S1;
+    if (fs.s1_profile) [[unlikely]] {
+        namespace Profile = VideoCommon::Nx2Profile;
+        Profile::Add(Profile::Counter::MethodWrites, std::exchange(fs.s1_writes, u64{0}));
+        Profile::Add(Profile::Counter::SameValueWrites, std::exchange(fs.s1_same_writes, u64{0}));
+    }
     // The groups the back's draw consumers see, from the front's own fingerprints.
     fs.v2_hash_log.Fold(fs.v2_groups, *fs.v2_table, fs.regs.data());
     V2::GroupTracker& groups = fs.v2_groups;
