@@ -3182,13 +3182,19 @@ bool RasterizerVulkan::OnCPUWrite(DAddr addr, u64 size) {
             if (collect) {
                 return true;
             }
-            pipeline_cache.InvalidateRegion(addr, size);
+            if (pipeline_cache.page_filter.Any(addr, size)) {
+                pipeline_cache.InvalidateRegion(addr, size);
+            }
             return false;
         }
         // A guest CPU thread: the caches stay untouched. The write is collected (the existing
         // GPU dirty memory path, exact bytes) and the owner applies it at its next commit point,
-        // before any lookup; shader code is invalidated at once, as before.
-        pipeline_cache.InvalidateRegion(addr, size);
+        // before any lookup; shader code is invalidated at once, as before. Perf fix C: pages
+        // that never held a program skip the shader cache's lock (guest threads and the owner
+        // contended on it).
+        if (pipeline_cache.page_filter.Any(addr, size)) {
+            pipeline_cache.InvalidateRegion(addr, size);
+        }
         return true;
     }
     {
@@ -3227,7 +3233,7 @@ void RasterizerVulkan::OnCacheInvalidations(std::span<const std::pair<DAddr, u64
             }
         });
         for (const auto& [addr, size] : ranges) {
-            if (addr != 0 && size != 0) {
+            if (addr != 0 && size != 0 && pipeline_cache.page_filter.Any(addr, size)) {
                 pipeline_cache.InvalidateRegion(addr, size);
             }
         }
@@ -5460,8 +5466,21 @@ void RasterizerVulkan::WithCaches(Func&& func) {
     }
     C::Stats::Count(C::Stats::Get().owner_calls);
     gpu.WakeCacheOwner();
+    // Perf fix C: spin first (no kernel wait on the hot path; the owner serves at its next
+    // commit point), then sleep.
+    const auto spin_start = std::chrono::steady_clock::now();
+    for (u32 spins = 0; !call.IsDone(); ++spins) {
+        if ((spins & 63) == 63 &&
+            std::chrono::steady_clock::now() - spin_start >= std::chrono::microseconds{100}) {
+            break;
+        }
+        C::CpuPause();
+    }
+    if (call.IsDone() || !call.PrepareSleep()) {
+        return;
+    }
     std::unique_lock lock{call.mutex};
-    while (!call.cv.wait_for(lock, std::chrono::milliseconds(2), [&call] { return call.done; })) {
+    while (!call.cv.wait_for(lock, std::chrono::milliseconds(2), [&call] { return call.acked; })) {
         // The owner may have gone idle between the wake and the push being seen: wake again.
         lock.unlock();
         gpu.WakeCacheOwner();

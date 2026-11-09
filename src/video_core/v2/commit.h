@@ -16,6 +16,10 @@
 #include <type_traits>
 #include <vector>
 
+#if defined(_M_X64) || defined(_M_IX86) || defined(__x86_64__) || defined(__i386__)
+#include <immintrin.h>
+#endif
+
 #include "common/common_types.h"
 #include "video_core/v2/epoch_publish.h"
 #include "video_core/v2/v2_switches.h"
@@ -331,20 +335,44 @@ struct ExternalOp {
 static_assert(std::is_trivially_copyable_v<ExternalOp>);
 
 /// A synchronous call another thread waits on (lives on the caller's stack).
+/// Perf fix C: the caller spins first (most calls are served at the owner's next commit point,
+/// microseconds away) and only then sleeps; the owner takes the lock and wakes the caller only
+/// when it went to sleep. The caller never returns before the owner is done with the object:
+/// a sleeping caller waits for `acked`, which the owner sets under the lock.
+inline void CpuPause() {
+#if defined(_M_X64) || defined(_M_IX86) || defined(__x86_64__) || defined(__i386__)
+    _mm_pause();
+#elif defined(__aarch64__)
+    asm volatile("yield");
+#endif
+}
+
 struct OwnerCall {
+    enum : u32 { Pending, Sleeping, Done };
     void (*function)(void* context) = nullptr;
     void* context = nullptr;
+    std::atomic<u32> state{Pending};
     std::mutex mutex;
     std::condition_variable cv;
-    bool done = false;
+    bool acked = false; ///< under mutex
 
     void Run() {
         function(context);
-        {
+        if (state.exchange(Done, std::memory_order_acq_rel) == Sleeping) {
             std::scoped_lock lock{mutex};
-            done = true;
+            acked = true;
+            cv.notify_one();
         }
-        cv.notify_all();
+    }
+
+    [[nodiscard]] bool IsDone() const {
+        return state.load(std::memory_order_acquire) == Done;
+    }
+
+    /// Caller: announces it sleeps. False when the call finished meanwhile (return at once).
+    [[nodiscard]] bool PrepareSleep() {
+        u32 expected = Pending;
+        return state.compare_exchange_strong(expected, Sleeping, std::memory_order_acq_rel);
     }
 };
 
