@@ -353,8 +353,8 @@ public:
     [[nodiscard]] bool DeltaImagesChange() const noexcept;
 
     /// EDEN_NX2_V2_DRAWCACHE: the next Configure records into `capture` what a draw recipe needs
-    /// (the handle words, storage buffer descriptors, views, samplers and push data it resolves),
-    /// resolving in full (no texture memo). Null: none.
+    /// (the handle words, storage buffer descriptors, views, samplers and push data it resolves;
+    /// a texture memo hit gives the handle words it compared). Null: none.
     void SetRecipeCapture(VideoCommon::V2::DrawCache::RecipeCapture* capture) noexcept {
         recipe_capture = capture;
     }

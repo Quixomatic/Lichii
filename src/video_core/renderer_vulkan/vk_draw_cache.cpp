@@ -555,8 +555,10 @@ void DrawCacheGlue::Store(DC::RecipeTable& table, u64 key, Recipe& recipe,
     Recipe& slot = table.Insert(key, evicted, [this](const Recipe& old) { Drop(old); });
     counters.evictions += evicted ? 1 : 0;
     ++counters.inserts;
-    // The built recipe's pages are held already (FillFromCapture); the slot takes them over.
-    slot = recipe;
+    // The slot takes the built recipe over (a swap: the builder keeps the cleared slot's
+    // storage for the next build, no deep copy).
+    std::swap(slot, recipe);
+    slot.key = key;
     counters.watched_pages = watch.Pages();
 }
 

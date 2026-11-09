@@ -673,8 +673,9 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     const auto& regs{maxwell3d->regs};
     const bool via_header_index{regs.sampler_binding == Maxwell::SamplerBinding::ViaHeaderBinding};
 
-    // A recipe capture records every handle read: it resolves in full.
-    const bool use_memo{texture_memo_eligible && !RecordingSampledTextures() && !Capture};
+    // A recipe capture records every handle read; a memo hit's handle words are the ones it
+    // compared, so the capture takes them from the memo (below) and the memo stays in use.
+    const bool use_memo{texture_memo_eligible && !RecordingSampledTextures()};
     const bool verify_memo{use_memo && TextureMemoVerify()};
     boost::container::small_vector<GPUVAddr, 32> handle_addresses;
     boost::container::small_vector<VideoCommon::TextureHandleRead, 32> handle_reads;
@@ -734,6 +735,17 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     if (resolve_in_full) {
         // EDEN_NX2_V2_COMMIT: sampler lookups defer to FillImageViews' commit below.
         texture_cache.BeginSamplerLookups();
+    }
+    if constexpr (Capture) {
+        if (!resolve_in_full) {
+            // The memo compared these handle words with memory just now (memo-eligible pipelines
+            // sample plain handles only, one word each, in descriptor order).
+            for (const VideoCommon::SampledTextureMemo::Entry& entry : texture_memo.entries) {
+                recipe_capture->AddWord(entry.handle_address, entry.raw);
+                recipe_capture->tsc_indices.push_back(
+                    TexturePair(entry.raw, via_header_index).second);
+            }
+        }
     }
 
     const auto config_stage{[&](size_t stage) LAMBDA_FORCEINLINE {
