@@ -180,9 +180,9 @@ public:
     }
 
     /// Pipeline v2 P5a (EDEN_NX2_V2_COMMIT without the cache locks): the fencing thread no longer
-    /// pops the caches' async flushes. A released batch that has pops, and every batch after it
-    /// until the owner caught up (fence order), goes to the caches' owner, which pops and runs
-    /// the operations at its next commit point; `wake` gets an idle owner there.
+    /// pops the caches' async flushes. The pops of a released batch go to the caches' owner,
+    /// which lands them at its next commit point (`wake` gets an idle owner there); the fencing
+    /// thread waits for that and runs the operations itself, in fence order (Perf fix C).
     void SetCommitBacklog(bool on, std::function<void()> wake) {
         commit_backlog = on;
         wake_owner = std::move(wake);
@@ -195,22 +195,20 @@ public:
 
     /// The caches' owner only: pops and runs, in fence order, what the fencing thread handed
     /// over (deferred writebacks land here, before the operations that make them guest-visible).
+    /// Perf fix C: the owner lands only the cache pops (the cache structures are its own); the
+    /// fencing thread waits for that and then runs the queries and operations itself, in fence
+    /// order (I5: a fence's pops precede its operations). Batches without pops never come here.
     void ServeBacklog() {
         if (!backlog_pending.load(std::memory_order_acquire)) {
             return;
         }
-        for (;;) {
-            std::deque<BacklogEntry> taken;
-            {
-                std::scoped_lock lock{backlog_mutex};
-                if (backlog.empty()) {
-                    backlog_inflight = false;
-                    backlog_pending.store(false, std::memory_order_release);
-                    return;
-                }
-                taken.swap(backlog);
-                backlog_inflight = true;
-            }
+        std::deque<BacklogEntry> taken;
+        {
+            std::scoped_lock lock{backlog_mutex};
+            taken.swap(backlog);
+            backlog_pending.store(false, std::memory_order_release);
+        }
+        if (!taken.empty()) {
             VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Fence);
             for (BacklogEntry& entry : taken) {
                 if ((entry.flushes & TextureFlushes) != 0) {
@@ -219,12 +217,17 @@ public:
                 if ((entry.flushes & BufferFlushes) != 0) {
                     buffer_cache.PopAsyncFlushes();
                 }
-                query_cache.PopAsyncFlushes();
-                for (auto& operation : entry.operations) {
-                    operation();
-                }
             }
-            VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Fence);
+        }
+        bool wake;
+        {
+            std::scoped_lock lock{backlog_mutex};
+            backlog_served.store(backlog_served.load(std::memory_order_relaxed) + taken.size(),
+                                 std::memory_order_release);
+            wake = backlog_waiting;
+        }
+        if (wake) {
+            backlog_cv.notify_one();
         }
     }
 
@@ -250,8 +253,9 @@ public:
             SubmitDeferredWork();
             std::unique_lock lk(wait_mutex);
             if (commit_backlog) [[unlikely]] {
-                // The fence's operation may be in the owner's backlog, and this is the owner.
-                while (!wait_cv.wait_for(lk, std::chrono::milliseconds(1), [&wait_finished] {
+                // The fencing thread may be waiting for this owner to land a fence's downloads
+                // before it runs the operations: serve it.
+                while (!wait_cv.wait_for(lk, std::chrono::microseconds(100), [&wait_finished] {
                     return wait_finished.load(std::memory_order_relaxed);
                 })) {
                     lk.unlock();
@@ -392,34 +396,54 @@ private:
                 texture_pops += (released.flushes & TextureFlushes) != 0 ? 1 : 0;
                 buffer_pops += (released.flushes & BufferFlushes) != 0 ? 1 : 0;
             }
-            if (commit_backlog) [[unlikely]] {
-                // P5a: this thread touches no cache. Batches with pops go to the owner, and so
-                // does everything after them until it caught up (operations keep fence order).
-                bool handed = false;
+            if (commit_backlog && (texture_pops != 0 || buffer_pops != 0)) [[unlikely]] {
+                // P5a: this thread touches no cache: the owner lands the pops. Perf fix C: only
+                // the pops go to the owner (not the operations, and not every later batch); this
+                // thread waits for them (spin, then sleep) and keeps the operations in fence
+                // order below. The old locked path waited for the cache locks the same way.
+                u64 target = 0;
                 bool wake = false;
                 {
                     std::scoped_lock lock{backlog_mutex};
-                    if (texture_pops != 0 || buffer_pops != 0 || !backlog.empty() ||
-                        backlog_inflight) {
-                        for (Released& released : batch) {
-                            backlog.push_back(
-                                BacklogEntry{std::move(released.operations), released.flushes});
+                    for (const Released& released : batch) {
+                        if ((released.flushes & (TextureFlushes | BufferFlushes)) != 0) {
+                            backlog.push_back(BacklogEntry{{}, released.flushes});
+                            ++backlog_requested;
                         }
-                        handed = true;
-                        wake = !backlog_pending.exchange(true, std::memory_order_acq_rel);
                     }
+                    target = backlog_requested;
+                    wake = !backlog_pending.exchange(true, std::memory_order_acq_rel);
                 }
-                if (handed) {
-                    if (wake && wake_owner) {
-                        wake_owner();
-                    }
-                    std::unique_lock lock(ring_guard);
-                    for (Released& released : batch) {
-                        delayed_destruction_ring.Push(std::move(released.fence));
-                    }
-                    batch.clear();
-                    continue;
+                if (wake && wake_owner) {
+                    wake_owner();
                 }
+                const auto spin_start = std::chrono::steady_clock::now();
+                for (u32 spins = 0; backlog_served.load(std::memory_order_acquire) < target;
+                     ++spins) {
+                    if ((spins & 63) == 63 && std::chrono::steady_clock::now() - spin_start >=
+                                                  std::chrono::microseconds{50}) {
+                        break;
+                    }
+                    std::this_thread::yield();
+                }
+                if (backlog_served.load(std::memory_order_acquire) < target) {
+                    std::unique_lock lock{backlog_mutex};
+                    backlog_waiting = true;
+                    while (!backlog_cv.wait_for(lock, std::chrono::milliseconds(1), [&] {
+                        return backlog_served.load(std::memory_order_acquire) >= target ||
+                               stop_token.stop_requested();
+                    })) {
+                        // The owner may have gone idle between the wake and the push.
+                        lock.unlock();
+                        if (wake_owner) {
+                            wake_owner();
+                        }
+                        lock.lock();
+                    }
+                    backlog_waiting = false;
+                }
+                texture_pops = 0;
+                buffer_pops = 0;
             }
             if (texture_pops != 0) {
                 std::scoped_lock lock{texture_cache.mutex};
@@ -597,8 +621,13 @@ private:
     std::function<void()> wake_owner;
     std::mutex backlog_mutex;
     std::deque<BacklogEntry> backlog;     ///< Under backlog_mutex
-    bool backlog_inflight = false;        ///< Under backlog_mutex: the owner runs taken entries
     std::atomic<bool> backlog_pending{false};
+    /// Perf fix C: pop entries handed to the owner and landed by it (the fencing thread waits
+    /// for served >= requested before it runs the batch's operations).
+    u64 backlog_requested = 0;            ///< Under backlog_mutex
+    std::atomic<u64> backlog_served{0};   ///< Stored under backlog_mutex
+    bool backlog_waiting = false;         ///< Under backlog_mutex: the fencing thread sleeps
+    std::condition_variable backlog_cv;
     std::condition_variable cv;
 
     std::jthread fence_thread;
