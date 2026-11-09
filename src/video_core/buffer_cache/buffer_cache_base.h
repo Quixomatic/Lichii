@@ -967,6 +967,8 @@ private:
     /// Bind mutations after it are requests in v2_binds, applied by CommitBinds.
     V2::Commit::RequestList v2_creates;
     V2::Commit::RequestList v2_binds;
+    /// Perf fix C: the scope's pending written marks, so a GPU-modified test scans only them.
+    boost::container::small_vector<std::pair<DAddr, u64>, 8> v2_written_marks;
     u64 v2_segment = 1;
     bool v2_proxy_finds = false;
     u64 v2_upload_count = 0; ///< uploads applied (verify)

@@ -2973,6 +2973,7 @@ void BufferCache<P>::DoUpdateComputeBuffers() {
 template <class P>
 void BufferCache<P>::V2BeginBindScope() {
     v2_binds.Reset(v2_segment++);
+    v2_written_marks.clear();
     v2_defer = true;
 }
 
@@ -3084,9 +3085,8 @@ bool BufferCache<P>::V2DeferBind(V2::Commit::Kind kind, Buffer& buffer, DAddr de
 
 template <class P>
 bool BufferCache<P>::V2PendingGpuWrite(DAddr device_addr, u64 size) const {
-    for (const V2::Commit::Request& request : v2_binds.Requests()) {
-        if (request.kind == V2::Commit::Kind::BufferMarkWritten &&
-            request.address < device_addr + size && device_addr < request.address + request.size) {
+    for (const auto& [address, mark_size] : v2_written_marks) {
+        if (address < device_addr + size && device_addr < address + mark_size) {
             return true;
         }
     }
@@ -3407,6 +3407,7 @@ void BufferCache<P>::MarkWrittenBuffer(BufferId buffer_id, DAddr device_addr, u3
         request.size = size;
         request.arg = needs_sync ? 1U : 0U;
         v2_binds.Push(request);
+        v2_written_marks.emplace_back(device_addr, size);
         return;
     }
     if constexpr (!IS_OPENGL) {
@@ -4013,16 +4014,8 @@ BufferId BufferCache<P>::LookupBuffer(DAddr device_addr, u32 size) const {
 template <class P>
 void BufferCache<P>::TouchBuffer(Buffer& buffer, BufferId buffer_id) noexcept {
     if (buffer_id != NULL_BUFFER_ID) {
-        if (v2_defer) [[unlikely]] {
-            V2::Commit::Request request{};
-            request.kind = V2::Commit::Kind::BufferTouch;
-            request.resource = V2::Commit::Resource::Buffer;
-            request.slot = buffer_id.index;
-            request.address = buffer.CpuAddr();
-            request.size = 1;
-            v2_binds.Push(request);
-            return;
-        }
+        // Perf fix C: a touch (LRU and track id) is applied in place even in a bind scope: no
+        // lookup reads it and its order against the scope's requests changes nothing.
         lru_cache.Touch(buffer.getLRUID(), frame_tick);
         if (commit != nullptr) [[unlikely]] {
             buffer.v2_track_id = (std::max)(buffer.v2_track_id, commit->submission);

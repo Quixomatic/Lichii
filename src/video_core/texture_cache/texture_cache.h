@@ -4847,10 +4847,22 @@ void TextureCache<P>::PredictImageViews(std::span<const ImageViewInOut> views, b
     v2_prepared.clear();
     u64 hits = 0;
     u64 misses = 0;
+    // Perf fix C: predicted effects only feed verify's comparison and the stats.
+    const bool predict = commit->verify || commit->stats;
     for (size_t index = 0; index < views.size(); ++index) {
         const ImageViewInOut& view = views[index];
         const CommitViewLookup lookup = LookupImageView(view.index, compute);
         if (!lookup.request) {
+            v2_view_ids[index] = lookup.id.index;
+            ++hits;
+            continue;
+        }
+        if (!commit->verify && lookup.kind == C::Kind::ImagePrepare && commit->list.Empty() &&
+            !(blacklist && view.blacklist)) {
+            // Perf fix C (MASTER_PLAN §5.6: commit cost tracks the mutation rate): a ready view
+            // ahead of every request is prepared in place, exactly where its request would have
+            // applied (first in the list, table unchanged since the peek). No request, no proxy.
+            PrepareImageView(lookup.id, false, false);
             v2_view_ids[index] = lookup.id.index;
             ++hits;
             continue;
@@ -4862,7 +4874,7 @@ void TextureCache<P>::PredictImageViews(std::span<const ImageViewInOut> views, b
         request.size = table.changes;
         request.arg = compute ? C::ArgCompute : 0;
         request.slot = lookup.id.index;
-        if (lookup.kind != C::Kind::ViewCreate && lookup.id != NULL_IMAGE_VIEW_ID) {
+        if (predict && lookup.kind != C::Kind::ViewCreate && lookup.id != NULL_IMAGE_VIEW_ID) {
             request.effects = PredictSegmentPrepare(lookup.id, false, false);
         }
         if (lookup.kind == C::Kind::ImagePrepare) {
@@ -4919,12 +4931,25 @@ void TextureCache<P>::PushPrepareRequest(ImageViewId id) {
     request.resource = V2::Commit::Resource::ImageView;
     request.slot = id.index;
     request.arg = V2::Commit::ArgDirect;
-    request.effects = PredictSegmentPrepare(id, false, false);
+    if (commit->verify || commit->stats) {
+        request.effects = PredictSegmentPrepare(id, false, false);
+    }
     commit->list.Push(request);
 }
 
 template <class P>
 bool TextureCache<P>::PrepareViewsCommit(std::span<const ImageViewInOut> views) {
+    if (!commit->stats) {
+        // Perf fix C: a list of direct prepares applies as the same prepares in the same order;
+        // without the stats nothing reads the requests.
+        has_deleted_images = false;
+        for (const ImageViewInOut& view : views) {
+            if (view.id) {
+                PrepareImageView(view.id, false, false);
+            }
+        }
+        return !has_deleted_images;
+    }
     const u64 start = commit->stats ? Nx2Profile::Now() : 0;
     commit->BeginSegment();
     v2_prepared.clear();
@@ -4967,7 +4992,9 @@ void TextureCache<P>::PushRenderTargetRequests(bool is_clear) {
         // views it will find; a target the bound view can't be shown to be (another address,
         // format or size: FindRenderTargetView may make a new image) leaves the effects unknown.
         bool known = true;
-        request.effects = PredictRenderTargetUpdate(is_clear, known);
+        if (commit->verify || commit->stats) {
+            request.effects = PredictRenderTargetUpdate(is_clear, known);
+        }
         if (!known) {
             request.slot = C::InvalidSlot; // Compare skips the effects of an unknown slot
         }
@@ -5040,7 +5067,9 @@ void TextureCache<P>::PushRenderTargetRequests(bool is_clear) {
         request.resource = C::Resource::ImageView;
         request.slot = id.index;
         request.arg = C::ArgModification | (invalidate ? C::ArgInvalidate : 0);
-        request.effects = PredictSegmentPrepare(id, true, invalidate);
+        if (commit->verify || commit->stats) {
+            request.effects = PredictSegmentPrepare(id, true, invalidate);
+        }
         commit->list.Push(request);
     }
 }
