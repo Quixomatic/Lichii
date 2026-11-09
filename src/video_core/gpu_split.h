@@ -173,6 +173,15 @@ public:
             Advance(std::exchange(s1_unadvanced, size_t{0}));
         }
     }
+    /// Front, S1: a Draw entry stands for the ~70 method words v1 sent per draw, and S1 sends
+    /// about half as many words per draw. The publish cadence counts each draw as more words,
+    /// so the back gets draws as often as it did from method words, not in twice the slices.
+    void S1PaceDraws(u32 draws) {
+        unpublished_words += size_t{draws} * S1DrawPaceWords;
+        if (unpublished_words >= publish_every) {
+            Publish();
+        }
+    }
     /// Front, S1: a one-word entry (Delta, Exec).
     void S1Word(Tegra::Engines::EngineInterface* engine, u64 word) {
         u64* const entry = S1Begin(engine, 1);
@@ -677,6 +686,10 @@ private:
         ir_run = nullptr;
         ir_run_classified = false;
         s1_cbuf = nullptr;
+        if (s1_cursor != s1_limit) {
+            // The run's unused reserved words are the arena's head: the next span starts there.
+            arena.Trim(static_cast<size_t>(s1_limit - s1_cursor));
+        }
         s1_cursor = nullptr;
         s1_limit = nullptr;
     }
@@ -686,6 +699,7 @@ private:
     void S1Reserve();
     static constexpr size_t S1ReserveWords = 64;
     static constexpr size_t S1AdvanceWords = 16;
+    static constexpr size_t S1DrawPaceWords = 32;
     /// Closes the open StateRun (P2 notes a write at the position after it: the next method
     /// starts a new record, so every noted write ends its record).
     void IrCut() {

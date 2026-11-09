@@ -81,6 +81,11 @@ public:
         mark_storage[(mark_head - 1) & (mark_capacity - 1)].end = head;
         return out;
     }
+    /// Front: gives back the newest span's last `words` (words Extend reserved but nobody used).
+    void Trim(size_t words) {
+        head -= words;
+        mark_storage[(mark_head - 1) & (mark_capacity - 1)].end = head;
+    }
     /// Front: frees the spans of records the back executed (sequence <= executed).
     void Retire(u64 executed) {
         while (mark_tail != mark_head) {

@@ -164,11 +164,12 @@ void GpuSplit::MaybeStart(Core::System& system_) {
     draw_records = ir && front_macros && V2::On(V2::Switch::IrDraws);
     draw_verify = draw_records && V2::Verify(V2::Switch::IrDraws);
     full_draw_records = draw_records && (draw_verify || V2::On(V2::Switch::Parallel));
-    ir_checks = ir_verify || draw_verify || V2::Stats::Enabled();
     if (ir && !V2::IrTrace::Directory().empty()) {
         ir_trace = std::make_unique<V2::IrTrace::Recorder>();
         LOG_INFO(HW_GPU, "V2 IR trace: one file per frame in {}", V2::IrTrace::Directory());
     }
+    // The trace is one of the per-record checks: without it ExecuteIr pays no extra branch.
+    ir_checks = ir_verify || draw_verify || V2::Stats::Enabled() || ir_trace != nullptr;
     {
         // S1 single owner (Fix F1): the back applies the front's classified entries.
         const V2::Mode regsem = V2::Get(V2::Switch::RegSem);
@@ -899,10 +900,10 @@ void GpuSplit::ReplayIrRecord(std::span<const u64> record, std::span<const u64> 
 size_t GpuSplit::ExecuteIr(const u64* entry) {
     const u64 head = entry[0];
     const size_t size = V2::Ir::RecordWords(head);
-    if (ir_trace) [[unlikely]] {
-        TraceIrRecord(entry);
-    }
     if (ir_checks) [[unlikely]] {
+        if (ir_trace) {
+            TraceIrRecord(entry);
+        }
         if (ir_verify) {
             CheckIrRecord(entry);
         }

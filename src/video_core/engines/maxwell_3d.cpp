@@ -2120,6 +2120,7 @@ void Maxwell3D::FrontS1Draws(VideoCommon::GpuSplit& split, FrontState& fs,
         std::memcpy(entry + 1, &out.draws[i], sizeof(out.draws[i]));
         split.S1Commit(S1::DrawWords);
     }
+    split.S1PaceDraws(out.count);
 }
 
 void Maxwell3D::FrontS1Groups(VideoCommon::GpuSplit& split, FrontState& fs) {
