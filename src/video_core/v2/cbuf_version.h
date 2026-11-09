@@ -99,48 +99,92 @@ public:
         return log->PageSum(address, size);
     }
 
-    /// The version of [address, address + size) made in `tick`, if nothing wrote it since:
-    /// no inline or host write logged over it, and `current` (what guest memory holds now, `size`
-    /// bytes) equal to its bytes.
-    [[nodiscard]] const Ref* Find(DAddr address, u32 size, u64 tick, const u8* current) {
+    /// The checks of Find that read no guest memory (Perf fix D: a lookup reads and compares
+    /// the range's bytes only when these pass): whether the version of [address, address +
+    /// size) made in `tick` may still hold. No inline or host write logged over it since, and
+    /// `page_sum` (the range's PageSum now, Begin) equal to its own.
+    [[nodiscard]] bool MayHold(DAddr address, u32 size, u64 tick, u64 page_sum) {
         Entry& entry = entries[Slot(address, size)];
         if (!entry.valid || entry.address != address || entry.size != size ||
             entry.tick != tick || entry.boundary != log->Boundary()) {
-            return nullptr;
+            return false;
         }
         const u64 sequence = log->Sequence();
         if (entry.sequence != sequence) {
             if (log->WrittenSince(entry.sequence, address, address + size)) {
                 entry.valid = false;
-                return nullptr;
+                return false;
             }
             entry.sequence = sequence;
         }
-        if (entry.page_sum != log->PageSum(address, size)) {
+        if (entry.page_sum != page_sum) {
             entry.valid = false;
-            return nullptr;
+            return false;
         }
-        if (current == nullptr || entry.bytes.size() != size ||
-            std::memcmp(entry.bytes.data(), current, size) != 0) {
-            // Written behind (a guest CPU write): a new version replaces it.
+        return true;
+    }
+
+    /// After MayHold returned true: the version, if `current` (what guest memory holds now,
+    /// `size` bytes) equals its bytes. A guest CPU write that changed any byte makes it miss.
+    [[nodiscard]] const Ref* Matching(DAddr address, u32 size, const u8* current) const {
+        const Entry& entry = entries[Slot(address, size)];
+        if (current == nullptr || !entry.valid || entry.address != address ||
+            entry.bytes.size() != size || std::memcmp(entry.bytes.data(), current, size) != 0) {
             return nullptr;
         }
         return &entry.ref;
     }
 
+    /// The version of [address, address + size) made in `tick`, if nothing wrote it since:
+    /// no inline or host write logged over it, and `current` (what guest memory holds now, `size`
+    /// bytes) equal to its bytes.
+    [[nodiscard]] const Ref* Find(DAddr address, u32 size, u64 tick, const u8* current) {
+        if (!MayHold(address, size, tick, log->PageSum(address, size))) {
+            return nullptr;
+        }
+        return Matching(address, size, current);
+    }
+
+    /// As Find, reading guest memory (`read()` returns its `size` bytes) only when the version
+    /// may still hold.
+    template <typename Read>
+    [[nodiscard]] const Ref* FindWith(DAddr address, u32 size, u64 tick, Read&& read) {
+        if (!MayHold(address, size, tick, log->PageSum(address, size))) {
+            return nullptr;
+        }
+        return Matching(address, size, read());
+    }
+
     /// Records a new version made from `bytes` (`size` of them) after Begin returned `page_sum`.
     void Insert(DAddr address, u32 size, u64 tick, const Ref& ref, u64 page_sum,
                 const u8* bytes) {
+        u8* const storage = Prepare(address, size, tick, page_sum);
+        std::memcpy(storage, bytes, size);
+        Commit(address, size, ref);
+    }
+
+    /// A new version of [address, address + size) in `tick` after Begin returned `page_sum`:
+    /// returns where its `size` bytes go. The caller reads guest memory into it once, copies
+    /// it to the stream (so the two can't differ), then Commit makes the version findable.
+    [[nodiscard]] u8* Prepare(DAddr address, u32 size, u64 tick, u64 page_sum) {
         Entry& entry = entries[Slot(address, size)];
-        entry.valid = true;
+        entry.valid = false;
         entry.address = address;
         entry.size = size;
         entry.tick = tick;
         entry.boundary = log->Boundary();
         entry.sequence = log->Sequence();
         entry.page_sum = page_sum;
+        entry.bytes.resize(size);
+        return entry.bytes.data();
+    }
+    void Commit(DAddr address, u32 size, const Ref& ref) {
+        Entry& entry = entries[Slot(address, size)];
+        if (entry.address != address || entry.size != size || entry.bytes.size() != size) {
+            return;
+        }
         entry.ref = ref;
-        entry.bytes.assign(bytes, bytes + size);
+        entry.valid = true;
     }
 
     /// The bytes of the version of [address, address + size) (verify).

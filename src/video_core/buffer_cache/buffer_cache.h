@@ -1126,16 +1126,11 @@ void BufferCache<P>::RecordGraphicsBuffers(VideoCommon::V2::DrawCache::BufferRec
                     static_assert(sizeof(Ref) <= sizeof(bind.ref));
                     const Ref* version = nullptr;
                     if (VideoCommon::V2::On(VideoCommon::V2::Switch::CbufVer)) {
-                        // The version the bind just referenced (or made) still holds the bytes.
-                        const u8* current = device_memory.GetSpan(binding.device_addr, size);
-                        if (current == nullptr) {
-                            version_scratch.resize(size);
-                            device_memory.ReadBlockUnsafe(binding.device_addr,
-                                                          version_scratch.data(), size);
-                            current = version_scratch.data();
-                        }
-                        version = VideoCommon::V2::CbufVer::Table<Ref>().Find(
-                            binding.device_addr, size, tick, current);
+                        // The version the bind just referenced (or made) still holds the bytes
+                        // (read and compared only when its write checks pass).
+                        version = VideoCommon::V2::CbufVer::Table<Ref>().FindWith(
+                            binding.device_addr, size, tick,
+                            [&] { return V2GuestBytes(binding.device_addr, size); });
                     }
                     if (version != nullptr) {
                         bind.kind = DC::BufferBind::Kind::Version;
@@ -1473,15 +1468,9 @@ void BufferCache<P>::ReplayHostStageBuffers(size_t stage,
                 // The range's version in this command buffer, while it still holds the bytes
                 // guest memory has (the version table compares them): no copy.
                 using Ref = typename Runtime::StreamUniformRef;
-                const u8* current = device_memory.GetSpan(binding.device_addr, size);
-                if (current == nullptr) {
-                    version_scratch.resize(size);
-                    device_memory.ReadBlockUnsafe(binding.device_addr, version_scratch.data(),
-                                                  size);
-                    current = version_scratch.data();
-                }
-                if (const Ref* const version = VideoCommon::V2::CbufVer::Table<Ref>().Find(
-                        binding.device_addr, size, runtime.CurrentTick(), current)) {
+                if (const Ref* const version = VideoCommon::V2::CbufVer::Table<Ref>().FindWith(
+                        binding.device_addr, size, runtime.CurrentTick(),
+                        [&] { return V2GuestBytes(binding.device_addr, size); })) {
                     channel_state->fast_bound_uniform_buffers[stage] |= 1u << index;
                     channel_state->uniform_buffer_binding_sizes[stage][index] = size;
                     runtime.RebindStreamUniform(*version, size);
@@ -2523,6 +2512,16 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
 }
 
 template <class P>
+const u8* BufferCache<P>::V2GuestBytes(DAddr device_addr, u32 size) {
+    if (const u8* const span = device_memory.GetSpan(device_addr, size)) {
+        return span;
+    }
+    version_scratch.resize(size);
+    device_memory.ReadBlockUnsafe(device_addr, version_scratch.data(), size);
+    return version_scratch.data();
+}
+
+template <class P>
 bool BufferCache<P>::BindUniformVersion(size_t stage, u32 index, u32 binding_index,
                                         DAddr device_addr, u32 size) {
     if constexpr (!IS_OPENGL && VideoCommon::StreamUniformReusable<Runtime>) {
@@ -2538,14 +2537,13 @@ bool BufferCache<P>::BindUniformVersion(size_t stage, u32 index, u32 binding_ind
         // Taken before the bytes are read: a host write after it ends the version.
         const u64 page_sum = table.Begin(device_addr, size);
         // What guest memory holds now: a version is referenced only while its bytes equal it, so
-        // a guest CPU write ends it at the next bind with no page in the write tracking.
-        const u8* current = device_memory.GetSpan(device_addr, size);
-        if (current == nullptr) {
-            version_scratch.resize(size);
-            device_memory.ReadBlockUnsafe(device_addr, version_scratch.data(), size);
-            current = version_scratch.data();
-        }
-        if (const Ref* const version = table.Find(device_addr, size, tick, current)) {
+        // a guest CPU write ends it at the next bind with no page in the write tracking. Read and
+        // compared only when the version's write checks pass (Perf fix D).
+        const Ref* const version =
+            table.MayHold(device_addr, size, tick, page_sum)
+                ? table.Matching(device_addr, size, V2GuestBytes(device_addr, size))
+                : nullptr;
+        if (version != nullptr) {
             bool same = true;
             if (verify) {
                 // The bytes the shader would read now (read again) against the version's.
@@ -2577,16 +2575,18 @@ bool BufferCache<P>::BindUniformVersion(size_t stage, u32 index, u32 binding_ind
                 return true;
             }
         }
-        // A new version: one read of guest memory feeds both the stream copy and the version's
-        // bytes, so the two can't differ when the CPU writes meanwhile.
-        if (current != version_scratch.data()) {
-            version_scratch.resize(size);
-            std::memcpy(version_scratch.data(), current, size);
+        // A new version: one read of guest memory into the version's own bytes feeds the stream
+        // copy too, so the two can't differ when the CPU writes meanwhile (two copies, no
+        // scratch).
+        u8* const bytes = table.Prepare(device_addr, size, tick, page_sum);
+        if (const u8* const span = device_memory.GetSpan(device_addr, size)) {
+            std::memcpy(bytes, span, size);
+        } else {
+            device_memory.ReadBlockUnsafe(device_addr, bytes, size);
         }
         const std::span<u8> span = runtime.BindMappedUniformBuffer(stage, binding_index, size);
-        std::memcpy(span.data(), version_scratch.data(), size);
-        table.Insert(device_addr, size, tick, runtime.LastStreamUniformRef(), page_sum,
-                     version_scratch.data());
+        std::memcpy(span.data(), bytes, size);
+        table.Commit(device_addr, size, runtime.LastStreamUniformRef());
         if (stats) {
             ++V2::P3Stats::Get().cbuf_copies;
         }

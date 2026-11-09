@@ -441,6 +441,46 @@ TEST_CASE("V2 P3 constant buffer versions see guest CPU writes through their byt
     REQUIRE(table->Find(A, 0x100, 1, guest.data()) == nullptr);
 }
 
+TEST_CASE("V2 P3 constant buffer versions read guest memory only when they may hold",
+          "[video_core][v2_p3]") {
+    using namespace VideoCommon::V2::CbufVer;
+    auto log = std::make_unique<WriteLog>();
+    auto table = std::make_unique<VersionTable<int>>(*log);
+    constexpr DAddr A = 0x20'0000;
+    std::vector<u8> guest(0x40, 0x5a);
+    // No version yet: FindWith never reads.
+    u32 reads = 0;
+    const auto read = [&] {
+        ++reads;
+        return static_cast<const u8*>(guest.data());
+    };
+    REQUIRE(table->FindWith(A, 0x40, 3, read) == nullptr);
+    REQUIRE(reads == 0);
+    // Prepare + fill + Commit is a version, found by its bytes.
+    const u64 page_sum = table->Begin(A, 0x40);
+    u8* const bytes = table->Prepare(A, 0x40, 3, page_sum);
+    std::memcpy(bytes, guest.data(), guest.size());
+    REQUIRE(table->FindWith(A, 0x40, 3, read) == nullptr); // not committed yet
+    table->Commit(A, 0x40, 9);
+    REQUIRE(table->MayHold(A, 0x40, 3, table->Begin(A, 0x40)));
+    REQUIRE(*table->FindWith(A, 0x40, 3, read) == 9);
+    REQUIRE(reads == 1);
+    // A guest CPU write still ends it at once (the bytes are compared on every lookup).
+    guest[0x3f] = 0;
+    REQUIRE(table->FindWith(A, 0x40, 3, read) == nullptr);
+    REQUIRE(reads == 2);
+    guest[0x3f] = 0x5a;
+    // A host write ends it without reading guest memory.
+    log->NoteHost(A, 4);
+    REQUIRE(table->FindWith(A, 0x40, 3, read) == nullptr);
+    REQUIRE(reads == 2);
+    // So does another tick.
+    table->Insert(A, 0x40, 3, 10, table->Begin(A, 0x40), guest.data());
+    REQUIRE(table->FindWith(A, 0x40, 4, read) == nullptr);
+    REQUIRE(reads == 2);
+    REQUIRE(*table->Find(A, 0x40, 3, guest.data()) == 10);
+}
+
 namespace {
 struct HeapModule {
     u32 set1_decorations{};
