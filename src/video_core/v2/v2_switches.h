@@ -55,6 +55,8 @@ enum class Switch : u32 {
     AdaptSubmit,  ///< EDEN_NX2_V2_ADAPTSUBMIT: adaptive flush heuristic instead of 128 draws
     SubmitThread, ///< EDEN_NX2_V2_SUBMITTHREAD: submit thread + finish thread (P5b)
     PresentPace,  ///< EDEN_NX2_V2_PRESENTPACE: bounded frames ahead with present wait (P5b)
+    Parallel,     ///< EDEN_NX2_V2_PARALLEL: segmented parallel resolve, ordered merge (P6a)
+    MultiFront,   ///< EDEN_NX2_V2_MULTIFRONT: front engines over channel groups (P6b)
     Count,
 };
 
@@ -90,6 +92,8 @@ inline constexpr std::array<const char*, static_cast<size_t>(Switch::Count)> swi
     "ADAPTSUBMIT",
     "SUBMITTHREAD",
     "PRESENTPACE",
+    "PARALLEL",
+    "MULTIFRONT",
 };
 
 namespace Detail {
