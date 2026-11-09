@@ -35,6 +35,10 @@ struct FlushParams {
     u32 weak_chunks = 6;        ///< DXVK: weak hints after 6 chunks
     u32 strong_chunks = 3;      ///< DXVK: strong hints after 3 chunks
     u32 idle_pending = 2;       ///< fewer submissions pending than this: the GPU is about to idle
+    /// Fix pass 1 (B8): the idle rule waits this long since the last submission. With a light GPU
+    /// load the GPU is always about to idle, and the rule alone submitted every chunk (OoT: 23 to
+    /// 44 submissions a frame).
+    u64 idle_min_interval_us = 1000;
     u32 max_chunk_threshold = 20;
     u32 cost_cap = 1500;        ///< DXVK: forced at a cost estimate of 1500
     u64 max_interval_us = 2000; ///< submit when this long passed with work recorded
@@ -148,7 +152,8 @@ private:
             return {};
         }
         // DXVK: the GPU is about to go idle: feed it now.
-        if (pending < params.idle_pending) {
+        if (pending < params.idle_pending &&
+            now_us - last_submit_us >= params.idle_min_interval_us) {
             return {FlushAction::Flush, ReasonIdle};
         }
         if (hint >= FlushHint::Strong && chunks >= params.strong_chunks) {
@@ -157,9 +162,11 @@ private:
         if (hint >= FlushHint::Weak && chunks >= params.weak_chunks) {
             return {FlushAction::Flush, ReasonWeak};
         }
-        // Thresholds grow with the queued work: min(20, pending * 3) chunks.
+        // Thresholds grow with the queued work: min(20, pending * 3) chunks. An idle GPU is the
+        // idle rule's (Fix pass 1, B8: with nothing pending the threshold was 0, and every chunk
+        // submitted whatever the idle rule decided).
         const u32 threshold = (std::min)(params.max_chunk_threshold, pending * 3);
-        if (chunks >= threshold) {
+        if (pending >= params.idle_pending && chunks >= threshold) {
             return {FlushAction::Flush, ReasonPending};
         }
         if (now_us - last_submit_us >= params.max_interval_us) {

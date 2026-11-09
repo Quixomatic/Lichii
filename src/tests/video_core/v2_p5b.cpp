@@ -147,10 +147,27 @@ TEST_CASE("V2 P5b flush heuristic decisions", "[video_core][v2_p5b]") {
         FlushHeuristic::Decision decision{};
         for (u32 i = 0; i < params.chunk_draws; ++i) {
             decision = heuristic.Advance(1, /*pending*/ 0, now);
+            now += params.idle_min_interval_us / (params.chunk_draws - 1) + 1;
         }
         REQUIRE(decision.action == FlushAction::Flush);
         REQUIRE(decision.reason == FlushHeuristic::ReasonIdle);
         REQUIRE(heuristic.Draws() == 0);
+    }
+    // Fix pass 1 (B8, OoT: 23 to 44 submissions a frame): a light load keeps the GPU about to
+    // idle, which must not submit every chunk.
+    SECTION("idle GPU: no idle flush sooner than the minimum interval") {
+        FlushHeuristic heuristic{params};
+        u32 flushes = 0;
+        // 10 draws per 100 us: 32-draw chunks every 320 us, all with the GPU idle.
+        for (u32 i = 0; i < 640; ++i) {
+            const u64 now = 1000 + u64{i} * 10;
+            if (heuristic.Advance(1, /*pending*/ 0, now).action == FlushAction::Flush) {
+                ++flushes;
+            }
+        }
+        // 6.4 ms of draws: at most one idle flush per millisecond, not one per chunk (20).
+        REQUIRE(flushes <= 7);
+        REQUIRE(flushes >= 1);
     }
     SECTION("busy GPU: threshold grows with pending work, chunks dispatched meanwhile") {
         FlushHeuristic heuristic{params};

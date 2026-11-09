@@ -4287,6 +4287,19 @@ void RasterizerVulkan::AdaptiveFlushWork(u32 cost) {
         const u64 done = master.KnownGpuTick();
         pending = static_cast<u32>(current > done + 1 ? current - done - 1 : 0);
     }
+    // Fix pass 1 (B8): any submission resets the heuristic, not only its own. A fence, present or
+    // readback submit left the draws since the heuristic's last flush counted, so it flushed again
+    // soon after (OoT: 11 draws per submission).
+    if (const u64 tick = scheduler.GetMasterSemaphore().CurrentTick(); tick != adapt_tick)
+        [[unlikely]] {
+        adapt_tick = tick;
+        if (now_us == 0) {
+            now_us = static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                          std::chrono::steady_clock::now().time_since_epoch())
+                                          .count());
+        }
+        flush_heuristic.NoteSubmit(now_us);
+    }
     const auto decision = flush_heuristic.Advance(cost, pending, now_us);
     P5b::Add(P5b::Counter::SubmitDraws);
     switch (decision.action) {

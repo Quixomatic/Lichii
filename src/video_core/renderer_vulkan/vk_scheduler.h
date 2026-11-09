@@ -534,6 +534,9 @@ private:
     void NoteImageReadTracked(VkImage image, u64 begin, u64 end);
     void FlushAllPendingWrites();
     void RecordHazardBarrier(u32 src_stages, u32 src_access, u32 dst_stages, u32 dst_access);
+    /// The barrier without the targeted-barrier count (a full barrier counts as that).
+    void RecordHazardBarrierUncounted(u32 src_stages, u32 src_access, u32 dst_stages,
+                                      u32 dst_access);
     void UpdateAutoFlush() {
         auto_flush = track_barriers && !targeted_scope && !state.renderpass &&
                      !barrier_tracker.Empty();

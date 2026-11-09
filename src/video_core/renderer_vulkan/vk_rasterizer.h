@@ -347,6 +347,7 @@ private:
     u32 draw_counter = 0;
     /// EDEN_NX2_V2_ADAPTSUBMIT
     bool adapt_submit = false;
+    u64 adapt_tick = 0; ///< The open tick the heuristic last saw (a change is a submission)
     VideoCommon::V2::FlushHeuristic flush_heuristic;
 #ifdef EGLANTINE_STREAMLINE
     std::optional<u64> oot_camera_sample_frame;

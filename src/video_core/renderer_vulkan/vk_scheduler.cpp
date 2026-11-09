@@ -724,10 +724,14 @@ void Scheduler::FlushAllPendingWrites() {
     const auto hazard = barrier_tracker.TakeAll();
     auto_flush = false;
     const auto reads = std::exchange(read_hazard, {});
+    const u32 stages = hazard.stages | reads.stages;
+    if (stages == 0) {
+        return; // Nothing pending: no barrier (Fix pass 1: this was still counted as one)
+    }
     VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::FullBarriers);
-    RecordHazardBarrier(hazard.stages | reads.stages, hazard.access | reads.access,
-                        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                        VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+    RecordHazardBarrierUncounted(stages, hazard.access | reads.access,
+                                 VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                 VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
 }
 
 void Scheduler::RecordHazardBarrier(u32 src_stages, u32 src_access, u32 dst_stages,
@@ -737,6 +741,11 @@ void Scheduler::RecordHazardBarrier(u32 src_stages, u32 src_access, u32 dst_stag
         return;
     }
     VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::TargetedBarriers);
+    RecordHazardBarrierUncounted(src_stages, src_access, dst_stages, dst_access);
+}
+
+void Scheduler::RecordHazardBarrierUncounted(u32 src_stages, u32 src_access, u32 dst_stages,
+                                             u32 dst_access) {
     const bool saved = std::exchange(auto_flush, false);
     Record([src_stages, src_access, dst_stages, dst_access](vk::CommandBuffer cmdbuf) {
         const VkMemoryBarrier barrier{
