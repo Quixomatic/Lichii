@@ -136,6 +136,12 @@ BackgroundReadback::Job BackgroundReadback::Submit() {
     // The producers (and the releases) go to the GPU; the job waits for that tick.
     const u64 producer_tick = scheduler.CurrentTick();
     scheduler.Flush();
+    // Fix pass 1 (B1, the save-load deadlock): Flush only hands the tick to the Vulkan worker.
+    // Its own transfer batch (uploads on the transfer queue, which graphics `producer_tick`
+    // waits for) reaches the transfer queue when the worker submits it. A job submitted before
+    // that sits ahead of the batch on the same queue, waiting for a graphics tick that waits for
+    // the batch behind it: neither ever runs. Wait until the worker submitted the tick.
+    scheduler.WaitWorker();
     Resources& r = ThreadResources();
     const vk::CommandBuffer cmdbuf{TakeCommandBuffer(r), device.GetDispatchLoader()};
     cmdbuf.Begin({
