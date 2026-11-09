@@ -168,7 +168,7 @@ void GpuSplit::MaybeStart(Core::System& system_) {
     {
         // S1 single owner (Fix F1): the back applies the front's classified entries.
         const V2::Mode regsem = V2::Get(V2::Switch::RegSem);
-        const bool s1_possible = ir && front_macros && !V2::On(V2::Switch::Parallel);
+        const bool s1_possible = ir && front_macros;
         s1_exec = s1_possible && draw_records && !draw_verify && regsem == V2::Mode::On;
         s1_check = s1_possible && !s1_exec && regsem != V2::Mode::Off &&
                    (regsem == V2::Mode::Verify || draw_verify);
@@ -914,8 +914,9 @@ size_t GpuSplit::ExecuteIr(const u64* entry) {
                         V2::RegSem::ApplyShadow3D(control, back_shadow.data(), method, value);
                 }
             }
+            // With S1 the shadow RAM lives on the front only.
             parallel->OnSegment(segment, verify ? back_regs.data() : nullptr,
-                                verify ? back_shadow.data() : nullptr,
+                                verify && !s1_exec ? back_shadow.data() : nullptr,
                                 verify ? &back_cbufs : nullptr);
         }
         break;

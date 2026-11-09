@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <bit>
+#include <cstddef>
 #include <cstring>
 
 #include "common/logging.h"
@@ -9,6 +11,7 @@
 #include "video_core/v2/regsem_3d.h"
 #include "video_core/v2/resolve/split_resolve.h"
 #include "video_core/v2/resolve/state_view.h"
+#include "video_core/v2/s1_deltas.h"
 #include "video_core/v2/v2_stats.h"
 #include "video_core/v2/v2_switches.h"
 
@@ -147,6 +150,95 @@ SerialReason SplitTraits::Resolve(Shard& shard, const Input& input, std::vector<
     constexpr u64 RingWords = GpuSplit::RingWords;
     bool active = true;
     u32 ordinal = 0;
+    // One predicted draw: its draw-cache shape and keys from the mirror at its position.
+    const auto add_draw = [&](const Ir::PredictedDraw& draw, u64 fingerprint, bool drift,
+                              const GroupTracker& groups) {
+        if (draw.kind != Ir::DrawKind::Array && draw.kind != Ir::DrawKind::Indexed) {
+            return;
+        }
+        PreDraw pre;
+        pre.fingerprint = fingerprint;
+        pre.indexed = draw.kind == Ir::DrawKind::Indexed;
+        pre.ordinal = ordinal++;
+        pre.engine = snapshot.engine;
+        pre.memory = snapshot.memory;
+        pre.drift = drift;
+        if (!drift) {
+            if (g_pipeline_key != nullptr) {
+                // P6c step (a): the draw's pipeline key from the same state view.
+                const SnapshotView view{
+                    mirror.regs.data(),
+                    &mirror.v2_cbufs,
+                    &groups,
+                    static_cast<MaxwellRegs::PrimitiveTopology>(draw.topology),
+                    ViewDraw{
+                        .first = draw.first,
+                        .count = draw.count,
+                        .instances = draw.instances,
+                        .base_vertex = draw.base_vertex,
+                        .base_instance = draw.base_instance,
+                        .indexed = pre.indexed,
+                    },
+                    snapshot.native_turing};
+                pre.pipeline_key = g_pipeline_key(view);
+            }
+            // The draw-cache shape holds the pipeline key's hash: only the canonical key the
+            // serial path uses with EDEN_NX2_V2_PIPEKEY equals the shard's.
+            const bool state_hash = pre.pipeline_key != nullptr && On(Switch::PipeKey);
+            const ShardKey key = g_shard_key(ShardKeyInputs{
+                .regs = mirror.regs.data(),
+                .groups = &groups,
+                .cbufs = &mirror.v2_cbufs,
+                .topology = draw.topology,
+                .indexed = pre.indexed,
+                .native_turing = snapshot.native_turing,
+                .engine = snapshot.engine,
+                .memory = snapshot.memory,
+                .state_hash = state_hash ? pre.pipeline_key->hash : 0,
+                .has_state_hash = state_hash,
+            });
+            pre.shape = key.shape;
+            pre.partial = key.partial;
+            pre.full = key.full;
+            pre.cbuf_masks = key.cbuf_masks;
+            pre.relevant = key.relevant;
+            pre.has_shape = key.has_shape;
+            pre.has_key = key.has_key;
+            pre.has_full = key.has_full;
+        }
+        records.push_back(pre);
+    };
+    // S1 classified runs (§5.6 step 2): plain stores of the front's deltas, its groups, its
+    // draws; no second run of the register semantics.
+    constexpr u32 cb_data = static_cast<u32>(offsetof(MaxwellRegs, const_buffer) / 4) + 4;
+    const auto apply_s1 = [&](const u64* entry) {
+        switch (S1::TagOf(entry[0])) {
+        case S1::Tag::Groups: {
+            const u32 changed = S1::GroupsDirty(entry[0]);
+            const u64* hash = entry + 1;
+            for (u32 bits = changed & HashedGroups; bits != 0; bits &= bits - 1) {
+                mirror.v2_groups.hashes[std::countr_zero(bits)] = *hash++;
+            }
+            mirror.v2_groups.dirty |= changed;
+            break;
+        }
+        case S1::Tag::Draw: {
+            mirror.v2_groups.BeginDraw(); // as the back's NoteDraw3D before it draws
+            add_draw(S1::DrawOf(entry), mirror.v2_groups.Fingerprint(HashedGroups), false,
+                     mirror.v2_groups);
+            break;
+        }
+        default:
+            S1::ApplyRegisters(entry, cb_data, table.const_buffer_offset,
+                               [&](u32 index, u32 value) { mirror.regs[index] = value; });
+            if (S1::TagOf(entry[0]) == S1::Tag::Exec &&
+                (table.flags[S1::IndexOf(entry[0])] & RegSem::CbufBindFlag) != 0) {
+                RegSem::BindCbuf3D(mirror.v2_cbufs, mirror.regs.data(), S1::IndexOf(entry[0]));
+            }
+            break;
+        }
+        return S1::EntryWords(entry);
+    };
     for (u64 position = input.begin; position < input.end;) {
         const size_t index = static_cast<size_t>(position & (RingWords - 1));
         const u64 head = input.ring[index];
@@ -170,8 +262,18 @@ SerialReason SplitTraits::Resolve(Shard& shard, const Input& input, std::vector<
             }
             const u64* it = input.arena->At(record.payload.index);
             const u64* const end = it + record.payload.words;
+            if ((record.header & Ir::Classified) != 0) {
+                while (it < end) {
+                    it += apply_s1(it);
+                }
+                break;
+            }
             while (it < end) {
                 const u64 word = *it;
+                if (S1::IsClassified(word)) {
+                    it += S1::EntryWords(it); // GpuSplit::S1Check entries: the words decide
+                    continue;
+                }
                 const size_t words = (word & MethodHasSegment) != 0 ? 2 : 1;
                 if ((word & RingKindMask) == RingMethod) {
                     const u32 method = static_cast<u32>((word >> 8) & 0xffff);
@@ -215,62 +317,7 @@ SerialReason SplitTraits::Resolve(Shard& shard, const Input& input, std::vector<
                 drift = groups.Fingerprint(HashedGroups) != body.fingerprint;
             }
             for (u32 i = 0; i < body.num_draws; ++i) {
-                const Ir::PredictedDraw& draw = body.draws[i];
-                if (draw.kind != Ir::DrawKind::Array && draw.kind != Ir::DrawKind::Indexed) {
-                    continue;
-                }
-                PreDraw pre;
-                pre.fingerprint = body.fingerprint;
-                pre.indexed = draw.kind == Ir::DrawKind::Indexed;
-                pre.ordinal = ordinal++;
-                pre.engine = snapshot.engine;
-                pre.memory = snapshot.memory;
-                pre.drift = drift;
-                if (!drift) {
-                    if (g_pipeline_key != nullptr) {
-                        // P6c step (a): the draw's pipeline key from the same state view.
-                        const SnapshotView view{
-                            mirror.regs.data(),
-                            &mirror.v2_cbufs,
-                            &groups,
-                            static_cast<MaxwellRegs::PrimitiveTopology>(draw.topology),
-                            ViewDraw{
-                                .first = draw.first,
-                                .count = draw.count,
-                                .instances = draw.instances,
-                                .base_vertex = draw.base_vertex,
-                                .base_instance = draw.base_instance,
-                                .indexed = pre.indexed,
-                            },
-                            snapshot.native_turing};
-                        pre.pipeline_key = g_pipeline_key(view);
-                    }
-                    // The draw-cache shape holds the pipeline key's hash: only the canonical key
-                    // the serial path uses with EDEN_NX2_V2_PIPEKEY equals the shard's.
-                    const bool state_hash =
-                        pre.pipeline_key != nullptr && On(Switch::PipeKey);
-                    const ShardKey key = g_shard_key(ShardKeyInputs{
-                        .regs = mirror.regs.data(),
-                        .groups = &groups,
-                        .cbufs = &mirror.v2_cbufs,
-                        .topology = draw.topology,
-                        .indexed = pre.indexed,
-                        .native_turing = snapshot.native_turing,
-                        .engine = snapshot.engine,
-                        .memory = snapshot.memory,
-                        .state_hash = state_hash ? pre.pipeline_key->hash : 0,
-                        .has_state_hash = state_hash,
-                    });
-                    pre.shape = key.shape;
-                    pre.partial = key.partial;
-                    pre.full = key.full;
-                    pre.cbuf_masks = key.cbuf_masks;
-                    pre.relevant = key.relevant;
-                    pre.has_shape = key.has_shape;
-                    pre.has_key = key.has_key;
-                    pre.has_full = key.has_full;
-                }
-                records.push_back(pre);
+                add_draw(body.draws[i], body.fingerprint, drift, groups);
             }
             break;
         }

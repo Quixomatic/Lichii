@@ -138,7 +138,7 @@ public:
     /// StateRuns the back applies without executing the methods (EDEN_NX2_V2_REGSEM=1 with the
     /// typed IR, front macros and EDEN_NX2_V2_IR_DRAWS=1). S1Check: REGSEM or IR_DRAWS is
     /// verify, the back executes the method words and checks the classified entries sent with
-    /// them. Neither with EDEN_NX2_V2_PARALLEL (its shards replay method words).
+    /// them. EDEN_NX2_V2_PARALLEL's shards apply the classified entries too.
     [[nodiscard]] bool S1Exec() const {
         return s1_exec;
     }

@@ -2028,6 +2028,9 @@ void Maxwell3D::FrontMultiS1(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
     if (!V2::DrawModel::IsInstanceLoopMethod(method)) {
         V2::DrawOutput out;
         model.OnMultiStart(method, fs.regs.data(), out);
+        if (split.Parallel() != nullptr) [[unlikely]] {
+            FrontParallelDraw(split, fs, out, ~0U, true);
+        }
         FrontS1Draws(split, fs, out);
     }
     const auto effects = [this](RegSem::Effect effect, u32 a, u32 b) {
@@ -2989,6 +2992,9 @@ void Maxwell3D::FrontEmitMacroEnd(Core::System& system, VideoCommon::GpuSplit& s
         // S1: the deferred batch as Draw entries; the back has no sink or state machine.
         VideoCommon::V2::DrawOutput out;
         fs.v2_draw_model.OnMacroEnd(fs.regs.data(), out);
+        if (split.Parallel() != nullptr) [[unlikely]] {
+            FrontParallelDraw(split, fs, out, ~0U, true);
+        }
         FrontS1Draws(split, fs, out);
         return;
     }
