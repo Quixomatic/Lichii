@@ -867,6 +867,35 @@ private:
     u64 modification_tick = 0;
     u64 frame_tick = 0;
     u64 prepare_epoch = 1; ///< F2-09, see ResidencyStamp
+    /// F2-05/F2-06: moves when the set of images or their scale changes (registration,
+    /// deletion, rescale): what a render target lookup over unchanged registers finds.
+    u64 image_set_epoch = 1;
+    /// F2-06: the render target registers of the last full update, its epoch and frame.
+    struct RenderTargetInputs {
+        std::array<Tegra::Engines::Maxwell3D::Regs::RenderTargetConfig, NUM_RT> rt{};
+        Tegra::Engines::Maxwell3D::Regs::Zeta zeta{};
+        Tegra::Engines::Maxwell3D::Regs::SurfaceClip surface_clip{};
+        Tegra::Engines::Maxwell3D::Regs::RtControl rt_control{};
+        Tegra::Engines::Maxwell3D::Regs::ZetaSize zeta_size{};
+        u32 zeta_enable{};
+        Tegra::Texture::MsaaMode anti_alias_samples_mode{};
+        u64 image_set_epoch{};
+        u64 map_serial{};
+        const void* memory{};
+        const void* engine{};
+        u64 frame{};
+        bool valid{};
+    } rt_inputs;
+    void SaveRenderTargetInputs();
+    [[nodiscard]] bool RenderTargetInputsHold() const;
+    /// F2-05: the state a clean-register render target check that skipped every target saw.
+    struct RtCleanStamp {
+        u64 serial{};
+        u64 modification{};
+        u64 epoch{};
+        u64 frame{};
+        bool operator==(const RtCleanStamp&) const = default;
+    } rt_clean_stamp;
 
     Common::ThreadWorker texture_decode_worker{1, "TextureDecoder", {},
                                                Common::ThreadPlacement::Efficiency};

@@ -1320,6 +1320,49 @@ void TextureCache<P>::UpdateRenderTargetsImpl(bool is_clear) {
     }
 
     flags[Dirty::DepthBiasGlobal] = true;
+    if (commit != nullptr) [[unlikely]] {
+        SaveRenderTargetInputs();
+    }
+}
+
+template <class P>
+void TextureCache<P>::SaveRenderTargetInputs() {
+    const auto& regs = maxwell3d->regs;
+    rt_inputs.rt = regs.rt;
+    rt_inputs.zeta = regs.zeta;
+    rt_inputs.surface_clip = regs.surface_clip;
+    rt_inputs.rt_control = regs.rt_control;
+    rt_inputs.zeta_size = regs.zeta_size;
+    rt_inputs.zeta_enable = regs.zeta_enable;
+    rt_inputs.anti_alias_samples_mode = regs.anti_alias_samples_mode;
+    rt_inputs.image_set_epoch = image_set_epoch;
+    rt_inputs.map_serial = gpu_memory->MapSerial();
+    rt_inputs.memory = gpu_memory;
+    rt_inputs.engine = maxwell3d;
+    rt_inputs.frame = frame_tick;
+    // A lookup that deleted images may find others when repeated.
+    rt_inputs.valid = !has_deleted_images;
+}
+
+template <class P>
+bool TextureCache<P>::RenderTargetInputsHold() const {
+    // F2-06: the registers every lookup of the full update reads are the ones it last read, no
+    // image was registered, deleted or rescaled since, and it ran this frame (its scale ratings
+    // move per frame): it would bind the same views and compute the same targets.
+    if (!rt_inputs.valid || rt_inputs.image_set_epoch != image_set_epoch ||
+        rt_inputs.frame != frame_tick || rt_inputs.memory != gpu_memory ||
+        rt_inputs.engine != maxwell3d ||
+        rt_inputs.map_serial != gpu_memory->MapSerial()) {
+        return false;
+    }
+    const auto& regs = maxwell3d->regs;
+    const auto same = [](const auto& lhs, const auto& rhs) {
+        return std::memcmp(&lhs, &rhs, sizeof(lhs)) == 0;
+    };
+    return same(rt_inputs.rt_control, regs.rt_control) && same(rt_inputs.rt, regs.rt) &&
+           same(rt_inputs.zeta, regs.zeta) && same(rt_inputs.surface_clip, regs.surface_clip) &&
+           same(rt_inputs.zeta_size, regs.zeta_size) && rt_inputs.zeta_enable == regs.zeta_enable &&
+           same(rt_inputs.anti_alias_samples_mode, regs.anti_alias_samples_mode);
 }
 
 template <class P>
@@ -1472,6 +1515,7 @@ void TextureCache<P>::DownloadMemory(DAddr cpu_addr, size_t size) {
             return;
         }
         image.flags &= ~ImageFlagBits::GpuModified;
+        BumpPrepareEpoch(); // its next render target use marks it modified again
         images.push_back(image_id);
     });
     if (images.empty()) {
@@ -3111,6 +3155,7 @@ bool TextureCache<P>::ScaleUp(Image& image) {
         V2::Commit::NoteEffect(commit, V2::Commit::EffectRescale);
     }
     BumpPrepareEpoch();
+    ++image_set_epoch;
     InvalidateScale(image);
     return true;
 }
@@ -3126,6 +3171,7 @@ bool TextureCache<P>::ScaleDown(Image& image) {
         V2::Commit::NoteEffect(commit, V2::Commit::EffectRescale);
     }
     BumpPrepareEpoch();
+    ++image_set_epoch;
     InvalidateScale(image);
     return true;
 }
@@ -3985,6 +4031,7 @@ ImageViewId TextureCache<P>::FindOrEmplaceImageView(ImageId image_id, const Imag
 template <class P>
 void TextureCache<P>::RegisterImage(ImageId image_id) {
     BumpPrepareEpoch();
+    ++image_set_epoch;
     ImageBase& image = slot_images[image_id];
     ASSERT_MSG(False(image.flags & ImageFlagBits::Registered),
                "Trying to register an already registered image");
@@ -4055,6 +4102,7 @@ void TextureCache<P>::ReportMissingImagePage(ImageId image_id, const Image& imag
 template <class P>
 void TextureCache<P>::UnregisterImage(ImageId image_id) {
     BumpPrepareEpoch();
+    ++image_set_epoch;
     Image& image = slot_images[image_id];
     ASSERT_MSG(True(image.flags & ImageFlagBits::Registered),
                "Trying to unregister an already registered image");
@@ -4192,6 +4240,7 @@ void TextureCache<P>::UntrackImage(ImageBase& image, ImageId image_id) {
 template <class P>
 void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
     BumpPrepareEpoch();
+    ++image_set_epoch;
     ImageBase& image = slot_images[image_id];
     ++images_deleted;
     VideoCommon::V2::Stats::CountMutation(VideoCommon::V2::Stats::Mutation::ImageDelete);
@@ -5034,6 +5083,21 @@ template <class P>
 void TextureCache<P>::PushRenderTargetRequests(bool is_clear) {
     namespace C = V2::Commit;
     auto& flags = maxwell3d->dirty.flags;
+    if (flags[Dirty::RenderTargets] && !is_clear && !commit->verify && RenderTargetInputsHold()) {
+        // F2-06 (§5.3 changed targets only): the full update would bind the views it bound and
+        // compute the targets it computed; consume its dirty flags as it does and take the
+        // clean-register path (prepares of the bound targets only).
+        flags[Dirty::RenderTargets] = false;
+        flags[Dirty::RenderTargetControl] = false;
+        for (size_t index = 0; index < NUM_RT; ++index) {
+            flags[Dirty::ColorBuffer0 + index] = false;
+        }
+        flags[Dirty::ZetaBuffer] = false;
+        flags[Dirty::DepthBiasGlobal] = true;
+        if (commit->stats) {
+            C::Stats::Count(C::Stats::Get().rt_skipped);
+        }
+    }
     if (flags[Dirty::RenderTargets]) {
         C::Request request{};
         request.kind = C::Kind::RenderTargets;
@@ -5056,6 +5120,23 @@ void TextureCache<P>::PushRenderTargetRequests(bool is_clear) {
     }
     // Clean render target registers: the bound views stay (a deletion or rescale of one dirties
     // them), so only what drawing into them does is left to decide.
+    // F2-05: once per binding: a check that skipped every target holds while no image was
+    // modified or CPU-written since, in the same frame and with the same targets.
+    const RtCleanStamp clean_now{render_targets_serial, modification_tick, prepare_epoch,
+                                 frame_tick};
+    if (!is_clear && !commit->verify && rt_clean_stamp == clean_now) {
+        if (commit->stats) {
+            C::Stats::Count(recipe_render_targets ? C::Stats::Get().rt_skipped
+                                                  : C::Stats::Get().lookup_hits);
+        }
+        return;
+    }
+    const size_t requests_before = commit->list.Requests().size();
+    SCOPE_EXIT {
+        rt_clean_stamp = !is_clear && commit->list.Requests().size() == requests_before
+                             ? clean_now
+                             : RtCleanStamp{};
+    };
     v2_prepared.clear();
     const bool skip = !commit->verify;
     for (size_t index = 0; index <= NUM_RT; ++index) {
