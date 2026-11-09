@@ -55,13 +55,19 @@ enum class Kind : u8 {
     External,            ///< a write, invalidation or unmap another thread posted
     Writeback,           ///< deferred GPU data owed to guest memory
     Serial,              ///< the lookup needed the result at once (P6: a serial segment)
+    BufferGeometrySync,  ///< a vertex/index buffer bind's synchronization (SynchronizeGeometryBuffer)
+    BufferMarkWritten,   ///< a written binding's GPU-modified mark (MarkWrittenBuffer)
+    BufferTouch,         ///< a bound buffer's LRU touch
+    BufferUsage,         ///< a bound range's usage mark (decides later uploads' path)
+    HeapSlot,            ///< a bindless heap slot reserved by a lookup; commit writes it
     Count,
 };
 inline constexpr size_t NumKinds = static_cast<size_t>(Kind::Count);
 inline constexpr std::array<const char*, NumKinds> kind_names{
     "buffer create", "buffer upload", "view create", "view bind",  "image prepare",
     "sampler create", "sampler bind", "rt update",  "rt prepare", "rescale",
-    "external",      "writeback",    "serial",
+    "external",      "writeback",    "serial",      "geometry sync", "mark written",
+    "buffer touch",  "buffer usage", "heap slot",
 };
 
 /// What applying a request did (hooks inside the caches). The old in-lookup path notes the same

@@ -970,6 +970,12 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     if (commit_lock_free) [[unlikely]] {
         CommitPoint();
     }
+    SCOPE_EXIT {
+        // A configure that failed after the update pass left its bind scope open.
+        if (commit != nullptr && buffer_cache.HasDeferredBinds()) [[unlikely]] {
+            CommitBindsAfterDraw();
+        }
+    };
     bool submitted = false;
     SCOPE_EXIT {
         auto& native = maxwell3d->GetNativeMacroEngine();
@@ -2455,6 +2461,11 @@ void RasterizerVulkan::DispatchCompute() {
     if (commit_lock_free) [[unlikely]] {
         CommitPoint();
     }
+    SCOPE_EXIT {
+        if (commit != nullptr && buffer_cache.HasDeferredBinds()) [[unlikely]] {
+            CommitBindsAfterDraw();
+        }
+    };
     FlushWork();
     gpu_memory->FlushCaching();
     if (frame_dump.Capturing()) {
@@ -5316,6 +5327,15 @@ void RasterizerVulkan::PostOrRun(const VideoCommon::V2::Commit::ExternalOp& op, 
         gpu.WakeCacheOwner();
         std::this_thread::yield();
     }
+}
+
+void RasterizerVulkan::CommitBindsAfterDraw() {
+    if (commit_lock_free) {
+        buffer_cache.CommitBinds();
+        return;
+    }
+    std::scoped_lock lock{buffer_cache.mutex};
+    buffer_cache.CommitBinds();
 }
 
 void RasterizerVulkan::InvalidateRegionCaches(DAddr addr, u64 size, VideoCommon::CacheType which) {

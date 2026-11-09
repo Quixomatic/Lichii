@@ -748,3 +748,102 @@ TEST_CASE("Draw cache buffer replay binds unchanged cached uniforms without sync
     Access::MarkCpuModifiedSilently(*f.cache, 0x20000, 0x1000);
     REQUIRE(f.cache->CountStaleRecipeRanges(recipe, memo) == 1);
 }
+
+namespace {
+namespace Commit = VideoCommon::V2::Commit;
+
+struct CommitChannel {
+    Tegra::Control::ChannelState state{0};
+    std::optional<VideoCommon::BufferCacheChannelInfo> channel;
+    VideoCommon::UniformBufferSizes sizes{};
+
+    explicit CommitChannel(Fixture& f) {
+        state.memory_manager = &*f.memory;
+        state.payload.emplace(f.system, *f.memory, state);
+        channel.emplace(state);
+        channel->uniform_buffer_sizes = &sizes;
+        Access::UseChannel(*f.cache, *channel);
+    }
+};
+} // namespace
+
+TEST_CASE("Commit: a missing buffer is a proxy patched at the end of the update pass",
+          "[buffer_ports][v2_p5]") {
+    Fixture f;
+    CommitChannel c{f};
+    Commit::Context context;
+    f.cache->SetCommit(&context);
+    c.sizes[0][0] = 0x2000;
+    c.channel->enabled_uniform_buffer_masks[0] = 1;
+    c.channel->uniform_buffers[0][0] = {.device_addr = 0x20000, .size = 0x2000, .buffer_id = {}};
+    f.cache->UpdateGraphicsBuffers(false);
+    const auto counters = context.stage.TakeCounters();
+    REQUIRE(counters.requests[static_cast<size_t>(Commit::Kind::BufferCreate)] == 1);
+    REQUIRE(counters.proxies_patched == 1);
+    const VideoCommon::BufferId id = c.channel->uniform_buffers[0][0].buffer_id;
+    REQUIRE(id);
+    REQUIRE_FALSE(Commit::IsProxy(id.index));
+    REQUIRE(Access::Get(*f.cache, id).IsInBounds(0x20000, 0x2000));
+    REQUIRE(f.cache->LookupBuffer(0x20000, 0x2000) == id);
+    f.cache->CommitBinds();
+    f.cache->SetCommit(nullptr);
+}
+
+TEST_CASE("Commit: a proxy whose creation merges a bound buffer resolves both to the merge",
+          "[buffer_ports][v2_p5]") {
+    Fixture f;
+    CommitChannel c{f};
+    Commit::Context context;
+    const VideoCommon::BufferId old_id = Access::Add(*f.cache, 0x20000, 0x10000);
+    f.cache->SetCommit(&context);
+    c.sizes[0][0] = 0x2000;
+    c.sizes[0][1] = 0x1000;
+    c.channel->enabled_uniform_buffer_masks[0] = 0b11;
+    // Binding 0 crosses the existing buffer's end: a miss whose creation joins it. Binding 1
+    // hits the existing buffer, which the merge deletes.
+    c.channel->uniform_buffers[0][0] = {.device_addr = 0x2f000, .size = 0x2000, .buffer_id = {}};
+    c.channel->uniform_buffers[0][1] = {.device_addr = 0x20000, .size = 0x1000, .buffer_id = {}};
+    f.cache->UpdateGraphicsBuffers(false);
+    const VideoCommon::BufferId merged = c.channel->uniform_buffers[0][0].buffer_id;
+    REQUIRE(merged);
+    REQUIRE_FALSE(Commit::IsProxy(merged.index));
+    REQUIRE(c.channel->uniform_buffers[0][1].buffer_id == merged);
+    REQUIRE(Access::Get(*f.cache, merged).IsInBounds(0x20000, 0x11000));
+    REQUIRE(f.cache->LookupBuffer(0x20000, 0x1000) == merged);
+    REQUIRE(f.cache->LookupBuffer(0x2f000, 0x2000) == merged);
+    // The binding's offset comes from its address in the merged buffer.
+    REQUIRE(Access::Get(*f.cache, merged).Offset(0x2f000) == 0xf000);
+    static_cast<void>(old_id);
+    f.cache->CommitBinds();
+    f.cache->SetCommit(nullptr);
+}
+
+TEST_CASE("Commit: bind uploads are ordered requests applied before the draw",
+          "[buffer_ports][v2_p5]") {
+    Fixture f;
+    CommitChannel c{f};
+    Commit::Context context;
+    const VideoCommon::BufferId id = Access::Add(*f.cache, 0x20000, 0x10000);
+    f.cache->SetCommit(&context);
+    c.sizes[0][0] = 0x2000; // over the skip-cache size: the cached path syncs
+    c.channel->enabled_uniform_buffer_masks[0] = 1;
+    c.channel->uniform_buffers[0][0] = {.device_addr = 0x20000, .size = 0x2000, .buffer_id = id};
+    std::memset(f.bytes + 0x10000, 0x33, 0x2000);
+    f.cache->WriteMemory(0x20000, 0x2000);
+    f.cache->UpdateGraphicsBuffers(false);
+    REQUIRE(f.cache->HasDeferredBinds());
+    Access::BindStage(*f.cache);
+    // Bound (buffer + offset) at once; the upload waits for the commit.
+    REQUIRE(f.runtime.uniform_binds == 1);
+    REQUIRE(f.runtime.uploads == 0);
+    f.cache->CommitBinds();
+    REQUIRE_FALSE(f.cache->HasDeferredBinds());
+    REQUIRE(f.runtime.uploads == 1);
+    REQUIRE(Access::Get(*f.cache, id).bytes[0] == 0x33);
+    // Off the scope, a bind syncs at once again.
+    f.bytes[0x10000] = 0x44;
+    f.cache->WriteMemory(0x20000, 4);
+    Access::BindStage(*f.cache);
+    REQUIRE(f.runtime.uploads == 2);
+    f.cache->SetCommit(nullptr);
+}

@@ -203,6 +203,8 @@ private:
     /// The same for work nobody waits on: posted to the owner when the caller isn't it.
     template <typename Func>
     void PostOrRun(const VideoCommon::V2::Commit::ExternalOp& op, Func&& func);
+    /// Applies deferred buffer binds a failed configure left (with the lock unless lock free).
+    void CommitBindsAfterDraw();
     /// AccelerateDisplay's body, with the caches held.
     std::optional<FramebufferTextureInfo> AccelerateDisplayImpl(
         const Tegra::FramebufferConfig& config, DAddr framebuffer_addr, u32 pixel_stride);

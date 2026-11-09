@@ -1115,6 +1115,8 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
             }
         }
     }
+    // EDEN_NX2_V2_COMMIT: the deferred buffer mutations land before the draw is encoded.
+    buffer_cache.CommitBinds();
     if (buffer_cache.any_buffer_uploaded) {
         buffer_cache.runtime.PostCopyBarrier();
         buffer_cache.any_buffer_uploaded = false;
@@ -1205,6 +1207,8 @@ bool GraphicsPipeline::ConfigureDelta(bool is_indexed) {
     if (heap_pipeline) {
         AddHeapWords();
     }
+    // EDEN_NX2_V2_COMMIT: the deferred buffer mutations land before the draw is encoded.
+    buffer_cache.CommitBinds();
     if (buffer_cache.any_buffer_uploaded) {
         buffer_cache.runtime.PostCopyBarrier();
         buffer_cache.any_buffer_uploaded = false;
@@ -1389,6 +1393,8 @@ GraphicsPipeline::RecipeResult GraphicsPipeline::ConfigureRecipe(
     if (heap_pipeline) {
         AddHeapWords();
     }
+    // EDEN_NX2_V2_COMMIT: the deferred buffer mutations land before the draw is encoded.
+    buffer_cache.CommitBinds();
     if (buffer_cache.any_buffer_uploaded) {
         buffer_cache.runtime.PostCopyBarrier();
         buffer_cache.any_buffer_uploaded = false;

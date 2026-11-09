@@ -320,6 +320,14 @@ public:
 
     void UpdateGraphicsBuffers(bool is_indexed);
 
+    /// Pipeline v2 P5a (EDEN_NX2_V2_COMMIT=1): applies, in order, the bind mutations deferred
+    /// since the last buffer update (uploads, geometry syncs, written marks, LRU touches, usage
+    /// marks), before the draw or dispatch is encoded. No-op otherwise.
+    void CommitBinds();
+    [[nodiscard]] bool HasDeferredBinds() const noexcept {
+        return v2_defer;
+    }
+
     void UpdateComputeBuffers();
 
     void BindHostGeometryBuffers(bool is_indexed);
@@ -711,6 +719,7 @@ private:
     void TouchBuffer(Buffer& buffer, BufferId buffer_id) noexcept;
 
     bool SynchronizeBuffer(Buffer& buffer, DAddr device_addr, u32 size);
+    bool SynchronizeBufferImpl(Buffer& buffer, DAddr device_addr, u32 size);
 
     /// SynchronizeBuffer for vertex buffer slots 0-31 and the index buffer (slot 32).
     void SynchronizeGeometryBuffer(u32 slot, BufferId buffer_id, DAddr device_addr, u32 size);
@@ -933,6 +942,30 @@ private:
     /// P5a: page_table published for lock-free readers (written with it by the commit owner).
     V2::Commit::Context* commit = nullptr;
     std::unique_ptr<V2::VaMap<CACHING_PAGEBITS, 36>> v2_pages;
+    /// P5a buffer requests. Lookups of the update pass return proxy ids for missing buffers
+    /// (BufferCreate requests in v2_creates), created and patched into the bindings at its end.
+    /// Bind mutations after it are requests in v2_binds, applied by CommitBinds.
+    V2::Commit::RequestList v2_creates;
+    V2::Commit::RequestList v2_binds;
+    u64 v2_segment = 1;
+    bool v2_proxy_finds = false;
+    u64 v2_upload_count = 0; ///< uploads applied (verify)
+    bool v2_defer = false;
+
+    /// Whether COMMIT=1 (not verify) defers buffer mutations.
+    [[nodiscard]] bool V2Defers() const noexcept {
+        return commit != nullptr && !commit->verify;
+    }
+    void V2BeginBindScope();
+    void V2ApplyCreates();
+    void V2PatchBindings(u32 proxy, BufferId id);
+    /// Defers a bind mutation on `buffer` (by device address); false when it can't be (apply now).
+    bool V2DeferBind(V2::Commit::Kind kind, Buffer& buffer, DAddr device_addr, u64 size, u32 arg);
+    /// The buffer serving `device_addr` now (the request's own while it lives and covers it).
+    BufferId V2CurrentBuffer(BufferId id, DAddr device_addr, u64 size);
+    /// A GPU-modified test that also sees the written marks deferred in this bind scope.
+    [[nodiscard]] bool V2PendingGpuWrite(DAddr device_addr, u64 size) const;
+    void V2NoteUsage(Buffer& buffer, u32 offset, u64 size);
     Common::ScratchBuffer<u8> tmp_buffer;
     std::vector<u8> verify_scratch; ///< EDEN_NX2_V2_CBUFVER=verify
 

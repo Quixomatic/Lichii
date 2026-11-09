@@ -708,6 +708,8 @@ bool ComputePipeline::ConfigureImpl(Tegra::Engines::KeplerCompute& kepler_comput
     } else {
         buffer_cache.BindHostComputeBuffers();
     }
+    // EDEN_NX2_V2_COMMIT: the deferred buffer mutations land before the dispatch is encoded.
+    buffer_cache.CommitBinds();
     if (buffer_cache.any_buffer_uploaded) {
         buffer_cache.runtime.PostCopyBarrier();
         buffer_cache.any_buffer_uploaded = false;

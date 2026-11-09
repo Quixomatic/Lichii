@@ -1088,7 +1088,8 @@ void BufferCache<P>::RecordGraphicsBuffers(VideoCommon::V2::DrawCache::BufferRec
                 const bool use_fast_buffer =
                     needs_alignment_stream ||
                     (has_host_buffer && size <= channel_state->uniform_buffer_skip_cache_size &&
-                     !memory_tracker.IsRegionGpuModified(binding.device_addr, size));
+                     !(memory_tracker.IsRegionGpuModified(binding.device_addr, size) ||
+               (v2_defer && V2PendingGpuWrite(binding.device_addr, size))));
                 if ((index == 17 && maxwell3d->root_tables.loaded && binding.size == 0) ||
                     native_bank || !has_host_buffer) {
                     bind.kind = DC::BufferBind::Kind::Normal;
@@ -1147,6 +1148,12 @@ bool BufferCache<P>::ReplayGraphicsBuffers(const VideoCommon::V2::DrawCache::Buf
                                            VideoCommon::V2::Versions::EpochMemo& memo) {
     namespace DC = VideoCommon::V2::DrawCache;
     namespace Versions = VideoCommon::V2::Versions;
+    if (V2Defers()) [[unlikely]] {
+        // The replay's binds defer their mutations like an update pass's (its fallback lookups
+        // create at once: P6 treats a replay creation as serial).
+        CommitBinds();
+        V2BeginBindScope();
+    }
     if constexpr (!IS_OPENGL && !HAS_FULL_INDEX_AND_PRIMITIVE_SUPPORT &&
                   VideoCommon::StreamUniformReusable<Runtime>) {
         if (!recipe.valid || recipe.has_index != is_indexed || current_draw_indirect ||
@@ -1328,7 +1335,7 @@ bool BufferCache<P>::ReplayGraphicsBuffers(const VideoCommon::V2::DrawCache::Buf
                 SynchronizeGeometryBuffer(NUM_VERTEX_BUFFERS, channel_state->index_buffer.buffer_id,
                                           channel_state->index_buffer.device_addr, size);
             }
-            buffer.MarkUsage(offset, size);
+            V2NoteUsage(buffer, offset, size);
             runtime.BindIndexBuffer(draw_state.topology, draw_state.index_buffer.format,
                                     draw_state.index_buffer.first, draw_state.index_buffer.count,
                                     buffer, offset, size);
@@ -1370,7 +1377,7 @@ bool BufferCache<P>::ReplayGraphicsBuffers(const VideoCommon::V2::DrawCache::Buf
             flags[Dirty::VertexBuffer0 + index] = false;
             const u32 stride = maxwell3d->regs.vertex_streams[index].stride;
             const u32 offset = buffer.Offset(binding.device_addr);
-            buffer.MarkUsage(offset, binding.size);
+            V2NoteUsage(buffer, offset, binding.size);
             if (!bindings.buffers.empty() && index != last_index + 1) {
                 flush_bindings();
             }
@@ -1440,7 +1447,7 @@ void BufferCache<P>::ReplayHostStageBuffers(size_t stage,
                 Buffer& buffer = slot_buffers[binding.buffer_id];
                 TouchBuffer(buffer, binding.buffer_id);
                 const u32 offset = buffer.Offset(binding.device_addr);
-                buffer.MarkUsage(offset, size);
+                V2NoteUsage(buffer, offset, size);
                 runtime.BindUniformBuffer(buffer, offset, size);
                 channel_state->fast_bound_uniform_buffers[stage] &= ~(1u << index);
                 ++replay_binds_replayed;
@@ -1471,7 +1478,7 @@ void BufferCache<P>::ReplayHostStageBuffers(size_t stage,
                     SynchronizeBuffer(buffer, binding.device_addr, size);
                 }
                 const u32 offset = buffer.Offset(binding.device_addr);
-                buffer.MarkUsage(offset, size);
+                V2NoteUsage(buffer, offset, size);
                 if (is_written) {
                     MarkWrittenBuffer(binding.buffer_id, binding.device_addr, size);
                 }
@@ -1498,7 +1505,7 @@ void BufferCache<P>::ReplayHostStageBuffers(size_t stage,
                     MarkWrittenBuffer(binding.buffer_id, binding.device_addr, size);
                 }
                 const u32 offset = buffer.Offset(binding.device_addr);
-                buffer.MarkUsage(offset, size);
+                V2NoteUsage(buffer, offset, size);
                 if constexpr (SEPARATE_IMAGE_BUFFERS_BINDINGS) {
                     if (((channel_state->image_texture_buffers[stage] >> index) & 1) != 0) {
                         runtime.BindImageBuffer(buffer, offset, size, binding.format);
@@ -1995,7 +2002,9 @@ void BufferCache<P>::BindHostIndexBuffer() {
             if (!draw_state.inline_index_draw_indexes.empty()) {
                 indices = std::span{draw_state.inline_index_draw_indexes.data(), size};
             } else if (guest_size != 0 &&
-                       !IsRegionGpuModified(channel_state->index_buffer.device_addr, guest_size)) {
+                       !(IsRegionGpuModified(channel_state->index_buffer.device_addr, guest_size) ||
+                         (v2_defer && V2PendingGpuWrite(channel_state->index_buffer.device_addr,
+                                                        guest_size)))) {
                 guest_uint8_indices.resize(guest_size);
                 device_memory.ReadBlockUnsafe(channel_state->index_buffer.device_addr,
                                               guest_uint8_indices.data(), guest_size);
@@ -2024,7 +2033,7 @@ void BufferCache<P>::BindHostIndexBuffer() {
         const u32 new_offset = offset + draw_state.index_buffer.first * u32(draw_state.index_buffer.FormatSizeInBytes());
         runtime.BindIndexBuffer(buffer, new_offset, size);
     } else {
-        buffer.MarkUsage(offset, size);
+        V2NoteUsage(buffer, offset, size);
         runtime.BindIndexBuffer(draw_state.topology, draw_state.index_buffer.format, draw_state.index_buffer.first, draw_state.index_buffer.count, buffer, offset, size);
     }
 }
@@ -2134,7 +2143,7 @@ void BufferCache<P>::BindHostVertexBuffers() {
             flags[Dirty::VertexBuffer0 + index] = false;
             const u32 stride = maxwell3d->regs.vertex_streams[index].stride;
             const u32 offset = buffer.Offset(binding.device_addr);
-            buffer.MarkUsage(offset, binding.size);
+            V2NoteUsage(buffer, offset, binding.size);
             if (!bindings.buffers.empty() && index != last_index + 1) {
                 flush_bindings();
             }
@@ -2177,7 +2186,7 @@ void BufferCache<P>::BindHostVertexBuffers() {
 
                 const u32 stride = maxwell3d->regs.vertex_streams[index].stride;
                 const u32 offset = buffer.Offset(binding.device_addr);
-                buffer.MarkUsage(offset, binding.size);
+                V2NoteUsage(buffer, offset, binding.size);
 
                 host_bindings.buffers.push_back(&buffer);
                 host_bindings.offsets.push_back(offset);
@@ -2265,7 +2274,8 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
     if (has_host_buffer && (*channel_state->uniform_buffer_sizes)[stage][index] == 0x10000 &&
         size != 0 && gpu_memory != nullptr && gpu_memory->UsesNativeTiling() &&
         (Nx2Perf::Verify() || !native_indirect_uniforms_this_frame.contains(device_addr)) &&
-        !memory_tracker.IsRegionGpuModified(device_addr, size) &&
+        !(memory_tracker.IsRegionGpuModified(device_addr, size) ||
+          (v2_defer && V2PendingGpuWrite(device_addr, size))) &&
         native_indirect_uniforms_this_frame.insert(device_addr).second) {
         // The bank size is only an upper limit: stop at the end of the mapped memory.
         u64 mapped_size = 0;
@@ -2280,12 +2290,16 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
                 .dst_offset = buffer.Offset(device_addr),
                 .size = upload_size,
             }};
-            UploadMemory(buffer, upload_size, upload_size, copies);
+            if (!v2_defer || !V2DeferBind(V2::Commit::Kind::BufferUpload, buffer, device_addr,
+                                          upload_size, V2::Commit::ArgDirect)) {
+                UploadMemory(buffer, upload_size, upload_size, copies);
+            }
         }
     }
     const bool use_fast_buffer = needs_alignment_stream
         || (has_host_buffer && size <= channel_state->uniform_buffer_skip_cache_size
-            && !memory_tracker.IsRegionGpuModified(device_addr, size));
+            && !(memory_tracker.IsRegionGpuModified(device_addr, size) ||
+          (v2_defer && V2PendingGpuWrite(device_addr, size))));
     if (use_fast_buffer) {
         if constexpr (IS_OPENGL) {
             if (runtime.HasFastBufferSubData()) {
@@ -2353,7 +2367,7 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
     if constexpr (HAS_PERSISTENT_UNIFORM_BUFFER_BINDINGS) {
         channel_state->uniform_buffer_binding_sizes[stage][binding_index] = size;
     }
-    buffer.MarkUsage(offset, size);
+    V2NoteUsage(buffer, offset, size);
     if constexpr (NEEDS_BIND_UNIFORM_INDEX) {
         runtime.BindUniformBuffer(stage, binding_index, buffer, offset, size);
     } else {
@@ -2451,6 +2465,11 @@ void BufferCache<P>::RefreshMultiRangeSegments(std::vector<MultiRangeSegment>& p
 template <class P>
 void BufferCache<P>::ResolveMultiRangeStorage(Binding& binding, bool is_written,
                                               std::vector<MultiRangeSegment>& pool) {
+    // Segment lookups use their buffers at once: no proxies (P6: a serial segment).
+    const bool proxy_finds = std::exchange(v2_proxy_finds, false);
+    SCOPE_EXIT {
+        v2_proxy_finds = proxy_finds;
+    };
     binding.segment_first = 0;
     binding.segment_count = 0;
     if constexpr (requires { runtime.BindMultiRangeStorageBuffer(u64{}, bool{}); }) {
@@ -2511,7 +2530,7 @@ bool BufferCache<P>::BindMultiRangeStorage(const Binding& binding, bool is_writt
             TouchBuffer(buffer, segment.buffer_id);
             SynchronizeBuffer(buffer, segment.device_addr, segment.size);
             const u32 offset = buffer.Offset(segment.device_addr);
-            buffer.MarkUsage(offset, segment.size);
+            V2NoteUsage(buffer, offset, segment.size);
             if (is_written && write_mark_limit != 0) {
                 // write_mark_limit: the native write mark (BindComputeStorageBuffer), spread over
                 // the segments in order.
@@ -2544,7 +2563,7 @@ void BufferCache<P>::BindHostGraphicsStorageBuffers(size_t stage) {
         SynchronizeBuffer(buffer, binding.device_addr, size);
 
         const u32 offset = buffer.Offset(binding.device_addr);
-        buffer.MarkUsage(offset, size);
+        V2NoteUsage(buffer, offset, size);
 
         if (is_written) {
             MarkWrittenBuffer(binding.buffer_id, binding.device_addr, size);
@@ -2574,7 +2593,7 @@ void BufferCache<P>::BindHostGraphicsTextureBuffers(size_t stage) {
 
         const u32 offset = buffer.Offset(binding.device_addr);
         const PixelFormat format = binding.format;
-        buffer.MarkUsage(offset, size);
+        V2NoteUsage(buffer, offset, size);
         if constexpr (SEPARATE_IMAGE_BUFFERS_BINDINGS) {
             if (((channel_state->image_texture_buffers[stage] >> index) & 1) != 0) {
                 runtime.BindImageBuffer(buffer, offset, size, format);
@@ -2609,7 +2628,7 @@ void BufferCache<P>::BindHostTransformFeedbackBuffers() {
             SynchronizeBuffer(buffer, binding.device_addr, size);
             MarkWrittenBuffer(binding.buffer_id, binding.device_addr, size);
             offset = buffer.Offset(binding.device_addr);
-            buffer.MarkUsage(offset, size);
+            V2NoteUsage(buffer, offset, size);
             host_buffer = &buffer;
         }
 
@@ -2653,7 +2672,8 @@ void BufferCache<P>::BindHostComputeUniformBuffers() {
         const bool use_fast_buffer =
             needs_alignment_stream ||
             (has_host_buffer && size <= channel_state->uniform_buffer_skip_cache_size &&
-             !memory_tracker.IsRegionGpuModified(binding.device_addr, size));
+             !(memory_tracker.IsRegionGpuModified(binding.device_addr, size) ||
+               (v2_defer && V2PendingGpuWrite(binding.device_addr, size))));
         if constexpr (!IS_OPENGL) {
             if (use_fast_buffer) {
                 const std::span<u8> span =
@@ -2665,7 +2685,7 @@ void BufferCache<P>::BindHostComputeUniformBuffers() {
 
         SynchronizeBuffer(buffer, binding.device_addr, size);
 
-        buffer.MarkUsage(offset, size);
+        V2NoteUsage(buffer, offset, size);
         if constexpr (NEEDS_BIND_UNIFORM_INDEX) {
             runtime.BindComputeUniformBuffer(binding_index, buffer, offset, size);
             ++binding_index;
@@ -2699,7 +2719,7 @@ void BufferCache<P>::BindHostComputeStorageBuffers() {
         SynchronizeBuffer(buffer, binding.device_addr, size);
 
         const u32 offset = buffer.Offset(binding.device_addr);
-        buffer.MarkUsage(offset, size);
+        V2NoteUsage(buffer, offset, size);
 
         const u32 mark =
             is_written ? static_cast<u32>(std::min<u64>(size, write_mark_limit)) : 0;
@@ -2732,7 +2752,7 @@ void BufferCache<P>::BindHostComputeTextureBuffers() {
 
         const u32 offset = buffer.Offset(binding.device_addr);
         const PixelFormat format = binding.format;
-        buffer.MarkUsage(offset, size);
+        V2NoteUsage(buffer, offset, size);
         if constexpr (SEPARATE_IMAGE_BUFFERS_BINDINGS) {
             if (((channel_state->image_compute_texture_buffers >> index) & 1) != 0) {
                 runtime.BindImageBuffer(buffer, offset, size, format);
@@ -2748,7 +2768,15 @@ void BufferCache<P>::BindHostComputeTextureBuffers() {
 template <class P>
 void BufferCache<P>::DoUpdateGraphicsBuffers(bool is_indexed) {
     graphics_segments.clear();
+    const bool defers = V2Defers();
+    if (defers) [[unlikely]] {
+        CommitBinds(); // a previous scope a failed configure left open
+    }
     BufferOperations([&]() {
+        if (defers) [[unlikely]] {
+            v2_creates.Reset(v2_segment++);
+            v2_proxy_finds = true;
+        }
         if (is_indexed) {
             UpdateIndexBuffer();
         }
@@ -2762,19 +2790,236 @@ void BufferCache<P>::DoUpdateGraphicsBuffers(bool is_indexed) {
         if (current_draw_indirect) {
             UpdateDrawIndirect();
         }
+        if (defers) [[unlikely]] {
+            v2_proxy_finds = false;
+            V2ApplyCreates();
+        }
         RefreshMultiRangeSegments(graphics_segments);
     });
+    if (defers) [[unlikely]] {
+        V2BeginBindScope();
+    }
 }
 
 template <class P>
 void BufferCache<P>::DoUpdateComputeBuffers() {
     compute_segments.clear();
+    const bool defers = V2Defers();
+    if (defers) [[unlikely]] {
+        CommitBinds();
+    }
     BufferOperations([&]() {
+        if (defers) [[unlikely]] {
+            v2_creates.Reset(v2_segment++);
+            v2_proxy_finds = true;
+        }
         UpdateComputeUniformBuffers();
         UpdateComputeStorageBuffers();
         UpdateComputeTextureBuffers();
+        if (defers) [[unlikely]] {
+            v2_proxy_finds = false;
+            V2ApplyCreates();
+        }
         RefreshMultiRangeSegments(compute_segments);
     });
+    if (defers) [[unlikely]] {
+        V2BeginBindScope();
+    }
+}
+
+template <class P>
+void BufferCache<P>::V2BeginBindScope() {
+    v2_binds.Reset(v2_segment++);
+    v2_defer = true;
+}
+
+template <class P>
+void BufferCache<P>::V2PatchBindings(u32 proxy, BufferId id) {
+    const auto patch = [&](auto& binding) {
+        if (binding.buffer_id.index == proxy) {
+            binding.buffer_id = id;
+        }
+    };
+    patch(channel_state->index_buffer);
+    for (auto& binding : channel_state->vertex_buffers) {
+        patch(binding);
+    }
+    for (auto& binding : v_buffer) {
+        patch(binding);
+    }
+    for (auto& stage : channel_state->uniform_buffers) {
+        for (auto& binding : stage) {
+            patch(binding);
+        }
+    }
+    for (auto& stage : channel_state->storage_buffers) {
+        for (auto& binding : stage) {
+            patch(binding);
+        }
+    }
+    for (auto& stage : channel_state->texture_buffers) {
+        for (auto& binding : stage) {
+            patch(binding);
+        }
+    }
+    for (auto& binding : channel_state->transform_feedback_buffers) {
+        patch(binding);
+    }
+    patch(channel_state->count_buffer_binding);
+    patch(channel_state->indirect_buffer_binding);
+    for (auto& binding : channel_state->compute_uniform_buffers) {
+        patch(binding);
+    }
+    for (auto& binding : channel_state->compute_storage_buffers) {
+        patch(binding);
+    }
+    for (auto& binding : channel_state->compute_texture_buffers) {
+        patch(binding);
+    }
+}
+
+template <class P>
+void BufferCache<P>::V2ApplyCreates() {
+    if (v2_creates.Empty()) {
+        return;
+    }
+    const u64 start = commit->stats ? VideoCommon::Nx2Profile::Now() : 0;
+    // In request order, each patched before the next applies: a later creation that merges an
+    // earlier one's buffer then finds it bound and clears it (DeleteBuffer), and the update
+    // pass runs again, as the old in-lookup creations did.
+    commit->stage.Apply(v2_creates, [&](const V2::Commit::Request& request) {
+        const BufferId id = FindBuffer(request.address, static_cast<u32>(request.size),
+                                       request.arg != 0);
+        V2PatchBindings(request.proxy, id);
+        return id.index;
+    });
+    if (commit->stats) {
+        auto& stats = V2::Commit::Stats::Get();
+        const auto counters = commit->stage.TakeCounters();
+        for (size_t kind = 0; kind < V2::Commit::NumKinds; ++kind) {
+            V2::Commit::Stats::Count(stats.requests[kind], counters.requests[kind]);
+        }
+        V2::Commit::Stats::Count(stats.proxies_patched, counters.proxies_patched);
+        V2::Commit::Stats::Count(stats.commits);
+        V2::Commit::Stats::Count(stats.commit_ns, VideoCommon::Nx2Profile::Now() - start);
+    }
+}
+
+template <class P>
+BufferId BufferCache<P>::V2CurrentBuffer(BufferId id, DAddr device_addr, u64 size) {
+    if (id && slot_buffers.contains(id) &&
+        slot_buffers[id].IsInBounds(device_addr, (std::max<u64>)(size, 1))) {
+        return id;
+    }
+    // Merged or recreated since the request (a replay's fallback lookup): the buffer that serves
+    // the address now.
+    const u64 page = device_addr >> CACHING_PAGEBITS;
+    return page < page_table.size() ? page_table[page] : NULL_BUFFER_ID;
+}
+
+template <class P>
+bool BufferCache<P>::V2DeferBind(V2::Commit::Kind kind, Buffer& buffer, DAddr device_addr,
+                                 u64 size, u32 arg) {
+    const u64 page = buffer.CpuAddr() >> CACHING_PAGEBITS;
+    if (page >= page_table.size()) {
+        return false;
+    }
+    const BufferId id = page_table[page];
+    if (!id || &slot_buffers[id] != &buffer) {
+        return false; // not a registered buffer (the null buffer): apply now
+    }
+    V2::Commit::Request request{};
+    request.kind = kind;
+    request.resource = V2::Commit::Resource::Buffer;
+    request.slot = id.index;
+    request.address = device_addr;
+    request.size = size;
+    request.arg = arg;
+    v2_binds.Push(request);
+    return true;
+}
+
+template <class P>
+bool BufferCache<P>::V2PendingGpuWrite(DAddr device_addr, u64 size) const {
+    for (const V2::Commit::Request& request : v2_binds.Requests()) {
+        if (request.kind == V2::Commit::Kind::BufferMarkWritten &&
+            request.address < device_addr + size && device_addr < request.address + request.size) {
+            return true;
+        }
+    }
+    return false;
+}
+
+template <class P>
+void BufferCache<P>::V2NoteUsage(Buffer& buffer, u32 offset, u64 size) {
+    if (v2_defer &&
+        V2DeferBind(V2::Commit::Kind::BufferUsage, buffer, buffer.CpuAddr() + offset, size, 0))
+        [[unlikely]] {
+        return;
+    }
+    buffer.MarkUsage(offset, size);
+}
+
+template <class P>
+void BufferCache<P>::CommitBinds() {
+    if (!v2_defer) {
+        return;
+    }
+    v2_defer = false;
+    if (v2_binds.Empty()) {
+        return;
+    }
+    namespace C = V2::Commit;
+    const u64 start = commit->stats ? VideoCommon::Nx2Profile::Now() : 0;
+    commit->stage.Apply(v2_binds, [&](const C::Request& request) {
+        const BufferId id =
+            V2CurrentBuffer(BufferId{request.slot}, request.address, request.size);
+        if (!id) {
+            return C::InvalidSlot;
+        }
+        Buffer& buffer = slot_buffers[id];
+        switch (request.kind) {
+        case C::Kind::BufferUpload:
+            if ((request.arg & C::ArgDirect) != 0) {
+                // The native bank's direct upload (no tracker check), as recorded.
+                std::array<BufferCopy, 1> copies{BufferCopy{
+                    .src_offset = 0,
+                    .dst_offset = buffer.Offset(request.address),
+                    .size = request.size,
+                }};
+                UploadMemory(buffer, request.size, request.size, copies);
+            } else {
+                SynchronizeBuffer(buffer, request.address, static_cast<u32>(request.size));
+            }
+            break;
+        case C::Kind::BufferGeometrySync:
+            SynchronizeGeometryBuffer(request.arg, id, request.address,
+                                      static_cast<u32>(request.size));
+            break;
+        case C::Kind::BufferMarkWritten:
+            MarkWrittenBuffer(id, request.address, static_cast<u32>(request.size),
+                              request.arg != 0);
+            break;
+        case C::Kind::BufferTouch:
+            TouchBuffer(buffer, id);
+            break;
+        case C::Kind::BufferUsage:
+            buffer.MarkUsage(buffer.Offset(request.address), request.size);
+            break;
+        default:
+            break;
+        }
+        return id.index;
+    });
+    if (commit->stats) {
+        auto& stats = C::Stats::Get();
+        const auto counters = commit->stage.TakeCounters();
+        for (size_t kind = 0; kind < C::NumKinds; ++kind) {
+            C::Stats::Count(stats.requests[kind], counters.requests[kind]);
+        }
+        C::Stats::Count(stats.commits);
+        C::Stats::Count(stats.commit_ns, VideoCommon::Nx2Profile::Now() - start);
+    }
 }
 
 template <class P>
@@ -3008,6 +3253,19 @@ void BufferCache<P>::UpdateComputeTextureBuffers() {
 
 template <class P>
 void BufferCache<P>::MarkWrittenBuffer(BufferId buffer_id, DAddr device_addr, u32 size, bool needs_sync) {
+    if (v2_defer && buffer_id) [[unlikely]] {
+        // Ordered after the binding's upload request, as the old order was (a sync skips the
+        // GPU-written ranges); bind-time reads see it through V2PendingGpuWrite.
+        V2::Commit::Request request{};
+        request.kind = V2::Commit::Kind::BufferMarkWritten;
+        request.resource = V2::Commit::Resource::Buffer;
+        request.slot = buffer_id.index;
+        request.address = device_addr;
+        request.size = size;
+        request.arg = needs_sync ? 1U : 0U;
+        v2_binds.Push(request);
+        return;
+    }
     if constexpr (!IS_OPENGL) {
         if (needs_sync) {
             Buffer& buffer = slot_buffers[buffer_id];
@@ -3298,10 +3556,55 @@ BufferId BufferCache<P>::FindBuffer(DAddr device_addr, u32 size, bool sparse_com
         auto& stats = V2::Commit::Stats::Get();
         if (commit->stats) {
             V2::Commit::Stats::Count(usable ? stats.lookup_hits : stats.lookup_misses);
-            if (!usable) {
-                V2::Commit::Stats::Count(
-                    stats.requests[static_cast<size_t>(V2::Commit::Kind::BufferCreate)]);
+        }
+        if (!usable && v2_proxy_finds) {
+            // A BufferCreate request with a proxy: the binding holds the proxy and its device
+            // address; the end of the update pass creates (joining whatever overlaps: a merge
+            // resolves the proxy to the merged buffer, the offset comes from the address) and
+            // patches it.
+            V2::Commit::Request request{};
+            request.kind = V2::Commit::Kind::BufferCreate;
+            request.resource = V2::Commit::Resource::Buffer;
+            request.address = device_addr;
+            request.size = size;
+            request.arg = sparse_compatible ? 1U : 0U;
+            const u64 begin = Common::AlignDown(device_addr, CACHING_PAGESIZE);
+            const u64 end = Common::AlignUp(device_addr + (std::max)(size, 1U), CACHING_PAGESIZE);
+            bool merges = false;
+            for (u64 at = begin; at < end && !merges; at += CACHING_PAGESIZE) {
+                merges = v2_pages->Load(at) != 0;
             }
+            request.effects = V2::Commit::EffectCreate | (merges ? V2::Commit::EffectDelete : 0);
+            return BufferId{v2_creates.Push(request, true)};
+        }
+        if (!usable && commit->stats) {
+            V2::Commit::Stats::Count(
+                stats.requests[static_cast<size_t>(V2::Commit::Kind::BufferCreate)]);
+        }
+        if (commit->verify && !usable) {
+            // A miss predicts a creation, and a merge when any page of the range has a buffer.
+            const u64 begin = Common::AlignDown(device_addr, CACHING_PAGESIZE);
+            const u64 end = Common::AlignUp(device_addr + (std::max)(size, 1U), CACHING_PAGESIZE);
+            bool merges = false;
+            for (u64 at = begin; at < end && !merges; at += CACHING_PAGESIZE) {
+                merges = v2_pages->Load(at) != 0;
+            }
+            const u64 deletions_before = buffer_deletions;
+            const BufferId created = CreateBuffer(device_addr, size, sparse_compatible);
+            const bool merged = buffer_deletions != deletions_before;
+            V2::Commit::Stats::Count(stats.verify_draws);
+            if (merged != merges || !created) {
+                V2::Commit::Stats::Count(stats.verify_mismatches);
+                static std::atomic<u32> logged{};
+                if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+                    LOG_WARNING(HW_GPU,
+                                "V2 commit verify: buffer create at {:#x}+{:#x}: predicted {}, "
+                                "the old path {}",
+                                device_addr, size, merges ? "a merge" : "a new buffer",
+                                merged ? "merged" : "made a new buffer");
+                }
+            }
+            return created;
         }
         if (commit->verify) {
             // The published map must agree with the page table, and predict the old path.
@@ -3556,6 +3859,16 @@ BufferId BufferCache<P>::LookupBuffer(DAddr device_addr, u32 size) const {
 template <class P>
 void BufferCache<P>::TouchBuffer(Buffer& buffer, BufferId buffer_id) noexcept {
     if (buffer_id != NULL_BUFFER_ID) {
+        if (v2_defer) [[unlikely]] {
+            V2::Commit::Request request{};
+            request.kind = V2::Commit::Kind::BufferTouch;
+            request.resource = V2::Commit::Resource::Buffer;
+            request.slot = buffer_id.index;
+            request.address = buffer.CpuAddr();
+            request.size = 1;
+            v2_binds.Push(request);
+            return;
+        }
         lru_cache.Touch(buffer.getLRUID(), frame_tick);
         if (commit != nullptr) [[unlikely]] {
             buffer.v2_track_id = (std::max)(buffer.v2_track_id, commit->submission);
@@ -3565,6 +3878,39 @@ void BufferCache<P>::TouchBuffer(Buffer& buffer, BufferId buffer_id) noexcept {
 
 template <class P>
 bool BufferCache<P>::SynchronizeBuffer(Buffer& buffer, DAddr device_addr, u32 size) {
+    if (v2_defer &&
+        V2DeferBind(V2::Commit::Kind::BufferUpload, buffer, device_addr, size, 0)) [[unlikely]] {
+        // EDEN_NX2_V2_COMMIT: an ordered upload request; the bind only needs the buffer and its
+        // offset. The result only feeds a stat.
+        return false;
+    }
+    if (commit != nullptr && commit->verify) [[unlikely]] {
+        // COMMIT=verify: an upload request is predicted from the CPU-modified state; an upload
+        // the prediction missed is a mismatch (one it predicted but GPU-written ranges covered
+        // is dependent on them).
+        const bool predicted = memory_tracker.IsRegionCpuModified(device_addr, size);
+        const u64 before = v2_upload_count;
+        const bool result = SynchronizeBufferImpl(buffer, device_addr, size);
+        const bool uploaded = v2_upload_count != before;
+        auto& stats = V2::Commit::Stats::Get();
+        V2::Commit::Stats::Count(stats.verify_draws);
+        if (uploaded && !predicted) {
+            V2::Commit::Stats::Count(stats.verify_mismatches);
+            static std::atomic<u32> logged{};
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+                LOG_WARNING(HW_GPU, "V2 commit verify: buffer upload at {:#x}+{:#x} not predicted",
+                            device_addr, size);
+            }
+        } else if (predicted && !uploaded) {
+            V2::Commit::Stats::Count(stats.verify_dependent);
+        }
+        return result;
+    }
+    return SynchronizeBufferImpl(buffer, device_addr, size);
+}
+
+template <class P>
+bool BufferCache<P>::SynchronizeBufferImpl(Buffer& buffer, DAddr device_addr, u32 size) {
     // An upload over a clean word of the tracker (word_manager.h) finds and changes nothing:
     // walk only the dirty ones. Verify walks every word and checks the clean words.
     const bool skip_clean = !Nx2Perf::Verify();
@@ -3651,6 +3997,17 @@ bool BufferCache<P>::SynchronizeBuffer(Buffer& buffer, DAddr device_addr, u32 si
 template <class P>
 void BufferCache<P>::SynchronizeGeometryBuffer(u32 slot, BufferId buffer_id, DAddr device_addr,
                                                u32 size) {
+    if (v2_defer && buffer_id) [[unlikely]] {
+        V2::Commit::Request request{};
+        request.kind = V2::Commit::Kind::BufferGeometrySync;
+        request.resource = V2::Commit::Resource::Buffer;
+        request.slot = buffer_id.index;
+        request.address = device_addr;
+        request.size = size;
+        request.arg = slot;
+        v2_binds.Push(request);
+        return;
+    }
     Buffer& buffer = slot_buffers[buffer_id];
     // The deletion count keeps a freed and reused buffer id from passing for the scanned one.
     GeometrySync& sync = geometry_syncs[slot];
@@ -3680,8 +4037,8 @@ void BufferCache<P>::UploadMemory(Buffer& buffer, u64 total_size_bytes, u64 larg
     VideoCommon::V2::Stats::CountMutation(VideoCommon::V2::Stats::Mutation::BufferUpload,
                                           total_size_bytes);
     if (commit != nullptr) [[unlikely]] {
-        // A BufferUpload request (committed on demand: SynchronizeBuffer's result and the
-        // tracker state it leaves decide the rest of the bind).
+        // A BufferUpload request applied (deferred to CommitBinds with COMMIT=1).
+        ++v2_upload_count;
         V2::Commit::NoteEffect(commit, V2::Commit::EffectUpload);
         if (commit->stats) {
             auto& stats = V2::Commit::Stats::Get();
