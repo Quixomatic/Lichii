@@ -101,7 +101,7 @@ void ReportStats(const char* thread_name, u64 window_ns) {
         const u64 busy = Take(stats.shard_busy_ns[shard]);
         const u64 count = Take(stats.shard_segments[shard]);
         busy_total += busy;
-        shard_line += fmt::format("{}{}: {:.0f}% {:.0f}/s", shard_line.empty() ? "" : ", ", shard,
+        shard_line += fmt::format("{}{}: {:.1f}% {:.0f}/s", shard_line.empty() ? "" : ", ", shard,
                                   100.0 * static_cast<double>(busy) / static_cast<double>(window_ns),
                                   static_cast<double>(count) / seconds);
     }
@@ -131,7 +131,7 @@ void ReportStats(const char* thread_name, u64 window_ns) {
     LOG_INFO(
         HW_GPU,
         "V2 stats {} P6 parallel resolve | segments {:.0f}/s ({:.1f} draws each), by shards "
-        "{:.1f}%, serial {:.1f}% ({}) | cuts: {} | size {} | shards {} ({:.0f}% busy overall): {} | "
+        "{:.1f}%, serial {:.1f}% ({}) | cuts: {} | size {} | shards {} ({:.1f}% busy overall): {} | "
         "commit {:.2f} ms/s, merge wait {:.2f} ms/s ({} waits), serial resolve on commit {:.2f} "
         "ms/s | refused {} | snapshot blocks copied {:.0f}/s, shared {:.1f}% | pre-resolved draws "
         "{:.0f}/s, unmatched {:.0f}/s, drift {}, no shape {:.0f}/s | verify: {} segments, {} "
