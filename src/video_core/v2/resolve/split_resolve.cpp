@@ -131,7 +131,9 @@ constexpr u64 MethodHasSegment = 1 << 5;
 
 void LoadMirror(RegSem::Mirror3D& mirror, const FrontSnapshot& snapshot) {
     snapshot.regs.CopyTo(mirror.regs.data());
-    snapshot.shadow.CopyTo(mirror.shadow.data());
+    if (snapshot.shadow.Valid()) {
+        snapshot.shadow.CopyTo(mirror.shadow.data()); // none with S1 (plain deltas)
+    }
     mirror.control = static_cast<RegSem::ShadowRamControl>(snapshot.control);
     mirror.instance_loop = snapshot.instance_loop;
     mirror.sink_pending = snapshot.sink_pending;
@@ -455,8 +457,15 @@ void SplitResolve::FrontDraw(const FrontView& view, const EngineInfo& engine,
         auto snapshot = std::make_shared<FrontSnapshot>();
         const u64 copied_before = regs_builder.copied + shadow_builder.copied;
         const u64 shared_before = regs_builder.shared + shadow_builder.shared;
-        snapshot->regs = regs_builder.Take(view.regs);
-        snapshot->shadow = shadow_builder.Take(view.shadow);
+        if (view.dirty_blocks != nullptr) {
+            snapshot->regs = regs_builder.Take(view.regs, *view.dirty_blocks);
+            *view.dirty_blocks = 0;
+        } else {
+            snapshot->regs = regs_builder.Take(view.regs);
+        }
+        if (!view.deltas) {
+            snapshot->shadow = shadow_builder.Take(view.shadow);
+        }
         if (stats) {
             Count(GetStats().snapshot_blocks_copied,
                   regs_builder.copied + shadow_builder.copied - copied_before);

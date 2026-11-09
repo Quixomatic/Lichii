@@ -113,6 +113,9 @@ REGSEM_FORCE_INLINE void Store3D(State& s, const Table3D& table, u32 index, u32 
     const u32 old_value = s.regs[index];
     if (old_value != value) {
         s.regs[index] = value;
+        if constexpr (requires { s.v2_dirty_blocks; }) {
+            s.v2_dirty_blocks |= u64{1} << (index >> 6); // P6 snapshots: blocks of 64
+        }
         if constexpr (requires { s.v2_hash_log; }) {
             s.v2_hash_log.Change(s.v2_groups, table, index, old_value, s.regs.data());
         } else {

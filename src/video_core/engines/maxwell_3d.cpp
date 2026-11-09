@@ -1673,6 +1673,8 @@ struct Maxwell3D::FrontState {
     /// kept only with EDEN_NX2_V2_PARALLEL (v2_cbufs_wanted).
     VideoCommon::V2::Resolve::CbufTable v2_cbufs;
     bool v2_cbufs_wanted{};
+    /// Register blocks of 64 changed since the last P6 snapshot (all after a copy or resync).
+    u64 v2_dirty_blocks{~u64{0}};
     std::unique_ptr<VideoCommon::V2::RegSem::Front3D> v2;
     /// EDEN_NX2_V2_REGSEM=1 (v2 non-null and On): FrontWrite's table-driven fast path.
     bool v2_on{};
@@ -2225,6 +2227,7 @@ void Maxwell3D::FrontMultiRegSem(FrontState& fs, u32 method, const u32* base_sta
 void Maxwell3D::FrontRegSemResync(FrontState& fs) {
     // The front's registers were set without the write path (copied, or resynchronized with
     // the back by EDEN_NX2_SPLIT_VERIFY).
+    fs.v2_dirty_blocks = ~u64{0};
     for (size_t stage = 0; stage < VideoCommon::V2::Resolve::CbufStages; ++stage) {
         for (size_t slot = 0; slot < VideoCommon::V2::Resolve::CbufSlots; ++slot) {
             const auto& cbuf = state.shader_stages[stage].const_buffers[slot];
@@ -2867,6 +2870,8 @@ void Maxwell3D::FrontParallelDraw(VideoCommon::GpuSplit& split, FrontState& fs,
         .instance_loop = fs.instance_loop,
         .sink_pending = fs.sink_pending,
         .draw_pending = fs.draw_pending,
+        .dirty_blocks = &fs.v2_dirty_blocks,
+        .deltas = fs.s1_exec,
     };
     const Resolve::SplitResolve::EngineInfo engine{
         .ref = split.Ref(this),

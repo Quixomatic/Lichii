@@ -86,12 +86,20 @@ public:
     using Snapshot = RegisterSnapshot<NumWords, BlockWords>;
     using Block = typename Snapshot::Block;
 
-    Snapshot Take(const u32* words) {
+    /// `dirty`: bit b set when block b may have changed since the previous Take (the writer's
+    /// dirty-block mask, AP6 T0); clean blocks are shared without a compare.
+    Snapshot Take(const u32* words, u64 dirty = ~u64{0}) {
+        static_assert(Snapshot::NumBlocks <= 64);
         Snapshot result;
         for (size_t block = 0; block < Snapshot::NumBlocks; ++block) {
             const size_t begin = block * BlockWords;
             const size_t count = (std::min)(BlockWords, NumWords - begin);
             const auto& previous = last.blocks[block];
+            if (previous != nullptr && (dirty & (u64{1} << block)) == 0) {
+                result.blocks[block] = previous;
+                ++shared;
+                continue;
+            }
             if (previous != nullptr &&
                 std::memcmp(previous->words.data(), words + begin, count * sizeof(u32)) == 0) {
                 result.blocks[block] = previous;

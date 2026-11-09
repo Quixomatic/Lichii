@@ -180,6 +180,10 @@ public:
         bool instance_loop;
         bool sink_pending;
         bool draw_pending;
+        /// The writer's dirty-block mask (null: compare every block); cleared by the snapshot.
+        u64* dirty_blocks = nullptr;
+        /// S1: the shards apply plain deltas and read no shadow RAM (none is snapshotted).
+        bool deltas = false;
     };
     /// The engine a draw belongs to.
     struct EngineInfo {
