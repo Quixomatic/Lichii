@@ -502,7 +502,26 @@ TEST_CASE("V2 write ranges: uploads and shader write summaries", "[video_core][v
         info.stores_global_memory = true;
         ShaderWrites::Record(address, info);
         CHECK(ShaderWrites::Lookup(address)->unbounded);
+        // Ranges that miss the key keep it: other pages, the same page around it, empty ranges.
+        ShaderWrites::Invalidate(address + 0x1000, address + 0x3000);
+        ShaderWrites::Invalidate(address - 0x2000, address);
+        ShaderWrites::Invalidate(address + 0x10, address + 0x800);
+        ShaderWrites::Invalidate(address, address);
+        CHECK(ShaderWrites::Lookup(address));
+        // A second program on a far page: an invalidation between the two keeps both.
+        constexpr u64 far = 0x9'7777'0000;
+        ShaderWrites::Record(far, info);
+        ShaderWrites::Invalidate(address + 0x1000, far);
+        CHECK(ShaderWrites::Lookup(address));
+        CHECK(ShaderWrites::Lookup(far));
+        ShaderWrites::Invalidate(far - 0x10, far + 1);
+        CHECK(!ShaderWrites::Lookup(far));
         ShaderWrites::Invalidate(address, address + 0x100);
+        CHECK(!ShaderWrites::Lookup(address));
+        // Recorded again after an invalidation: found and invalidated again.
+        ShaderWrites::Record(address, info);
+        CHECK(ShaderWrites::Lookup(address));
+        ShaderWrites::Invalidate(address & ~u64{0xfff}, (address & ~u64{0xfff}) + 0x1000);
         CHECK(!ShaderWrites::Lookup(address));
     }
 }

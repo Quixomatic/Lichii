@@ -5,6 +5,7 @@
 #include <atomic>
 
 #include "shader_recompiler/shader_info.h"
+#include "video_core/page_filter.h"
 #include "video_core/v2/shader_writes.h"
 #include "video_core/v2/v2_switches.h"
 
@@ -24,6 +25,17 @@ struct Slot {
 };
 
 std::array<Slot, NumSlots> g_slots;
+
+// The pages and the address range of every key ever recorded (never shrink). Invalidations run
+// for every inline upload and pre-draw invalidation; almost none reach a program's page, so they
+// return here instead of walking every slot.
+std::atomic<u64> g_lowest{~u64{0}};
+std::atomic<u64> g_highest{0};
+
+PageFilter& RecordedPages() {
+    static PageFilter filter;
+    return filter;
+}
 
 size_t SlotOf(u64 device_address) {
     u64 value = (device_address >> 4) * 0x9e3779b97f4a7c15ULL;
@@ -84,6 +96,16 @@ void Record(u64 device_address, const Shader::Info& info) {
             }
         }
     }
+    if (slot.key.load(std::memory_order_relaxed) != device_address) {
+        // Published before the key, so an invalidation that sees the key also sees these.
+        RecordedPages().Mark(device_address, 1);
+        if (device_address < g_lowest.load(std::memory_order_relaxed)) {
+            g_lowest.store(device_address, std::memory_order_relaxed);
+        }
+        if (device_address > g_highest.load(std::memory_order_relaxed)) {
+            g_highest.store(device_address, std::memory_order_relaxed);
+        }
+    }
     const u32 sequence = slot.sequence.load(std::memory_order_relaxed);
     slot.sequence.store(sequence + 1, std::memory_order_relaxed);
     std::atomic_thread_fence(std::memory_order_release);
@@ -123,6 +145,11 @@ std::optional<Summary> Lookup(u64 device_address) {
 }
 
 void Invalidate(u64 begin, u64 end) {
+    if (begin >= end || end <= g_lowest.load(std::memory_order_relaxed) ||
+        begin > g_highest.load(std::memory_order_relaxed) ||
+        !RecordedPages().Any(begin, end - begin)) {
+        return;
+    }
     for (Slot& slot : g_slots) {
         const u64 key = slot.key.load(std::memory_order_relaxed);
         if (key >= begin && key < end) {
