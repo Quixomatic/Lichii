@@ -180,7 +180,7 @@ ViewCheck CheckWithView(DmaPusher& dma_pusher, GPUVAddr address, u32 value, V2::
     const u32 memory_word = memory.Read<u32>(address);
     const V2::AcquireDecision decision =
         V2::DecideAcquire(op, value, word, forwarded, memory_word,
-                          split.PendingUnboundedWrite(V2::Producer::Dispatch));
+                          split.PendingUnboundedWrite(V2::Producer::QmdRelease));
     switch (decision.verdict) {
     case V2::AcquireVerdict::Met:
     case V2::AcquireVerdict::MetByQueued:

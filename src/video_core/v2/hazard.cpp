@@ -28,6 +28,12 @@ void HazardTable::Clear() {
         slots->fill(Link{});
     }
     wide.fill(0);
+    wide_entries.fill(Link{});
+    wide_head = 0;
+    wide_count = 0;
+    target_sets.fill(TargetSet{});
+    target_current = 0;
+    targets_overflow = 0;
     unbounded.fill(0);
     unbounded_synced.fill(0);
     overflow_position = 0;
@@ -98,7 +104,19 @@ void HazardTable::Insert(Entry& entry, u32 index) {
     if (first != last) {
         entry.chained = false;
         entry.previous = {};
-        wide[static_cast<size_t>(entry.producer)] = entry.position;
+        if (wide_count == MaxWide) {
+            // The oldest wide write leaves the list: lookups for its producer scan everything
+            // while it may still be queued.
+            const Link& oldest = wide_entries[wide_head];
+            if (entries[oldest.index].position == oldest.position) {
+                const size_t p = static_cast<size_t>(entries[oldest.index].producer);
+                wide[p] = std::max(wide[p], oldest.position);
+            }
+            wide_head = (wide_head + 1) % MaxWide;
+            --wide_count;
+        }
+        wide_entries[(wide_head + wide_count) % MaxWide] = {index, entry.position};
+        ++wide_count;
         return;
     }
     Link& slot = (*slots)[Slot(first)];
@@ -160,6 +178,26 @@ void HazardTable::NoteUnbounded(Producer producer, u64 position) {
 void HazardTable::NoteSync(u64 position) {
     (void)position;
     unbounded_synced = unbounded;
+    for (TargetSet& set : target_sets) {
+        set.synced = set.position;
+    }
+}
+
+void HazardTable::NoteDrawTargets(std::span<const std::pair<u64, u64>> ranges, u64 position) {
+    const size_t num = std::min(ranges.size(), MaxTargets);
+    TargetSet& current = target_sets[target_current];
+    if (current.count == num &&
+        std::equal(ranges.begin(), ranges.begin() + num, current.ranges.begin())) {
+        current.position = position;
+        return;
+    }
+    target_current = (target_current + 1) % TargetSets;
+    TargetSet& next = target_sets[target_current];
+    targets_overflow = std::max(targets_overflow, next.synced);
+    next.count = static_cast<u32>(num);
+    std::copy(ranges.begin(), ranges.begin() + num, next.ranges.begin());
+    next.position = position;
+    next.synced = 0;
 }
 
 void HazardTable::Retire(u64 consumed) {
@@ -265,6 +303,20 @@ HazardResult HazardTable::Find(u64 address, u64 size, u64 consumed, const Hazard
             Linear(address, end, consumed, filter.ranged, result, wait, found, num_found,
                    covered);
         } else {
+            for (size_t i = 0; i < wide_count; ++i) {
+                const Link link = wide_entries[(wide_head + i) % MaxWide];
+                if (!Live(link, consumed)) {
+                    continue;
+                }
+                const Entry& entry = entries[link.index];
+                const u32 bit = ProducerBit(entry.producer);
+                if ((filter.ranged & bit) == 0 || entry.end <= address || entry.begin >= end) {
+                    continue;
+                }
+                // Wide writes are not forwarded (their order against the chains' is unknown).
+                result.producers |= bit;
+                wait = std::max(wait, entry.position);
+            }
             for (u64 page = first_page; page <= last_page; ++page) {
                 // The read's bytes on this page: once newer known stores cover them, older
                 // entries on the page don't matter.
@@ -300,6 +352,24 @@ HazardResult HazardTable::Find(u64 address, u64 size, u64 consumed, const Hazard
                         }
                     }
                     link = entry.previous;
+                }
+            }
+        }
+    }
+    if (filter.synced_draw_targets) {
+        if (targets_overflow > consumed) {
+            wait = std::max(wait, targets_overflow);
+            result.overflow = true;
+        }
+        for (const TargetSet& set : target_sets) {
+            if (set.synced <= consumed) {
+                continue;
+            }
+            for (u32 i = 0; i < set.count; ++i) {
+                if (set.ranges[i].first < end && set.ranges[i].second > address) {
+                    wait = std::max(wait, set.synced);
+                    result.producers |= ProducerBit(Producer::Draw);
+                    break;
                 }
             }
         }

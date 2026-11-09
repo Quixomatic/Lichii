@@ -9,6 +9,7 @@
 #include "video_core/engines/maxwell_dma.h"
 #include "video_core/gpu_split.h"
 #include "video_core/memory_manager.h"
+#include "video_core/textures/decoders.h"
 #include "video_core/v2/front_writes.h"
 
 namespace VideoCommon::V2 {
@@ -47,14 +48,51 @@ void NoteReleaseWrite(GpuSplit& split, const Tegra::MemoryManager& memory, GPUVA
     }
 }
 
+size_t DeviceRanges(const Tegra::MemoryManager& memory, GPUVAddr address, u64 size,
+                    std::span<std::pair<u64, u64>> out) {
+    if (out.empty() || size == 0) {
+        return 0;
+    }
+    const auto segments = memory.GetSubmappedRange(address, static_cast<size_t>(size));
+    size_t count = 0;
+    for (const auto& [device, length] : segments) {
+        const std::pair<u64, u64> range{device, device + length};
+        if (count != 0 && out[count - 1].second == range.first) {
+            out[count - 1].second = range.second;
+        } else if (count < out.size()) {
+            out[count++] = range;
+        } else {
+            // Too many pieces: one range around all of them (it may cover more, never less).
+            out[count - 1].first = std::min(out[count - 1].first, range.first);
+            out[count - 1].second = std::max(out[count - 1].second, range.second);
+            for (size_t i = 0; i + 1 < count; ++i) {
+                out[count - 1].first = std::min(out[count - 1].first, out[i].first);
+                out[count - 1].second = std::max(out[count - 1].second, out[i].second);
+            }
+            out[0] = out[count - 1];
+            count = 1;
+        }
+    }
+    return count;
+}
+
 void NoteRangeWriteGpu(GpuSplit& split, const Tegra::MemoryManager& memory, GPUVAddr address,
                        u64 size, Producer producer) {
     if (size == 0) {
         return;
     }
     const GPUVAddr end = address + size;
-    if (end < address || (end - 1) / PageSize - address / PageSize >= MaxRangePages) {
+    if (end < address) {
         split.NoteUnboundedWrite(producer);
+        return;
+    }
+    if ((end - 1) / PageSize - address / PageSize >= MaxRangePages) {
+        // Long writes (storage buffers, copies): their device runs, as wide entries.
+        std::array<std::pair<u64, u64>, 8> ranges;
+        const size_t count = DeviceRanges(memory, address, size, ranges);
+        for (size_t i = 0; i < count; ++i) {
+            split.NoteRangeWrite(ranges[i].first, ranges[i].second - ranges[i].first, producer);
+        }
         return;
     }
     // Page by page: GPU pages may map anywhere in device memory.
@@ -65,6 +103,51 @@ void NoteRangeWriteGpu(GpuSplit& split, const Tegra::MemoryManager& memory, GPUV
         }
         begin = page_end;
     }
+}
+
+std::optional<GpuRange> UploadRange(const u32* upload, u32 exec) {
+    const u32 line_length = upload[0];
+    const u32 line_count = upload[1];
+    const GPUVAddr address = (GPUVAddr{upload[2]} << 32) | upload[3];
+    const u32 pitch = upload[4];
+    if (line_length == 0 || line_count == 0 || address == 0) {
+        return GpuRange{address, 0};
+    }
+    if ((exec & 1) != 0) {
+        // As Upload::State::ProcessData: one line per pitch.
+        return GpuRange{address, u64{line_count - 1} * pitch + line_length};
+    }
+    // Block linear: the whole swizzled surface it rewrites (Upload::State::ProcessData).
+    const u32 block = upload[5];
+    u32 width = upload[6];
+    u32 x_elements = line_length;
+    u32 x_offset = upload[10];
+    u32 shift = 4;
+    for (const u32 value : {width, x_elements, x_offset, static_cast<u32>(address)}) {
+        if (value != 0) {
+            shift = std::min(shift, static_cast<u32>(std::countr_zero(value)));
+        }
+    }
+    width >>= shift;
+    const u64 size = Tegra::Texture::CalculateSize(true, 1U << shift, width, upload[7], upload[8],
+                                                   (block >> 4) & 0xf, (block >> 8) & 0xf);
+    return GpuRange{address, size};
+}
+
+void NoteUploadMethod(GpuSplit& split, const Tegra::MemoryManager& memory, const u32* registers,
+                      u32 method, u32 argument, std::optional<GpuRange>& pending) {
+    if (method == 0x6c) {
+        pending = UploadRange(registers + 0x60, argument);
+        return;
+    }
+    if (method != 0x6d) {
+        return;
+    }
+    if (!pending) {
+        split.NoteUnboundedWrite(Producer::Upload);
+        return;
+    }
+    NoteRangeWriteGpu(split, memory, pending->first, pending->second, Producer::Upload);
 }
 
 void NoteReport3D(GpuSplit& split, const Tegra::MemoryManager& memory, const u32* regs) {

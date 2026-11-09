@@ -60,6 +60,7 @@
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_query_cache.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
+#include "video_core/v2/shader_writes.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 #include "video_core/renderer_vulkan/vk_state_tracker.h"
@@ -813,6 +814,18 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         return pipeline_cache.CurrentGraphicsPipeline();
     }()};
     const bool verify_views = verify_pipeline != nullptr && verify_pipeline == pipeline;
+    if (pipeline != nullptr && VideoCommon::V2::ShaderWrites::Enabled()) [[unlikely]] {
+        // Pipeline v2: what the bound programs store, for the split front's write ranges.
+        for (size_t index = 0; index < shader_write_addresses.size(); ++index) {
+            const VAddr address = pipeline_cache.ProgramDeviceAddress(index);
+            if (address != shader_write_addresses[index] || pipeline != shader_write_pipeline) {
+                shader_write_addresses[index] = address;
+                VideoCommon::V2::ShaderWrites::Record(address,
+                                                      pipeline->StageInfo(index == 0 ? 0 : index - 1));
+            }
+        }
+        shader_write_pipeline = pipeline;
+    }
     if (verify_pipeline != nullptr) {
         ++fast_draw_stats.verified;
         fast_draw_stats.pipeline_mismatches += verify_pipeline != pipeline ? 1 : 0;
@@ -2050,6 +2063,10 @@ void RasterizerVulkan::DispatchCompute() {
     if (!pipeline) {
         if (kepler_compute->IsNativeMode()) throw Shader::RuntimeError("Native compute pipeline unavailable");
         return;
+    }
+    if (VideoCommon::V2::ShaderWrites::Enabled()) [[unlikely]] {
+        VideoCommon::V2::ShaderWrites::Record(pipeline_cache.ComputeDeviceAddress(),
+                                              pipeline->ShaderInfo());
     }
     std::scoped_lock lock{texture_cache.mutex, buffer_cache.mutex};
     std::optional<ByteAddressedShadow> byte_addressed_shadow;

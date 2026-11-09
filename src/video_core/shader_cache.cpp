@@ -33,6 +33,7 @@
 #include "video_core/memory_manager.h"
 #include "video_core/nx2_debug_control.h"
 #include "video_core/shader_cache.h"
+#include "video_core/v2/shader_writes.h"
 #include "video_core/shader_environment.h"
 #include "video_core/texture_cache/util.h"
 
@@ -129,6 +130,7 @@ bool ShaderCache::RefreshStages(std::array<u64, 6>& unique_hashes) try {
     for (size_t index = 0; index < Tegra::Engines::Maxwell3D::Regs::MaxShaderProgram; ++index) {
         if (!maxwell3d->regs.IsShaderConfigEnabled(index)) {
             unique_hashes[index] = 0;
+            program_device_addresses[index] = 0;
             continue;
         }
         const auto& shader_config{maxwell3d->regs.pipelines[index]};
@@ -136,11 +138,13 @@ bool ShaderCache::RefreshStages(std::array<u64, 6>& unique_hashes) try {
         if (program == Tegra::Engines::Maxwell3D::Regs::ShaderType::Pixel &&
             !maxwell3d->regs.rasterize_enable) {
             unique_hashes[index] = 0;
+            program_device_addresses[index] = 0;
             continue;
         }
         if (mesh && program == Tegra::Engines::Maxwell3D::Regs::ShaderType::Geometry) {
             // A header without code: the mesh program's environment reads its output map.
             unique_hashes[index] = 0;
+            program_device_addresses[index] = 0;
             continue;
         }
         const GPUVAddr shader_addr{native
@@ -216,6 +220,7 @@ bool ShaderCache::RefreshStages(std::array<u64, 6>& unique_hashes) try {
         }
         shader_infos[index] = shader_info;
         unique_hashes[index] = shader_info->unique_hash;
+        program_device_addresses[index] = *cpu_shader_addr;
         if (mesh && (program == Tegra::Engines::Maxwell3D::Regs::ShaderType::VertexB ||
                      program == Tegra::Engines::Maxwell3D::Regs::ShaderType::Tessellation)) {
             unique_hashes[index] ^= MeshStateHash();
@@ -257,6 +262,7 @@ const ShaderInfo* ShaderCache::ComputeShader() {
     const auto& qmd{kepler_compute->launch_description};
     const GPUVAddr shader_addr{program_base + qmd.program_start};
     const std::optional<VAddr> cpu_shader_addr{gpu_memory->GpuToCpuAddress(shader_addr)};
+    compute_device_address = cpu_shader_addr.value_or(0);
     if (!cpu_shader_addr) {
         LOG_ERROR(HW_GPU, "Invalid GPU address for shader {:#016x}", shader_addr);
         return nullptr;
@@ -386,6 +392,9 @@ void ShaderCache::Register(std::unique_ptr<ShaderInfo> data, VAddr addr, size_t 
 
 void ShaderCache::InvalidatePagesInRegion(VAddr addr, size_t size) {
     const VAddr addr_end = addr + size;
+    if (VideoCommon::V2::ShaderWrites::Enabled()) [[unlikely]] {
+        VideoCommon::V2::ShaderWrites::Invalidate(addr, addr_end);
+    }
     // Rejected programs are few and in a few places: look at them only for writes that can
     // reach them (this runs for every inline upload and pre-draw invalidation).
     if (addr_end > rejected_lowest.load(std::memory_order_relaxed) &&

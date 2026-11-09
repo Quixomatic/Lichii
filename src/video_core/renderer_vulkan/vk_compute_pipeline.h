@@ -96,6 +96,10 @@ public:
         return build_task_done.load(std::memory_order::acquire);
     }
 
+    [[nodiscard]] const Shader::Info& ShaderInfo() const noexcept {
+        return info;
+    }
+
 private:
     /// Builds the pipeline once, on whichever thread gets here first.
     void RunBuild();

@@ -8,7 +8,10 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include "shader_recompiler/shader_info.h"
+#include "video_core/v2/front_writes.h"
 #include "video_core/v2/hazard.h"
+#include "video_core/v2/shader_writes.h"
 
 namespace {
 
@@ -194,8 +197,9 @@ TEST_CASE("V2 hazard table: lookups match a model on random writes", "[video_cor
     int forwards = 0;
     int waits = 0;
     for (int step = 0; step < 20000; ++step) {
-        // Two pages, so lookups also cross a page boundary.
-        const u64 address = 0x10fc0 + (rng() % 32) * 4;
+        // Writes within one page: writes across pages are wide and never forwarded (the
+        // dedicated section covers them).
+        const u64 address = 0x10f00 + (rng() % 32) * 4;
         if (rng() % 3 != 0) {
             Write write{address, u64{4} << (rng() % 3), ++position, rng() % 4 != 0, {}};
             for (u8& byte : write.bytes) {
@@ -366,5 +370,97 @@ TEST_CASE("V2 acquire decisions", "[video_core][v2_hazard]") {
               AcquireVerdict::Fallback);
         CHECK(DecideAcquire(SemaphoreOp::Equal, 5, unknown, 0, 5, 0).verdict ==
               AcquireVerdict::Fallback);
+    }
+}
+
+TEST_CASE("V2 hazard table: wide writes and draw targets", "[video_core][v2_hazard]") {
+    HazardTable table;
+    const HazardFilter all{};
+
+    SECTION("a wide write is found without scanning unrelated entries") {
+        table.NoteRange(0x1000000, 0x200000, 1, Producer::Dispatch); // a 2 MiB storage buffer
+        for (u64 i = 0; i < 3000; ++i) {
+            table.NoteRange(0x400000 + i * 0x1000, 0x40, i + 2, Producer::CbData);
+        }
+        const HazardResult hit = table.Find(0x1100000, 4, 0, all);
+        CHECK(hit.kind == Kind::Wait);
+        CHECK(hit.position == 1);
+        CHECK(!hit.overflow);
+        CHECK(table.Find(0x3000000, 4, 0, all).kind == Kind::Clear);
+        CHECK(table.Find(0x1100000, 4, 1, all).kind == Kind::Clear);
+    }
+
+    SECTION("more wide writes than the list holds fall back to scanning") {
+        for (u64 i = 0; i < 70; ++i) {
+            table.NoteRange(0x10000000 + i * 0x100000, 0x20000, i + 1, Producer::Copy);
+        }
+        // The oldest ones left the list but are still found.
+        CHECK(table.Find(0x10000000 + 0x10, 4, 0, all).position == 1);
+        CHECK(table.Find(0x10000000 + 69 * 0x100000, 4, 0, all).position == 70);
+    }
+
+    SECTION("draw targets count once a host-level sync follows them") {
+        const std::array<std::pair<u64, u64>, 2> targets{{{0x50000, 0x60000}, {0x80000, 0x81000}}};
+        table.NoteDrawTargets(targets, 5);
+        HazardFilter draws;
+        draws.ranged = 0;
+        draws.synced_draw_targets = true;
+        // Not before a sync: draws after the last host-level wait don't order the reads.
+        CHECK(table.Find(0x50010, 4, 0, draws).kind == Kind::Clear);
+        table.NoteDrawTargets(targets, 7); // same targets: the run goes on
+        table.NoteSync(8);
+        const HazardResult hit = table.Find(0x50010, 4, 0, draws);
+        CHECK(hit.kind == Kind::Wait);
+        CHECK(hit.position == 7);
+        CHECK(table.Find(0x70000, 4, 0, draws).kind == Kind::Clear);
+        CHECK(table.Find(0x80000, 4, 7, draws).kind == Kind::Clear);
+        // New targets: the old run still counts until the back ran it.
+        const std::array<std::pair<u64, u64>, 1> other{{{0x90000, 0x91000}}};
+        table.NoteDrawTargets(other, 9);
+        table.NoteSync(10);
+        CHECK(table.Find(0x50010, 4, 0, draws).position == 7);
+        CHECK(table.Find(0x90010, 4, 0, draws).position == 9);
+    }
+}
+
+TEST_CASE("V2 write ranges: uploads and shader write summaries", "[video_core][v2_hazard]") {
+    SECTION("pitch-linear upload") {
+        // line_length_in, line_count, address high/low, pitch, block, width, height, depth...
+        const std::array<u32, 12> upload{0x40, 3, 0x1, 0x2000, 0x100, 0, 0, 0, 1, 0, 0, 0};
+        const auto range = UploadRange(upload.data(), 1);
+        REQUIRE(range);
+        CHECK(range->first == 0x1'0000'2000ULL);
+        CHECK(range->second == 2 * 0x100 + 0x40);
+    }
+    SECTION("block-linear upload covers its whole surface") {
+        const std::array<u32, 12> upload{0x100, 4, 0, 0x10000, 0, 0, 0x100, 16, 1, 0, 0, 0};
+        const auto range = UploadRange(upload.data(), 0);
+        REQUIRE(range);
+        CHECK(range->second >= 0x100 * 4);
+    }
+    SECTION("summaries") {
+        constexpr u64 address = 0x7777'0000;
+        CHECK(!ShaderWrites::Lookup(address));
+        Shader::Info info{};
+        ShaderWrites::Record(address, info);
+        auto summary = ShaderWrites::Lookup(address);
+        REQUIRE(summary);
+        CHECK(summary->WritesNothing());
+        info.storage_buffers_descriptors.push_back(
+            Shader::StorageBufferDescriptor{.cbuf_index = 1, .cbuf_offset = 0x20, .count = 2,
+                                            .is_written = true});
+        ShaderWrites::Record(address, info);
+        summary = ShaderWrites::Lookup(address);
+        REQUIRE(summary);
+        CHECK(!summary->unbounded);
+        REQUIRE(summary->num_storage == 1);
+        CHECK(summary->storage[0].cbuf_index == 1);
+        CHECK(summary->storage[0].cbuf_offset == 0x20);
+        CHECK(summary->storage[0].count == 2);
+        info.stores_global_memory = true;
+        ShaderWrites::Record(address, info);
+        CHECK(ShaderWrites::Lookup(address)->unbounded);
+        ShaderWrites::Invalidate(address, address + 0x100);
+        CHECK(!ShaderWrites::Lookup(address));
     }
 }

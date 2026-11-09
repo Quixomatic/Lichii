@@ -312,6 +312,8 @@ public:
     std::array<Engines::EngineInterface*, max_subchannels> subchannels{};
     /// The copy engine's registers its launches read, as sent (NoteTrackedWrite).
     VideoCommon::V2::DmaWriteTracker dma_writes;
+    /// The inline-to-memory engine's upload registers, as sent (NoteTrackedWrite).
+    VideoCommon::V2::UploadWriteTracker i2m_writes;
     std::array<Engines::EngineTypes, max_subchannels> subchannel_type;
 
     Engines::Puller puller;

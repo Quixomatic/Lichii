@@ -39,6 +39,7 @@
 #include "video_core/rasterizer_interface.h"
 #include "video_core/textures/decoders.h"
 #include "video_core/v2/front_writes.h"
+#include "video_core/v2/shader_writes.h"
 #include "video_core/v2/regsem_3d.h"
 
 namespace Tegra::Engines {
@@ -1431,6 +1432,7 @@ struct KeplerCompute::FrontState {
     VideoCommon::V2::Mode v2_mode{};
     std::unique_ptr<VideoCommon::V2::RegSem::MirrorCompute> v2_mirror;
     u64 v2_writes{};
+    std::optional<std::pair<GPUVAddr, u64>> v2_upload; ///< The upload being sent (P2)
 };
 
 KeplerCompute::FrontState& KeplerCompute::Front(VideoCommon::GpuSplit& split) {
@@ -1605,8 +1607,111 @@ void KeplerCompute::FrontCallMethod(Core::System& system, VideoCommon::GpuSplit&
     }
     FrontApply(fs, method, argument);
     split.Method(this, method, argument, is_last_call, segment);
-    if (method == 0x6c3 && split.TracksWrites()) [[unlikely]] {
+    if (split.TracksWrites()) [[unlikely]] {
+        FrontNoteWrites(split, fs, method, argument);
+    }
+}
+
+void KeplerCompute::FrontNoteWrites(VideoCommon::GpuSplit& split, FrontState& fs, u32 method,
+                                    u32 argument) {
+    using VideoCommon::V2::Producer;
+    switch (method) {
+    case 0x6c3:
         VideoCommon::V2::NoteReportCompute(split, memory_manager, fs.registers.data(), argument);
+        return;
+    case 0x107:
+        FrontNoteInlineQmd(split, fs);
+        return;
+    case 0x6c:
+    case 0x6d:
+        VideoCommon::V2::NoteUploadMethod(split, memory_manager, fs.registers.data(), method,
+                                          argument, fs.v2_upload);
+        return;
+    case 0xae:
+    case 0xaf:
+    case 0xb0:
+        // QMD signals: the scheduler launches QMDs from memory the front doesn't read.
+        split.NoteUnboundedWrite(Producer::Dispatch);
+        split.NoteUnboundedWrite(Producer::QmdRelease);
+        return;
+    case 0x45: // Macro code and bindings
+    case 0x46:
+    case 0x47:
+    case 0x48:
+        return;
+    default:
+        if (MayWriteMemory(method)) {
+            split.NoteUnboundedWrite(Producer::Dispatch);
+            split.NoteUnboundedWrite(Producer::QmdRelease);
+        }
+        return;
+    }
+}
+
+void KeplerCompute::FrontNoteInlineQmd(VideoCommon::GpuSplit& split, FrontState& fs) {
+    namespace V2 = VideoCommon::V2;
+    using V2::Producer;
+    const u32* const registers = fs.registers.data();
+    const u32* const qmd = registers + 0xc8;
+    // As ProcessNativeMethod(0x107): the QMD is stored, then launched unless it waits for a
+    // dependency (then the scheduler launches it from memory later).
+    const GPUVAddr qmd_address = ((GPUVAddr{registers[0xc6]} << 32) | registers[0xc7]) << 8;
+    V2::NoteRangeWriteGpu(split, memory_manager, qmd_address, 256, Producer::Upload);
+    if ((registers[0xa7] & (1U << 24)) == 0 && (registers[0xcc] & (1U << 12)) != 0) {
+        split.NoteUnboundedWrite(Producer::Dispatch);
+        split.NoteUnboundedWrite(Producer::QmdRelease);
+        return;
+    }
+    split.NoteUnboundedWrite(Producer::QmdRelease);
+    const GPUVAddr program = (GPUVAddr{qmd[49] & 0x1ffff} << 32) | qmd[48];
+    const auto program_device = memory_manager.GpuToCpuAddress(program);
+    const auto summary = program_device ? V2::ShaderWrites::Lookup(*program_device)
+                                        : std::optional<V2::ShaderWrites::Summary>{};
+    if (!summary || summary->unbounded) {
+        split.NoteUnboundedWrite(Producer::Dispatch);
+        return;
+    }
+    // Storage buffers: their descriptors (address, size) in the QMD's constant buffers, as the
+    // buffer cache binds them. A descriptor a queued write may still change can't be trusted.
+    V2::HazardFilter descriptor_filter;
+    descriptor_filter.unbounded = V2::ProducerBit(Producer::Upload) |
+                                  V2::ProducerBit(Producer::Copy) |
+                                  V2::ProducerBit(Producer::Dispatch) |
+                                  V2::ProducerBit(Producer::Draw);
+    std::array<V2::GpuRange, 16> writes;
+    size_t num_writes = 0;
+    for (u32 i = 0; i < summary->num_storage; ++i) {
+        const auto& storage = summary->storage[i];
+        if (storage.cbuf_index >= NumConstBuffers || ((qmd[20] >> storage.cbuf_index) & 1) == 0) {
+            split.NoteUnboundedWrite(Producer::Dispatch);
+            return;
+        }
+        const u32 high = qmd[33 + storage.cbuf_index * 2];
+        const GPUVAddr cbuf = (GPUVAddr{high & 0xff} << 32) | qmd[32 + storage.cbuf_index * 2];
+        const u32 cbuf_size = ((high >> 19) & 0x1fff) << 4;
+        for (u32 element = 0; element < storage.count; ++element) {
+            const u32 offset = storage.cbuf_offset + element * 16;
+            const auto device = memory_manager.GpuToCpuAddress(cbuf + offset);
+            if (offset + 16 > cbuf_size || !device || num_writes == writes.size()) {
+                split.NoteUnboundedWrite(Producer::Dispatch);
+                return;
+            }
+            std::array<u32, 4> descriptor;
+            memory_manager.ReadBlockUnsafe(cbuf + offset, descriptor.data(), sizeof(descriptor));
+            const V2::HazardResult pending =
+                split.FindWrites(*device, sizeof(descriptor), descriptor_filter,
+                                 reinterpret_cast<u8*>(descriptor.data()));
+            if (pending.kind == V2::HazardResult::Kind::Wait) {
+                split.NoteUnboundedWrite(Producer::Dispatch);
+                return;
+            }
+            const GPUVAddr address = (GPUVAddr{descriptor[1]} << 32) | descriptor[0];
+            writes[num_writes++] = {address, descriptor[2]};
+        }
+    }
+    for (size_t i = 0; i < num_writes; ++i) {
+        V2::NoteRangeWriteGpu(split, memory_manager, writes[i].first, writes[i].second,
+                              Producer::Dispatch);
     }
 }
 
@@ -1626,11 +1731,9 @@ void KeplerCompute::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuS
         }
     }
     split.MultiMethod(this, method, base_start, amount, methods_pending, segment);
-    if (method == 0x6c3 && split.TracksWrites()) [[unlikely]] {
-        // Each word triggers one; the registers it reads are not among these words.
+    if (split.TracksWrites()) [[unlikely]] {
         for (u32 i = 0; i < amount; ++i) {
-            VideoCommon::V2::NoteReportCompute(split, memory_manager, fs.registers.data(),
-                                               base_start[i]);
+            FrontNoteWrites(split, fs, method, base_start[i]);
         }
     }
 }
@@ -1654,8 +1757,8 @@ void KeplerCompute::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& s
         }
         FrontApply(fs, address, value);
         split.MacroWrite(this, address, value);
-        if (address == 0x6c3 && split.TracksWrites()) [[unlikely]] {
-            VideoCommon::V2::NoteReportCompute(split, memory_manager, fs.registers.data(), value);
+        if (split.TracksWrites()) [[unlikely]] {
+            FrontNoteWrites(split, fs, address, value);
         }
         return true;
     };

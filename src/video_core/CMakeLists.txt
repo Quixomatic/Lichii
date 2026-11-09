@@ -129,6 +129,8 @@ add_library(video_core STATIC
     v2/ir.h
     v2/landing.h
     v2/regsem.cpp
+    v2/shader_writes.cpp
+    v2/shader_writes.h
     v2/regsem.h
     v2/regsem_3d.h
     v2/v2_stats.cpp

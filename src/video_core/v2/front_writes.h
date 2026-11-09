@@ -4,6 +4,9 @@
 #pragma once
 
 #include <array>
+#include <optional>
+#include <span>
+#include <utility>
 
 #include "common/common_types.h"
 #include "video_core/v2/hazard.h"
@@ -42,6 +45,38 @@ void NoteReport3D(GpuSplit& split, const Tegra::MemoryManager& memory, const u32
 /// copy of the compute registers.
 void NoteReportCompute(GpuSplit& split, const Tegra::MemoryManager& memory, const u32* registers,
                        u32 control);
+
+/// A GPU range (address, bytes).
+using GpuRange = std::pair<GPUVAddr, u64>;
+
+/// What an inline upload (3D launch_dma/inline_data, compute exec_upload/data_upload,
+/// inline-to-memory exec/data: all at methods 0x60-0x6d) writes: `upload` is the 12 words of
+/// Upload::Registers (method 0x60 on), `exec` the exec/launch word (bit 0: pitch linear).
+[[nodiscard]] std::optional<GpuRange> UploadRange(const u32* upload, u32 exec);
+
+/// An upload method was sent to an engine whose registers are `registers` (indexed by method):
+/// the exec method computes the range into `pending`, each data method records it (the data
+/// words are what write it, so their positions are the ones to wait for).
+void NoteUploadMethod(GpuSplit& split, const Tegra::MemoryManager& memory, const u32* registers,
+                      u32 method, u32 argument, std::optional<GpuRange>& pending);
+
+/// The inline-to-memory engine's upload registers as the front sends them.
+struct UploadWriteTracker {
+    std::array<u32, 0x6e> registers{};
+    std::optional<GpuRange> pending;
+
+    void Note(GpuSplit& split, const Tegra::MemoryManager& memory, u32 method, u32 argument) {
+        if (method < registers.size()) {
+            registers[method] = argument;
+        }
+        NoteUploadMethod(split, memory, registers.data(), method, argument, pending);
+    }
+};
+
+/// The device ranges a GPU range maps to, as one bounding range per contiguous run (merged into
+/// one when there are more than `max_ranges`). Empty if unmapped.
+size_t DeviceRanges(const Tegra::MemoryManager& memory, GPUVAddr address, u64 size,
+                    std::span<std::pair<u64, u64>> out);
 
 /// The copy engine's methods as the front sends them: it keeps the registers a launch reads.
 struct DmaWriteTracker {

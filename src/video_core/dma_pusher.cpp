@@ -622,13 +622,16 @@ bool DmaPusher::WaitForListWriters(GPUVAddr address, size_t size, bool cpu_writt
     // (and dispatches whose writes are bounded) that overlap the list. A list on GPU-written
     // pages waits for every writer that may reach it: the copy path needs the writer recorded.
     V2::HazardFilter filter;
-    filter.ranged = V2::ProducerBit(V2::Producer::Copy) | V2::ProducerBit(V2::Producer::Dispatch);
+    constexpr u32 writers = V2::ProducerBit(V2::Producer::Copy) |
+                            V2::ProducerBit(V2::Producer::Dispatch) |
+                            V2::ProducerBit(V2::Producer::Upload);
+    filter.ranged = writers;
     u64 target = 0;
     if (cpu_written) {
-        target = split.SyncedWriterPosition();
+        // Unbounded ones before the last sync (bounded ones only if they overlap).
+        filter.unbounded_synced = writers;
     } else {
-        filter.unbounded = V2::ProducerBit(V2::Producer::Copy) |
-                           V2::ProducerBit(V2::Producer::Dispatch);
+        filter.unbounded = writers;
     }
     for (GPUVAddr chunk = address; chunk < address + size;) {
         const GPUVAddr chunk_end =
@@ -691,15 +694,15 @@ void DmaPusher::NoteTrackedWrite(Engines::EngineInterface& engine, Engines::Engi
         }
         break;
     case Engines::EngineTypes::KeplerCompute:
-        // Dispatches write where their shaders store (and release what their QMDs say).
-        if (writer) {
+        // With its macros on the front, the compute engine notes each method it sends
+        // (KeplerCompute::FrontNoteWrites), launches with their bounded writes.
+        if (writer && !static_cast<Engines::KeplerCompute&>(engine).FrontRunsMacros()) {
             split.NoteUnboundedWrite(Producer::Dispatch);
+            split.NoteUnboundedWrite(Producer::QmdRelease);
         }
         break;
     case Engines::EngineTypes::KeplerMemory:
-        if (method < engine.execution_mask.size() && engine.execution_mask[method]) {
-            split.NoteUnboundedWrite(Producer::Upload);
-        }
+        i2m_writes.Note(split, memory_manager, method, argument);
         break;
     case Engines::EngineTypes::Fermi2D:
         if (method >= MacroRegistersStart ||

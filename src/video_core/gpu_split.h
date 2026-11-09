@@ -131,6 +131,10 @@ public:
     void NoteUnboundedWrite(V2::Producer producer) {
         hazards.NoteUnbounded(producer, write_position);
     }
+    /// Front: the draw just sent writes these device ranges (render and depth targets).
+    void NoteDrawTargets(std::span<const std::pair<u64, u64>> ranges) {
+        hazards.NoteDrawTargets(ranges, write_position);
+    }
     /// Front: the queued writes to a device range that `filter` orders against (V2::HazardTable).
     [[nodiscard]] V2::HazardResult FindWrites(u64 device_address, u64 size,
                                               const V2::HazardFilter& filter, u8* out = nullptr) {

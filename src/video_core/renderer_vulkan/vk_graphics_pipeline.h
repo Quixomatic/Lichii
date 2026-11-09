@@ -333,6 +333,11 @@ public:
         gpu_memory = gpu_memory_;
     }
 
+    /// The translated program of `stage` (VertexB, TessControl, TessEval, Geometry, Fragment).
+    [[nodiscard]] const Shader::Info& StageInfo(size_t stage) const noexcept {
+        return stage_infos[stage];
+    }
+
 private:
     template <typename Spec>
     bool ConfigureImpl(bool is_indexed);

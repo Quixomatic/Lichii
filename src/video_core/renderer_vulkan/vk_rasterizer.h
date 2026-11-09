@@ -194,6 +194,9 @@ private:
     /// Remembers render target 0 of a draw with one of Ocarina of Time's tonemap shaders.
     void TrackOotTonemappedImage(const GraphicsPipeline& pipeline);
     bool TryNx2IndirectReset(bool is_indexed, u32 instance_count);
+    /// Pipeline v2: the program addresses whose write summaries were last recorded.
+    std::array<VAddr, 6> shader_write_addresses{};
+    const GraphicsPipeline* shader_write_pipeline{};
 
     void FlushWork();
 
