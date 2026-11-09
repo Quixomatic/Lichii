@@ -5,12 +5,14 @@
 
 #include <array>
 #include <atomic>
+#include <cstddef>
 #include <cstring>
 #include <memory>
 
 #include "common/logging.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/v2/regsem.h"
+#include "video_core/v2/resolve/cbuf_table.h"
 #include "video_core/v2/v2_switches.h"
 
 // Table-driven register mirrors for the split front (EDEN_NX2_V2_REGSEM). The functions here
@@ -34,6 +36,7 @@ struct Mirror3D {
     bool draw_pending{};
     bool skip_same{};
     GroupTracker v2_groups;
+    Resolve::CbufTable v2_cbufs; ///< P6c: the constant buffer bindings these registers made
 };
 
 /// Per front Maxwell3D: the mode it started with and, for verify, the table-driven copy.
@@ -60,6 +63,36 @@ struct Front3D {
         return shadow[method];
     }
     return argument;
+}
+
+/// P6c: a write to bind_groups[stage].raw_config binds the const_buffer registers to a slot
+/// (Maxwell3D::ProcessCBBind), on states that keep the bindings (v2_cbufs).
+inline void BindCbuf3D(Resolve::CbufTable& cbufs, const u32* regs, u32 method) {
+    using Regs = Tegra::Engines::Maxwell3D::Regs;
+    constexpr u32 first = static_cast<u32>(offsetof(Regs, bind_groups) / sizeof(u32)) + 4;
+    constexpr u32 stride = static_cast<u32>(sizeof(Regs::BindGroup) / sizeof(u32));
+    constexpr u32 cbuf = static_cast<u32>(offsetof(Regs, const_buffer) / sizeof(u32));
+    static_assert(offsetof(Regs::BindGroup, raw_config) == 4 * sizeof(u32));
+    static_assert(offsetof(Regs::ConstantBuffer, address_high) == 4 &&
+                  offsetof(Regs::ConstantBuffer, address_low) == 8);
+    const u32 stage = (method - first) / stride;
+    const u32 config = regs[method];
+    const u32 slot = (config >> 4) & 0x1f;
+    if (stage >= Resolve::CbufStages || slot >= Resolve::CbufSlots) {
+        return; // the slot field is 5 bits; the state array holds 18
+    }
+    cbufs.stages[stage][slot] = Resolve::CbufBinding{
+        .address = (u64{regs[cbuf + 1]} << 32) | u64{regs[cbuf + 2]},
+        .size = regs[cbuf],
+        .enabled = config & 1,
+    };
+}
+
+template <typename State>
+inline void NoteCbufBind3D(State& s, u32 method) {
+    if constexpr (requires { s.v2_cbufs; }) {
+        BindCbuf3D(s.v2_cbufs, s.regs.data(), method);
+    }
 }
 
 template <typename State>
@@ -129,6 +162,7 @@ bool Write3D(State& s, const Table3D& table, u32 method, u32 argument, bool from
     }
     if ((flags & CbufBindFlag) != 0) {
         s.v2_groups.Touch(RegGroup::CbufBind);
+        NoteCbufBind3D(s, method);
     }
     s.sink_pending = false;
     return true;
@@ -194,6 +228,7 @@ void WriteMulti3D(State& s, const Table3D& table, u32 method, const u32* words, 
             }
             if ((flags & CbufBindFlag) != 0) {
                 s.v2_groups.Touch(RegGroup::CbufBind);
+                NoteCbufBind3D(s, method);
             }
         }
     }
@@ -211,6 +246,9 @@ void CopyMirror3D(Mirror3D& mirror, const State& s) {
     mirror.skip_same = s.skip_same;
     mirror.v2_groups = GroupTracker{};
     Rehash3D(mirror.v2_groups, mirror.regs.data());
+    if constexpr (requires { s.v2_cbufs; }) {
+        mirror.v2_cbufs = s.v2_cbufs;
+    }
 }
 
 inline bool ReportMismatch() {

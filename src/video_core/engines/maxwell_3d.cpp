@@ -1459,6 +1459,8 @@ struct Maxwell3D::FrontState {
     /// EDEN_NX2_V2_REGSEM (null when off): groups and fingerprints of these registers (=1), or
     /// the table-driven copy compared with them (verify).
     VideoCommon::V2::GroupTracker v2_groups;
+    /// EDEN_NX2_V2_REGSEM=1: the constant buffer bindings these registers made (P6c snapshots).
+    VideoCommon::V2::Resolve::CbufTable v2_cbufs;
     std::unique_ptr<VideoCommon::V2::RegSem::Front3D> v2;
     /// EDEN_NX2_V2_IR_DRAWS: the back's draw manager as the front predicts it (Draw records).
     VideoCommon::V2::DrawModel v2_draw_model;
@@ -1685,6 +1687,12 @@ void Maxwell3D::FrontMultiRegSem(FrontState& fs, u32 method, const u32* base_sta
 void Maxwell3D::FrontRegSemResync(FrontState& fs) {
     // The front's registers were set without the write path (copied, or resynchronized with
     // the back by EDEN_NX2_SPLIT_VERIFY).
+    for (size_t stage = 0; stage < VideoCommon::V2::Resolve::CbufStages; ++stage) {
+        for (size_t slot = 0; slot < VideoCommon::V2::Resolve::CbufSlots; ++slot) {
+            const auto& cbuf = state.shader_stages[stage].const_buffers[slot];
+            fs.v2_cbufs.stages[stage][slot] = {cbuf.address, cbuf.size, cbuf.enabled ? 1U : 0U};
+        }
+    }
     if (fs.v2->mode == VideoCommon::V2::Mode::Verify) {
         if (!fs.v2->mirror) {
             fs.v2->mirror = std::make_unique<VideoCommon::V2::RegSem::Mirror3D>();
@@ -2217,6 +2225,7 @@ void Maxwell3D::FrontParallelDraw(VideoCommon::GpuSplit& split, FrontState& fs,
         .regs = fs.regs.data(),
         .shadow = fs.shadow.data(),
         .groups = &fs.v2_groups,
+        .cbufs = &fs.v2_cbufs,
         .control = static_cast<u32>(fs.control),
         .instance_loop = fs.instance_loop,
         .sink_pending = fs.sink_pending,

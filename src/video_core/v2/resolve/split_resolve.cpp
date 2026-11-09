@@ -96,6 +96,7 @@ void LoadMirror(RegSem::Mirror3D& mirror, const FrontSnapshot& snapshot) {
     mirror.draw_pending = snapshot.draw_pending;
     mirror.skip_same = false; // the ring holds what the back applies: apply all of it
     mirror.v2_groups = snapshot.groups;
+    mirror.v2_cbufs = snapshot.cbufs != nullptr ? *snapshot.cbufs : CbufTable{};
 }
 
 } // Anonymous namespace
@@ -314,6 +315,13 @@ void SplitResolve::FrontDraw(const FrontView& view, const EngineInfo& engine,
                   regs_builder.shared + shadow_builder.shared - shared_before);
         }
         snapshot->groups = *view.groups;
+        if (view.cbufs != nullptr) {
+            // Bindings change far less often than segments are cut: share the last copy.
+            if (last_cbufs == nullptr || !(*last_cbufs == *view.cbufs)) {
+                last_cbufs = std::make_shared<const CbufTable>(*view.cbufs);
+            }
+            snapshot->cbufs = last_cbufs;
+        }
         snapshot->control = view.control;
         snapshot->instance_loop = view.instance_loop;
         snapshot->sink_pending = view.sink_pending;
@@ -357,7 +365,8 @@ void SplitResolve::OnPublish(u64 position) {
     }
 }
 
-void SplitResolve::OnSegment(const Ir::SegmentBody& body, const u32* back_regs) {
+void SplitResolve::OnSegment(const Ir::SegmentBody& body, const u32* back_regs,
+                             const CbufTable* back_cbufs) {
     t_commit = this;
     const u64 start = NowNs();
     if (holding) {
@@ -398,6 +407,32 @@ void SplitResolve::OnSegment(const Ir::SegmentBody& body, const u32* back_regs) 
                                     body.id, index, snapshot_value, back_regs[index]);
                     }
                     break;
+                }
+            }
+            // P6c: the constant buffer bindings the snapshot carries are the back engine's.
+            if (back_cbufs != nullptr) {
+                Count(GetStats().snapshot_checks);
+                const CbufTable& snapshot_cbufs =
+                    input.snapshot->cbufs != nullptr ? *input.snapshot->cbufs : CbufTable{};
+                for (size_t stage = 0; stage < CbufStages; ++stage) {
+                    for (size_t slot = 0; slot < CbufSlots; ++slot) {
+                        const CbufBinding& a = snapshot_cbufs.stages[stage][slot];
+                        const CbufBinding& b = back_cbufs->stages[stage][slot];
+                        if (a == b) {
+                            continue;
+                        }
+                        Count(GetStats().snapshot_mismatches);
+                        if (ShouldLogMismatch()) {
+                            LOG_WARNING(HW_GPU,
+                                        "V2 parallel verify: segment {} snapshot constant buffer "
+                                        "stage {} slot {} is {:#x}+{:#x} enabled {}, the back has "
+                                        "{:#x}+{:#x} enabled {}",
+                                        body.id, stage, slot, a.address, a.size, a.enabled,
+                                        b.address, b.size, b.enabled);
+                        }
+                        stage = CbufStages;
+                        break;
+                    }
                 }
             }
         }

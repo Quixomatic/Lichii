@@ -26,6 +26,7 @@
 #include "video_core/v2/resolve/parallel_resolve.h"
 #include "video_core/v2/resolve/segment.h"
 #include "video_core/v2/resolve/split_resolve.h"
+#include "video_core/v2/resolve/state_view.h"
 #include "video_core/v2/regsem_3d.h"
 #include "video_core/v2/ir_arena.h"
 
@@ -885,4 +886,186 @@ TEST_CASE("V2 P6: published shapes are found by the shards", "[video_core][v2_p6
     CHECK(!Resolve::FindShape(0x9999, &relevant));
     Resolve::ClearShapes();
     CHECK(!Resolve::FindShape(0x1234, &relevant));
+}
+
+// ---- P6c: the state view -------------------------------------------------------------------------
+
+using Tegra::Engines::Maxwell3D;
+
+namespace {
+
+/// The writes a resolve-relevant register stream is made of: program offsets and enables, the
+/// program region, constant buffer address/size, constant buffer binds and plain pipeline state.
+struct ViewStream {
+    std::vector<u32> plain;
+    std::vector<u32> programs;
+    std::array<u32, 5> binds{};
+    u32 cbuf = 0;
+
+    explicit ViewStream(const V2::RegSem::Table3D& table) {
+        using Regs = Tegra::Engines::Maxwell3D::Regs;
+        for (u32 index = 0x200; index < 0xd00 && plain.size() < 48; ++index) {
+            if ((table.flags[index] & V2::RegSem::Exec) == 0 &&
+                table.groups[index] == V2::RegGroup::Pipeline) {
+                plain.push_back(index);
+            }
+        }
+        for (u32 program = 0; program < Regs::MaxShaderProgram; ++program) {
+            programs.push_back(static_cast<u32>(MAXWELL3D_REG_INDEX(pipelines)) +
+                               program * static_cast<u32>(sizeof(Regs::Pipeline) / 4));
+        }
+        for (u32 stage = 0; stage < 5; ++stage) {
+            binds[stage] = static_cast<u32>(MAXWELL3D_REG_INDEX(bind_groups)) +
+                           stage * static_cast<u32>(sizeof(Regs::BindGroup) / 4) + 4;
+        }
+        cbuf = static_cast<u32>(MAXWELL3D_REG_INDEX(const_buffer));
+    }
+
+    std::pair<u32, u32> Next(std::mt19937& rng) const {
+        switch (rng() % 6) {
+        case 0:
+            return {plain[rng() % plain.size()], rng() % 4};
+        case 1: // a program's enable word (bit 0) or its offset
+            return {programs[rng() % programs.size()] + (rng() % 2), rng() % 2 == 0 ? 1U : rng()};
+        case 2:
+            return {static_cast<u32>(MAXWELL3D_REG_INDEX(program_region)) + (rng() % 2),
+                    rng() % 16};
+        case 3:
+            return {cbuf + rng() % 3, rng() % 0x10000};
+        default: // a bind: slot 0-23 (18 and above bind nothing), valid or not
+            return {binds[rng() % binds.size()], ((rng() % 24) << 4) | (rng() % 4 != 0 ? 1U : 0U)};
+        }
+    }
+};
+
+/// The live engine as the back's methods leave it: the registers, and ProcessCBBind's rule.
+void EngineWrite(Tegra::Engines::Maxwell3D& engine, const V2::RegSem::Table3D& table, u32 method,
+                 u32 value) {
+    using Regs = Tegra::Engines::Maxwell3D::Regs;
+    engine.regs.reg_array[method] = value;
+    if ((table.flags[method] & V2::RegSem::CbufBindFlag) == 0) {
+        return;
+    }
+    const u32 stage = (method - static_cast<u32>(MAXWELL3D_REG_INDEX(bind_groups))) /
+                      static_cast<u32>(sizeof(Regs::BindGroup) / 4);
+    const auto& bind = engine.regs.bind_groups[stage];
+    if (bind.shader_slot >= Regs::MaxConstBuffers) {
+        return;
+    }
+    auto& buffer = engine.state.shader_stages[stage].const_buffers[bind.shader_slot];
+    buffer.enabled = bind.valid.Value() != 0;
+    buffer.address = engine.regs.const_buffer.Address();
+    buffer.size = engine.regs.const_buffer.size;
+}
+
+} // Anonymous namespace
+
+TEST_CASE("V2 P6c: a snapshot view after replay equals the live engine view",
+          "[video_core][v2_p6c]") {
+    namespace RegSem = V2::RegSem;
+    ScopedSystemTestContext context;
+    Core::System system;
+    Core::DeviceMemory physical;
+    Tegra::MaxwellDeviceMemoryManager device_memory{physical};
+    Tegra::MemoryManager memory{system, device_memory, 32, 1ULL << 31};
+    Tegra::Engines::Maxwell3D engine{memory};
+    const RegSem::Table3D& table = RegSem::GetTable3D();
+    const auto no_effects = [](RegSem::Effect, u32, u32) {};
+    const ViewStream stream{table};
+
+    // The front mirror starts from the engine (FrontRegSemResync).
+    auto front = std::make_unique<RegSem::Mirror3D>();
+    std::memcpy(front->regs.data(), engine.regs.reg_array.data(), sizeof(front->regs));
+    front->v2_cbufs = Resolve::CbufTableOf(Resolve::LiveView{engine});
+    RegSem::Rehash3D(front->v2_groups, front->regs.data());
+
+    struct Expected {
+        std::vector<u32> regs;
+        Resolve::CbufTable cbufs;
+        std::array<GPUVAddr, 6> programs{};
+        u64 fingerprint = 0;
+        u32 topology = 0;
+    };
+    struct Segment {
+        Resolve::RegisterSnapshot<0xe00> regs;
+        std::shared_ptr<const Resolve::CbufTable> cbufs;
+        V2::GroupTracker groups;
+        std::vector<std::vector<std::pair<u32, u32>>> draws; ///< deltas before each draw
+        std::vector<Expected> expected;
+    };
+    std::vector<Segment> segments;
+    Resolve::SnapshotBuilder<0xe00> builder;
+    std::shared_ptr<const Resolve::CbufTable> last_cbufs;
+    std::mt19937 rng{61};
+    u64 binds_changed = 0;
+    for (u32 cut = 0; cut < 24; ++cut) {
+        Segment& segment = segments.emplace_back();
+        segment.regs = builder.Take(front->regs.data());
+        if (last_cbufs == nullptr || !(*last_cbufs == front->v2_cbufs)) {
+            last_cbufs = std::make_shared<const Resolve::CbufTable>(front->v2_cbufs);
+        }
+        segment.cbufs = last_cbufs;
+        segment.groups = front->v2_groups;
+        const u32 draws = 1 + rng() % 24;
+        for (u32 draw = 0; draw < draws; ++draw) {
+            auto& writes = segment.draws.emplace_back();
+            for (u32 w = rng() % 9; w > 0; --w) {
+                writes.push_back(stream.Next(rng));
+            }
+            const Resolve::CbufTable before = front->v2_cbufs;
+            for (const auto& [method, value] : writes) {
+                RegSem::Write3D(*front, table, method, value, false, no_effects);
+                EngineWrite(engine, table, method, value);
+            }
+            binds_changed += before == front->v2_cbufs ? 0 : 1;
+            Expected& expected = segment.expected.emplace_back();
+            expected.topology = rng() % 10;
+            engine.draw_manager.draw_state.topology =
+                static_cast<Resolve::MaxwellRegs::PrimitiveTopology>(expected.topology);
+            const Resolve::LiveView live{engine};
+            expected.regs.assign(engine.regs.reg_array.begin(), engine.regs.reg_array.end());
+            expected.cbufs = Resolve::CbufTableOf(live);
+            for (size_t program = 0; program < 6; ++program) {
+                expected.programs[program] = Resolve::ProgramAddress(live, program);
+            }
+            V2::GroupTracker groups;
+            RegSem::Rehash3D(groups, engine.regs.reg_array.data());
+            expected.fingerprint = groups.Fingerprint(V2::HashedGroups);
+        }
+    }
+    REQUIRE(binds_changed > 20);
+
+    // Shards replay every segment afterwards: the snapshots must still hold their time's state.
+    u64 programs_seen = 0;
+    for (size_t index = 0; index < segments.size(); ++index) {
+        const Segment& segment = segments[index];
+        auto shard = std::make_unique<RegSem::Mirror3D>();
+        segment.regs.CopyTo(shard->regs.data());
+        shard->v2_cbufs = *segment.cbufs;
+        shard->v2_groups = segment.groups;
+        for (size_t draw = 0; draw < segment.draws.size(); ++draw) {
+            INFO("segment " << index << " draw " << draw);
+            for (const auto& [method, value] : segment.draws[draw]) {
+                RegSem::Write3D(*shard, table, method, value, false, no_effects);
+            }
+            const Expected& expected = segment.expected[draw];
+            const Resolve::SnapshotView view{
+                shard->regs.data(),
+                &shard->v2_cbufs,
+                &shard->v2_groups,
+                static_cast<Resolve::MaxwellRegs::PrimitiveTopology>(expected.topology),
+                Resolve::ViewDraw{},
+                false};
+            REQUIRE(std::memcmp(&view.Regs(), expected.regs.data(),
+                                sizeof(Resolve::MaxwellRegs)) == 0);
+            REQUIRE(Resolve::CbufTableOf(view) == expected.cbufs);
+            CHECK(static_cast<u32>(view.Topology()) == expected.topology);
+            CHECK(view.Groups().Fingerprint(V2::HashedGroups) == expected.fingerprint);
+            for (size_t program = 0; program < 6; ++program) {
+                CHECK(Resolve::ProgramAddress(view, program) == expected.programs[program]);
+                programs_seen += expected.programs[program] != 0 ? 1 : 0;
+            }
+        }
+    }
+    CHECK(programs_seen > 0);
 }

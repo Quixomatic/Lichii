@@ -32,6 +32,7 @@
 #include "video_core/nx2_profile.h"
 #include "video_core/v2/resolve/multifront.h"
 #include "video_core/v2/resolve/split_resolve.h"
+#include "video_core/v2/resolve/state_view.h"
 #include "video_core/v2/p5b_stats.h"
 #include "video_core/v2/qmd_front.h"
 #include "video_core/v2/ir_check.h"
@@ -719,9 +720,13 @@ size_t GpuSplit::ExecuteIr(const u64* entry) {
         if (parallel != nullptr) {
             const auto* const maxwell3d =
                 objects->As<Tegra::Engines::Maxwell3D>(segment.engine);
-            parallel->OnSegment(segment, maxwell3d != nullptr && parallel->Verify()
-                                             ? maxwell3d->regs.reg_array.data()
-                                             : nullptr);
+            const bool verify = maxwell3d != nullptr && parallel->Verify();
+            V2::Resolve::CbufTable back_cbufs;
+            if (verify) {
+                back_cbufs = V2::Resolve::CbufTableOf(V2::Resolve::LiveView{*maxwell3d});
+            }
+            parallel->OnSegment(segment, verify ? maxwell3d->regs.reg_array.data() : nullptr,
+                                verify ? &back_cbufs : nullptr);
         }
         break;
     }

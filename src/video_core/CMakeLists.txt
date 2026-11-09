@@ -159,6 +159,7 @@ add_library(video_core STATIC
     v2/timeline_join.h
     v2/pipeline_lookup.h
     v2/regsem.cpp
+    v2/resolve/cbuf_table.h
     v2/resolve/cow_regs.h
     v2/resolve/multifront.cpp
     v2/resolve/multifront.h
@@ -167,6 +168,7 @@ add_library(video_core STATIC
     v2/resolve/segment.h
     v2/resolve/split_resolve.cpp
     v2/resolve/split_resolve.h
+    v2/resolve/state_view.h
     v2/shader_writes.cpp
     v2/shader_writes.h
     v2/regsem.h

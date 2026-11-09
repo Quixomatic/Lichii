@@ -13,6 +13,7 @@
 #include "video_core/v2/ir.h"
 #include "video_core/v2/ir_arena.h"
 #include "video_core/v2/regsem.h"
+#include "video_core/v2/resolve/cbuf_table.h"
 #include "video_core/v2/resolve/cow_regs.h"
 #include "video_core/v2/resolve/parallel_resolve.h"
 #include "video_core/v2/resolve/segment.h"
@@ -96,6 +97,7 @@ struct FrontSnapshot {
     RegisterSnapshot<0xe00> regs;
     RegisterSnapshot<0xe00> shadow;
     GroupTracker groups;
+    std::shared_ptr<const CbufTable> cbufs; ///< P6c: shared while the bindings don't change
     u32 control = 0;
     bool instance_loop = false;
     bool sink_pending = false;
@@ -136,6 +138,7 @@ public:
         const u32* regs;
         const u32* shadow;
         const GroupTracker* groups;
+        const CbufTable* cbufs;
         u32 control;
         bool instance_loop;
         bool sink_pending;
@@ -178,7 +181,8 @@ public:
     void OnPublish(u64 position);
 
     // Back thread (the commit thread).
-    void OnSegment(const Ir::SegmentBody& body, const u32* back_regs);
+    /// `back_regs`, `back_cbufs`: the back engine's state (verify only, else null).
+    void OnSegment(const Ir::SegmentBody& body, const u32* back_regs, const CbufTable* back_cbufs);
     /// The shard's record for the draw the back is about to decide (null: none matches).
     [[nodiscard]] const PreDraw* TakeDraw(u64 fingerprint, bool indexed);
     [[nodiscard]] bool Verify() const {
@@ -202,6 +206,7 @@ private:
     Segmenter segmenter;
     SnapshotBuilder<0xe00> regs_builder;
     SnapshotBuilder<0xe00> shadow_builder;
+    std::shared_ptr<const CbufTable> last_cbufs;
     bool open = false;
     SegmentInput open_input;
     std::deque<SegmentInput> closed;
