@@ -228,8 +228,14 @@ public:
     /// Applies one list now (P5a: the producer is the owner, segments arrive in order).
     template <typename Fn>
     void Apply(RequestList& list, Fn&& apply) {
+        if (list.Empty()) {
+            next_segment = (std::max)(next_segment, list.Segment() + 1);
+            return;
+        }
         for (Request& request : list.Requests()) {
-            ++counters.requests[static_cast<size_t>(request.kind)];
+            if (counting) [[unlikely]] {
+                ++counters.requests[static_cast<size_t>(request.kind)];
+            }
             if (IsProxy(request.slot)) {
                 // A request on an earlier request's result (a prepare of a view created first).
                 request.slot = list.Resolve(request.slot);
@@ -237,11 +243,15 @@ public:
             const u32 slot = apply(static_cast<const Request&>(request));
             if (IsProxy(request.proxy)) {
                 list.Patch(request.proxy, slot);
-                ++counters.proxies_patched;
+                counters.proxies_patched += counting ? 1 : 0;
             }
         }
-        ++counters.segments;
+        counters.segments += counting ? 1 : 0;
         next_segment = (std::max)(next_segment, list.Segment() + 1);
+    }
+    /// F2-23: the counters only feed the stats.
+    void SetCounting(bool counting_) noexcept {
+        counting = counting_;
     }
 
     /// P6: any thread hands a finished segment to the commit thread.
@@ -306,6 +316,7 @@ private:
     std::map<u64, RequestList*> pending; ///< Commit thread only
     u64 next_segment = 0;
     Counters counters;
+    bool counting = true;
 };
 
 /// What another thread asks the owner to do with guest memory state.

@@ -462,6 +462,7 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
             commit->verify = V2::Verify(V2::Switch::Commit);
             commit->lock_free = !commit->verify && !V2::On(V2::Switch::CommitLocked);
             commit->stats = V2::Stats::Enabled();
+            commit->stage.SetCounting(commit->stats || commit->verify);
             commit_lock_free = commit->lock_free;
             texture_cache.SetCommit(commit.get());
             buffer_cache.SetCommit(commit.get());
