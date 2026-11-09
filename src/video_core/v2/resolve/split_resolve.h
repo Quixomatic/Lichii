@@ -61,6 +61,9 @@ struct ShardKeyInputs {
     bool native_turing = false;
     uintptr_t engine = 0;
     uintptr_t memory = 0;
+    /// The draw's pipeline key hash (the shape's pipeline part); without it no shape.
+    u64 state_hash = 0;
+    bool has_state_hash = false;
 };
 struct ShardKey {
     u64 shape = 0;

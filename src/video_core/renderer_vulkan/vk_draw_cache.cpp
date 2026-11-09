@@ -33,49 +33,13 @@ using V2::RegGroup;
 
 namespace {
 
-/// The register groups the shape holds whole: pipeline-key state, the programs and the render
-/// targets. Of the viewport group only the registers the pipeline key reads (swizzles and the
-/// like, KeyViewportRegisters) are in it, so scissor and viewport changes (dynamic state) keep
-/// the recipe; of the vertex streams only their layout (GraphicsKey).
-constexpr u32 ShapeGroups = GroupBit(RegGroup::Pipeline) | GroupBit(RegGroup::Shaders) |
-                            GroupBit(RegGroup::RenderTargets);
-
-/// The viewport-group registers some pipeline key block reads (P3's KeyBlockRegisters through
-/// the register semantics table), built once.
-const std::vector<u32>& KeyViewportRegisters() {
-    static const std::vector<u32> registers = [] {
-        using Regs = Tegra::Engines::Maxwell3D::Regs;
-        // Of the viewport transforms the key reads only the swizzle word (RefreshSwizzles); the
-        // scale and translation are dynamic state.
-        constexpr u32 transforms =
-            static_cast<u32>(offsetof(Regs, viewport_transform) / sizeof(u32));
-        constexpr u32 transform_words = sizeof(Regs::ViewportTransform) / sizeof(u32);
-        constexpr u32 transforms_end =
-            transforms + static_cast<u32>(sizeof(Regs::viewport_transform) / sizeof(u32));
-        constexpr u32 swizzle_word =
-            static_cast<u32>(offsetof(Regs::ViewportTransform, swizzle) / sizeof(u32));
-        std::vector<u32> result;
-        const auto& groups = V2::RegSem::GetTable3D().groups;
-        for (size_t block = 0; block < NumKeyBlocks; ++block) {
-            for (const auto& [first, count] : KeyBlockRegisters(static_cast<KeyBlock>(block))) {
-                for (u32 index = first; index < first + count && index < groups.size(); ++index) {
-                    if (groups[index] != RegGroup::Viewport) {
-                        continue;
-                    }
-                    if (index >= transforms && index < transforms_end &&
-                        (index - transforms) % transform_words != swizzle_word) {
-                        continue;
-                    }
-                    result.push_back(index);
-                }
-            }
-        }
-        std::ranges::sort(result);
-        result.erase(std::unique(result.begin(), result.end()), result.end());
-        return result;
-    }();
-    return registers;
-}
+/// The register groups the shape fingerprints: the programs and the render targets. The rest of
+/// what a recipe depends on through registers is the pipeline key (FixedPipelineState, which
+/// already leaves out everything dynamic state allows: depth bias, blend constants, stencil
+/// references, viewports and scissors...), taken as its hash. The texture pools and vertex
+/// streams are in the key when the shaders read them (GraphicsKey); constant buffer and handle
+/// words are validated inputs.
+constexpr u32 ShapeGroups = GroupBit(RegGroup::Shaders) | GroupBit(RegGroup::RenderTargets);
 
 constexpr size_t GraphicsSets = 1024; ///< x4 ways: 4096 recipes
 constexpr size_t ComputeSets = 256;   ///< x4 ways: 1024 recipes
@@ -89,14 +53,14 @@ constexpr bool ShapeWord(size_t word) {
 
 using Maxwell = Tegra::Engines::Maxwell3D::Regs;
 
-/// The draw shape from a register file: shared by the serial path and the P6 shards, so both
-/// compute the same value by construction.
-u64 ShapeOf(const Maxwell& regs, const V2::GroupTracker& groups, const KeyInputs& inputs,
-            bool is_indexed, bool native_turing, uintptr_t engine, uintptr_t memory) {
-    u64 shape = groups.Fingerprint(ShapeGroups);
-    for (const u32 index : KeyViewportRegisters()) {
-        shape = DC::Mix(shape, (u64{index} << 32) | regs.reg_array[index]);
-    }
+/// The draw shape: the pipeline key's hash (`state_hash`, FixedPipelineState::Hash), the program
+/// and render target groups, and the draw's inputs outside both. Shared by the serial path (the
+/// looked-up pipeline's hash) and the P6 shards (their own pipeline key's), so both compute the
+/// same value by construction.
+u64 ShapeOf(u64 state_hash, const Maxwell& regs, const V2::GroupTracker& groups,
+            const KeyInputs& inputs, bool is_indexed, bool native_turing, uintptr_t engine,
+            uintptr_t memory) {
+    u64 shape = DC::Mix(groups.Fingerprint(ShapeGroups), state_hash);
     shape = DC::Mix(shape, static_cast<u64>(inputs.topology));
     shape = DC::Mix(shape, static_cast<u64>(inputs.engine_state));
     shape = DC::Mix(shape, inputs.squashed_iterated_blend ? 1 : 0);
@@ -151,8 +115,12 @@ V2::Resolve::ShardKey ShardKeyOf(const V2::Resolve::ShardKeyInputs& in) {
         .squashed_iterated_blend = Settings::values.use_squashed_iterated_blend ? true : false,
     };
     V2::Resolve::ShardKey key;
-    key.shape = ShapeOf(regs, *in.groups, inputs, in.indexed, in.native_turing, in.engine,
-                        in.memory);
+    if (!in.has_state_hash) {
+        // The shape needs the pipeline key (computed by the shard with EDEN_NX2_V2_PIPEKEY).
+        return key;
+    }
+    key.shape = ShapeOf(in.state_hash, regs, *in.groups, inputs, in.indexed, in.native_turing,
+                        in.engine, in.memory);
     key.has_shape = true;
     u32 relevant = 0;
     std::array<u32, 5> key_cbufs{};
@@ -215,14 +183,28 @@ DrawCacheGlue::~DrawCacheGlue() {
     watch.Clear();
 }
 
-u64 DrawCacheGlue::GraphicsShape(bool is_indexed, const Tegra::Engines::Maxwell3D& maxwell3d,
-                                 const Tegra::MemoryManager& memory) const {
-    return ShapeOf(maxwell3d.regs, maxwell3d.v2_groups,
+u64 DrawCacheGlue::GraphicsShape(const GraphicsPipeline& pipeline, bool is_indexed,
+                                 const Tegra::Engines::Maxwell3D& maxwell3d,
+                                 const Tegra::MemoryManager& memory) {
+    return ShapeOf(pipeline.StateHash(), maxwell3d.regs, maxwell3d.v2_groups,
                    FixedPipelineState::CurrentInputs(maxwell3d), is_indexed,
                    const_cast<Tegra::Engines::Maxwell3D&>(maxwell3d)
                        .GetNativeMacroEngine()
                        .native_turing,
                    reinterpret_cast<uintptr_t>(&maxwell3d), reinterpret_cast<uintptr_t>(&memory));
+}
+
+DC::ShapeInfo DrawCacheGlue::ShapeInfoOf(u64 shape, const GraphicsPipeline& pipeline) {
+    // What the bound shaders use (P3's relevance masking): properties of the pipeline alone.
+    DC::ShapeInfo info{.shape = shape};
+    info.relevant_groups = (pipeline.ReadsVertexAttributes() ? GroupBit(RegGroup::VertexStreams)
+                                                             : 0) |
+                           (pipeline.UsesTexturePools() ? GroupBit(RegGroup::TexPools) : 0);
+    for (size_t stage = 0; stage < info.key_cbufs.size(); ++stage) {
+        info.key_cbufs[stage] =
+            pipeline.HandleConstantBuffers()[stage] | pipeline.StorageConstantBuffers()[stage];
+    }
+    return info;
 }
 
 u64 DrawCacheGlue::GraphicsKey(u64 shape, const DC::ShapeInfo& info,
@@ -294,30 +276,45 @@ DC::Miss DrawCacheGlue::Validate(Recipe& recipe, const void* engine,
     return miss;
 }
 
+void DrawCacheGlue::TakeParallelDraw(bool is_indexed, const Tegra::Engines::Maxwell3D& maxwell3d,
+                                     const Tegra::MemoryManager& memory) {
+    parallel_pre = nullptr;
+    V2::Resolve::SplitResolve* const parallel = V2::Resolve::SplitResolve::t_commit;
+    if (parallel == nullptr) [[likely]] {
+        return;
+    }
+    // EDEN_NX2_V2_PARALLEL: a shard resolved this draw's shape and partial key (taken for every
+    // draw, so the records stay in step with the draws).
+    const V2::Resolve::PreDraw* pre =
+        parallel->TakeDraw(maxwell3d.v2_groups.Fingerprint(V2::HashedGroups), is_indexed);
+    if (pre != nullptr &&
+        (pre->engine != reinterpret_cast<uintptr_t>(&maxwell3d) ||
+         pre->memory != reinterpret_cast<uintptr_t>(&memory) ||
+         maxwell3d.engine_state != Tegra::Engines::Maxwell3D::EngineHint::None)) {
+        pre = nullptr;
+    }
+    // The later steps of this draw (the pipeline key) take the same record.
+    parallel->SetTaken(pre);
+    parallel_pre = pre;
+}
+
 DrawCacheGlue::Decision DrawCacheGlue::DecideDraw(bool continued, bool is_indexed,
                                                   bool is_indirect,
+                                                  const GraphicsPipeline* pipeline,
                                                   const Tegra::Engines::Maxwell3D& maxwell3d,
                                                   const Tegra::MemoryManager& memory) {
     DC::Counters& counters = GraphicsCounters();
     ++counters.lookups;
     pending_draw = {};
-    const bool cache_on = !is_indirect && maxwell3d.draw_manager.draw_state
-                                              .inline_index_draw_indexes.empty();
-    // EDEN_NX2_V2_PARALLEL: a shard resolved this draw's shape and partial key (taken for every
-    // draw, so the records stay in step with the draws).
-    const V2::Resolve::PreDraw* pre = nullptr;
+    // Draws no recipe can hold are not looked up at all (BeginDrawCapture's conditions).
+    const bool cache_on =
+        !is_indirect && pipeline != nullptr && pipeline->TakesRecipes() && pipeline->IsBuilt() &&
+        !pipeline->IsMeshPipeline() && maxwell3d.regs.transform_feedback_enabled == 0 &&
+        maxwell3d.draw_manager.draw_state.inline_index_draw_indexes.empty();
     V2::Resolve::SplitResolve* const parallel = V2::Resolve::SplitResolve::t_commit;
-    if (parallel != nullptr) [[unlikely]] {
-        pre = parallel->TakeDraw(maxwell3d.v2_groups.Fingerprint(V2::HashedGroups), is_indexed);
-        if (pre != nullptr &&
-            (!pre->has_shape || pre->engine != reinterpret_cast<uintptr_t>(&maxwell3d) ||
-             pre->memory != reinterpret_cast<uintptr_t>(&memory) ||
-             maxwell3d.engine_state != Tegra::Engines::Maxwell3D::EngineHint::None)) {
-            pre = nullptr;
-        }
-        // The later steps of this draw (the pipeline key) take the same record.
-        parallel->SetTaken(pre);
-    }
+    const V2::Resolve::PreDraw* const pre =
+        parallel_pre != nullptr && parallel_pre->has_shape ? parallel_pre : nullptr;
+    parallel_pre = nullptr;
     const bool parallel_verify = pre != nullptr && V2::Verify(V2::Switch::Parallel);
     const auto note_step = [parallel](V2::Resolve::Step step, bool by_shard) {
         if (parallel != nullptr) [[unlikely]] {
@@ -334,22 +331,26 @@ DrawCacheGlue::Decision DrawCacheGlue::DecideDraw(bool continued, bool is_indexe
                 shape = pre->shape;
                 if (parallel_verify) {
                     V2::Resolve::Count(V2::Resolve::GetStats().verify_draws);
-                    const u64 serial = GraphicsShape(is_indexed, maxwell3d, memory);
+                    const u64 serial = GraphicsShape(*pipeline, is_indexed, maxwell3d, memory);
                     if (serial != shape) {
                         NoteParallelMismatch("shape", shape, serial);
                         shape = serial;
                     }
                 }
             } else {
-                shape = GraphicsShape(is_indexed, maxwell3d, memory);
+                shape = GraphicsShape(*pipeline, is_indexed, maxwell3d, memory);
             }
             note_step(V2::Resolve::Step::Shape, pre != nullptr);
             pending_draw.shape = shape;
-            pending_draw.valid = true;
-            const DC::ShapeInfo* const info = graphics_shapes.Find(shape);
+            const DC::ShapeInfo* info = graphics_shapes.Find(shape);
             if (info == nullptr) {
-                miss = DC::Miss::NoShape;
-                return nullptr;
+                // A new shape: what its shaders use comes from the pipeline, no resolve needed.
+                graphics_shapes.Insert(ShapeInfoOf(shape, *pipeline));
+                info = graphics_shapes.Find(shape);
+                if (V2::On(V2::Switch::Parallel)) [[unlikely]] {
+                    V2::Resolve::PublishShape(info->shape, info->relevant_groups,
+                                              info->key_cbufs);
+                }
             }
             u64 key = 0;
             if (pre != nullptr && pre->has_full && pre->shape == shape &&
@@ -383,9 +384,19 @@ DrawCacheGlue::Decision DrawCacheGlue::DecideDraw(bool continued, bool is_indexe
                 key = GraphicsKey(shape, *info, maxwell3d);
                 note_step(V2::Resolve::Step::DrawKey, false);
             }
+            pending_draw.key = key;
+            pending_draw.valid = true;
             Recipe* const recipe = graphics_table.Find(key);
             if (recipe == nullptr) {
                 miss = DC::Miss::NoEntry;
+                // Probation: a recipe only for a key seen before.
+                pending_draw.admit = graphics_seen.Admit(key);
+                counters.probation += pending_draw.admit ? 0 : 1;
+            } else if (recipe->pipeline != pipeline) {
+                // Another pipeline behind an equal shape (a hash collision, or one replaced).
+                miss = DC::Miss::Pipeline;
+                pending_draw.admit = true;
+                return nullptr;
             }
             return recipe;
         },
@@ -397,10 +408,13 @@ DrawCacheGlue::Decision DrawCacheGlue::DecideDraw(bool continued, bool is_indexe
         // Counted as a hit once the replay recorded the draw (NoteReplayed).
         if (decision.verify) {
             ++counters.verify_samples;
+            pending_draw.admit = true;
         }
     } else {
         ++counters.misses[static_cast<size_t>(decision.miss)];
         counters.invalidated += decision.invalidated ? 1 : 0;
+        // An entry that failed validation repeats: rebuild it.
+        pending_draw.admit |= decision.invalidated;
     }
     return decision;
 }
@@ -409,7 +423,8 @@ DrawCacheGlue::RecipeCapture* DrawCacheGlue::BeginDrawCapture(
     const GraphicsPipeline& pipeline, bool is_indexed, bool is_indirect, bool mesh,
     bool frame_dump, const Tegra::Engines::Maxwell3D& maxwell3d) {
     static_cast<void>(is_indexed);
-    if (!pending_draw.valid || is_indirect || mesh || frame_dump || !pipeline.TakesRecipes() ||
+    if (!pending_draw.valid || !pending_draw.admit || is_indirect || mesh || frame_dump ||
+        !pipeline.TakesRecipes() ||
         !pipeline.IsBuilt() || maxwell3d.regs.transform_feedback_enabled != 0 ||
         !maxwell3d.draw_manager.draw_state.inline_index_draw_indexes.empty()) {
         return nullptr;
@@ -596,20 +611,8 @@ void DrawCacheGlue::FinishDrawCapture(GraphicsPipeline& pipeline, const Decision
     if (Framebuffer* const framebuffer = texture_cache.GetFramebuffer()) {
         recipe.render_pass = reinterpret_cast<u64>(framebuffer->RenderPass());
     }
-    // The shape learns what the bound shaders use (P3's relevance masking).
-    DC::ShapeInfo info{.shape = pending_draw.shape};
-    info.relevant_groups = (pipeline.ReadsVertexAttributes() ? GroupBit(RegGroup::VertexStreams)
-                                                             : 0) |
-                           (pipeline.UsesTexturePools() ? GroupBit(RegGroup::TexPools) : 0);
-    for (size_t stage = 0; stage < info.key_cbufs.size(); ++stage) {
-        info.key_cbufs[stage] =
-            pipeline.HandleConstantBuffers()[stage] | pipeline.StorageConstantBuffers()[stage];
-    }
-    graphics_shapes.Insert(info);
-    if (V2::On(V2::Switch::Parallel)) [[unlikely]] {
-        V2::Resolve::PublishShape(info.shape, info.relevant_groups, info.key_cbufs);
-    }
-    Store(graphics_table, GraphicsKey(pending_draw.shape, info, maxwell3d), recipe, decision, false);
+    // The shape learnt what its shaders use when DecideDraw met it.
+    Store(graphics_table, pending_draw.key, recipe, decision, false);
     DC::ThreadStats().graphics_occupied = graphics_table.Occupied();
     DC::ThreadStats().graphics_capacity = graphics_table.Capacity();
 }
@@ -678,12 +681,19 @@ DrawCacheGlue::Decision DrawCacheGlue::DecideDispatch(const Tegra::Engines::Kepl
             pending_dispatch.valid = true;
             const DC::ShapeInfo* const info = compute_shapes.Find(shape);
             if (info == nullptr) {
+                // The shape learns its pipeline's handle slots from a resolve: on the second
+                // sighting (probation, as for keys).
                 miss = DC::Miss::NoShape;
+                pending_dispatch.admit = compute_seen.Admit(shape);
+                counters.probation += pending_dispatch.admit ? 0 : 1;
                 return nullptr;
             }
-            Recipe* const recipe = compute_table.Find(ComputeKey(shape, *info, kepler));
+            const u64 key = ComputeKey(shape, *info, kepler);
+            Recipe* const recipe = compute_table.Find(key);
             if (recipe == nullptr) {
                 miss = DC::Miss::NoEntry;
+                pending_dispatch.admit = compute_seen.Admit(key);
+                counters.probation += pending_dispatch.admit ? 0 : 1;
             }
             return recipe;
         },
@@ -692,17 +702,20 @@ DrawCacheGlue::Decision DrawCacheGlue::DecideDispatch(const Tegra::Engines::Kepl
     if (decision.path == DC::Path::Replay) {
         if (decision.verify) {
             ++counters.verify_samples;
+            pending_dispatch.admit = true;
         }
     } else {
         ++counters.misses[static_cast<size_t>(decision.miss)];
         counters.invalidated += decision.invalidated ? 1 : 0;
+        pending_dispatch.admit |= decision.invalidated;
     }
     return decision;
 }
 
 DrawCacheGlue::RecipeCapture* DrawCacheGlue::BeginDispatchCapture(const ComputePipeline& pipeline,
                                                                   bool eligible) {
-    if (!pending_dispatch.valid || !eligible || !pipeline.TakesRecipes()) {
+    if (!pending_dispatch.valid || !pending_dispatch.admit || !eligible ||
+        !pipeline.TakesRecipes()) {
         return nullptr;
     }
     capture.Clear();

@@ -372,7 +372,8 @@ GraphicsPipeline::GraphicsPipeline(
     const std::array<const Shader::Info*, NUM_STAGES>& infos,
     std::function<std::array<vk::ShaderModule, NUM_STAGES>()> emit_stages,
     std::optional<MeshEmulationSetup> mesh_emulation_)
-    : key{key_}, device{device_}, texture_cache{texture_cache_}, buffer_cache{buffer_cache_},
+    : key{key_}, state_hash{key_.state.Hash()}, device{device_}, texture_cache{texture_cache_},
+      buffer_cache{buffer_cache_},
       pipeline_cache(pipeline_cache_), scheduler{scheduler_},
       guest_descriptor_queue{guest_descriptor_queue_},
       descriptor_buffer_ring{descriptor_buffer_ring_}, spv_modules{std::move(stages)},

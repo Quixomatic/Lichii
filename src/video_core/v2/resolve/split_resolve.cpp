@@ -10,6 +10,7 @@
 #include "video_core/v2/resolve/split_resolve.h"
 #include "video_core/v2/resolve/state_view.h"
 #include "video_core/v2/v2_stats.h"
+#include "video_core/v2/v2_switches.h"
 
 namespace VideoCommon::V2::Resolve {
 
@@ -226,24 +227,6 @@ SerialReason SplitTraits::Resolve(Shard& shard, const Input& input, std::vector<
                 pre.memory = snapshot.memory;
                 pre.drift = drift;
                 if (!drift) {
-                    const ShardKey key = g_shard_key(ShardKeyInputs{
-                        .regs = mirror.regs.data(),
-                        .groups = &groups,
-                        .cbufs = &mirror.v2_cbufs,
-                        .topology = draw.topology,
-                        .indexed = pre.indexed,
-                        .native_turing = snapshot.native_turing,
-                        .engine = snapshot.engine,
-                        .memory = snapshot.memory,
-                    });
-                    pre.shape = key.shape;
-                    pre.partial = key.partial;
-                    pre.full = key.full;
-                    pre.cbuf_masks = key.cbuf_masks;
-                    pre.relevant = key.relevant;
-                    pre.has_shape = key.has_shape;
-                    pre.has_key = key.has_key;
-                    pre.has_full = key.has_full;
                     if (g_pipeline_key != nullptr) {
                         // P6c step (a): the draw's pipeline key from the same state view.
                         const SnapshotView view{
@@ -262,6 +245,30 @@ SerialReason SplitTraits::Resolve(Shard& shard, const Input& input, std::vector<
                             snapshot.native_turing};
                         pre.pipeline_key = g_pipeline_key(view);
                     }
+                    // The draw-cache shape holds the pipeline key's hash: only the canonical key
+                    // the serial path uses with EDEN_NX2_V2_PIPEKEY equals the shard's.
+                    const bool state_hash =
+                        pre.pipeline_key != nullptr && On(Switch::PipeKey);
+                    const ShardKey key = g_shard_key(ShardKeyInputs{
+                        .regs = mirror.regs.data(),
+                        .groups = &groups,
+                        .cbufs = &mirror.v2_cbufs,
+                        .topology = draw.topology,
+                        .indexed = pre.indexed,
+                        .native_turing = snapshot.native_turing,
+                        .engine = snapshot.engine,
+                        .memory = snapshot.memory,
+                        .state_hash = state_hash ? pre.pipeline_key->hash : 0,
+                        .has_state_hash = state_hash,
+                    });
+                    pre.shape = key.shape;
+                    pre.partial = key.partial;
+                    pre.full = key.full;
+                    pre.cbuf_masks = key.cbuf_masks;
+                    pre.relevant = key.relevant;
+                    pre.has_shape = key.has_shape;
+                    pre.has_key = key.has_key;
+                    pre.has_full = key.has_full;
                 }
                 records.push_back(pre);
             }

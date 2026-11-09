@@ -1065,12 +1065,29 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     };
     GraphicsPipeline* const delta_pipeline =
         fast_draw_on ? TakeReusableDraw(is_indexed, is_indirect) : nullptr;
+    const auto lookup_pipeline = [&] {
+        Profile::Scope scope{Profile::Zone::PipelineLookup};
+        // A continued-draw check that looked the pipeline up already (nothing changed since).
+        if (cont_lookup_valid) [[unlikely]] {
+            return cont_lookup;
+        }
+        return pipeline_cache.CurrentGraphicsPipeline();
+    };
     // EDEN_NX2_V2_DRAWCACHE: the fast-path ladder (MASTER_PLAN §5.3) in one decision: a continued
-    // draw (P3, above), else a validated recipe replay, else the dirty-group resolve.
+    // draw (P3, above), else a validated recipe replay, else the dirty-group resolve. The shape is
+    // the pipeline key's (dynamic state stays out of it), so the pipeline is looked up first
+    // (with EDEN_NX2_V2_PIPEKEY an unchanged key costs no lookup).
     VideoCommon::V2::DrawCache::Decision cache_decision{};
+    GraphicsPipeline* looked_up = nullptr;
+    bool have_lookup = false;
     if (drawcache) [[unlikely]] {
+        DrawCache().TakeParallelDraw(is_indexed, *maxwell3d, *gpu_memory);
+        if (delta_pipeline == nullptr) {
+            looked_up = lookup_pipeline();
+            have_lookup = true;
+        }
         cache_decision = DrawCache().DecideDraw(delta_pipeline != nullptr, is_indexed,
-                                                is_indirect, *maxwell3d, *gpu_memory);
+                                                is_indirect, looked_up, *maxwell3d, *gpu_memory);
     }
     GraphicsPipeline* const replay_pipeline =
         cache_decision.path == VideoCommon::V2::DrawCache::Path::Replay && !cache_decision.verify
@@ -1083,14 +1100,8 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     GraphicsPipeline* const verify_pipeline = fast_draw_verify ? delta_pipeline : nullptr;
     GraphicsPipeline* const pipeline{replay_pipeline != nullptr ? replay_pipeline
                                      : delta_pipeline && !verify_pipeline ? delta_pipeline
-                                                                          : [&] {
-        Profile::Scope scope{Profile::Zone::PipelineLookup};
-        // A continued-draw check that looked the pipeline up already (nothing changed since).
-        if (cont_lookup_valid) [[unlikely]] {
-            return cont_lookup;
-        }
-        return pipeline_cache.CurrentGraphicsPipeline();
-    }()};
+                                     : have_lookup                        ? looked_up
+                                                                          : lookup_pipeline()};
     cont_lookup_valid = false;
     if (parallel_commit != nullptr) [[unlikely]] {
         parallel_commit->EndDraw(); // the shard's record is this draw's only

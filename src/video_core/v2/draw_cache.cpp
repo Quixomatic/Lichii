@@ -256,7 +256,8 @@ std::string FormatCounters(const char* name, const char* unit, const Counters& c
         "{:.0f}/s, hits with storage pages written (synchronized) {:.0f}/s | buffer replay: all "
         "{:.0f}/s, partial {:.0f}/s, existing path {:.0f}/s, bindings from the recipe {:.0f}/s, "
         "synced {:.0f}/s, verify stale ranges {} | table {}/{} "
-        "({:.1f}%), inserts {:.0f}/s, evictions {:.0f}/s | verify {} samples, {} mismatches, {} "
+        "({:.1f}%), inserts {:.0f}/s, evictions {:.0f}/s, first sightings (no recipe) {:.0f}/s | "
+        "verify {} samples, {} mismatches, {} "
         "deferred by the epoch",
         name, static_cast<double>(decided) / seconds, pct(c.continued), pct(c.hits),
         pct(c.invalidated), misses.empty() ? std::string{" none"} : misses,
@@ -271,7 +272,7 @@ std::string FormatCounters(const char* name, const char* unit, const Counters& c
         static_cast<double>(c.buffer_binds_synced) / seconds, c.buffer_stale, occupied, capacity,
         capacity == 0 ? 0.0 : 100.0 * static_cast<double>(occupied) / static_cast<double>(capacity),
         static_cast<double>(c.inserts) / seconds, static_cast<double>(c.evictions) / seconds,
-        c.verify_samples, c.verify_mismatches, c.verify_deferred);
+        static_cast<double>(c.probation) / seconds, c.verify_samples, c.verify_mismatches, c.verify_deferred);
 }
 
 } // Anonymous namespace

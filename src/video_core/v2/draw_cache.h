@@ -91,6 +91,31 @@ private:
     std::array<ShapeInfo, Entries> entries{};
 };
 
+/// Admission control (AnyPS5's probation): a key gets a recipe on its second sighting, so keys
+/// seen once (most of a scene's unique draws) never capture, insert or evict. Direct mapped: a
+/// key whose slot another key took since counts as unseen again.
+class SeenFilter {
+public:
+    static constexpr size_t Entries = 8192;
+
+    /// Whether `key` was seen before (and still is remembered); remembers it either way.
+    [[nodiscard]] bool Admit(u64 key) {
+        const u64 tag = key | 1; // 0 is the empty slot
+        u64& slot = tags[static_cast<size_t>((key * 0x9e3779b97f4a7c15ULL) >> 51) % Entries];
+        if (slot == tag) {
+            return true;
+        }
+        slot = tag;
+        return false;
+    }
+    void Clear() {
+        tags.fill(0);
+    }
+
+private:
+    std::array<u64, Entries> tags{};
+};
+
 /// A captured guest input word run: where it is (device address for versions, host pointer for the
 /// compare) and the bytes the resolve read.
 struct Capture {
@@ -563,6 +588,7 @@ struct Counters {
     std::array<u64, NumMisses> misses{};
     u64 inserts{};
     u64 evictions{};
+    u64 probation{}; ///< misses whose key was seen for the first time (no recipe built)
     u64 verify_samples{};
     u64 verify_mismatches{};
     u64 verify_deferred{}; ///< the memo deferred a CPU write the fresh walk saw (not a mismatch)

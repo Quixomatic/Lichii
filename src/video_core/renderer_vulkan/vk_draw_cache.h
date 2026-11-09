@@ -15,6 +15,10 @@ namespace Tegra {
 class MemoryManager;
 }
 
+namespace VideoCommon::V2::Resolve {
+struct PreDraw;
+}
+
 namespace Vulkan {
 
 class ComputePipeline;
@@ -36,14 +40,21 @@ public:
     DrawCacheGlue& operator=(const DrawCacheGlue&) = delete;
 
     // --- Draws ---------------------------------------------------------------------------------
+    /// EDEN_NX2_V2_PARALLEL: takes the shard's record for this draw, before the pipeline lookup
+    /// (which takes the shard's pipeline key from it). Every draw, so the records stay in step.
+    void TakeParallelDraw(bool is_indexed, const Tegra::Engines::Maxwell3D& maxwell3d,
+                          const Tegra::MemoryManager& memory);
     /// The ladder for a draw: continued (P3 took a delta draw), else a validated recipe, else a
-    /// resolve. No cache mutation here and no lock needed: versions and generations are atomics,
-    /// the rest belongs to the resolving thread.
+    /// resolve. `pipeline` is the looked-up pipeline (null when continued or none): the shape is
+    /// its key's hash with the programs and render targets. No cache mutation here and no lock
+    /// needed: versions and generations are atomics, the rest belongs to the resolving thread.
     [[nodiscard]] Decision DecideDraw(bool continued, bool is_indexed, bool is_indirect,
+                                      const GraphicsPipeline* pipeline,
                                       const Tegra::Engines::Maxwell3D& maxwell3d,
                                       const Tegra::MemoryManager& memory);
     /// Before a full Configure of `pipeline`: the capture to arm (null when the draw can't be
-    /// cached). Takes the stamp the recipe's inputs are checked against.
+    /// cached, or its key is seen for the first time: admission on the second sighting). Takes
+    /// the stamp the recipe's inputs are checked against.
     [[nodiscard]] RecipeCapture* BeginDrawCapture(const GraphicsPipeline& pipeline, bool is_indexed,
                                                   bool is_indirect, bool mesh,
                                                   bool frame_dump,
@@ -87,12 +98,18 @@ public:
 private:
     struct Pending {
         u64 shape{};
-        bool valid{};
+        u64 key{};
+        bool valid{};    ///< shape and key computed
+        bool admit{};    ///< build a recipe (second sighting, invalidated entry or verify)
         bool capturing{};
     };
 
-    [[nodiscard]] u64 GraphicsShape(bool is_indexed, const Tegra::Engines::Maxwell3D& maxwell3d,
-                                    const Tegra::MemoryManager& memory) const;
+    [[nodiscard]] static u64 GraphicsShape(const GraphicsPipeline& pipeline, bool is_indexed,
+                                           const Tegra::Engines::Maxwell3D& maxwell3d,
+                                           const Tegra::MemoryManager& memory);
+    /// What the shape table holds for a shape, learnt from its pipeline (no resolve needed).
+    [[nodiscard]] static VideoCommon::V2::DrawCache::ShapeInfo ShapeInfoOf(
+        u64 shape, const GraphicsPipeline& pipeline);
     [[nodiscard]] static u64 GraphicsKey(u64 shape, const VideoCommon::V2::DrawCache::ShapeInfo& info,
                                          const Tegra::Engines::Maxwell3D& maxwell3d);
     [[nodiscard]] static u64 ComputeShape(const Tegra::Engines::KeplerCompute& kepler,
@@ -117,6 +134,9 @@ private:
     VideoCommon::V2::DrawCache::RecipeTable compute_table;
     VideoCommon::V2::DrawCache::ShapeTable graphics_shapes;
     VideoCommon::V2::DrawCache::ShapeTable compute_shapes;
+    VideoCommon::V2::DrawCache::SeenFilter graphics_seen;
+    VideoCommon::V2::DrawCache::SeenFilter compute_seen;
+    const VideoCommon::V2::Resolve::PreDraw* parallel_pre{}; ///< EDEN_NX2_V2_PARALLEL: the shard record TakeParallelDraw took
     VideoCommon::V2::Versions::EpochMemo memo;
     VideoCommon::V2::Versions::PageWatch watch;
     VideoCommon::V2::DrawCache::VerifySampler graphics_sampler;

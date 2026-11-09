@@ -366,6 +366,10 @@ public:
     [[nodiscard]] bool TakesRecipes() const noexcept {
         return recipe_eligible;
     }
+    /// FixedPipelineState::Hash of the key (the pipeline part of a draw-cache shape).
+    [[nodiscard]] u64 StateHash() const noexcept {
+        return state_hash;
+    }
     enum class RecipeResult : u8 {
         Recorded, ///< the draw's state is recorded
         Rebuild,  ///< the recipe no longer matches (images deleted, other render targets):
@@ -428,6 +432,7 @@ private:
     void Validate();
 
     const GraphicsPipelineCacheKey key;
+    const u64 state_hash;
     Tegra::Engines::Maxwell3D* maxwell3d;
     Tegra::MemoryManager* gpu_memory;
     const Device& device;
