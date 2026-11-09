@@ -11,6 +11,7 @@
 #include <memory>
 #include <thread>
 #include <type_traits>
+#include <utility>
 
 #include "common/common_types.h"
 #include "video_core/v2/hazard.h"
@@ -133,6 +134,52 @@ public:
     [[nodiscard]] bool DrawRecords() const {
         return draw_records;
     }
+    /// Fix F1 (S1 single owner, v2/s1_deltas.h; fixed per start): the 3D front sends classified
+    /// StateRuns the back applies without executing the methods (EDEN_NX2_V2_REGSEM=1 with the
+    /// typed IR, front macros and EDEN_NX2_V2_IR_DRAWS=1). S1Check: REGSEM or IR_DRAWS is
+    /// verify, the back executes the method words and checks the classified entries sent with
+    /// them. Neither with EDEN_NX2_V2_PARALLEL (its shards replay method words).
+    [[nodiscard]] bool S1Exec() const {
+        return s1_exec;
+    }
+    [[nodiscard]] bool S1Check() const {
+        return s1_check;
+    }
+    /// Front, S1: room for `words` of classified entries for `engine` in the open StateRun (a
+    /// Classified one with S1Exec), opening one when needed. Fill them, then S1Commit(words).
+    u64* S1Begin(Tegra::Engines::EngineInterface* engine, size_t words) {
+        SelectEngine(engine);
+        s1_cbuf = nullptr;
+        if (ir_run != nullptr && ir_run_classified == s1_exec &&
+            ir_run_words + words <= MaxRunWords) [[likely]] {
+            if (u64* const entry = arena.Extend(words)) [[likely]] {
+                ir_run_words += words;
+                return entry;
+            }
+        }
+        return S1OpenRun(words);
+    }
+    void S1Commit(size_t words) {
+        if (s1_open_words != 0) [[unlikely]] {
+            const size_t header = std::exchange(s1_open_words, size_t{0});
+            Commit(header);
+        }
+        Advance(words);
+    }
+    /// Front, S1: a one-word entry (Delta, Exec).
+    void S1Word(Tegra::Engines::EngineInterface* engine, u64 word) {
+        u64* const entry = S1Begin(engine, 1);
+        entry[0] = word;
+        S1Commit(1);
+    }
+    /// Front, S1: constant buffer words uploaded to `buffer` + `offset`, coalesced with the open
+    /// Cbuf entry while they continue it (V2::S1 Cbuf). `slot`: const_buffer.buffer[slot] took
+    /// the word (with `store`).
+    void S1Cbuf(Tegra::Engines::EngineInterface* engine, bool store, u32 slot, u64 buffer,
+                u32 offset, u32 word);
+    /// Front, S1: inline index words for `method` (V2::S1 Inline entries).
+    void S1Inline(Tegra::Engines::EngineInterface* engine, u32 method, const u32* words,
+                  u32 count);
     /// Whether Draw/Dispatch records carry their full bodies (group hashes, predicted draws):
     /// only when something reads them, EDEN_NX2_V2_PARALLEL or IR_DRAWS=verify. Otherwise they
     /// are V2::Ir::CompactBody records.
@@ -598,7 +645,9 @@ private:
     void IrMethod(Tegra::Engines::EngineInterface* engine, u64 word, const GPUVAddr* segment) {
         SelectEngine(engine);
         const size_t words = segment != nullptr ? 2 : 1;
-        if (ir_run != nullptr && ir_run_words + words <= MaxRunWords) [[likely]] {
+        s1_cbuf = nullptr;
+        if (ir_run != nullptr && !ir_run_classified && ir_run_words + words <= MaxRunWords)
+            [[likely]] {
             if (u64* const entry = arena.Extend(words)) [[likely]] {
                 entry[0] = word;
                 if (segment != nullptr) {
@@ -615,7 +664,10 @@ private:
     void IrCloseRun() {
         ir_run[V2::Ir::HeaderWords] = V2::Ir::PackRef(ir_run_index, static_cast<u32>(ir_run_words));
         ir_run = nullptr;
+        ir_run_classified = false;
+        s1_cbuf = nullptr;
     }
+    u64* S1OpenRun(size_t words);
     /// Closes the open StateRun (P2 notes a write at the position after it: the next method
     /// starts a new record, so every noted write ends its record).
     void IrCut() {
@@ -724,6 +776,8 @@ private:
     bool draw_verify{};  ///< EDEN_NX2_V2_IR_DRAWS=verify: the back checks draws (V2::IrCheck)
     bool full_draw_records{}; ///< FullDrawRecords
     bool ir_checks{}; ///< ir_verify, draw_verify or V2 stats: ExecuteIr's per-record checks
+    bool s1_exec{};   ///< S1Exec
+    bool s1_check{};  ///< S1Check
     std::unique_ptr<u64[]> ring;
     V2::Resolve::SplitResolve* parallel{}; ///< EDEN_NX2_V2_PARALLEL (owned; deleted at Stop)
 
@@ -740,6 +794,9 @@ private:
     u64* ir_run{}; ///< Header of the open StateRun
     size_t ir_run_words{};
     u32 ir_run_index{}; ///< Arena index of the open StateRun's entries
+    bool ir_run_classified{}; ///< The open StateRun is an Ir::Classified one
+    size_t s1_open_words{};   ///< S1OpenRun's record, committed by S1Commit
+    u64* s1_cbuf{}; ///< The open run's last entry when it is a Cbuf entry S1Cbuf may extend
     size_t ir_pending_words{};   ///< IrPayloadBegin's record, until IrPayloadCommit
     size_t ir_pending_payload{};
     bool ir_ref_failed{};        ///< IrRef found the object table full

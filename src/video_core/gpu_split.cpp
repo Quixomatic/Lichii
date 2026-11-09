@@ -36,6 +36,7 @@
 #include "video_core/v2/p5b_stats.h"
 #include "video_core/v2/qmd_front.h"
 #include "video_core/v2/ir_check.h"
+#include "video_core/v2/s1_deltas.h"
 #include "video_core/v2/ir_exec.h"
 #include "video_core/v2/front_writes.h"
 #include "video_core/v2/v2_stats.h"
@@ -163,6 +164,14 @@ void GpuSplit::MaybeStart(Core::System& system_) {
     draw_verify = draw_records && V2::Verify(V2::Switch::IrDraws);
     full_draw_records = draw_records && (draw_verify || V2::On(V2::Switch::Parallel));
     ir_checks = ir_verify || draw_verify || V2::Stats::Enabled();
+    {
+        // S1 single owner (Fix F1): the back applies the front's classified entries.
+        const V2::Mode regsem = V2::Get(V2::Switch::RegSem);
+        const bool s1_possible = ir && front_macros && !V2::On(V2::Switch::Parallel);
+        s1_exec = s1_possible && draw_records && !draw_verify && regsem == V2::Mode::On;
+        s1_check = s1_possible && !s1_exec && regsem != V2::Mode::Off &&
+                   (regsem == V2::Mode::Verify || draw_verify);
+    }
     if (draw_verify) {
         V2::IrCheck::Start();
     }
@@ -197,10 +206,11 @@ void GpuSplit::MaybeStart(Core::System& system_) {
                  "hook after {} us",
                  spin_window_ns / 1000, std::thread::hardware_concurrency(), idle_hook_ns / 1000);
     }
-    LOG_INFO(HW_GPU, "GPU thread split: engine methods run on a second thread{}{}{}",
+    LOG_INFO(HW_GPU, "GPU thread split: engine methods run on a second thread{}{}{}{}",
              front_macros ? ", macros on the first" : "",
              ir ? (ir_verify ? ", typed IR (verified)" : ", typed IR") : "",
-             draw_records ? (draw_verify ? ", draw records (checked)" : ", draw records") : "");
+             draw_records ? (draw_verify ? ", draw records (checked)" : ", draw records") : "",
+             s1_exec ? ", 3D register deltas" : (s1_check ? ", 3D register deltas (checked)" : ""));
 }
 
 void GpuSplit::Stop() {
@@ -236,6 +246,11 @@ void GpuSplit::Stop() {
     draw_verify = false;
     full_draw_records = false;
     ir_checks = false;
+    s1_exec = false;
+    s1_check = false;
+    ir_run_classified = false;
+    s1_open_words = 0;
+    s1_cbuf = nullptr;
     V2::IrCheck::Stop();
     ir_sequence = 0;
     ir_run = nullptr;
@@ -552,6 +567,84 @@ void GpuSplit::IrOpenRun(u64 word, const GPUVAddr* segment) {
     Advance(entry_words);
 }
 
+u64* GpuSplit::S1OpenRun(size_t words) {
+    constexpr size_t header = V2::Ir::HeaderWords + 1;
+    u64* const record = IrBegin(V2::Ir::Kind::StateRun, 0, header,
+                                V2::Ir::HasPayload | (s1_exec ? V2::Ir::Classified : 0));
+    u64* const entries = ArenaBegin(words, ir_sequence, write_position + header);
+    ir_run_index = arena.IndexOf(entries);
+    record[V2::Ir::HeaderWords] = V2::Ir::PackRef(ir_run_index, 0);
+    ir_run = record;
+    ir_run_words = words;
+    ir_run_classified = s1_exec;
+    s1_open_words = header;
+    return entries;
+}
+
+void GpuSplit::S1Cbuf(Tegra::Engines::EngineInterface* engine, bool store, u32 slot, u64 buffer,
+                      u32 offset, u32 word) {
+    namespace S1 = V2::S1;
+    if (u64* const head = s1_cbuf; head != nullptr && engine == front_engine) {
+        const u64 h = head[0];
+        const u32 count = S1::CbufCount(h);
+        const u32 m0 = S1::CbufMethod0(h);
+        const bool joins = ((h & S1::CbufStore) != 0) == store && head[1] == buffer &&
+                           S1::ValueOf(h) + count * 4 == offset && count < S1::MaxCbufWords;
+        bool inc = (h & S1::CbufInc) != 0;
+        bool method_ok = !store;
+        if (store) {
+            if (count == 1 && !inc && slot == m0 + 1) {
+                inc = true;
+                method_ok = true;
+            } else {
+                method_ok = slot == m0 + (inc ? count : 0);
+            }
+        }
+        if (joins && method_ok) {
+            u32* data = nullptr;
+            if (count % 2 != 0) {
+                data = reinterpret_cast<u32*>(head + 2 + count / 2) + 1;
+            } else if (ir_run_words + 1 <= MaxRunWords) {
+                if (u64* const extra = arena.Extend(1)) {
+                    ++ir_run_words;
+                    *extra = 0;
+                    data = reinterpret_cast<u32*>(extra);
+                }
+            }
+            if (data != nullptr) {
+                *data = word;
+                head[0] = S1::MakeCbuf(store, inc, m0, count + 1, S1::ValueOf(h));
+                if (count % 2 == 0) {
+                    Advance(1); // A publish here closes the run with this word in it
+                }
+                return;
+            }
+        }
+    }
+    u64* const entry = S1Begin(engine, 3);
+    entry[0] = S1::MakeCbuf(store, false, slot, 1, offset);
+    entry[1] = buffer;
+    entry[2] = word;
+    s1_cbuf = entry;
+    S1Commit(3);
+}
+
+void GpuSplit::S1Inline(Tegra::Engines::EngineInterface* engine, u32 method, const u32* words,
+                        u32 count) {
+    namespace S1 = V2::S1;
+    while (count > 0) {
+        const u32 piece = std::min(count, S1::MaxInlineWords);
+        const size_t size = 1 + (size_t{piece} + 1) / 2;
+        u64* const entry = S1Begin(engine, size);
+        entry[0] = S1::MakeRegister(S1::Tag::Inline, method, piece);
+        entry[size - 1] = 0;
+        std::memcpy(entry + 1, words, size_t{piece} * sizeof(u32));
+        S1Commit(size);
+        words += piece;
+        count -= piece;
+    }
+}
+
 void GpuSplit::MultiMethod(Tegra::Engines::EngineInterface* engine, u32 method, const u32* words,
                            u32 amount, u32 methods_pending, const GPUVAddr* segment) {
     SelectEngine(engine);
@@ -611,6 +704,10 @@ SPLIT_FORCE_INLINE size_t GpuSplit::ExecuteMethod3D(Tegra::Engines::EngineInterf
     {
         using Tegra::Engines::Maxwell3D;
         auto* const maxwell3d = static_cast<Maxwell3D*>(engine);
+        if (V2::S1::IsClassified(head)) [[unlikely]] {
+            // S1Check: the entries the front would send instead, checked against this engine.
+            return maxwell3d->S1CheckEntry(entry);
+        }
         constexpr u32 cb_data = MAXWELL3D_REG_INDEX(const_buffer.buffer);
         if (method - cb_data < 16 && (head & HasSegment) == 0) {
             // Single constant buffer words in a row (macros write them one by one) go up in
@@ -664,6 +761,9 @@ SPLIT_FORCE_INLINE size_t GpuSplit::ExecuteMethod(const u64* entry, size_t words
     const u64 head = entry[0];
     const u32 method = static_cast<u32>((head >> 8) & 0xffff);
     const u32 argument = static_cast<u32>(head >> 32);
+    if (V2::S1::IsClassified(head)) [[unlikely]] {
+        return static_cast<Tegra::Engines::Maxwell3D*>(engine)->S1CheckEntry(entry);
+    }
     if (!engine->reports_fast_draw_breaks) {
         Nx2FastDraw::Break(Nx2FastDraw::Reason::OtherEngine);
     }
@@ -741,6 +841,11 @@ size_t GpuSplit::ExecuteIr(const u64* entry) {
         const u64* it = arena.At(payload.index);
         const u64* const end = it + payload.words;
         auto* const engine = back_engine;
+        if ((head & V2::Ir::Classified) != 0) {
+            // S1 single owner: register deltas and typed entries, no method execution.
+            static_cast<Tegra::Engines::Maxwell3D*>(engine)->ExecuteS1Run(it, end);
+            break;
+        }
         if (engine->fast_maxwell3d) {
             while (it < end) {
                 it += ExecuteMethod3D(engine, it, static_cast<size_t>(end - it));

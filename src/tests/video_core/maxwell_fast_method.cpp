@@ -90,6 +90,28 @@ struct GpuSplitTestAccess {
         split.full_draw_records = full;
     }
 
+    static void SetS1(GpuSplit& split, bool exec, bool check) {
+        split.s1_exec = exec;
+        split.s1_check = check;
+    }
+
+    /// Runs everything sent so far on the calling thread as the back.
+    static void RunBack(GpuSplit& split) {
+        split.Publish();
+        SetBackThread(true);
+        u64 position = split.consumed.load();
+        while (position < split.write_position) {
+            const size_t index = position & GpuSplit::RingMask;
+            const size_t size = split.Execute(
+                &split.ring[index],
+                std::min<u64>(split.write_position - position, GpuSplit::RingWords - index));
+            position += size != 0 ? size : GpuSplit::RingWords - index;
+        }
+        split.consumed.store(position);
+        split.consumed_cache = position;
+        SetBackThread(false);
+    }
+
     static void SetBackThread(bool back) {
         GpuSplit::on_back_thread = back;
     }
@@ -1773,6 +1795,220 @@ TEST_CASE("V2 IR: without a consumer, draw records are compact and run the same"
     CHECK(compact.first == 63);
     // 5 ring words per compact record instead of 27.
     CHECK(compact.words + 64 * 20 <= full.words);
+}
+
+namespace Tegra::Engines {
+
+struct Maxwell3DTestAccess {
+    static void MacroWrite(Maxwell3D& engine, Core::System& system,
+                           VideoCommon::GpuSplit& split, u32 method, u32 value) {
+        engine.FrontWrite(split, engine.Front(system, split), method, value, true, true);
+    }
+    static bool EndMacro(Maxwell3D& engine, Core::System& system, VideoCommon::GpuSplit& split) {
+        return engine.FrontEndMacro(system, split, engine.Front(system, split));
+    }
+};
+
+} // namespace Tegra::Engines
+
+namespace {
+
+/// The draws a Maxwell3D makes, with the draw state the rasterizer reads.
+class RecordingRasterizer final : public Null::RasterizerNull {
+public:
+    struct Record {
+        u32 kind; ///< 0 draw, 1 clear, 2 texture
+        bool indexed;
+        u32 instances;
+        u32 topology;
+        u32 vertex_first;
+        u32 vertex_count;
+        u32 index_first;
+        u32 index_count;
+        u32 index_format;
+        u64 index_address;
+        u32 base_index;
+        u32 base_instance;
+        size_t inline_bytes;
+        bool operator==(const Record&) const = default;
+    };
+
+    explicit RecordingRasterizer(Tegra::GPU& gpu) : RasterizerNull{gpu} {}
+
+    void Draw(bool is_indexed, u32 instance_count) override {
+        const auto& state = engine->draw_manager.draw_state;
+        draws.push_back({
+            .kind = 0,
+            .indexed = is_indexed,
+            .instances = instance_count,
+            .topology = static_cast<u32>(state.topology),
+            .vertex_first = is_indexed ? 0 : state.vertex_buffer.first,
+            .vertex_count = is_indexed ? 0 : state.vertex_buffer.count,
+            .index_first = is_indexed ? state.index_buffer.first : 0,
+            .index_count = is_indexed ? state.index_buffer.count : 0,
+            .index_format = is_indexed ? static_cast<u32>(state.index_buffer.format) : 0,
+            .index_address = is_indexed ? state.index_buffer.StartAddress() : 0,
+            .base_index = state.base_index,
+            .base_instance = state.base_instance,
+            .inline_bytes = state.inline_index_draw_indexes.size(),
+        });
+        if (check_groups && engine->v2_groups.valid) {
+            // The front's hashes, as the back holds them at the draw, are the registers'.
+            VideoCommon::V2::GroupTracker copy = engine->v2_groups;
+            REQUIRE(VideoCommon::V2::RegSem::Rehash3D(copy, engine->regs.reg_array.data()) == 0);
+        }
+    }
+    void Clear(u32 layer_count) override {
+        draws.push_back({.kind = 1, .instances = layer_count});
+    }
+    void DrawTexture() override {
+        draws.push_back({.kind = 2});
+    }
+
+    Maxwell3D* engine{};
+    bool check_groups{};
+    std::vector<Record> draws;
+};
+
+} // Anonymous namespace
+
+TEST_CASE("V2 S1 deltas applied on the back match the method executor on random streams",
+          "[video_core][gpu_split_dispatch][v2_s1]") {
+    // Fix F1: the front runs the register semantics and sends classified entries; the back
+    // applies them without executing methods. The reference is the v1 engine executing every
+    // method itself (CallMethod / CallMultiMethod, DrawDeferred at macro ends).
+    using Access = VideoCommon::GpuSplitTestAccess;
+    using M3Access = Tegra::Engines::Maxwell3DTestAccess;
+    using VideoCommon::V2::Mode;
+    using VideoCommon::V2::Switch;
+    constexpr std::array<u32, 22> draw_methods{
+        DrawBegin,
+        DrawEnd,
+        MAXWELL3D_REG_INDEX(vertex_buffer.first),
+        MAXWELL3D_REG_INDEX(vertex_buffer.count),
+        MAXWELL3D_REG_INDEX(index_buffer.first),
+        MAXWELL3D_REG_INDEX(index_buffer.count),
+        MAXWELL3D_REG_INDEX(index_buffer.format),
+        MAXWELL3D_REG_INDEX(index_buffer32_first),
+        MAXWELL3D_REG_INDEX(index_buffer16_subsequent),
+        MAXWELL3D_REG_INDEX(draw_inline_index),
+        MAXWELL3D_REG_INDEX(inline_index_2x16.even),
+        MAXWELL3D_REG_INDEX(inline_index_4x8.index0),
+        MAXWELL3D_REG_INDEX(vertex_array_instance_first),
+        MAXWELL3D_REG_INDEX(vertex_array_instance_subsequent),
+        MAXWELL3D_REG_INDEX(global_base_vertex_index),
+        MAXWELL3D_REG_INDEX(global_base_instance_index),
+        MAXWELL3D_REG_INDEX(clear_surface),
+        MAXWELL3D_REG_INDEX(draw_texture.src_y0),
+        MAXWELL3D_REG_INDEX(topology_override),
+        MAXWELL3D_REG_INDEX(primitive_topology_control),
+        MAXWELL3D_REG_INDEX(load_mme.start_address),
+        MAXWELL3D_REG_INDEX(falcon[4]),
+    };
+    for (const u32 seed : {1u, 2u, 3u, 4u}) {
+        CAPTURE(seed);
+        Fixture f;
+        f.system.Initialize();
+        auto& ref = f.slow; // v1: executes every method
+        auto& s1 = f.fast;  // the front's deltas, applied on its back
+        RecordingRasterizer ref_draws{f.gpu};
+        RecordingRasterizer s1_draws{f.gpu};
+        ref_draws.engine = &ref;
+        s1_draws.engine = &s1;
+        s1_draws.check_groups = true;
+        ref.BindRasterizer(&ref_draws);
+        s1.BindRasterizer(&s1_draws);
+        // The engines exist (v1 executors); the front and the split take S1 from here.
+        const V2SwitchScope regsem{Switch::RegSem, Mode::On};
+        const V2SwitchScope draws{Switch::IrDraws, Mode::On};
+        VideoCommon::GpuSplit split;
+        Access::Initialize(split, f.system);
+        Access::SetIr(split, true);
+        Access::SetDrawRecords(split, false);
+        Access::SetS1(split, true, false);
+        std::mt19937 rng{seed};
+        const auto call = [&](u32 method, u32 value, bool is_last) {
+            ref.CallMethod(f.system, method, value, is_last);
+            s1.FrontCallMethod(f.system, split, method, value, is_last);
+        };
+        const auto multi = [&](u32 method, const std::vector<u32>& words) {
+            const u32 amount = static_cast<u32>(words.size());
+            ref.CallMultiMethod(f.system, method, words.data(), amount, amount);
+            s1.FrontCallMultiMethod(f.system, split, method, words.data(), amount, amount);
+        };
+        const auto compare = [&] {
+            Access::RunBack(split);
+            REQUIRE(s1.regs.reg_array == ref.regs.reg_array);
+            REQUIRE(s1.dirty.flags == ref.dirty.flags);
+            REQUIRE(s1_draws.draws.size() == ref_draws.draws.size());
+            for (size_t i = 0; i < ref_draws.draws.size(); ++i) {
+                CAPTURE(i);
+                REQUIRE(s1_draws.draws[i] == ref_draws.draws[i]);
+            }
+            for (size_t stage = 0; stage < s1.state.shader_stages.size(); ++stage) {
+                for (size_t slot = 0; slot < Maxwell3D::Regs::MaxConstBuffers; ++slot) {
+                    const auto& x = s1.state.shader_stages[stage].const_buffers[slot];
+                    const auto& y = ref.state.shader_stages[stage].const_buffers[slot];
+                    REQUIRE(x.address == y.address);
+                    REQUIRE(x.size == y.size);
+                    REQUIRE(x.enabled == y.enabled);
+                }
+            }
+            REQUIRE(s1.root_tables.tables == ref.root_tables.tables);
+            REQUIRE(s1.root_tables.offset == ref.root_tables.offset);
+        };
+        for (u32 step = 0; step < 6000; ++step) {
+            CAPTURE(step);
+            const u32 kind = rng() % 100;
+            const bool from_macro = rng() % 2 == 0;
+            const auto write = [&](u32 method, u32 value) {
+                if (from_macro) {
+                    ref.CallMethod(f.system, method, value, true);
+                    M3Access::MacroWrite(s1, f.system, split, method, value);
+                } else {
+                    call(method, value, rng() % 4 != 0);
+                }
+            };
+            if (kind < 30) {
+                const u32 method = f.state_methods[rng() % f.state_methods.size()];
+                write(method, RandomArgument(rng, method, ref));
+            } else if (kind < 60) {
+                const u32 method = draw_methods[rng() % draw_methods.size()];
+                write(method, RandomArgument(rng, method, ref));
+            } else if (kind < 68) {
+                const u32 method = executable_methods[rng() % executable_methods.size()];
+                write(method, RandomArgument(rng, method, ref));
+            } else if (kind < 78) {
+                write(CbData + rng() % 16, rng());
+            } else if (kind < 80) {
+                write(CbOffset, (rng() % 0x4000) * 4);
+            } else if (kind < 86) {
+                std::vector<u32> words(1 + rng() % 8);
+                for (u32& word : words) {
+                    word = rng() % 3 == 0 ? rng() : rng() % 4;
+                }
+                const u32 pick = rng() % 4;
+                const u32 method =
+                    pick == 0   ? CbData + rng() % 16
+                    : pick == 1 ? MAXWELL3D_REG_INDEX(draw_inline_index)
+                    : pick == 2 ? draw_methods[rng() % draw_methods.size()]
+                                : f.state_methods[rng() % f.state_methods.size()];
+                multi(method, words);
+            } else if (kind < 89) {
+                call(ShadowControl, rng() % 4, true);
+            } else if (kind < 96) {
+                if (M3Access::EndMacro(s1, f.system, split)) {
+                    ref.draw_manager.DrawDeferred(ref);
+                }
+            } else {
+                Access::RunBack(split);
+                ref.dirty.flags.reset();
+                s1.dirty.flags.reset();
+            }
+            compare();
+        }
+        REQUIRE(!ref_draws.draws.empty());
+    }
 }
 
 TEST_CASE("V2 hazard: unknown reports block reads of their bytes until they land, not their page",

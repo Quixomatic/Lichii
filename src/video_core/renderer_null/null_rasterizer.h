@@ -31,7 +31,7 @@ public:
     }
 };
 
-class RasterizerNull final : public VideoCore::RasterizerInterface,
+class RasterizerNull : public VideoCore::RasterizerInterface,
                              protected VideoCommon::ChannelSetupCaches<VideoCommon::ChannelInfo> {
 public:
     explicit RasterizerNull(Tegra::GPU& gpu);

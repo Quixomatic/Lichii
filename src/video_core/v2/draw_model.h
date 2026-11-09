@@ -24,10 +24,13 @@ namespace VideoCommon::V2 {
 /// Draws one step produced, in order.
 struct DrawOutput {
     std::array<Ir::PredictedDraw, 8> draws{};
+    /// S1::DrawVariant bits per draw: how the draw manager reached it (S1 Draw entries).
+    std::array<u8, 8> variants{};
     u32 count{};
 
-    void Push(const Ir::PredictedDraw& draw) {
+    void Push(const Ir::PredictedDraw& draw, u8 variant = 0) {
         if (count < draws.size()) {
+            variants[count] = variant;
             draws[count++] = draw;
         }
     }
@@ -78,7 +81,8 @@ public:
 private:
     void DrawDeferred(bool loop_continues, const u32* regs, DrawOutput& out);
     void DrawEnd(u32 instance_count, bool force_draw, const u32* regs, DrawOutput& out);
-    void ProcessDraw(bool indexed, u32 instance_count, const u32* regs, DrawOutput& out);
+    void ProcessDraw(bool indexed, u32 instance_count, const u32* regs, DrawOutput& out,
+                     u8 variant = 0);
     void UpdateTopology(const u32* regs);
 };
 

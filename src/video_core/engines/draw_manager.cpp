@@ -14,6 +14,7 @@
 #include "video_core/rasterizer_interface.h"
 #include "video_core/render_trace.h"
 #include "video_core/v2/ir_check.h"
+#include "video_core/v2/s1_deltas.h"
 #include "video_core/v2/v2_stats.h"
 
 namespace Tegra::Engines {
@@ -391,6 +392,49 @@ void Maxwell3D::DrawManager::ProcessDraw(Maxwell3D& maxwell3d, bool draw_indexed
         maxwell3d.rasterizer->Draw(draw_indexed, instance_count);
     } else {
         TraceSuppressedDraw(maxwell3d, false);
+    }
+}
+
+void Maxwell3D::DrawManager::DrawPredicted(Maxwell3D& maxwell3d,
+                                           const VideoCommon::V2::Ir::PredictedDraw& draw,
+                                           u8 variant) {
+    // The draw state DrawEnd, DrawDeferred, DrawIndexSmall and DrawArrayInstanced would leave,
+    // from the front's DrawModel; the registers are the ones they read.
+    using Kind = VideoCommon::V2::Ir::DrawKind;
+    namespace S1 = VideoCommon::V2::S1;
+    switch (draw.kind) {
+    case Kind::Clear:
+        return Clear(maxwell3d, draw.first);
+    case Kind::Texture:
+        return DrawTexture(maxwell3d);
+    case Kind::Array:
+        draw_state.topology = static_cast<Maxwell3D::Regs::PrimitiveTopology>(draw.topology);
+        draw_state.vertex_buffer.first = draw.first;
+        draw_state.vertex_buffer.count = draw.count;
+        draw_state.base_index = draw.base_vertex;
+        draw_state.base_instance = draw.base_instance;
+        return ProcessDraw(maxwell3d, false, draw.instances);
+    case Kind::Indexed:
+        draw_state.topology = static_cast<Maxwell3D::Regs::PrimitiveTopology>(draw.topology);
+        draw_state.index_buffer = maxwell3d.regs.index_buffer;
+        draw_state.index_buffer.first = draw.first;
+        draw_state.index_buffer.count = draw.count;
+        draw_state.base_index = draw.base_vertex;
+        draw_state.base_instance = draw.base_instance;
+        if ((variant & S1::DrawInline) != 0) {
+            draw_state.index_buffer.format = Maxwell3D::Regs::IndexFormat::UnsignedInt;
+        }
+        if ((variant & (S1::DrawInline | S1::DrawIndexDirty)) != 0) {
+            maxwell3d.dirty.flags[VideoCommon::Dirty::IndexBuffer] = true;
+        }
+        ProcessDraw(maxwell3d, true, draw.instances);
+        if ((variant & S1::DrawInline) != 0) {
+            draw_state.inline_index_draw_indexes.clear();
+        }
+        return;
+    default:
+        // Indirect draws come as their own records (HostIndirect).
+        return;
     }
 }
 

@@ -70,6 +70,8 @@ enum Flags : u64 {
     HasThunk = 1ULL << 24,   ///< Callback: the payload starts with the thunk the back calls
     HasSegment = 1ULL << 25, ///< MethodData: MethodDataBody::segment is the DMA segment
     HasPayload = 1ULL << 26, ///< Word 2 is a PayloadRef
+    /// StateRun: S1 classified entries for a Maxwell3D (v2/s1_deltas.h), not method words
+    Classified = 1ULL << 27,
 };
 
 inline constexpr size_t HeaderWords = 2;
@@ -111,7 +113,8 @@ inline constexpr ObjectRef NoObject = ~0U;
 // StateRun entries: one word per method write, two when it carries a DMA segment, in the
 // format of the old Method ring entry (gpu_split.h) so the back runs them on the same path:
 // bits 0-3 = 2 (method), 4 IsLast, 5 HasSegment, 6 Direct (a macro write), 8-23 method,
-// 32-63 argument; a HasSegment entry is followed by the segment address.
+// 32-63 argument; a HasSegment entry is followed by the segment address. A Classified run
+// holds S1 entries instead (v2/s1_deltas.h); with the S1 check on, method runs carry them too.
 
 /// MethodData: a method with several data words (CallMultiMethod).
 struct MethodDataBody {

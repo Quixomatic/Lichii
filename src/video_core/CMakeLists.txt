@@ -173,6 +173,7 @@ add_library(video_core STATIC
     v2/shader_writes.h
     v2/regsem.h
     v2/regsem_3d.h
+    v2/s1_deltas.h
     v2/v2_stats.cpp
     v2/v2_stats.h
     v2/v2_switches.cpp

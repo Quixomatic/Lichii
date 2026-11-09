@@ -3,6 +3,7 @@
 
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/v2/draw_model.h"
+#include "video_core/v2/s1_deltas.h"
 
 namespace VideoCommon::V2 {
 
@@ -74,18 +75,20 @@ void DrawModel::UpdateTopology(const u32* regs) {
     }
 }
 
-void DrawModel::ProcessDraw(bool indexed, u32 instance_count, const u32* regs, DrawOutput& out) {
+void DrawModel::ProcessDraw(bool indexed, u32 instance_count, const u32* regs, DrawOutput& out,
+                            u8 variant) {
     UpdateTopology(regs);
     out.Push(Ir::PredictedDraw{
-        .kind = indexed ? Ir::DrawKind::Indexed : Ir::DrawKind::Array,
-        .topology = state.topology,
-        .reserved = 0,
-        .first = indexed ? state.index_first : state.vertex_first,
-        .count = indexed ? state.index_count : state.vertex_count,
-        .instances = instance_count,
-        .base_vertex = state.base_index,
-        .base_instance = state.base_instance,
-    });
+                 .kind = indexed ? Ir::DrawKind::Indexed : Ir::DrawKind::Array,
+                 .topology = state.topology,
+                 .reserved = 0,
+                 .first = indexed ? state.index_first : state.vertex_first,
+                 .count = indexed ? state.index_count : state.vertex_count,
+                 .instances = instance_count,
+                 .base_vertex = state.base_index,
+                 .base_instance = state.base_instance,
+             },
+             variant);
 }
 
 void DrawModel::DrawEnd(u32 instance_count, bool force_draw, const u32* regs, DrawOutput& out) {
@@ -118,7 +121,7 @@ void DrawModel::DrawEnd(u32 instance_count, bool force_draw, const u32* regs, Dr
         state.base_index = r.global_base_vertex_index;
         state.index_first = r.index_buffer.first;
         state.index_count = state.inline_bytes / 4;
-        ProcessDraw(true, instance_count, regs, out);
+        ProcessDraw(true, instance_count, regs, out, S1::DrawInline);
         state.inline_bytes = 0;
         break;
     }
@@ -156,7 +159,7 @@ void DrawModel::OnExecute(u32 method, u32 argument, const u32* regs, DrawOutput&
         state.index_first = small.first;
         state.index_count = small.count;
         state.topology = static_cast<u8>(small.topology.Value());
-        ProcessDraw(true, 1, regs, out);
+        ProcessDraw(true, 1, regs, out, S1::DrawIndexDirty);
     };
     const auto array_instanced = [&](const Regs::VertexArray& array, bool subsequent) {
         state.topology = static_cast<u8>(array.topology.Value());

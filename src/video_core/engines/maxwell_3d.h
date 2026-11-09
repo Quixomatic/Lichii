@@ -3130,6 +3130,10 @@ public:
         void UpdateTopology(Maxwell3D& maxwell3d);
         void ProcessDraw(Maxwell3D& maxwell3d, bool draw_indexed, u32 instance_count);
         void ProcessDrawIndirect(Maxwell3D& maxwell3d);
+        /// S1 single owner (v2/s1_deltas.h Draw entries): a draw the front's DrawModel decided,
+        /// on registers already current; the state machine above doesn't run.
+        void DrawPredicted(Maxwell3D& maxwell3d, const VideoCommon::V2::Ir::PredictedDraw& draw,
+                           u8 variant);
         /// EDEN_NX2_V2_IR_DRAWS=verify: hands the draw about to happen to V2::IrCheck.
         void NoteV2DrawCheck(Maxwell3D& maxwell3d, VideoCommon::V2::Ir::DrawKind kind,
                              u32 instance_count);
@@ -3179,6 +3183,13 @@ public:
     /// EDEN_NX2_V2_REGSEM: register groups changed since the last draw (draw_dirty for the draw
     /// being resolved) and their fingerprints, kept by the thread executing the methods.
     VideoCommon::V2::GroupTracker v2_groups;
+
+    /// S1 single owner (Fix F1, v2/s1_deltas.h), on the split's back: applies a classified
+    /// StateRun (register deltas and typed entries).
+    void ExecuteS1Run(const u64* it, const u64* end);
+    /// GpuSplit::S1Check: a classified entry sent beside the method words this engine executes;
+    /// applies it to a register copy and compares. Returns its size in words.
+    size_t S1CheckEntry(const u64* entry);
 
     /// Reads a register value located at the input method address
     u32 GetRegisterValue(u32 method) const;
@@ -3503,6 +3514,28 @@ private:
     void TableMethodCall(VideoCommon::V2::RegSem::Action3D action, u32 method, u32 argument,
                          u32 nonshadow_argument, bool is_last_call);
     void ConsumeSinkV2();
+    // S1 single owner (Fix F1): the front classifies, the back applies (v2/s1_deltas.h).
+    struct S1Sink;
+    struct S1CheckState;
+    void FrontWriteS1(VideoCommon::GpuSplit& split, FrontState& state, u32 method, u32 argument,
+                      bool is_last_call, bool from_macro);
+    void FrontMultiS1(VideoCommon::GpuSplit& split, FrontState& state, u32 method,
+                      const u32* base_start, u32 amount, u32 methods_pending);
+    /// S1Check: the classified entries of a write the table-driven registers `regs` took.
+    void FrontCheckS1(VideoCommon::GpuSplit& split, FrontState& fs, const u32* table_regs,
+                      u32 method, u32 old_value, u32 old_offset, bool is_last_call);
+    /// S1Check after a multi-method run: the registers it left, as deltas.
+    void FrontCheckMultiS1(VideoCommon::GpuSplit& split, const u32* table_regs, u32 method,
+                           const u32* base_start, u32 amount, u32 old_offset);
+    void FrontS1Draws(VideoCommon::GpuSplit& split, FrontState& state,
+                      const VideoCommon::V2::DrawOutput& out);
+    /// The dirty groups, hashes and fast draw breaks the next draw sees (an S1 Groups entry).
+    void FrontS1Groups(VideoCommon::GpuSplit& split, FrontState& state);
+    /// The end of a front macro: sends what the back does there (a deferred instanced batch the
+    /// macro left) when it can do anything. Returns whether it did.
+    bool FrontEndMacro(Core::System& system, VideoCommon::GpuSplit& split, FrontState& state);
+    void S1CbufWrite(GPUVAddr buffer, u32 offset, const u32* words, u32 count);
+    std::unique_ptr<S1CheckState> s1_check;
     void VerifyMultiV2(VideoCommon::V2::RegSem::BackMirror3D& mirror, u32 method, const u32* base_start,
                        u32 amount);
     VideoCommon::V2::RegSem::BackMirror3D& BackMirror();
@@ -3526,6 +3559,7 @@ private:
                             std::span<u32> out);
     std::unique_ptr<FrontState> front;
     bool front_macros{};
+    friend struct Maxwell3DTestAccess;
     // EDEN_NX2_SPLIT_VERIFY: the last SET_SHADOW_RAM_CONTROL writes each side saw (argument,
     // mode before, path), printed when the sides disagree.
     struct ControlWrite {
