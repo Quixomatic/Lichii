@@ -696,6 +696,7 @@ private:
     V2::Mode acquire_mode{};
     V2::Mode hazard_mode{};
     u64 spin_window_ns{};
+    u64 idle_hook_ns{}; ///< EDEN_NX2_V2_SPIN: the back's idle hook after this long idle
     u64 front_spin_start{};
     V2::HazardTable hazards;
     V2::HazardTable unlanded; ///< Fence-flagged known releases until they land (Landing)

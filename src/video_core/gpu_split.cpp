@@ -56,6 +56,20 @@ void Pause() {
 #endif
 }
 
+/// How long the back's old idle spin (8192 pauses) takes here, measured once. With
+/// EDEN_NX2_V2_SPIN the back still runs its idle hook (the deferred submit) after this long, so
+/// the spin window changes when it sleeps, not when it submits.
+u64 OldIdleSpinNs() {
+    static const u64 ns = [] {
+        const u64 start = Nx2Profile::Now();
+        for (u32 i = 0; i < 8192; ++i) {
+            Pause();
+        }
+        return Nx2Profile::Now() - start;
+    }();
+    return ns;
+}
+
 [[maybe_unused]] std::atomic<u32> g_back_thread_id{};
 
 #if defined(_MSC_VER) && !defined(__clang__)
@@ -173,8 +187,11 @@ void GpuSplit::MaybeStart(Core::System& system_) {
             microseconds = std::strtoull(value, nullptr, 10);
         }
         spin_window_ns = std::thread::hardware_concurrency() > 8 ? microseconds * 1000 : 0;
-        LOG_INFO(HW_GPU, "GPU thread split: hand-off spin window {} us ({} logical CPUs)",
-                 spin_window_ns / 1000, std::thread::hardware_concurrency());
+        idle_hook_ns = OldIdleSpinNs();
+        LOG_INFO(HW_GPU,
+                 "GPU thread split: hand-off spin window {} us ({} logical CPUs), back idle "
+                 "hook after {} us",
+                 spin_window_ns / 1000, std::thread::hardware_concurrency(), idle_hook_ns / 1000);
     }
     LOG_INFO(HW_GPU, "GPU thread split: engine methods run on a second thread{}{}{}",
              front_macros ? ", macros on the first" : "",
@@ -834,11 +851,34 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
                 back_idle_at.store(read_position, std::memory_order_relaxed);
             }
             // The front usually sends more within microseconds: spin briefly before sleeping.
+            // EDEN_NX2_V2_SPIN: the window decides when the back sleeps; the idle hook still
+            // runs after the old spin's time (OldIdleSpinNs), so submits keep their cadence.
             u64 spin_start = 0;
+            u64 idle_start = 0;
+            bool hook_ran = false;
             for (u32 spins = 0;
-                 (spin_window ? SpinWindowOpen(spins, spin_start) : spins < 8192) &&
                  available == read_position && !hook_requested.load(std::memory_order_relaxed);
                  ++spins) {
+                if (!spin_window) {
+                    if (spins >= 8192) {
+                        break;
+                    }
+                } else {
+                    const bool open = SpinWindowOpen(spins, spin_start);
+                    if (spins == 0) {
+                        idle_start = Nx2Profile::Now();
+                    } else if (!hook_ran && (spins & 63) == 0 && idle_hook != nullptr &&
+                               Nx2Profile::Now() - idle_start >= idle_hook_ns) {
+                        hook_ran = true;
+                        hook_requested.store(false, std::memory_order_seq_cst);
+                        idle_hook_requested.store(false, std::memory_order_relaxed);
+                        ServeCpuLane();
+                        idle_hook(idle_argument);
+                    }
+                    if (!open && (hook_ran || idle_hook == nullptr)) {
+                        break;
+                    }
+                }
                 Pause();
                 available = published.load(std::memory_order_acquire);
             }
@@ -848,7 +888,7 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
                 ServeHookRequests();
                 continue;
             }
-            if (available == read_position && idle_hook != nullptr) {
+            if (available == read_position && idle_hook != nullptr && !hook_ran) {
                 hook_requested.store(false, std::memory_order_seq_cst);
                 idle_hook_requested.store(false, std::memory_order_relaxed);
                 ServeCpuLane();

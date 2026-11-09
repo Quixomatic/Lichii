@@ -36,7 +36,8 @@ void Barrier(const Ir::BarrierBody& body, const Context& context) {
         static_cast<RasterizerInterface*>(object)->InvalidateGPUCache();
         return;
     case Ir::BarrierOp::ReleaseFences:
-        static_cast<RasterizerInterface*>(object)->ReleaseFences();
+        static_cast<RasterizerInterface*>(object)->ReleaseFences(body.a !=
+                                                                 Ir::ReleaseFencesUnforced);
         return;
     case Ir::BarrierOp::SignalReference:
         static_cast<RasterizerInterface*>(object)->SignalReference();

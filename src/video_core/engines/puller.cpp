@@ -68,10 +68,11 @@ u32 ReadSemaphoreWord(DmaPusher& dma_pusher, GPUVAddr address) {
 // only feeds it runs there in order; reads of what it wrote first wait for it (DrainBack). With
 // the typed IR it is a Barrier record (EDEN_NX2_V2_IR).
 template <typename Func>
-void OnBackBarrier(DmaPusher& dma_pusher, VideoCommon::V2::Ir::BarrierOp op, const Func& func) {
+void OnBackBarrier(DmaPusher& dma_pusher, VideoCommon::V2::Ir::BarrierOp op, const Func& func,
+                   u64 a = 0) {
     if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
         const VideoCommon::V2::Ir::BarrierBody body{
-            .op = op, .object = split.Ref(dma_pusher.rasterizer), .a = 0, .b = 0};
+            .op = op, .object = split.Ref(dma_pusher.rasterizer), .a = a, .b = 0};
         split.Emit(VideoCommon::V2::Ir::Kind::Barrier, body, func);
     } else {
         func();
@@ -597,9 +598,11 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
             view_passes = Passes(view);
             if (view.verdict == V2::AcquireVerdict::NotMet && view_mode == V2::Mode::On) {
                 // Nothing sent to the word meets it: a drain can't change that, only a release
-                // the back runs later (or the CPU's). Suspend at once: register the latch, let
-                // the back release the pending fences (a release among them latches it), and
-                // let the polls decide, without waiting for the back here.
+                // the back runs later (or the CPU's). Suspend at once: register the latch and
+                // let the polls decide, without waiting for the back here. The fencing thread
+                // releases pending fences as the GPU passes them (a release among them latches
+                // it), so the back only releases those already signalled: no forced fence,
+                // submit and GPU wait (MASTER_PLAN §6). The 1 ms valve keeps the forced form.
                 if (V2Stats::Enabled()) [[unlikely]] {
                     V2Stats::NoteDecision(VideoCommon::DrainSite::Acquire, Decision::Avoided);
                 }
@@ -608,7 +611,10 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
                     waiters.Add(this, *device, acquire.value, acquire.operation);
                 }
                 OnBackBarrier(dma_pusher, VideoCommon::V2::Ir::BarrierOp::ReleaseFences,
-                              [rasterizer = dma_pusher.rasterizer] { rasterizer->ReleaseFences(); });
+                              [rasterizer = dma_pusher.rasterizer] {
+                                  rasterizer->ReleaseFences(false);
+                              },
+                              VideoCommon::V2::Ir::ReleaseFencesUnforced);
                 NoteAcquireRecord(dma_pusher, acquire.address, acquire.value, acquire.operation,
                                   static_cast<u32>(view.verdict));
                 pending_acquire = acquire;

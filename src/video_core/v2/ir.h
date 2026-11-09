@@ -273,6 +273,9 @@ struct BarrierBody {
     u64 a;
     u64 b;
 };
+/// BarrierBody::a of a ReleaseFences barrier: release only the fences already signalled (an
+/// unmet acquire's suspension), not a forced fence + submit + GPU wait.
+inline constexpr u64 ReleaseFencesUnforced = 1;
 
 enum class ReadbackOp : u32 {
     Flush,            ///< rasterizer->FlushRegion(address, bytes) [CPU queue flush]
