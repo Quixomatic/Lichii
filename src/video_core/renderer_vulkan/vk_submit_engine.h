@@ -87,6 +87,15 @@ struct SubmitWork {
     bool graphics_waits_transfer{};
     u32 num_extra_waits{};
     std::array<std::pair<VkSemaphore, u64>, 8> extra_waits{};
+    /// Perf fix C (EDEN_NX2_V2_XREADBACK): readback jobs submitted on the transfer queue right
+    /// after this submission; each waits for this tick and signals its own timeline value.
+    struct PostJob {
+        VkCommandBuffer cmdbuf{};
+        VkSemaphore semaphore{};
+        u64 value{};
+    };
+    u32 num_post_jobs{};
+    std::array<PostJob, 4> post_jobs{};
     std::chrono::steady_clock::time_point handed{};
 };
 

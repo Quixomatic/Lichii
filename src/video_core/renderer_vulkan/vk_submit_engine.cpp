@@ -245,6 +245,17 @@ void SubmitEngine::DoSubmit(SubmitWork& work) {
         vk::Check(result);
         break;
     }
+    // Perf fix C: readback jobs of this tick go to the transfer queue behind this tick's own
+    // transfer batch (submitted above), so queue order needs no CPU wait on the recorder.
+    for (u32 i = 0; i < work.num_post_jobs && transfer != nullptr; ++i) {
+        const SubmitWork::PostJob& job = work.post_jobs[i];
+        const VkResult job_result = transfer->Submit(job.cmdbuf, master.TimelineHandle(),
+                                                     work.tick, job.semaphore, job.value);
+        if (job_result == VK_ERROR_DEVICE_LOST) {
+            device.ReportLoss();
+        }
+        vk::Check(job_result);
+    }
     context.submitted = std::chrono::steady_clock::now();
     if (P5bStats::Enabled()) {
         P5bStats::Add(Counter::SubmitThreadSubmits, threaded ? 1 : 0);

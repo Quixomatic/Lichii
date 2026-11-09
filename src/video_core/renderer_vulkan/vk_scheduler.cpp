@@ -362,6 +362,14 @@ void Scheduler::NoteAcquireJoin() {
     }
 }
 
+bool Scheduler::AddTransferJob(VkCommandBuffer cmdbuf, VkSemaphore semaphore, u64 value) {
+    if (!submit_engine || !transfer_queue) {
+        return false;
+    }
+    return timeline_join.AddPostJob(reinterpret_cast<u64>(cmdbuf),
+                                    reinterpret_cast<u64>(semaphore), value);
+}
+
 bool Scheduler::AddGraphicsWait(VkSemaphore semaphore, u64 value) {
     if (!submit_engine) {
         return false;
@@ -1295,6 +1303,15 @@ void Scheduler::SubmitExecutionEngine(VkSemaphore signal_semaphore, VkSemaphore 
         for (u32 i = 0; i < batch.num_extra_waits; ++i) {
             work.extra_waits[i] = {reinterpret_cast<VkSemaphore>(batch.extra_waits[i].semaphore),
                                    batch.extra_waits[i].value};
+        }
+        work.num_post_jobs = (std::min<u32>)(batch.num_post_jobs,
+                                             static_cast<u32>(work.post_jobs.size()));
+        for (u32 i = 0; i < work.num_post_jobs; ++i) {
+            work.post_jobs[i] = {
+                reinterpret_cast<VkCommandBuffer>(batch.post_jobs[i].cmdbuf),
+                reinterpret_cast<VkSemaphore>(batch.post_jobs[i].semaphore),
+                batch.post_jobs[i].value,
+            };
         }
         submit_engine->Submit(std::move(work));
         if (trace_frame_end != 0) {

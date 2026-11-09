@@ -36,6 +36,12 @@ public:
         u64 value = 0;
     };
     static constexpr size_t MaxExtraWaits = 8;
+    struct PostJob {
+        u64 cmdbuf = 0;
+        u64 semaphore = 0;
+        u64 value = 0;
+    };
+    static constexpr size_t MaxPostJobs = 4;
 
     /// What one submission needs, computed when it closes.
     struct Batch {
@@ -46,7 +52,20 @@ public:
         bool graphics_waits_transfer = false;
         u32 num_extra_waits = 0;      ///< readback jobs the graphics submission waits for
         std::array<Wait, MaxExtraWaits> extra_waits{};
+        u32 num_post_jobs = 0;        ///< readback jobs submitted right after this submission
+        std::array<PostJob, MaxPostJobs> post_jobs{};
     };
+
+    /// Perf fix C: a readback job (opaque command buffer, its timeline and value) the submit
+    /// path queues on the transfer queue right after the open submission, waiting for its tick.
+    /// False when every slot is taken: the caller submits it itself.
+    [[nodiscard]] bool AddPostJob(u64 cmdbuf, u64 semaphore, u64 value) noexcept {
+        if (num_post_jobs == post_jobs.size()) {
+            return false;
+        }
+        post_jobs[num_post_jobs++] = {cmdbuf, semaphore, value};
+        return true;
+    }
 
     /// Whether a transfer op on a resource last used by graphics tick `track` may join the open
     /// submission's transfer batch.
@@ -117,6 +136,9 @@ public:
         batch.graphics_waits_transfer = has_transfer;
         batch.num_extra_waits = num_waits;
         batch.extra_waits = waits;
+        batch.num_post_jobs = num_post_jobs;
+        batch.post_jobs = post_jobs;
+        num_post_jobs = 0;
         has_transfer = false;
         transfer_wait = 0;
         num_waits = 0;
@@ -131,6 +153,8 @@ private:
     bool blocked = false;
     u32 num_waits = 0;
     std::array<Wait, MaxExtraWaits> waits{};
+    u32 num_post_jobs = 0;
+    std::array<PostJob, MaxPostJobs> post_jobs{};
 };
 
 /// A per-thread timeline's values for readback jobs (BackgroundResources): monotonic, and

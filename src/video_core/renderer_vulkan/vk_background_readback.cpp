@@ -135,13 +135,6 @@ BackgroundReadback::Job BackgroundReadback::Submit() {
     }
     // The producers (and the releases) go to the GPU; the job waits for that tick.
     const u64 producer_tick = scheduler.CurrentTick();
-    scheduler.Flush();
-    // Fix pass 1 (B1, the save-load deadlock): Flush only hands the tick to the Vulkan worker.
-    // Its own transfer batch (uploads on the transfer queue, which graphics `producer_tick`
-    // waits for) reaches the transfer queue when the worker submits it. A job submitted before
-    // that sits ahead of the batch on the same queue, waiting for a graphics tick that waits for
-    // the batch behind it: neither ever runs. Wait until the worker submitted the tick.
-    scheduler.WaitWorker();
     Resources& r = ThreadResources();
     const vk::CommandBuffer cmdbuf{TakeCommandBuffer(r), device.GetDispatchLoader()};
     cmdbuf.Begin({
@@ -169,12 +162,26 @@ BackgroundReadback::Job BackgroundReadback::Submit() {
     }
     cmdbuf.End();
     const u64 value = r.values.Next();
-    const VkResult result = transfer->Submit(*cmdbuf, scheduler.GetMasterSemaphore().TimelineHandle(),
-                                             producer_tick, *r.timeline, value);
-    if (result == VK_ERROR_DEVICE_LOST) {
-        device.ReportLoss();
+    // Perf fix C (MASTER_PLAN §6 class C): the job rides the producing submission: the submit
+    // path queues it on the transfer queue right behind that tick's own transfer batch, so the
+    // recorder never waits for the worker. Fix pass 1's B1 order (job after the batch graphics
+    // `producer_tick` waits for) holds by construction.
+    if (scheduler.AddTransferJob(*cmdbuf, *r.timeline, value)) {
+        scheduler.Flush();
+    } else {
+        scheduler.Flush();
+        // Fix pass 1 (B1, the save-load deadlock): Flush only hands the tick to the Vulkan
+        // worker, and its transfer batch reaches the queue when the worker submits it; a job
+        // submitted before that waits on a tick that waits for the batch behind it.
+        scheduler.WaitWorker();
+        const VkResult result =
+            transfer->Submit(*cmdbuf, scheduler.GetMasterSemaphore().TimelineHandle(),
+                             producer_tick, *r.timeline, value);
+        if (result == VK_ERROR_DEVICE_LOST) {
+            device.ReportLoss();
+        }
+        vk::Check(result);
     }
-    vk::Check(result);
     r.in_flight.push_back({value, *cmdbuf});
     const Job job{*r.timeline, value, std::chrono::steady_clock::now()};
     // Graphics work after the readback must not overwrite what it reads; the images come back

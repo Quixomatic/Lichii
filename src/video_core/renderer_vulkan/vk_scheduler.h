@@ -299,6 +299,10 @@ public:
 
     /// Recording thread: the next graphics submission waits for `value` on `semaphore`.
     bool AddGraphicsWait(VkSemaphore semaphore, u64 value);
+    /// Recording thread (Perf fix C): the submit path queues `cmdbuf` on the transfer queue right
+    /// after the open submission, waiting for its tick and signalling `value` on `semaphore`.
+    /// False without a submit engine or with every slot taken (the caller submits it itself).
+    bool AddTransferJob(VkCommandBuffer cmdbuf, VkSemaphore semaphore, u64 value);
 
     /// Stops hoisting to the transfer queue until the next submission.
     void BlockTransferHoisting() {
