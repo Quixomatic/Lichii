@@ -445,7 +445,7 @@ void SplitResolve::OnPublish(u64 position) {
 }
 
 void SplitResolve::OnSegment(const Ir::SegmentBody& body, const u32* back_regs,
-                             const CbufTable* back_cbufs) {
+                             const u32* back_shadow, const CbufTable* back_cbufs) {
     t_commit = this;
     const u64 start = NowNs();
     if (holding) {
@@ -487,6 +487,25 @@ void SplitResolve::OnSegment(const Ir::SegmentBody& body, const u32* back_regs,
                                     body.id, index, snapshot_value, back_regs[index]);
                     }
                     break;
+                }
+            }
+            if (back_shadow != nullptr) {
+                Count(GetStats().snapshot_checks);
+                for (u32 index = 0; index < 0xe00; ++index) {
+                    if (index == body.pending_method) {
+                        continue;
+                    }
+                    const u32 snapshot_value = input.snapshot->shadow.Read(index);
+                    if (snapshot_value != back_shadow[index]) {
+                        Count(GetStats().snapshot_mismatches);
+                        if (ShouldLogMismatch(MismatchLog::Snapshot)) {
+                            LOG_WARNING(HW_GPU,
+                                        "V2 parallel verify: segment {} snapshot shadow {:#x} is "
+                                        "{:#x}, the back has {:#x}",
+                                        body.id, index, snapshot_value, back_shadow[index]);
+                        }
+                        break;
+                    }
                 }
             }
             // P6c: the constant buffer bindings the snapshot carries are the back engine's.

@@ -36,6 +36,7 @@
 #include "video_core/v2/p5b_stats.h"
 #include "video_core/v2/qmd_front.h"
 #include "video_core/v2/ir_check.h"
+#include "video_core/v2/regsem_3d.h"
 #include "video_core/v2/s1_deltas.h"
 #include "video_core/v2/ir_exec.h"
 #include "video_core/v2/front_writes.h"
@@ -897,10 +898,24 @@ size_t GpuSplit::ExecuteIr(const u64* entry) {
                 objects->As<Tegra::Engines::Maxwell3D>(segment.engine);
             const bool verify = maxwell3d != nullptr && parallel->Verify();
             V2::Resolve::CbufTable back_cbufs;
+            // The back's registers with the state writes still in its method sink (they count
+            // as done; the next executable method applies them), and its shadow RAM.
+            static thread_local std::array<u32, Tegra::Engines::Maxwell3D::Regs::NUM_REGS>
+                back_regs;
+            static thread_local std::array<u32, Tegra::Engines::Maxwell3D::Regs::NUM_REGS>
+                back_shadow;
             if (verify) {
                 back_cbufs = V2::Resolve::CbufTableOf(V2::Resolve::LiveView{*maxwell3d});
+                back_regs = maxwell3d->regs.reg_array;
+                back_shadow = maxwell3d->shadow_state.reg_array;
+                const auto control = maxwell3d->shadow_state.shadow_ram_control;
+                for (const auto& [method, value] : maxwell3d->method_sink) {
+                    back_regs[method] =
+                        V2::RegSem::ApplyShadow3D(control, back_shadow.data(), method, value);
+                }
             }
-            parallel->OnSegment(segment, verify ? maxwell3d->regs.reg_array.data() : nullptr,
+            parallel->OnSegment(segment, verify ? back_regs.data() : nullptr,
+                                verify ? back_shadow.data() : nullptr,
                                 verify ? &back_cbufs : nullptr);
         }
         break;

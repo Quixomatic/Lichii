@@ -209,8 +209,10 @@ public:
     void OnPublish(u64 position);
 
     // Back thread (the commit thread).
-    /// `back_regs`, `back_cbufs`: the back engine's state (verify only, else null).
-    void OnSegment(const Ir::SegmentBody& body, const u32* back_regs, const CbufTable* back_cbufs);
+    /// `back_regs` (method sink applied), `back_shadow`, `back_cbufs`: the back engine's state
+    /// (verify only, else null).
+    void OnSegment(const Ir::SegmentBody& body, const u32* back_regs, const u32* back_shadow,
+                   const CbufTable* back_cbufs);
     /// The shard's record for the draw the back is about to decide (null: none matches).
     [[nodiscard]] const PreDraw* TakeDraw(u64 fingerprint, bool indexed);
     /// P6c: the record DecideDraw accepted for the draw being resolved (engine, memory and
