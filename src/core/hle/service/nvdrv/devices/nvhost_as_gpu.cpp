@@ -179,10 +179,12 @@ void nvhost_as_gpu::Nx2Map(u64 gpu_address, u64 cpu_address, u64 size) {
     Nx2GpuMemoryRegistry::Get().RecordDeviceRange(cpu_address, size, device_address);
     // On the GPU thread, like unmaps: a GMMU map takes the texture cache lock, and the callers hold
     // nx2:gpu locks that the GPU thread takes under that lock (sparse blocks backed on write).
-    system.GPU().MapInOrder(
-        gpu_address, size, [gmmu = gmmu.get(), gpu_address, device_address, size] {
-            gmmu->Map(gpu_address, device_address, size, Tegra::PTEKind::PITCH, false);
-        });
+    system.GPU().MapInOrder({.op = VideoCommon::V2::Ir::MapOp::GmmuMap,
+                             .flags = VideoCommon::V2::Ir::MapBeforeLaterReads,
+                             .gpu_address = gpu_address,
+                             .device_address = device_address,
+                             .size = size,
+                             .object = reinterpret_cast<u64>(gmmu.get())});
     LOG_DEBUG(Service_NVDRV, "Switch 2 GPU mapping {:#x}+{:#x} -> CPU {:#x}", gpu_address, size,
               cpu_address);
 }
@@ -193,7 +195,10 @@ void nvhost_as_gpu::Nx2Unmap(u64 gpu_address, u64 size) {
         return;
     }
     // The GPU thread may still be running command lists that use the range.
-    system.GPU().RunInOrder([gmmu = gmmu.get(), gpu_address, size] { gmmu->Unmap(gpu_address, size); });
+    system.GPU().MapInOrder({.op = VideoCommon::V2::Ir::MapOp::GmmuUnmap,
+                             .gpu_address = gpu_address,
+                             .size = size,
+                             .object = reinterpret_cast<u64>(gmmu.get())});
     LOG_DEBUG(Service_NVDRV, "Switch 2 GPU unmapping {:#x}+{:#x}", gpu_address, size);
 }
 
@@ -213,16 +218,18 @@ void nvhost_as_gpu::Nx2Release(u64 cpu_address, u64 size) {
     auto* const mapper = range.heap && session != nullptr ? session->mapper.get() : nullptr;
     auto& smmu = system.Host1x().MemoryManager();
     // Queued after the GPU unmaps of the range, so the GPU thread is done with it.
-    system.GPU().RunInOrder([&smmu, mapper, range, cpu_address, size] {
-        if (range.heap) {
-            if (mapper != nullptr) {
-                mapper->Unmap(cpu_address, size);
-            }
-            return;
-        }
-        smmu.Unmap(range.address, size);
-        smmu.Free(range.address, Common::AlignUp(size, 0x20000));
-    });
+    if (range.heap) {
+        system.GPU().MapInOrder({.op = VideoCommon::V2::Ir::MapOp::HeapRelease,
+                                 .cpu_address = cpu_address,
+                                 .size = size,
+                                 .object = reinterpret_cast<u64>(mapper)});
+    } else {
+        system.GPU().MapInOrder({.op = VideoCommon::V2::Ir::MapOp::SmmuRelease,
+                                 .device_address = range.address,
+                                 .size = size,
+                                 .extra = Common::AlignUp(size, 0x20000),
+                                 .object = reinterpret_cast<u64>(&smmu)});
+    }
     LOG_DEBUG(Service_NVDRV, "Switch 2 released backing {:#x}+{:#x}", cpu_address, size);
 }
 
@@ -241,12 +248,13 @@ void nvhost_as_gpu::Nx2Sparse(u64 gpu_address, u64 size, bool create) {
         const DAddr device_address = it->second.second;
         nx2_sparse_ranges.erase(it);
         // After the command lists that may still use it.
-        system.GPU().RunInOrder([gmmu = gmmu.get(), &smmu, gpu_address, size, device_address,
-                                 device_size] {
-            gmmu->Unmap(gpu_address, size);
-            smmu.Unmap(device_address, size);
-            smmu.Free(device_address, device_size);
-        });
+        system.GPU().MapInOrder({.op = VideoCommon::V2::Ir::MapOp::SparseRelease,
+                                 .gpu_address = gpu_address,
+                                 .device_address = device_address,
+                                 .size = size,
+                                 .extra = device_size,
+                                 .object = reinterpret_cast<u64>(gmmu.get()),
+                                 .object2 = reinterpret_cast<u64>(&smmu)});
         return;
     }
     const DAddr device_address = smmu.Allocate(device_size);
@@ -257,10 +265,12 @@ void nvhost_as_gpu::Nx2Sparse(u64 gpu_address, u64 size, bool create) {
     }
     nx2_sparse_ranges[gpu_address] = {size, device_address};
     // On the GPU thread, as in Nx2Map.
-    system.GPU().MapInOrder(
-        gpu_address, size, [gmmu = gmmu.get(), gpu_address, device_address, size] {
-            gmmu->Map(gpu_address, device_address, size, Tegra::PTEKind::PITCH, false);
-        });
+    system.GPU().MapInOrder({.op = VideoCommon::V2::Ir::MapOp::GmmuMap,
+                             .flags = VideoCommon::V2::Ir::MapBeforeLaterReads,
+                             .gpu_address = gpu_address,
+                             .device_address = device_address,
+                             .size = size,
+                             .object = reinterpret_cast<u64>(gmmu.get())});
     LOG_DEBUG(Service_NVDRV, "Switch 2 sparse region {:#x}+{:#x} -> device {:#x}", gpu_address,
               size, device_address);
 }
@@ -300,13 +310,14 @@ void nvhost_as_gpu::Nx2SparseTile(u64 gpu_address, u64 cpu_address, u64 size) {
     // whose contents are now what the game's memory holds there.
     const DAddr device = device_address + (gpu_address - start);
     auto& smmu = system.Host1x().MemoryManager();
-    system.GPU().MapInOrder(
-        gpu_address, size, [&smmu, device, cpu_address, size, asid = session->asid] {
-            smmu.Unmap(device, size);
-            if (cpu_address != 0) {
-                smmu.Map(device, cpu_address, size, asid, true);
-            }
-        });
+    system.GPU().MapInOrder({.op = VideoCommon::V2::Ir::MapOp::SparseTile,
+                             .flags = VideoCommon::V2::Ir::MapBeforeLaterReads,
+                             .gpu_address = gpu_address,
+                             .device_address = device,
+                             .cpu_address = cpu_address,
+                             .size = size,
+                             .extra = session->asid.id,
+                             .object = reinterpret_cast<u64>(&smmu)});
 }
 
 void nvhost_as_gpu::OnClose(DeviceFD fd) {}

@@ -6,18 +6,17 @@
 
 #pragma once
 
-#include <functional>
 #include <atomic>
 #include <condition_variable>
 #include <mutex>
 #include <optional>
 #include <thread>
-#include <variant>
 
 #include "common/bounded_threadsafe_queue.h"
 #include "common/polyfill_thread.h"
 #include "video_core/dma_pusher.h"
 #include "video_core/framebuffer_config.h"
+#include "video_core/v2/ir.h"
 
 namespace Tegra {
 struct FramebufferConfig;
@@ -40,69 +39,35 @@ class RendererBase;
 
 namespace VideoCommon::GPUThread {
 
-/// Command to signal to the GPU thread that a command list is ready for processing
-struct SubmitListCommand final {
-    explicit SubmitListCommand(s32 channel_, Tegra::CommandList&& entries_)
-        : channel{channel_}, entries{std::move(entries_)} {}
-
-    s32 channel;
-    Tegra::CommandList entries;
+/// What a CpuRecord asks the GPU thread to do (Pipeline v2 P1b: typed records instead of a
+/// variant of commands and std::function closures).
+enum class CpuOp : u8 {
+    Submit,      ///< Parse a command list of `channel` (`list`)
+    Flush,       ///< Flush [address, address + size) of the caches (synchronous GPU mode)
+    Tick,        ///< Run the GPU's TickWork: its typed sync requests (GPU::Impl)
+    Map,         ///< A GPU/SMMU memory map or unmap (`map`, objects as pointers)
+    Notify,      ///< Nothing to run: its sequence tells a waiter the GPU got past it
+    SignalEvent, ///< Signal the kernel event `object` (owned by its service)
 };
 
-/// Command to signal to the GPU thread to flush a region
-struct FlushRegionCommand final {
-    explicit constexpr FlushRegionCommand(DAddr addr_, u64 size_) : addr{addr_}, size{size_} {}
-
-    DAddr addr;
-    u64 size;
-};
-
-/// Command to signal to the GPU thread to invalidate a region
-struct InvalidateRegionCommand final {
-    explicit constexpr InvalidateRegionCommand(DAddr addr_, u64 size_) : addr{addr_}, size{size_} {}
-
-    DAddr addr;
-    u64 size;
-};
-
-/// Command to signal to the GPU thread to flush and invalidate a region
-struct FlushAndInvalidateRegionCommand final {
-    explicit constexpr FlushAndInvalidateRegionCommand(DAddr addr_, u64 size_)
-        : addr{addr_}, size{size_} {}
-
-    DAddr addr;
-    u64 size;
-};
-
-/// Command to make the gpu look into pending requests
-struct GPUTickCommand final {};
-
-/// Command to run a function on the GPU thread after the commands queued before it
-struct RunCommand final {
-    std::function<void()> func;
-    /// With the GPU split, run on its front (after draining the back) instead of deferring to the
-    /// back, so command lists read after this one see what func did (GMMU maps).
-    bool before_later_reads{};
-};
-
-using CommandData =
-    std::variant<std::monostate, SubmitListCommand, FlushRegionCommand, InvalidateRegionCommand,
-                 FlushAndInvalidateRegionCommand, GPUTickCommand, RunCommand>;
-
-struct CommandDataContainer {
-    CommandDataContainer() = default;
-
-    explicit CommandDataContainer(CommandData&& data_, u64 next_fence_, bool block_)
-        : data{std::move(data_)}, fence{next_fence_}, block(block_) {}
-
-    CommandData data;
-    u64 fence{};
+/// A record of the CPU->GPU-thread queue. `sequence` is its command fence: +1 per record and
+/// signalled in queue order once the record ran (SignalCommandFence), on the split's back for
+/// everything but command lists.
+struct CpuRecord {
+    CpuOp op{};
     bool block{};
+    s32 channel{};
+    u64 sequence{};
+    u64 address{};
+    u64 size{};
+    u64 object{};
+    VideoCommon::V2::Ir::MapBody map{};
+    Tegra::CommandList list;
 };
 
 /// Struct used to synchronize the GPU thread
 struct SynchState final {
-    using CommandQueue = Common::SPSCQueue<CommandDataContainer>;
+    using CommandQueue = Common::SPSCQueue<CpuRecord>;
     std::mutex write_lock;
     CommandQueue queue;
     u64 last_fence{};
@@ -138,14 +103,29 @@ public:
 
     void TickGPU(bool is_async);
 
-    /// Runs func on the GPU thread once the commands queued before it have been processed.
-    void Run(std::function<void()>&& func, bool is_async, bool before_later_reads = false);
+    /// A memory map or unmap, run once the commands queued before it have been processed
+    /// (MapBeforeLaterReads: also before the GPU thread reads later command lists).
+    void QueueMap(const VideoCommon::V2::Ir::MapBody& map, bool is_async);
+
+    /// A record that runs nothing: returns its sequence, which SignaledSequence reaches once the
+    /// commands queued before it have been processed.
+    u64 Notify(bool is_async);
+
+    /// Signals a kernel event once the commands queued before it have been processed.
+    void SignalEvent(void* event, bool is_async);
+
+    /// The sequence of the last record that ran.
+    [[nodiscard]] u64 SignaledSequence() const {
+        return state.signaled_fence.load(std::memory_order_acquire);
+    }
 
     void NotifyShutdown();
 
 private:
-    /// Pushes a command to be executed by the GPU thread
-    u64 PushCommand(CommandData&& command_data, bool block, bool is_async);
+    /// Pushes a record to be executed by the GPU thread; returns its sequence.
+    u64 PushCommand(CpuRecord&& record, bool block, bool is_async);
+    /// With the split: the front sends a record that isn't a command list to the back.
+    void SendToBack(CpuRecord& record, VideoCore::RasterizerInterface* rasterizer_ptr);
 
     Core::System& system;
     VideoCore::RasterizerInterface* rasterizer = nullptr;

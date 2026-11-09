@@ -594,7 +594,7 @@ private:
     // console's graphics server completes unmap jobs behind the submitted work.
     void SignalAfterGpu(u32 slot) {
         auto* const event = EventFor(slot);
-        system.GPU().RunInOrder([this, event] { event->Signal(system.Kernel()); });
+        system.GPU().SignalInOrder(event);
     }
 
     // Sub 102: word 2 is the memory handle 101 returned, word 3 the job slot. The game frees the
@@ -727,7 +727,7 @@ private:
                 Nvidia::Devices::Nx2GpuMemoryRegistry::Get().Unmap(first, last - first + 1);
             }
             // The region's backing: all of it, or the blocks a sparse region got as it was written.
-            std::shared_ptr<std::atomic<bool>> done;
+            u64 done = 0;
             for (auto region = m_gpu_only_regions.lower_bound(first);
                  region != m_gpu_only_regions.end() && region->first <= last;) {
                 if (region->first + region->second.size - 1 > last) {
@@ -736,9 +736,8 @@ private:
                 }
                 Nvidia::Devices::Nx2GpuMemoryRegistry::Get().ReleaseBacking(
                     region->second.cpu_address, region->second.size);
-                if (!done) {
-                    done = std::make_shared<std::atomic<bool>>(false);
-                    system.GPU().RunInOrder([done] { done->store(true, std::memory_order_release); });
+                if (done == 0) {
+                    done = system.GPU().MarkInOrder();
                 }
                 m_released_regions.push_back({std::move(region->second), done});
                 region = m_gpu_only_regions.erase(region);
@@ -813,7 +812,7 @@ private:
     void FreeReleasedRegions() {
         auto* const process = system.ApplicationProcess();
         std::erase_if(m_released_regions, [&](ReleasedRegion& released) {
-            if (!released.done->load(std::memory_order_acquire)) {
+            if (!system.GPU().InOrderDone(released.done)) {
                 return false;
             }
             auto& region = released.region;
@@ -906,8 +905,7 @@ private:
             Nvidia::Devices::Nx2GpuMemoryRegistry::Get().Unmap(gpu_address, it->second.size);
             Nvidia::Devices::Nx2GpuMemoryRegistry::Get().ReleaseBacking(it->second.cpu_address,
                                                                         it->second.size);
-            auto done = std::make_shared<std::atomic<bool>>(false);
-            system.GPU().RunInOrder([done] { done->store(true, std::memory_order_release); });
+            const u64 done = system.GPU().MarkInOrder();
             m_gpu_only_bytes -= it->second.size;
             m_released_regions.push_back({std::move(it->second), done});
             m_gpu_only_regions.erase(it);
@@ -1354,7 +1352,7 @@ private:
         using Core::Memory::YUZU_PAGESIZE;
         region.tiles = true;
         region.tile_pages.assign(Common::DivCeil(region.size, YUZU_PAGESIZE), false);
-        std::shared_ptr<std::atomic<bool>> done;
+        u64 done = 0;
         u64 released = 0;
         for (u64 block = 0; block < region.blocks.size(); ++block) {
             if (region.blocks[block] != BlockBacked) {
@@ -1368,9 +1366,8 @@ private:
             }
             Nvidia::Devices::Nx2GpuMemoryRegistry::Get().MapSparseTile(block_address, 0,
                                                                         backing->second.size);
-            if (!done) {
-                done = std::make_shared<std::atomic<bool>>(false);
-                system.GPU().RunInOrder([done] { done->store(true, std::memory_order_release); });
+            if (done == 0) {
+                done = system.GPU().MarkInOrder();
             }
             released += backing->second.size;
             m_released_regions.push_back({std::move(backing->second), done});
@@ -1416,7 +1413,7 @@ private:
     };
     struct ReleasedRegion {
         GpuOnlyRegion region;
-        std::shared_ptr<std::atomic<bool>> done; ///< Set by the GPU thread past the region's last use
+        u64 done; ///< GPU::MarkInOrder after the region's last use (InOrderDone once past it)
     };
     std::map<u64, GpuOnlyRegion> m_gpu_only_regions; ///< By GPU address
     std::map<u64, u64> m_gpu_only_ranges; ///< 214 regions without the sparse flag: GPU address -> size

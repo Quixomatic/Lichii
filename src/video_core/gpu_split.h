@@ -364,7 +364,6 @@ public:
         EmitPayload(kind, body, payload, payload_words, legacy);
         Drain(site);
     }
-    void DeferFunction(std::function<void()>&& func);
     /// Runs `func` on the back and waits for it: for work on back-owned state, such as a buffer
     /// cache download that records into the Vulkan scheduler. A drained back still submits from
     /// its idle hook, so the front never touches that state itself.

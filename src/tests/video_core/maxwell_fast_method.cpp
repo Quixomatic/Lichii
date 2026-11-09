@@ -25,6 +25,7 @@
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/gpu.h"
 #include "video_core/gpu_split.h"
+#include "video_core/gpu_thread.h"
 #include "video_core/memory_manager.h"
 #include "video_core/renderer_null/null_rasterizer.h"
 #include "video_core/v2/regsem_3d.h"
@@ -1089,4 +1090,72 @@ TEST_CASE("V2 register groups: compare-on-write and incremental fingerprints",
     }
     VideoCommon::V2::GroupTracker check = mirror->v2_groups;
     REQUIRE(RegSem::Rehash3D(check, mirror->regs.data()) == 0);
+}
+
+TEST_CASE("V2 typed records run on the back without thunks, as their deferred calls do",
+          "[video_core][gpu_split_dispatch][v2_ir]") {
+    using Access = VideoCommon::GpuSplitTestAccess;
+    namespace Ir = VideoCommon::V2::Ir;
+    Fixture f;
+    f.system.Initialize();
+    f.memory.BindRasterizer(&f.rasterizer);
+    for (const bool ir : {false, true}) {
+        VideoCommon::GpuSplit split;
+        Access::SetIr(split, ir);
+        Access::Start(split, f.system);
+        SCOPE_EXIT { split.Stop(); };
+        // Barriers on the rasterizer (WFI, invalidations, fences, reference).
+        for (const auto op : {Ir::BarrierOp::WaitForIdle, Ir::BarrierOp::InvalidateCaches,
+                              Ir::BarrierOp::ReleaseFences, Ir::BarrierOp::SignalReference}) {
+            const Ir::BarrierBody body{.op = op, .object = split.Ref(&f.rasterizer), .a = 0, .b = 0};
+            split.Emit(Ir::Kind::Barrier, body, [] {});
+        }
+        // A readback that sets an engine's dirty flag from the caches (none dirty here).
+        f.fast.current_dirty = true;
+        const Ir::ReadbackBody dirty{.op = Ir::ReadbackOp::SegmentDirty,
+                                     .object = split.Ref(&f.fast),
+                                     .object2 = split.Ref(&f.memory),
+                                     .cache = 0,
+                                     .address = 0x2000'0000,
+                                     .bytes = 64};
+        split.Emit(Ir::Kind::Readback, dirty, [engine = &f.fast, memory = &f.memory] {
+            engine->current_dirty = memory->IsMemoryDirty(0x2000'0000, 64);
+        });
+        // Command list pages in the payload arena.
+        const std::array<u64, 3> pages{0x1000, 0x2000, 0x3000};
+        const Ir::ReadbackBody list{.op = Ir::ReadbackOp::ListPages,
+                                    .object = split.Ref(&f.rasterizer)};
+        split.EmitPayload(Ir::Kind::Readback, list, pages.data(), pages.size(), [] {});
+        // The CPU queue's command fence.
+        auto state_storage = std::make_unique<VideoCommon::GPUThread::SynchState>();
+        auto& state = *state_storage;
+        const Ir::SyncPointBody signal{.id = 0,
+                                       .value = 0,
+                                       .op = Ir::SyncPointOp::CommandSignal,
+                                       .object = split.Ref(&state),
+                                       .a = 77,
+                                       .b = 0};
+        split.Emit(Ir::Kind::SyncPoint, signal, [&state] {
+            VideoCommon::GPUThread::SignalCommandFence(state, 77, false);
+        });
+        // A record the back only reads.
+        split.Note(Ir::Kind::Acquire, Ir::AcquireBody{.address = 0x40, .value = 1});
+        split.Drain(VideoCommon::DrainSite::Other);
+        CHECK(!f.fast.current_dirty);
+        CHECK(state.signaled_fence.load() == 77);
+        CHECK(Access::IrBadRecords(split) == 0);
+    }
+    // Map records: what the GPU runs for a map and an unmap.
+    const Ir::MapBody map{.op = Ir::MapOp::GmmuMap,
+                          .flags = 0,
+                          .gpu_address = 0x4000'0000,
+                          .device_address = 0x30'0000,
+                          .size = 0x10000,
+                          .object = reinterpret_cast<u64>(&f.memory)};
+    f.gpu.ExecuteMap(map);
+    REQUIRE(f.memory.GpuToCpuAddress(0x4000'0000 + 0x1234) == DAddr{0x30'1234});
+    Ir::MapBody unmap = map;
+    unmap.op = Ir::MapOp::GmmuUnmap;
+    f.gpu.ExecuteMap(unmap);
+    REQUIRE(!f.memory.GpuToCpuAddress(0x4000'0000 + 0x1234));
 }

@@ -335,7 +335,7 @@ struct PresentBody {
 enum class SyncPointOp : u32 {
     Increment,     ///< rasterizer->SignalSyncPoint(id)
     CommandSignal, ///< The CPU queue's command fence `a` ran (block `b`)
-    SignalEvent,   ///< Kernel event `a` (a pointer, owned by its service) is signalled
+    SignalEvent,   ///< The kernel event `object` (owned by its service) is signalled
     Count,
 };
 

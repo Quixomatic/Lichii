@@ -15,10 +15,15 @@
 #include "video_core/cdma_pusher.h"
 #include "video_core/framebuffer_config.h"
 #include "video_core/rasterizer_download_area.h"
+#include "video_core/v2/ir.h"
 
 namespace Core {
 class System;
 } // namespace Core
+
+namespace Kernel {
+class KEvent;
+} // namespace Kernel
 
 namespace VideoCore {
 class RendererBase;
@@ -263,13 +268,24 @@ public:
     /// Notify rasterizer that any caches of the specified region should be flushed to Switch memory
     void FlushRegion(DAddr addr, u64 size);
 
-    /// Runs func on the GPU thread after the command lists submitted so far.
-    void RunInOrder(std::function<void()>&& func);
+    /// A GPU/SMMU memory map or unmap (typed Map record, object pointers in `map`), run on the
+    /// GPU thread after the command lists submitted so far. With MapBeforeLaterReads it is also
+    /// done before the GPU thread reads the command lists submitted later, and
+    /// [gpu_address, gpu_address + size) counts as pending (IsMapPending) until then.
+    void MapInOrder(const VideoCommon::V2::Ir::MapBody& map);
 
-    /// RunInOrder for GPU memory maps: also done before the GPU thread reads the command lists
-    /// submitted later (with the GPU split, on its front rather than its back).
-    /// [gpu_addr, gpu_addr + size) is the range of GPU addresses the map changes.
-    void MapInOrder(GPUVAddr gpu_addr, u64 size, std::function<void()>&& func);
+    /// Runs a Map record (GPU thread, or the split's back).
+    void ExecuteMap(const VideoCommon::V2::Ir::MapBody& map);
+
+    /// A marker after the command lists submitted so far: InOrderDone(marker) once the GPU
+    /// thread (or the split's back) got past them.
+    [[nodiscard]] u64 MarkInOrder();
+    [[nodiscard]] bool InOrderDone(u64 marker) const;
+
+    /// Signals a kernel event once the GPU got past the command lists submitted so far.
+    void SignalInOrder(Kernel::KEvent* event);
+    /// Runs a SignalEvent record (GPU thread, or the split's back).
+    void SignalEventInOrder(void* event);
 
     /// Whether a MapInOrder over part of [gpu_addr, gpu_addr + size) is queued and not done yet.
     [[nodiscard]] bool IsMapPending(GPUVAddr gpu_addr, u64 size) const;

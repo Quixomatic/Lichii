@@ -115,6 +115,8 @@ void SyncPoint(const Ir::SyncPointBody& body, const Context& context) {
                                       body.b != 0);
         return;
     case Ir::SyncPointOp::SignalEvent:
+        context.system.GPU().SignalEventInOrder(object);
+        return;
     case Ir::SyncPointOp::Count:
         break;
     }
@@ -194,6 +196,15 @@ bool Execute(const Ir::RecordView& record, const Context& context) {
         const auto& body = record.As<Ir::ChannelBody>();
         context.objects.As<Tegra::Control::Scheduler>(body.scheduler)
             ->BindChannelOnBack(*context.objects.As<Tegra::GPU>(body.gpu), body.bind_id);
+        return true;
+    }
+    case Ir::Kind::Map: {
+        // The CPU queue's map with its objects back as pointers.
+        Ir::MapBody body = record.As<Ir::MapBody>();
+        body.object = reinterpret_cast<u64>(context.objects.Get(static_cast<u32>(body.object)));
+        body.object2 =
+            reinterpret_cast<u64>(context.objects.Get(static_cast<u32>(body.object2)));
+        context.system.GPU().ExecuteMap(body);
         return true;
     }
     case Ir::Kind::Draw:

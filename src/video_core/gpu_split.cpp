@@ -502,14 +502,6 @@ void GpuSplit::MultiMethod(Tegra::Engines::EngineInterface* engine, u32 method, 
     }
 }
 
-void GpuSplit::DeferFunction(std::function<void()>&& func) {
-    auto* const heap = new std::function<void()>(std::move(func));
-    Defer([heap] {
-        (*heap)();
-        delete heap;
-    });
-}
-
 SPLIT_FORCE_INLINE size_t GpuSplit::ExecuteMethod(const u64* entry, size_t words) {
     const u64 head = entry[0];
     const u32 method = static_cast<u32>((head >> 8) & 0xffff);

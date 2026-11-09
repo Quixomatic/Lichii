@@ -65,7 +65,7 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
         system.RegisterHostThread();
 
         auto current_context = context.Acquire();
-        CommandDataContainer next;
+        CpuRecord next;
         // When a pending channel last moved or a command arrived (see the polling below).
         auto last_progress = std::chrono::steady_clock::now();
         namespace Profile = VideoCommon::Nx2Profile;
@@ -125,56 +125,20 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
             if (split.Active()) {
                 // Only command lists are parsed here; everything else runs on the back thread
                 // in order, and so does the signal that the command ran.
-                auto* const rasterizer_ptr = renderer.ReadRasterizer();
-                if (auto* submit_list = std::get_if<SubmitListCommand>(&next.data)) {
+                if (next.op == CpuOp::Submit) {
                     Profile::Scope scope{Profile::Zone::Push};
-                    scheduler.Push(system.GPU(), submit_list->channel, std::move(submit_list->entries));
-                } else if (std::holds_alternative<GPUTickCommand>(next.data)) {
-                    // TickWork ends fast draw reuse itself when it runs a request.
-                    const V2::Ir::BarrierBody body{.op = V2::Ir::BarrierOp::TickWork,
-                                                   .object = split.Ref(&system.GPU()),
-                                                   .a = 0,
-                                                   .b = 0};
-                    split.Emit(V2::Ir::Kind::Barrier, body,
-                               [gpu = &system.GPU()] { gpu->TickWork(); },
-                               VideoCommon::GpuSplit::FastDrawNeutral);
-                } else if (auto* run = std::get_if<RunCommand>(&next.data)) {
-                    if (run->before_later_reads) {
-                        // GPU memory maps unmap caches (UnmapMemory downloads): the back's state.
-                        split.DeferFunction(std::move(run->func));
-                        split.Drain(VideoCommon::DrainSite::Map);
-                    } else {
-                        split.DeferFunction(std::move(run->func));
-                    }
-                } else if (const auto* flush = std::get_if<FlushRegionCommand>(&next.data)) {
-                    const V2::Ir::ReadbackBody body{.op = V2::Ir::ReadbackOp::Flush,
-                                                    .object = split.Ref(rasterizer_ptr),
-                                                    .address = flush->addr,
-                                                    .bytes = flush->size};
-                    split.Emit(V2::Ir::Kind::Readback, body,
-                               [rasterizer_ptr, addr = flush->addr, size = flush->size] {
-                        rasterizer_ptr->FlushRegion(addr, size);
-                    });
-                } else if (const auto* invalidate = std::get_if<InvalidateRegionCommand>(&next.data)) {
-                    const V2::Ir::BarrierBody body{.op = V2::Ir::BarrierOp::Invalidate,
-                                                   .object = split.Ref(rasterizer_ptr),
-                                                   .a = invalidate->addr,
-                                                   .b = invalidate->size};
-                    split.Emit(V2::Ir::Kind::Barrier, body,
-                               [rasterizer_ptr, addr = invalidate->addr, size = invalidate->size] {
-                        rasterizer_ptr->OnCacheInvalidation(addr, size);
-                    });
+                    scheduler.Push(system.GPU(), next.channel, std::move(next.list));
                 } else {
-                    ASSERT(false);
+                    SendToBack(next, renderer.ReadRasterizer());
                 }
                 const V2::Ir::SyncPointBody signal{.id = 0,
                                                    .value = 0,
                                                    .op = V2::Ir::SyncPointOp::CommandSignal,
                                                    .object = split.Ref(&state),
-                                                   .a = next.fence,
+                                                   .a = next.sequence,
                                                    .b = next.block ? 1U : 0U};
                 split.Emit(V2::Ir::Kind::SyncPoint, signal,
-                           [state_ptr = &state, fence = next.fence, block = next.block] {
+                           [state_ptr = &state, fence = next.sequence, block = next.block] {
                     SignalCommandFence(*state_ptr, fence, block);
                 }, VideoCommon::GpuSplit::FastDrawNeutral);
 
@@ -182,47 +146,127 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                 last_progress = std::chrono::steady_clock::now();
                 continue;
             }
-            if (auto* submit_list = std::get_if<SubmitListCommand>(&next.data)) {
+            switch (next.op) {
+            case CpuOp::Submit: {
                 Profile::Scope scope{Profile::Zone::Push};
-                scheduler.Push(system.GPU(), submit_list->channel, std::move(submit_list->entries));
-            } else if (std::holds_alternative<GPUTickCommand>(next.data)) {
+                scheduler.Push(system.GPU(), next.channel, std::move(next.list));
+                break;
+            }
+            case CpuOp::Tick: {
                 Profile::Scope scope{Profile::Zone::Tick};
                 system.GPU().TickWork();
-            } else if (auto* run = std::get_if<RunCommand>(&next.data)) {
-                Profile::Scope scope{Profile::Zone::Run};
-                run->func();
-            } else if (const auto* flush = std::get_if<FlushRegionCommand>(&next.data)) {
-                Profile::Scope scope{Profile::Zone::FlushInvalidate};
-                renderer.ReadRasterizer()->FlushRegion(flush->addr, flush->size);
-            } else if (const auto* invalidate = std::get_if<InvalidateRegionCommand>(&next.data)) {
-                Profile::Scope scope{Profile::Zone::FlushInvalidate};
-                renderer.ReadRasterizer()->OnCacheInvalidation(invalidate->addr, invalidate->size);
-            } else {
-                ASSERT(false);
+                break;
             }
-            SignalCommandFence(state, next.fence, next.block);
+            case CpuOp::Map: {
+                Profile::Scope scope{Profile::Zone::Run};
+                system.GPU().ExecuteMap(next.map);
+                break;
+            }
+            case CpuOp::Notify:
+                break;
+            case CpuOp::SignalEvent: {
+                Profile::Scope scope{Profile::Zone::Run};
+                system.GPU().SignalEventInOrder(reinterpret_cast<void*>(next.object));
+                break;
+            }
+            case CpuOp::Flush: {
+                Profile::Scope scope{Profile::Zone::FlushInvalidate};
+                renderer.ReadRasterizer()->FlushRegion(next.address, next.size);
+                break;
+            }
+            }
+            SignalCommandFence(state, next.sequence, next.block);
             last_progress = std::chrono::steady_clock::now();
         }
     });
 }
 
+void ThreadManager::SendToBack(CpuRecord& record, VideoCore::RasterizerInterface* rasterizer_ptr) {
+    auto& split = VideoCommon::GpuSplit::Get();
+    switch (record.op) {
+    case CpuOp::Submit:
+        break;
+    case CpuOp::Tick: {
+        // TickWork ends fast draw reuse itself when it runs a request.
+        const V2::Ir::BarrierBody body{.op = V2::Ir::BarrierOp::TickWork,
+                                       .object = split.Ref(&system.GPU()),
+                                       .a = 0,
+                                       .b = 0};
+        split.Emit(V2::Ir::Kind::Barrier, body, [gpu = &system.GPU()] { gpu->TickWork(); },
+                   VideoCommon::GpuSplit::FastDrawNeutral);
+        break;
+    }
+    case CpuOp::Map: {
+        // GPU memory maps unmap caches (UnmapMemory downloads): the back's state.
+        V2::Ir::MapBody body = record.map;
+        body.object = split.Ref(reinterpret_cast<const void*>(record.map.object));
+        body.object2 = split.Ref(reinterpret_cast<const void*>(record.map.object2));
+        split.Emit(V2::Ir::Kind::Map, body,
+                   [gpu = &system.GPU(), map = record.map] { gpu->ExecuteMap(map); });
+        if ((record.map.flags & V2::Ir::MapBeforeLaterReads) != 0) {
+            // The front reads later command lists through the GPU page table it changes.
+            split.Drain(VideoCommon::DrainSite::Map);
+        }
+        break;
+    }
+    case CpuOp::Notify:
+        break; // Only the command signal
+    case CpuOp::SignalEvent: {
+        const V2::Ir::SyncPointBody body{
+            .id = 0,
+            .value = 0,
+            .op = V2::Ir::SyncPointOp::SignalEvent,
+            .object = split.Ref(reinterpret_cast<const void*>(record.object)),
+            .a = 0,
+            .b = 0};
+        split.Emit(V2::Ir::Kind::SyncPoint, body,
+                   [gpu = &system.GPU(), event = record.object] {
+            gpu->SignalEventInOrder(reinterpret_cast<void*>(event));
+        });
+        break;
+    }
+    case CpuOp::Flush: {
+        const V2::Ir::ReadbackBody body{.op = V2::Ir::ReadbackOp::Flush,
+                                        .object = split.Ref(rasterizer_ptr),
+                                        .address = record.address,
+                                        .bytes = record.size};
+        split.Emit(V2::Ir::Kind::Readback, body,
+                   [rasterizer_ptr, addr = record.address, size = record.size] {
+            rasterizer_ptr->FlushRegion(addr, size);
+        });
+        break;
+    }
+    }
+}
+
 void ThreadManager::SubmitList(s32 channel, Tegra::CommandList&& entries, bool is_async) {
-    PushCommand(SubmitListCommand(channel, std::move(entries)), false, is_async);
+    CpuRecord record{.op = CpuOp::Submit, .channel = channel};
+    record.list = std::move(entries);
+    PushCommand(std::move(record), false, is_async);
 }
 
 void ThreadManager::FlushRegion(DAddr addr, u64 size, bool is_async) {
     if (!is_async) {
         // Always flush with synchronous GPU mode
-        PushCommand(FlushRegionCommand(addr, size), false, is_async);
+        PushCommand(CpuRecord{.op = CpuOp::Flush, .address = addr, .size = size}, false, is_async);
     }
 }
 
 void ThreadManager::TickGPU(bool is_async) {
-    PushCommand(GPUTickCommand(), false, is_async);
+    PushCommand(CpuRecord{.op = CpuOp::Tick}, false, is_async);
 }
 
-void ThreadManager::Run(std::function<void()>&& func, bool is_async, bool before_later_reads) {
-    PushCommand(RunCommand{std::move(func), before_later_reads}, false, is_async);
+void ThreadManager::QueueMap(const V2::Ir::MapBody& map, bool is_async) {
+    PushCommand(CpuRecord{.op = CpuOp::Map, .map = map}, false, is_async);
+}
+
+u64 ThreadManager::Notify(bool is_async) {
+    return PushCommand(CpuRecord{.op = CpuOp::Notify}, false, is_async);
+}
+
+void ThreadManager::SignalEvent(void* event, bool is_async) {
+    PushCommand(CpuRecord{.op = CpuOp::SignalEvent, .object = reinterpret_cast<u64>(event)}, false,
+                is_async);
 }
 
 void ThreadManager::InvalidateRegion(DAddr addr, u64 size) {
@@ -232,7 +276,8 @@ void ThreadManager::InvalidateRegion(DAddr addr, u64 size) {
 void ThreadManager::FlushAndInvalidateRegion(DAddr addr, u64 size, bool is_async) {
     if (Settings::IsGPULevelHigh()) {
         if (!is_async) {
-            PushCommand(FlushRegionCommand(addr, size), false, is_async);
+            PushCommand(CpuRecord{.op = CpuOp::Flush, .address = addr, .size = size}, false,
+                        is_async);
         } else {
             auto& gpu = system.GPU();
             const u64 fence = gpu.RequestFlush(addr, size);
@@ -243,7 +288,7 @@ void ThreadManager::FlushAndInvalidateRegion(DAddr addr, u64 size, bool is_async
     rasterizer->OnCacheInvalidation(addr, size);
 }
 
-u64 ThreadManager::PushCommand(CommandData&& command_data, bool block, bool is_async) {
+u64 ThreadManager::PushCommand(CpuRecord&& record, bool block, bool is_async) {
     if (!is_async) {
         // In synchronous GPU mode, block the caller until the command has executed
         block = true;
@@ -251,7 +296,9 @@ u64 ThreadManager::PushCommand(CommandData&& command_data, bool block, bool is_a
 
     std::unique_lock lk(state.write_lock);
     const u64 fence{++state.last_fence};
-    state.queue.EmplaceWait(std::move(command_data), fence, block);
+    record.sequence = fence;
+    record.block = block;
+    state.queue.EmplaceWait(std::move(record));
 
     if (block) {
         state.cv.wait(lk, thread.get_stop_token(), [this, fence] {
