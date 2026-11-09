@@ -166,7 +166,9 @@ public:
     void Insert(DAddr address, u32 size, u64 tick, const Ref& ref, u64 page_sum,
                 const u8* bytes) {
         u8* const storage = Prepare(address, size, tick, page_sum);
-        std::memcpy(storage, bytes, size);
+        if (size != 0) {
+            std::memcpy(storage, bytes, size);
+        }
         Commit(address, size, ref);
     }
 
