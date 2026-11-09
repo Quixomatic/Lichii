@@ -985,6 +985,7 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         }
         delta_views.assign(views.begin(), views.end());
         delta_samplers.assign(samplers.begin(), samplers.end());
+        delta_recipe = nullptr;
         configured_stages = Spec::enabled_stages;
         delta_views_valid = true;
     }
@@ -1518,8 +1519,14 @@ GraphicsPipeline::RecipeResult GraphicsPipeline::ConfigureRecipe(
         NoteRecipePush(*push_out, rescaling, render_area, heap_push.words);
     }
     // A delta draw after this one keeps what this draw bound (as after a captured Configure).
-    delta_views.assign(views.begin(), views.end());
-    delta_samplers.assign(samplers.begin(), samplers.end());
+    // F2-14: already so when the last configure was a hit of this same recipe build.
+    if (delta_recipe != &recipe || delta_recipe_stamp != recipe.inputs.stamp ||
+        !delta_views_valid) {
+        delta_views.assign(views.begin(), views.end());
+        delta_samplers.assign(samplers.begin(), samplers.end());
+        delta_recipe = &recipe;
+        delta_recipe_stamp = recipe.inputs.stamp;
+    }
     configured_stages = recipe_stages;
     delta_views_valid = true;
     Profile::Scope scope{Profile::Zone::ConfigureDraw};

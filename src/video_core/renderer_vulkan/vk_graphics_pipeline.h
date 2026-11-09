@@ -477,6 +477,9 @@ private:
     std::array<u32, NUM_STAGES> handle_constant_buffers{};
     std::vector<VideoCommon::ImageViewInOut> delta_views;
     std::vector<VideoCommon::SamplerId> delta_samplers;
+    /// F2-14: the recipe build (slot, stamp) the delta views came from (null: a resolve).
+    const void* delta_recipe{};
+    u64 delta_recipe_stamp{};
 
     // EDEN_NX2_V2_DRAWCACHE (v2/draw_cache.h).
     VideoCommon::V2::DrawCache::RecipeCapture* recipe_capture{};

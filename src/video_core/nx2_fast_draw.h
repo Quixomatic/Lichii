@@ -146,6 +146,12 @@ struct Delta {
     [[nodiscard]] bool Empty() const {
         return num_writes == 0 && (binds[0] | binds[1] | binds[2] | binds[3] | binds[4]) == 0;
     }
+    /// Starts over (readers and writers only touch entries below the counts).
+    void Reset() {
+        binds = {};
+        num_writes = 0;
+        num_device_writes = 0;
+    }
 
     /// Whether data written reaches [address, address + size), whose device memory is spans: at
     /// one of its GPU addresses, or through any GPU address that maps its device memory.

@@ -491,10 +491,15 @@ GraphicsPipeline* RasterizerVulkan::TakeReusableDraw(bool is_indexed, bool is_in
     namespace FastDraw = VideoCommon::Nx2FastDraw;
     namespace V2 = VideoCommon::V2;
     const ReusableDraw draw = std::exchange(reusable_draw, ReusableDraw{});
-    const FastDraw::Delta delta = std::exchange(FastDraw::g_delta, FastDraw::Delta{});
+    // F2-14: read in place and started over on return (no copy of the 0.5 KiB delta out and in;
+    // the stats keep their copy).
+    const FastDraw::Delta& delta = FastDraw::g_delta;
+    SCOPE_EXIT {
+        FastDraw::g_delta.Reset();
+    };
     cont_lookup_valid = false;
     const bool contdraw = V2::On(V2::Switch::ContDraw);
-    if ((contdraw || V2::P3Stats::Enabled()) && V2::TrackGroups()) [[unlikely]] {
+    if (V2::P3Stats::Enabled() && V2::TrackGroups()) [[unlikely]] {
         cont_delta = delta;
     }
     const auto full = [&](FullDraw reason) -> GraphicsPipeline* {
