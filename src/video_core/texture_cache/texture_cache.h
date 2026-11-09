@@ -1922,6 +1922,20 @@ void TextureCache<P>::CommitAsyncFlushes() {
     if constexpr (IMPLEMENTS_ASYNC_DOWNLOADS) {
         auto& download_ids = uncommitted_downloads;
         const size_t redundant_images = DeduplicatePendingImageDownloads(download_ids, slot_images);
+        if (commit != nullptr && commit->writeback) [[unlikely]] {
+            // EDEN_NX2_V2_WRITEBACK: owed since an earlier fence. An image no longer
+            // GPU-modified has nothing to write back (a reactive flush or a CPU write took it),
+            // and writing it would only go over newer guest bytes.
+            const size_t before = download_ids.size();
+            std::erase_if(download_ids, [&](const PendingDownload& download) {
+                return download.is_swizzle && !download.retired_image &&
+                       False(download.GetImage(slot_images).flags & ImageFlagBits::GpuModified);
+            });
+            auto& stats = V2::Commit::Stats::Get();
+            V2::Commit::Stats::Count(stats.writeback_dropped,
+                                     before - download_ids.size() + redundant_images);
+            V2::Commit::Stats::Count(stats.writeback_flushed, download_ids.size());
+        }
         if (download_ids.empty()) {
             committed_downloads.emplace_back(std::move(uncommitted_downloads));
             uncommitted_downloads.clear();

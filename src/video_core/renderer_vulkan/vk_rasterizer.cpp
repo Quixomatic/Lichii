@@ -456,6 +456,8 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
             if (commit_lock_free) {
                 fence_manager.SetCommitBacklog(true, [this] { gpu.WakeCacheOwner(); });
             }
+            commit->writeback = V2::On(V2::Switch::Writeback);
+            fence_manager.SetDeferredWritebacks(commit->writeback);
             LOG_INFO(Render_Vulkan, "EDEN_NX2_V2_COMMIT: {}, {}",
                      commit->verify ? "verify (the old locked path runs, predictions compared)"
                                     : "pure lookups and a commit stage",
@@ -3938,6 +3940,22 @@ void RasterizerVulkan::TickFrame() {
     descriptor_buffer_ring.TickFrame();
     fence_manager.TickFrame();
     staging_pool.TickFrame();
+    if (commit != nullptr && commit->writeback) [[unlikely]] {
+        // EDEN_NX2_V2_WRITEBACK: what is still owed lands by the next frame at the latest.
+        bool owed = false;
+        const auto look = [&] {
+            owed = texture_cache.HasUncommittedFlushes() || buffer_cache.HasUncommittedFlushes();
+        };
+        if (commit_lock_free) {
+            WithCaches(look);
+        } else {
+            std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
+            look();
+        }
+        if (owed) {
+            fence_manager.SignalFence([] {}, true);
+        }
+    }
     if (commit_lock_free) [[unlikely]] {
         WithCaches([&] {
             texture_cache.TickFrame();

@@ -656,6 +656,7 @@ struct Context {
     ExternalQueue external;
     u64 submission = 0;       ///< the owner's current scheduler tick (track ids)
     bool stats = false;
+    bool writeback = false;   ///< EDEN_NX2_V2_WRITEBACK: owed downloads wait for a guest sync
 
     /// Opens a segment for the lookups that follow.
     void BeginSegment() {

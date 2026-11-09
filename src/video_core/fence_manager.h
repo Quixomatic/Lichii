@@ -31,6 +31,7 @@
 #include "video_core/nx2_fast_draw.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/rasterizer_interface.h"
+#include "video_core/v2/commit.h"
 
 namespace VideoCommon {
 
@@ -72,7 +73,15 @@ public:
 
     void SignalReference() {
         std::function<void()> do_nothing([] {});
-        SignalFence(std::move(do_nothing));
+        // No guest sync rides on it: with deferred writebacks it commits no downloads.
+        SignalFence(std::move(do_nothing), false);
+    }
+
+    /// Pipeline v2 P5a (EDEN_NX2_V2_WRITEBACK): GPU data owed to guest memory (the caches'
+    /// uncommitted downloads) is committed only at fences a guest sync rides on, or at frame end,
+    /// instead of at every fence.
+    void SetDeferredWritebacks(bool on) {
+        defer_writebacks = on;
     }
 
     void SyncOperation(std::function<void()>&& func) {
@@ -83,7 +92,9 @@ public:
         uncommitted_operations.emplace_back(std::move(func));
     }
 
-    void SignalFence(std::function<void()>&& func) {
+    /// `observable`: a guest sync rides on the fence (a syncpoint, a release, a report): GPU data
+    /// owed to guest memory must land before it. Only deferred writebacks look at it.
+    void SignalFence(std::function<void()>&& func, bool observable = true) {
         Nx2Profile::Scope profile_scope{Nx2Profile::Zone::Fence};
         // A fence that writes a fence-flagged query report is never skipped as empty: a skipped
         // fence runs its operation at once, before the host GPU has run the work the report
@@ -97,7 +108,14 @@ public:
         if constexpr (!can_async_check) {
             TryReleasePendingFences<false>();
         }
-        auto [should_flush, committed_flushes] = CommitCacheFlushes();
+        // EDEN_NX2_V2_WRITEBACK: the owed downloads wait for a fence the guest can observe.
+        const bool defer = defer_writebacks && !observable;
+        if (defer &&
+            (texture_cache.HasAsyncFlushWork() || buffer_cache.HasUncommittedFlushes()))
+            [[unlikely]] {
+            V2::Commit::Stats::Count(V2::Commit::Stats::Get().writeback_queued);
+        }
+        auto [should_flush, committed_flushes] = defer ? CacheFlushes{} : CommitCacheFlushes();
         if (Nx2Profile::Enabled()) {
             NoteFenceDecision(delay_fence, committed_flushes);
         }
@@ -219,7 +237,7 @@ public:
                 wait_finished.store(true, std::memory_order_relaxed);
                 wait_cv.notify_all();
             });
-            SignalFence(std::move(func));
+            SignalFence(std::move(func), false);
             // The fence's commands can be held back by a deferred flush that only this thread
             // submits. The fencing thread waits for that submission before releasing the fence,
             // so waiting here without submitting deadlocks (Ocarina of Time entering gameplay).
@@ -560,6 +578,7 @@ private:
         u8 flushes;
     };
     bool commit_backlog = false;
+    bool defer_writebacks = false;
     std::function<void()> wake_owner;
     std::mutex backlog_mutex;
     std::deque<BacklogEntry> backlog;     ///< Under backlog_mutex
