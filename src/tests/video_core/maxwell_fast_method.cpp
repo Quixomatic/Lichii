@@ -27,6 +27,8 @@
 #include "video_core/gpu_split.h"
 #include "video_core/memory_manager.h"
 #include "video_core/renderer_null/null_rasterizer.h"
+#include "video_core/v2/regsem_3d.h"
+#include "video_core/v2/v2_switches.h"
 
 namespace VideoCommon {
 
@@ -54,7 +56,21 @@ struct GpuSplitTestAccess {
         return GpuSplit::RingWords - 1;
     }
 
+    static void SetIr(GpuSplit& split, bool ir) {
+        split.ir = ir;
+        split.ir_verify = ir;
+    }
+
+    static const u64* Ring(const GpuSplit& split) {
+        return split.ring.get();
+    }
+
+    static u64 IrBadRecords(const GpuSplit& split) {
+        return split.ir_bad_records;
+    }
+
     static u64 Execute(GpuSplit& split, u64 position, u64 available) {
+
         const size_t index = position & GpuSplit::RingMask;
         const size_t size = split.Execute(
             &split.ring[index], std::min<u64>(available - position, GpuSplit::RingWords - index));
@@ -836,4 +852,237 @@ TEST_CASE("Maxwell3D's split front uploads macro code sent as one multi-method r
     const auto& macros = engine.GetNativeMacroEngine();
     REQUIRE(macros.native_write_offset == pointer * 3 + code.size());
     CHECK(std::equal(code.begin(), code.end(), macros.native_code.begin() + pointer * 3));
+}
+
+namespace {
+
+/// Sets a v2 switch for the scope.
+struct V2SwitchScope {
+    VideoCommon::V2::Switch name;
+    VideoCommon::V2::Mode previous;
+
+    V2SwitchScope(VideoCommon::V2::Switch name_, VideoCommon::V2::Mode mode)
+        : name{name_}, previous{VideoCommon::V2::Get(name_)} {
+        VideoCommon::V2::g_modes[static_cast<size_t>(name)] = mode;
+    }
+    ~V2SwitchScope() {
+        VideoCommon::V2::g_modes[static_cast<size_t>(name)] = previous;
+    }
+};
+
+} // Anonymous namespace
+
+TEST_CASE("V2 typed IR runs the same engine calls as the word stream",
+          "[video_core][gpu_split_dispatch][v2_ir]") {
+    using Access = VideoCommon::GpuSplitTestAccess;
+    Fixture f;
+    f.system.Initialize();
+    VideoCommon::GpuSplit words;
+    VideoCommon::GpuSplit typed;
+    Access::Initialize(words, f.system);
+    Access::Initialize(typed, f.system);
+    Access::SetIr(typed, true);
+    std::vector<u32> words_calls;
+    std::vector<u32> typed_calls;
+    u64 words_read = 0;
+    u64 typed_read = 0;
+    std::mt19937 rng{1234};
+    // The word stream runs on f.slow, the IR on f.fast: Compare checks they end up equal.
+    for (u32 round = 0; round < 20; ++round) {
+        for (u32 i = 0; i < 300; ++i) {
+            const u32 choice = static_cast<u32>(rng() % 16);
+            if (choice < 7) {
+                const u32 method = f.state_methods[rng() % f.state_methods.size()];
+                const u32 argument = RandomArgument(rng, method, f.slow);
+                const bool is_last = rng() % 4 != 0;
+                words.Method(&f.slow, method, argument, is_last, nullptr);
+                typed.Method(&f.fast, method, argument, is_last, nullptr);
+            } else if (choice < 10) {
+                const u32 method = executable_methods[rng() % executable_methods.size()];
+                const u32 argument = RandomArgument(rng, method, f.slow);
+                if (choice == 9) {
+                    words.MacroWrite(&f.slow, method, argument);
+                    typed.MacroWrite(&f.fast, method, argument);
+                } else {
+                    words.Method(&f.slow, method, argument, true, nullptr);
+                    typed.Method(&f.fast, method, argument, true, nullptr);
+                }
+            } else if (choice < 13) {
+                // Constant buffer words one by one (the back batches them) or as one run.
+                const u32 count = 1 + static_cast<u32>(rng() % 20);
+                std::vector<u32> data(count);
+                for (auto& word : data) {
+                    word = static_cast<u32>(rng());
+                }
+                if (choice == 12) {
+                    words.MultiMethod(&f.slow, CbData, data.data(), count, count, nullptr);
+                    typed.MultiMethod(&f.fast, CbData, data.data(), count, count, nullptr);
+                } else {
+                    for (const u32 word : data) {
+                        const u32 method = CbData + static_cast<u32>(rng() % 16);
+                        words.MacroWrite(&f.slow, method, word);
+                        typed.MacroWrite(&f.fast, method, word);
+                    }
+                }
+            } else if (choice < 15) {
+                const u32 value = static_cast<u32>(rng());
+                words.Defer([&words_calls, value] { words_calls.push_back(value); });
+                typed.Defer([&typed_calls, value] { typed_calls.push_back(value); },
+                            VideoCommon::GpuSplit::Hint(VideoCommon::V2::Ir::Kind::Barrier));
+            } else {
+                const u32 value = static_cast<u32>(rng());
+                const VideoCommon::V2::Ir::ReleaseBody body{.address = value, .payload = value};
+                words.DeferTyped(VideoCommon::V2::Ir::Kind::Release, body,
+                                 [&words_calls, value] { words_calls.push_back(~value); });
+                typed.DeferTyped(VideoCommon::V2::Ir::Kind::Release, body,
+                                 [&typed_calls, value] { typed_calls.push_back(~value); });
+            }
+        }
+        // Execute what both sent, as the back would (a publish closes the open StateRun).
+        words.Publish();
+        typed.Publish();
+        while (words_read != Access::End(words)) {
+            words_read = Access::Execute(words, words_read, Access::End(words));
+        }
+        while (typed_read != Access::End(typed)) {
+            typed_read = Access::Execute(typed, typed_read, Access::End(typed));
+        }
+        f.slow.ConsumeSink(f.system);
+        f.fast.ConsumeSink(f.system);
+        f.Compare();
+        REQUIRE(words_calls == typed_calls);
+        REQUIRE(Access::IrBadRecords(typed) == 0);
+        REQUIRE(typed.Mark().sequence != 0);
+        REQUIRE(words.Mark().sequence == 0);
+    }
+}
+
+TEST_CASE("V2 table-driven 3D front mirror sends what the hand-written one sends",
+          "[video_core][gpu_split_dependencies][v2_regsem]") {
+    using Access = VideoCommon::GpuSplitTestAccess;
+    using VideoCommon::V2::Mode;
+    using VideoCommon::V2::Switch;
+    Fixture f;
+    Maxwell3D table_engine{f.memory};
+    Maxwell3D verify_engine{f.memory};
+    VideoCommon::GpuSplit hand;
+    VideoCommon::GpuSplit table;
+    VideoCommon::GpuSplit verify;
+    Access::Initialize(hand, f.system);
+    Access::Initialize(table, f.system);
+    Access::Initialize(verify, f.system);
+    std::mt19937 rng{99};
+    const auto call = [&](Maxwell3D& engine, VideoCommon::GpuSplit& split, Mode mode, u32 method,
+                          u32 argument, bool is_last) {
+        const V2SwitchScope scope{Switch::RegSem, mode};
+        engine.FrontCallMethod(f.system, split, method, argument, is_last);
+    };
+    const auto multi = [&](Maxwell3D& engine, VideoCommon::GpuSplit& split, Mode mode, u32 method,
+                           const std::vector<u32>& data) {
+        const V2SwitchScope scope{Switch::RegSem, mode};
+        const u32 amount = static_cast<u32>(data.size());
+        engine.FrontCallMultiMethod(f.system, split, method, data.data(), amount, amount);
+    };
+    constexpr u32 StartAddressPointer = MAXWELL3D_REG_INDEX(load_mme.start_address_ptr);
+    constexpr u32 StartAddress = MAXWELL3D_REG_INDEX(load_mme.start_address);
+    constexpr u32 Falcon4 = MAXWELL3D_REG_INDEX(falcon[4]);
+    for (u32 i = 0; i < 20000; ++i) {
+        const u32 choice = static_cast<u32>(rng() % 20);
+        u32 method;
+        u32 argument;
+        if (choice < 10) {
+            method = f.state_methods[rng() % f.state_methods.size()];
+            argument = rng() % 3 == 0 ? static_cast<u32>(rng()) : static_cast<u32>(rng() % 3);
+        } else if (choice < 14) {
+            method = executable_methods[rng() % executable_methods.size()];
+            argument = RandomArgument(rng, method, f.fast);
+        } else if (choice == 14) {
+            method = ShadowControl;
+            argument = static_cast<u32>(rng() % 4);
+        } else if (choice == 15) {
+            method = rng() % 2 ? StartAddressPointer : StartAddress;
+            argument = static_cast<u32>(rng() % 8);
+        } else if (choice == 16) {
+            method = rng() % 2 ? Falcon4 : CbData + static_cast<u32>(rng() % 16);
+            argument = static_cast<u32>(rng());
+        } else {
+            method = rng() % 2 ? CbData : f.state_methods[rng() % f.state_methods.size()];
+            std::vector<u32> data(1 + rng() % 6);
+            for (auto& word : data) {
+                word = static_cast<u32>(rng() % 3);
+            }
+            multi(f.fast, hand, Mode::Off, method, data);
+            multi(table_engine, table, Mode::On, method, data);
+            multi(verify_engine, verify, Mode::Verify, method, data);
+            continue;
+        }
+        const bool is_last = rng() % 4 != 0;
+        call(f.fast, hand, Mode::Off, method, argument, is_last);
+        call(table_engine, table, Mode::On, method, argument, is_last);
+        call(verify_engine, verify, Mode::Verify, method, argument, is_last);
+    }
+    // The same ring entries: the same writes dropped and sent, with the same values.
+    REQUIRE(Access::End(hand) == Access::End(table));
+    REQUIRE(Access::End(hand) == Access::End(verify));
+    const auto words = static_cast<size_t>(Access::End(hand));
+    for (size_t i = 0; i < words; ++i) {
+        const u64 a = Access::Ring(hand)[i];
+        if ((a & 0xf) == 1) { // Engine entries hold each ring's own engine pointer
+            ++i;
+            continue;
+        }
+        REQUIRE(a == Access::Ring(table)[i]);
+        REQUIRE(a == Access::Ring(verify)[i]);
+    }
+    CHECK(std::equal(f.fast.GetNativeMacroPositions().begin(),
+                     f.fast.GetNativeMacroPositions().end(),
+                     table_engine.GetNativeMacroPositions().begin()));
+}
+
+TEST_CASE("V2 register groups: compare-on-write and incremental fingerprints",
+          "[video_core][v2_regsem]") {
+    namespace RegSem = VideoCommon::V2::RegSem;
+    using VideoCommon::V2::GroupBit;
+    using VideoCommon::V2::RegGroup;
+    Fixture f; // Constructs a Maxwell3D, which builds the table.
+    const RegSem::Table3D& table = RegSem::GetTable3D();
+    auto mirror = std::make_unique<RegSem::Mirror3D>();
+    mirror->skip_same = true;
+    RegSem::Rehash3D(mirror->v2_groups, mirror->regs.data());
+    mirror->v2_groups.TakeDirty();
+    const auto none = [](RegSem::Effect, u32, u32) { return true; };
+    const u32 state = MAXWELL3D_REG_INDEX(viewport_transform);
+    const u32 viewport = GroupBit(RegGroup::Viewport);
+    REQUIRE(table.groups[state] == RegGroup::Viewport);
+    REQUIRE(table.const_buffer_offset == CbOffset);
+    REQUIRE(table.instruction_ptr == MAXWELL3D_REG_INDEX(load_mme.instruction_ptr));
+    REQUIRE((table.flags[DrawEnd] & (RegSem::LoopSkippable | RegSem::DrawEnd)) ==
+            (RegSem::LoopSkippable | RegSem::DrawEnd));
+    REQUIRE((table.flags[MAXWELL3D_REG_INDEX(bind_groups[2].raw_config)] &
+             RegSem::CbufBindFlag) != 0);
+    // A changed write dirties its group and is sent; the same value again does neither.
+    REQUIRE(RegSem::Write3D(*mirror, table, state, 5, false, none));
+    REQUIRE(mirror->v2_groups.TakeDirty() == viewport);
+    const u64 all = mirror->v2_groups.Fingerprint(VideoCommon::V2::HashedGroups);
+    REQUIRE_FALSE(RegSem::Write3D(*mirror, table, state, 5, false, none));
+    REQUIRE(mirror->v2_groups.TakeDirty() == 0);
+    REQUIRE(mirror->v2_groups.Fingerprint(VideoCommon::V2::HashedGroups) == all);
+    // Writing the old value back restores the old fingerprint.
+    const u64 before = mirror->v2_groups.Fingerprint(viewport);
+    REQUIRE(RegSem::Write3D(*mirror, table, state, 6, false, none));
+    REQUIRE(mirror->v2_groups.Fingerprint(viewport) != before);
+    REQUIRE(RegSem::Write3D(*mirror, table, state, 5, false, none));
+    REQUIRE(mirror->v2_groups.Fingerprint(viewport) == before);
+    mirror->v2_groups.TakeDirty();
+    // Constant buffer data dirties CbufData whatever the words; it is always sent.
+    REQUIRE(RegSem::Write3D(*mirror, table, CbData, 0, false, none));
+    REQUIRE(mirror->v2_groups.TakeDirty() == GroupBit(RegGroup::CbufData));
+    // Random writes: the incremental hashes equal the ones computed from scratch.
+    std::mt19937 rng{7};
+    for (u32 i = 0; i < 100000; ++i) {
+        const u32 method = f.state_methods[rng() % f.state_methods.size()];
+        RegSem::Write3D(*mirror, table, method, static_cast<u32>(rng() % 4), false, none);
+    }
+    VideoCommon::V2::GroupTracker check = mirror->v2_groups;
+    REQUIRE(RegSem::Rehash3D(check, mirror->regs.data()) == 0);
 }
