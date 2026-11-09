@@ -144,6 +144,30 @@ public:
         targeted_scope = active;
         UpdateAutoFlush();
     }
+    /// Perf fix C (EDEN_NX2_V2_DYNRENDER, MASTER_PLAN §5.5 targeted barriers): records an
+    /// operation outside any pass that touches only buffers and query pools (copies, fills,
+    /// their own barriers). The tracker's pending writes are attachment writes to images, which
+    /// such an operation can't read or overwrite (host buffers never alias host images; buffer
+    /// hazards keep their own barriers), so it flushes none of them. Without the tracker: the
+    /// old RequestOutsideRenderPassOperationContext + Record.
+    template <typename T>
+    void RecordBufferOperation(T&& command,
+                               std::source_location location = std::source_location::current()) {
+        if (!track_barriers) {
+            RequestOutsideRenderPassOperationContext(location);
+            Record(std::forward<T>(command));
+            return;
+        }
+        if (state.renderpass) {
+            CountRenderPassEnd(location.file_name(), location.line());
+        }
+        EndRenderPass();
+        const bool saved = std::exchange(targeted_scope, true);
+        UpdateAutoFlush();
+        Record(std::forward<T>(command));
+        targeted_scope = saved;
+        UpdateAutoFlush();
+    }
     /// Dispatches: ends a pass without flushing the tracked writes (the dispatch's own barrier
     /// orders its reads).
     void RequestOutsideRenderPassForDispatch(

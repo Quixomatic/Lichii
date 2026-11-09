@@ -65,8 +65,7 @@ public:
             const auto& dev = device.GetLogical();
             dev.ResetQueryPool(*query_pool, 0, BANK_SIZE);
         } else {
-            scheduler.RequestOutsideRenderPassOperationContext();
-            scheduler.Record([pool = *query_pool](vk::CommandBuffer cmdbuf) {
+            scheduler.RecordBufferOperation([pool = *query_pool](vk::CommandBuffer cmdbuf) {
                 cmdbuf.ResetQueryPool(pool, 0, BANK_SIZE);
             });
         }
@@ -158,8 +157,7 @@ public:
             .pQueueFamilyIndices = nullptr,
         };
         accumulation_buffer = memory_allocator.CreateBuffer(buffer_ci, MemoryUsage::DeviceLocal);
-        scheduler.RequestOutsideRenderPassOperationContext();
-        scheduler.Record([buffer = *accumulation_buffer](vk::CommandBuffer cmdbuf) {
+        scheduler.RecordBufferOperation([buffer = *accumulation_buffer](vk::CommandBuffer cmdbuf) {
             cmdbuf.FillBuffer(buffer, 0, 8, 0);
         });
     }
@@ -283,8 +281,7 @@ public:
             size_t bank_id = bank->GetIndex();
             auto& resolve_buffer = buffers[resolve_buffer_index];
             VkQueryPool query_pool = bank->GetInnerPool();
-            scheduler.RequestOutsideRenderPassOperationContext();
-            scheduler.Record([start, amount, base_offset, query_pool, wait_on_last,
+            scheduler.RecordBufferOperation([start, amount, base_offset, query_pool, wait_on_last,
                               buffer = *resolve_buffer](vk::CommandBuffer cmdbuf) {
                 const VkBufferMemoryBarrier copy_query_pool_barrier{
                     .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
@@ -377,8 +374,7 @@ public:
                                           min_accumulation_limit, max_accumulation_limit);
 
         } else {
-            scheduler.RequestOutsideRenderPassOperationContext();
-            scheduler.Record([buffer = *accumulation_buffer](vk::CommandBuffer cmdbuf) {
+            scheduler.RecordBufferOperation([buffer = *accumulation_buffer](vk::CommandBuffer cmdbuf) {
                 cmdbuf.FillBuffer(buffer, 0, 8, 0);
             });
         }
@@ -711,8 +707,7 @@ public:
     }
 
     void Sync(StagingBufferRef& stagging_buffer, size_t extra_offset, size_t start, size_t size) {
-        scheduler.RequestOutsideRenderPassOperationContext();
-        scheduler.Record([this, dst_buffer = stagging_buffer.buffer, extra_offset, start,
+        scheduler.RecordBufferOperation([this, dst_buffer = stagging_buffer.buffer, extra_offset, start,
                           size](vk::CommandBuffer cmdbuf) {
             std::array<VkBufferCopy, 1> copy{VkBufferCopy{
                 .srcOffset = start * QUERY_SIZE,
@@ -1782,8 +1777,7 @@ void QueryCacheRuntime::SyncValues(std::span<SyncValuesType> values, VkBuffer ba
         src_buffer = base_src_buffer;
     }
 
-    impl->scheduler.RequestOutsideRenderPassOperationContext();
-    impl->scheduler.Record([src_buffer, dst_buffers = std::move(impl->buffers_to_upload_to), vk_copies = std::move(impl->copies_setup)](vk::CommandBuffer cmdbuf) {
+    impl->scheduler.RecordBufferOperation([src_buffer, dst_buffers = std::move(impl->buffers_to_upload_to), vk_copies = std::move(impl->copies_setup)](vk::CommandBuffer cmdbuf) {
         size_t size = dst_buffers.size();
         for (size_t i = 0; i < size; i++) {
             cmdbuf.CopyBuffer(src_buffer, dst_buffers[i].first, vk_copies[i]);
