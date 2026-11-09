@@ -24,8 +24,10 @@ namespace VideoCommon::V2 {
 
 /// A release the front knows the payload of: 4 bytes, or `bytes` 16 (the payload as 64 bits,
 /// then a timestamp). `known` false: a counter report or a reduction, whose value is unknown.
+/// `fenced`: the query cache writes it when its fence runs (QueryPropertiesFlags::IsAFence), so it
+/// is also kept until it lands (GpuSplit::NoteUnlandedWrite).
 void NoteReleaseWrite(GpuSplit& split, const Tegra::MemoryManager& memory, GPUVAddr address,
-                      u32 payload, u32 bytes, bool known, Producer producer);
+                      u32 payload, u32 bytes, bool known, Producer producer, bool fenced);
 
 /// A write of [address, address + size) whose bytes the front doesn't know. Long or unmapped
 /// ranges become a write the front can't bound.

@@ -15,6 +15,7 @@
 #include "common/common_types.h"
 #include "video_core/v2/hazard.h"
 #include "video_core/v2/ir.h"
+#include "video_core/v2/landing.h"
 #include "video_core/v2/v2_switches.h"
 
 namespace Core {
@@ -159,6 +160,21 @@ public:
     }
     [[nodiscard]] bool MayHoldReports(u64 device_address, u64 size) const {
         return hazards.MayHoldReports(device_address, size);
+    }
+    /// Front: a fence-flagged release of known bytes was just sent. It is in memory only once
+    /// its fence ran (v2/landing.h); until then FindUnlanded forwards it.
+    void NoteUnlandedWrite(u64 device_address, const void* bytes, u32 size) {
+        if (unlanded.Size() == V2::HazardTable::Capacity) [[unlikely]] {
+            unlanded.Retire(V2::Landing::landed.load(std::memory_order_acquire));
+        }
+        unlanded.NoteKnown(device_address, bytes, size, write_position, V2::Producer::Release);
+    }
+    /// Front: the fence-flagged releases to a device range that are not in memory yet, queued
+    /// or run by the back (Forward applies their bytes over `out`).
+    [[nodiscard]] V2::HazardResult FindUnlanded(u64 device_address, u64 size, u8* out) {
+        const u64 landed = V2::Landing::landed.load(std::memory_order_acquire);
+        unlanded.Retire(landed);
+        return unlanded.Find(device_address, size, landed, V2::HazardFilter{}, out);
     }
     /// Any thread, EDEN_NX2_V2_CPULANE: has the back run `hook` after its current entry (or at
     /// once if it waits for work).
@@ -466,6 +482,8 @@ private:
     }
 
     void BackLoop(std::stop_token stop_token);
+    /// The size of the entry at `entry` in ring words (0: wrap).
+    static size_t EntryWords(const u64* entry);
     /// Runs the entry at `entry` (of the `words` published before the ring's end), returns its size.
     size_t Execute(const u64* entry, size_t words);
     /// One method entry (the old Method entry, or one in an IR StateRun), returns its size.
@@ -502,6 +520,8 @@ private:
     u64 spin_window_ns{};
     u64 front_spin_start{};
     V2::HazardTable hazards;
+    V2::HazardTable unlanded; ///< Fence-flagged known releases until they land (Landing)
+    u64 back_entry_position{}; ///< Back: ring position of the entry it runs (TracksWrites)
 
     // Back side.
     Tegra::Engines::EngineInterface* back_engine{};

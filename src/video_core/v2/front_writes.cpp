@@ -22,7 +22,7 @@ constexpr u64 MaxRangePages = 64;
 } // Anonymous namespace
 
 void NoteReleaseWrite(GpuSplit& split, const Tegra::MemoryManager& memory, GPUVAddr address,
-                      u32 payload, u32 bytes, bool known, Producer producer) {
+                      u32 payload, u32 bytes, bool known, Producer producer, bool fenced) {
     const auto device = memory.GpuToCpuAddress(address);
     if (!device) {
         return; // The back drops it too (the query cache skips unmapped reports)
@@ -33,12 +33,18 @@ void NoteReleaseWrite(GpuSplit& split, const Tegra::MemoryManager& memory, GPUVA
     }
     if (bytes <= 4) {
         split.NoteKnownWrite(*device, &payload, sizeof(payload), producer);
+        if (fenced) {
+            split.NoteUnlandedWrite(*device, &payload, sizeof(payload));
+        }
         return;
     }
     // The payload as 64 bits, then a timestamp the front can't tell.
     const std::array<u32, 2> value{payload, 0};
     split.NoteKnownWrite(*device, value.data(), sizeof(value), producer);
     split.NoteRangeWrite(*device + 8, bytes - 8, producer);
+    if (fenced) {
+        split.NoteUnlandedWrite(*device, value.data(), sizeof(value));
+    }
 }
 
 void NoteRangeWriteGpu(GpuSplit& split, const Tegra::MemoryManager& memory, GPUVAddr address,
@@ -74,8 +80,10 @@ void NoteReport3D(GpuSplit& split, const Tegra::MemoryManager& memory, const u32
         regs[MAXWELL3D_REG_INDEX(report_semaphore.address_low)];
     const bool payload = ((query >> 23) & 0x1f) == 0; // Report::Payload
     const bool short_query = ((query >> 28) & 1) != 0;
+    // ProcessQueryGet: a short Release is fence-flagged; ReportOnly and long ones are not.
     NoteReleaseWrite(split, memory, address, regs[MAXWELL3D_REG_INDEX(report_semaphore.payload)],
-                     short_query ? 4 : 16, payload, Producer::Report);
+                     short_query ? 4 : 16, payload, Producer::Report,
+                     short_query && operation == 0);
 }
 
 void NoteReportCompute(GpuSplit& split, const Tegra::MemoryManager& memory, const u32* registers,
@@ -89,7 +97,7 @@ void NoteReportCompute(GpuSplit& split, const Tegra::MemoryManager& memory, cons
     const bool reduction = ((control >> 3) & 1) != 0;
     const bool one_word = ((control >> 28) & 1) != 0;
     NoteReleaseWrite(split, memory, address, registers[0x6c2], reduction || one_word ? 4 : 16,
-                     !reduction, Producer::Report);
+                     !reduction, Producer::Report, one_word);
 }
 
 void DmaWriteTracker::Note(GpuSplit& split, const Tegra::MemoryManager& memory, u32 method,
@@ -154,7 +162,7 @@ void DmaWriteTracker::Note(GpuSplit& split, const Tegra::MemoryManager& memory, 
         const GPUVAddr address = MaxwellDMA::PackedGPUVAddr{semaphore[0], semaphore[1]};
         NoteReleaseWrite(split, memory, address, semaphore[2],
                          type == LaunchDMA::SemaphoreType::RELEASE_ONE_WORD_SEMAPHORE ? 4 : 16,
-                         true, Producer::Release);
+                         true, Producer::Release, true);
     }
 }
 

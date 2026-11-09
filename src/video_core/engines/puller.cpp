@@ -80,8 +80,10 @@ void OnBackRelease(DmaPusher& dma_pusher, GPUVAddr address, u32 payload, u32 byt
         };
         split.DeferTyped(VideoCommon::V2::Ir::Kind::Release, body, func);
         if (split.TracksWrites()) [[unlikely]] {
+            // 4-byte releases are fence-flagged (IsAFence); the 16-byte WriteLong is not.
             VideoCommon::V2::NoteReleaseWrite(split, dma_pusher.memory_manager, address, payload,
-                                              bytes, true, VideoCommon::V2::Producer::Release);
+                                              bytes, true, VideoCommon::V2::Producer::Release,
+                                              bytes == 4);
         }
     } else {
         func();
@@ -168,8 +170,13 @@ ViewCheck CheckWithView(DmaPusher& dma_pusher, GPUVAddr address, u32 value, V2::
     V2::HazardFilter filter;
     filter.ranged = V2::ProducerBit(V2::Producer::Release) | V2::ProducerBit(V2::Producer::Report);
     u32 forwarded = 0;
-    const V2::HazardResult word =
+    V2::HazardResult word =
         split.FindWrites(*device, sizeof(u32), filter, reinterpret_cast<u8*>(&forwarded));
+    if (word.kind == V2::HazardResult::Kind::Clear) {
+        // A fence-flagged release the back ran whose fence hasn't: memory doesn't hold it yet,
+        // but the host runs it before this channel goes on, as for a queued one.
+        word = split.FindUnlanded(*device, sizeof(u32), reinterpret_cast<u8*>(&forwarded));
+    }
     const u32 memory_word = memory.Read<u32>(address);
     const V2::AcquireDecision decision =
         V2::DecideAcquire(op, value, word, forwarded, memory_word,
@@ -525,8 +532,27 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
         if (view_mode != V2::Mode::Off) [[unlikely]] {
             const ViewCheck view = CheckWithView(dma_pusher, acquire.address, acquire.value,
                                                  ViewOp(acquire.operation));
-            NoteViewDecision(view);
             view_passes = Passes(view);
+            if (view.verdict == V2::AcquireVerdict::NotMet && view_mode == V2::Mode::On) {
+                // Nothing sent to the word meets it: a drain can't change that, only a release
+                // the back runs later (or the CPU's). Suspend at once: register the latch, let
+                // the back release the pending fences (a release among them latches it), and
+                // let the polls decide, without waiting for the back here.
+                if (V2Stats::Enabled()) [[unlikely]] {
+                    V2Stats::NoteDecision(VideoCommon::DrainSite::Acquire, Decision::Avoided);
+                }
+                auto& waiters = Nx2SemaphoreWaiters::Get();
+                if (const auto device = dma_pusher.memory_manager.GpuToCpuAddress(acquire.address)) {
+                    waiters.Add(this, *device, acquire.value, acquire.operation);
+                }
+                OnBack([rasterizer = dma_pusher.rasterizer] { rasterizer->ReleaseFences(); },
+                       VideoCommon::V2::Ir::Kind::Barrier);
+                pending_acquire = acquire;
+                dma_pusher.suspensions.fetch_add(1, std::memory_order_release);
+                VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AcquireWaits, 1);
+                return;
+            }
+            NoteViewDecision(view);
             if (view_passes && view_mode == V2::Mode::On) {
                 if (view.verdict == V2::AcquireVerdict::MetByQueued) {
                     // What the front reads after the acquire waits for the work sent before

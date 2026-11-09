@@ -71,12 +71,6 @@ HazardTable::Entry& HazardTable::Push(u64 address, u64 end, u64 position, Produc
     entry.producer = producer;
     entry.known = 0;
     Insert(entry, index);
-    if (producer == Producer::Release || producer == Producer::Report) {
-        for (u64 page = address >> PageBits; page <= (end - 1) >> PageBits; ++page) {
-            const size_t bit = ReportBit(page);
-            (*report_pages)[bit / 64] |= u64{1} << (bit % 64);
-        }
-    }
     return entry;
 }
 
@@ -150,6 +144,13 @@ void HazardTable::NoteRange(u64 address, u64 size, u64 position, Producer produc
         }
     }
     Push(address, end, position, producer);
+    if (producer == Producer::Release || producer == Producer::Report) {
+        // A counter report or reduction: its value reaches memory at a point the front can't see.
+        for (u64 page = address >> PageBits; page <= (end - 1) >> PageBits; ++page) {
+            const size_t bit = ReportBit(page);
+            (*report_pages)[bit / 64] |= u64{1} << (bit % 64);
+        }
+    }
 }
 
 void HazardTable::NoteUnbounded(Producer producer, u64 position) {

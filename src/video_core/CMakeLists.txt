@@ -127,6 +127,7 @@ add_library(video_core STATIC
     v2/hazard.cpp
     v2/hazard.h
     v2/ir.h
+    v2/landing.h
     v2/regsem.cpp
     v2/regsem.h
     v2/regsem_3d.h

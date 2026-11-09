@@ -142,6 +142,8 @@ void GpuSplit::MaybeStart(Core::System& system_) {
     tracks_writes = acquire_mode != V2::Mode::Off || hazard_mode != V2::Mode::Off;
     feed_idle_back = acquire_mode != V2::Mode::Off;
     hazards.Clear();
+    unlanded.Clear();
+    V2::Landing::landed.store(0, std::memory_order_relaxed);
     // AnyPS5's hand-off spin (HandoffSpin.hpp): spin before a kernel wait only with more than 8
     // logical CPUs, where the waiting thread does not take the other one's core.
     spin_window = V2::On(V2::Switch::Spin);
@@ -193,6 +195,8 @@ void GpuSplit::Stop() {
     acquire_mode = V2::Mode::Off;
     hazard_mode = V2::Mode::Off;
     hazards.Clear();
+    unlanded.Clear();
+    V2::Landing::landed.store(0, std::memory_order_relaxed);
     SetCpuLaneHook(nullptr, nullptr);
     cpu_lane_requested.store(false, std::memory_order_relaxed);
     back_idle_at.store(~u64{0}, std::memory_order_relaxed);
@@ -531,6 +535,11 @@ size_t GpuSplit::ExecuteIr(const u64* entry) {
         const u64* it = entry + V2::Ir::HeaderWords;
         const u64* const end = entry + size;
         while (it < end) {
+            if (tracks_writes) [[unlikely]] {
+                // Each method's own end position: what the front noted its writes at.
+                V2::Landing::tag = back_entry_position + static_cast<u64>(it - entry) +
+                                   ((*it & HasSegment) != 0 ? 2 : 1);
+            }
             it += ExecuteMethod(it, static_cast<size_t>(end - it));
         }
         break;
@@ -566,6 +575,25 @@ size_t GpuSplit::ExecuteIr(const u64* entry) {
         break;
     }
     return size;
+}
+
+size_t GpuSplit::EntryWords(const u64* entry) {
+    const u64 head = entry[0];
+    switch (static_cast<Kind>(head & 0xf)) {
+    case Kind::Wrap:
+        return 0;
+    case Kind::Engine:
+        return 2;
+    case Kind::Method:
+        return (head & HasSegment) != 0 ? 2 : 1;
+    case Kind::Multi:
+        return ((head & HasSegment) != 0 ? 3 : 2) + ((head >> 32) + 1) / 2;
+    case Kind::Call:
+        return 2 + static_cast<size_t>((head >> 8) & 0xffffff);
+    case Kind::Ir:
+        return V2::Ir::RecordWords(head);
+    }
+    return 1;
 }
 
 size_t GpuSplit::Execute(const u64* entry, size_t words) {
@@ -667,6 +695,10 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
         u64 last_store = read_position;
         while (read_position != available) {
             const size_t index = read_position & RingMask;
+            if (tracks_writes) [[unlikely]] {
+                back_entry_position = read_position;
+                V2::Landing::tag = read_position + EntryWords(&ring[index]);
+            }
             const size_t size =
                 Execute(&ring[index], std::min<u64>(available - read_position, RingWords - index));
             read_position += size != 0 ? size : RingWords - index;

@@ -1870,6 +1870,13 @@ bool Maxwell3D::FrontDmaReadHazard(VideoCommon::GpuSplit& split, GPUVAddr source
         for (size_t i = 0; i < out.size(); ++i) {
             out[i] = memory_manager.Read<u32>(source + i * sizeof(u32));
         }
+        // Fence-flagged releases not in memory yet come first (older than anything queued
+        // that isn't one of them), then the queued writes.
+        const V2::HazardResult unlanded =
+            split.FindUnlanded(*device, out.size() * sizeof(u32), reinterpret_cast<u8*>(out.data()));
+        if (unlanded.kind == V2::HazardResult::Kind::Wait) {
+            return fall_back(Reason::ReportPage); // A release's timestamp: only the query cache has it
+        }
         const V2::HazardResult result =
             split.FindWrites(*device, out.size() * sizeof(u32), filter,
                              reinterpret_cast<u8*>(out.data()));
@@ -1878,10 +1885,11 @@ bool Maxwell3D::FrontDmaReadHazard(VideoCommon::GpuSplit& split, GPUVAddr source
             wait = std::max(wait, sync);
         }
         if (wait == 0) {
-            V2::Stats::NoteDecision(site, narrowed ? Decision::Narrowed
-                                          : result.kind == V2::HazardResult::Kind::Forward
-                                              ? Decision::Forwarded
-                                              : Decision::Avoided);
+            const bool forwarded = result.kind == V2::HazardResult::Kind::Forward ||
+                                   unlanded.kind == V2::HazardResult::Kind::Forward;
+            V2::Stats::NoteDecision(site, narrowed    ? Decision::Narrowed
+                                          : forwarded ? Decision::Forwarded
+                                                      : Decision::Avoided);
             return true;
         }
         if (attempt == 2) {

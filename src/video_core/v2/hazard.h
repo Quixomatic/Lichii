@@ -103,9 +103,10 @@ public:
     [[nodiscard]] HazardResult Find(u64 address, u64 size, u64 consumed, const HazardFilter& filter,
                                     u8* out = nullptr);
 
-    /// Whether a release or report was ever sent to a page of the range (sticky, hashed): the
-    /// query cache may hold its value back past the back running it (fence-flagged releases,
-    /// counter reports), so a read there must flush the reports first.
+    /// Whether a release or report of unknown value (a counter, a reduction) was ever sent to a
+    /// page of the range (sticky, hashed): the query cache may hold it back past the back running
+    /// it, so a read there must flush the reports first. Releases of known payloads are tracked
+    /// until they land instead (GpuSplit::FindUnlanded).
     [[nodiscard]] bool MayHoldReports(u64 address, u64 size) const;
 
     /// The newest unbounded write of `producer` still queued, or 0.
