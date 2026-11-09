@@ -603,7 +603,7 @@ void DmaPusher::CallMultiMethod(const u32* base_start, u32 num_methods) {
     }
 }
 
-bool DmaPusher::WaitForListWriters(GPUVAddr address, size_t size) {
+bool DmaPusher::WaitForListWriters(GPUVAddr address, size_t size, bool cpu_written) {
     namespace V2 = VideoCommon::V2;
     using V2::Stats::Decision;
     auto& split = VideoCommon::GpuSplit::Get();
@@ -619,10 +619,17 @@ bool DmaPusher::WaitForListWriters(GPUVAddr address, size_t size) {
     }
     // The fetch of a GP entry is ordered after earlier engine work only by a host-level wait in
     // between (83d6c8d78b): compute and copy work sent before the last one, plus queued copies
-    // whose destination overlaps the list.
-    u64 target = split.SyncedWriterPosition();
+    // (and dispatches whose writes are bounded) that overlap the list. A list on GPU-written
+    // pages waits for every writer that may reach it: the copy path needs the writer recorded.
     V2::HazardFilter filter;
-    filter.ranged = V2::ProducerBit(V2::Producer::Copy);
+    filter.ranged = V2::ProducerBit(V2::Producer::Copy) | V2::ProducerBit(V2::Producer::Dispatch);
+    u64 target = 0;
+    if (cpu_written) {
+        target = split.SyncedWriterPosition();
+    } else {
+        filter.unbounded = V2::ProducerBit(V2::Producer::Copy) |
+                           V2::ProducerBit(V2::Producer::Dispatch);
+    }
     for (GPUVAddr chunk = address; chunk < address + size;) {
         const GPUVAddr chunk_end =
             std::min<GPUVAddr>(address + size, (chunk & ~GPUVAddr{0xfff}) + 0x1000);
@@ -643,6 +650,9 @@ bool DmaPusher::WaitForListWriters(GPUVAddr address, size_t size) {
                                                         : Decision::Waited);
     if (mode == V2::Mode::On) {
         return target > consumed && split.WaitForPosition(target, site);
+    }
+    if (!cpu_written) {
+        return split.WaitForWriters(); // Verify: GPU-written lists are read from their copies
     }
     // Verify: read the words after the narrow wait, then wait as before and compare.
     const bool waited = target > consumed && split.WaitForPosition(target, site);
@@ -775,7 +785,7 @@ bool DmaPusher::ReadGpuWrittenCommands(GPUVAddr address, u32 count, bool* pendin
     // meanwhile too.
     const bool resumed = std::exchange(resumed_list_read, false);
     if (split.Active() && !resumed) {
-        split.WaitForWriters();
+        WaitForListWriters(address, size_t{count} * sizeof(u32), false);
     }
     bool past_sync = !split.Active();
     using GpuWrittenList = VideoCore::RasterizerInterface::GpuWrittenList;

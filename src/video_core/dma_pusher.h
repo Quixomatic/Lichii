@@ -193,7 +193,9 @@ private:
     /// Before a command list on pages no GPU work wrote is read: waits for the work that can
     /// write it (GpuSplit::WaitForWriters; EDEN_NX2_V2_HAZARD narrows it). Returns whether it
     /// waited.
-    bool WaitForListWriters(GPUVAddr address, size_t size);
+    /// `cpu_written`: CPU-written lists, which only work before the last host-level sync orders (else
+    /// GPU-written ones, whose writers the copy path needs recorded).
+    bool WaitForListWriters(GPUVAddr address, size_t size, bool cpu_written = true);
     /// EDEN_NX2_V2_ACQUIRE/HAZARD: records the guest memory writes of an engine method just sent
     /// to the split's back (GpuSplit::TracksWrites). `writer`: IsMemoryWriter.
     void NoteTrackedWrite(Engines::EngineInterface& engine, Engines::EngineTypes type, u32 method,
