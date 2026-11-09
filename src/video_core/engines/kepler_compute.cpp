@@ -601,6 +601,12 @@ void KeplerCompute::CallMultiMethod(Core::System& system, u32 method, const u32*
 }
 
 bool KeplerCompute::DispatchNativeCompute(const NativeQmdScheduler::Descriptor& qmd) {
+    if (VideoCommon::V2::IrCheck::g_active) [[unlikely]] {
+        // EDEN_NX2_V2_IR_DRAWS verify: the front predicts QMD launches. Count the launch here,
+        // before the host decides to skip or replace its work (the native network skips and
+        // replacements below; inline QMDs read "dispatched 0 times" for those).
+        VideoCommon::V2::IrCheck::NoteDispatch(GPUVAddr{native_registers[0xad]} << 8);
+    }
     launch_description = {};
     launch_description.grid_dim_x.Assign(qmd[12]);
     launch_description.grid_dim_y.Assign(qmd[13] & 0xffff);
@@ -1592,9 +1598,9 @@ void KeplerCompute::VerifyComputeWrite(Core::System& system, u32 method, u32 arg
 }
 
 void KeplerCompute::NoteV2Dispatch(bool native) {
-    if (VideoCommon::V2::IrCheck::g_active) [[unlikely]] {
-        VideoCommon::V2::IrCheck::NoteDispatch(
-            native ? (GPUVAddr{native_registers[0xad]} << 8) : 0);
+    if (!native && VideoCommon::V2::IrCheck::g_active) [[unlikely]] {
+        // Native launches are counted when the QMD launches (DispatchNativeCompute).
+        VideoCommon::V2::IrCheck::NoteDispatch(0);
     }
     if (VideoCommon::V2::On(VideoCommon::V2::Switch::RegSem)) [[unlikely]] {
         if (native) {
