@@ -90,6 +90,11 @@ inline void BindCbuf3D(Resolve::CbufTable& cbufs, const u32* regs, u32 method) {
 
 template <typename State>
 inline void NoteCbufBind3D(State& s, u32 method) {
+    if constexpr (requires { s.v2_cbufs_wanted; }) {
+        if (!s.v2_cbufs_wanted) {
+            return; // nobody reads them (the front without EDEN_NX2_V2_PARALLEL)
+        }
+    }
     if constexpr (requires { s.v2_cbufs; }) {
         BindCbuf3D(s.v2_cbufs, s.regs.data(), method);
     }

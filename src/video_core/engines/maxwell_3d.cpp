@@ -1660,8 +1660,10 @@ struct Maxwell3D::FrontState {
     /// EDEN_NX2_V2_REGSEM=1: the hashes of v2_groups wait here until something reads them
     /// (folded by FrontDrawGroups and FrontParallelDraw; Perf fix D).
     VideoCommon::V2::RegSem::HashLog3D v2_hash_log;
-    /// EDEN_NX2_V2_REGSEM=1: the constant buffer bindings these registers made (P6c snapshots).
+    /// EDEN_NX2_V2_REGSEM=1: the constant buffer bindings these registers made (P6c snapshots),
+    /// kept only with EDEN_NX2_V2_PARALLEL (v2_cbufs_wanted).
     VideoCommon::V2::Resolve::CbufTable v2_cbufs;
+    bool v2_cbufs_wanted{};
     std::unique_ptr<VideoCommon::V2::RegSem::Front3D> v2;
     /// EDEN_NX2_V2_REGSEM=1 (v2 non-null and On): FrontWrite's table-driven fast path.
     bool v2_on{};
@@ -1801,6 +1803,7 @@ Maxwell3D::FrontState& Maxwell3D::Front(Core::System& system, VideoCommon::GpuSp
             front->v2 = std::make_unique<VideoCommon::V2::RegSem::Front3D>();
             front->v2->mode = VideoCommon::V2::Get(VideoCommon::V2::Switch::RegSem);
             front->v2_on = front->v2->mode == VideoCommon::V2::Mode::On;
+            front->v2_cbufs_wanted = split.Parallel() != nullptr;
             FrontRegSemResync(*front);
             front->s1_exec = split.S1Exec() && front->v2_on;
             front->s1_check = split.S1Check();
