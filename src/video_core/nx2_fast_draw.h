@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "common/common_types.h"
+#include "video_core/v2/v2_switches.h"
 
 namespace Tegra {
 class MemoryManager;
@@ -83,18 +84,28 @@ inline void SetEnabledForTest(bool on) {
 }
 
 inline std::atomic<u64> g_serial{1};
+/// Pipeline v2 (EDEN_NX2_V2_CONTDRAW): the breaks other than register value changes. Continued
+/// draws decide register changes from the register groups instead of the serial.
+inline std::atomic<u64> g_event_serial{1};
 /// The last break's reason and, for Register and Method, its 3D method (diagnostics).
 inline std::atomic<u32> g_last_break{};
 
 inline void Break(Reason reason, u32 method = 0) {
     if (Enabled()) {
         g_serial.fetch_add(1, std::memory_order_relaxed);
+        if (V2::On(V2::Switch::ContDraw) && reason != Reason::Register) [[unlikely]] {
+            g_event_serial.fetch_add(1, std::memory_order_relaxed);
+        }
         g_last_break.store(static_cast<u32>(reason) | (method << 8), std::memory_order_relaxed);
     }
 }
 
 inline u64 Serial() {
     return g_serial.load(std::memory_order_relaxed);
+}
+
+inline u64 EventSerial() {
+    return g_event_serial.load(std::memory_order_relaxed);
 }
 
 /// The device memory a GPU range maps to. A write through another GPU address that maps the

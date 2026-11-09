@@ -380,6 +380,7 @@ private:
         u64 map_serial{};
         u64 tick{};
         u64 render_pass{};
+        u64 event_serial{}; ///< EDEN_NX2_V2_CONTDRAW: Nx2FastDraw::EventSerial()
         Maxwell::PrimitiveTopology topology{};
         bool is_indexed{};
     };
@@ -437,8 +438,24 @@ private:
     /// map_serial as read then), and the images it samples need no preparing.
     bool DeltaStillHolds(u64 serial, u64 map_serial);
     void NoteResolvedDraw(GraphicsPipeline* pipeline, bool is_indexed, bool is_indirect, u64 serial,
-                          u64 map_serial);
+                          u64 map_serial, u64 event_serial);
     void ReportFastDraws();
+    /// Pipeline v2 (EDEN_NX2_V2_CONTDRAW): the groups changed since the candidate draw allow a
+    /// continued draw of `draw`; may look the pipeline up (kept in cont_lookup).
+    bool ContinuedDrawHolds(const ReusableDraw& draw);
+    /// Pipeline v2 P3: the register groups changed since the last resolved draw that the bound
+    /// pipeline can see (relevance masking by shader use).
+    [[nodiscard]] u32 RelevantGroups(u32 groups, const GraphicsPipeline& pipeline,
+                                     const VideoCommon::Nx2FastDraw::Delta& delta,
+                                     bool is_indexed) const;
+    /// The pipeline ContinuedDrawHolds looked up for this draw (PrepareDraw takes it instead of
+    /// a second lookup), valid while cont_lookup_valid.
+    GraphicsPipeline* cont_lookup{};
+    bool cont_lookup_valid{};
+    /// Serial() when TakeReusableDraw took a continued draw (register changes allowed).
+    u64 cont_take_serial{};
+    /// The delta TakeReusableDraw took, kept for the relevance stats.
+    VideoCommon::Nx2FastDraw::Delta cont_delta{};
     ReusableDraw reusable_draw;
     ReusableDraw taken_draw; ///< The draw TakeReusableDraw last returned the pipeline of
     /// Device memory of the constant buffers TakeReusableDraw checks for texture handle writes.

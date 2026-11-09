@@ -307,6 +307,29 @@ public:
         return handle_constant_buffers;
     }
 
+    /// Constant buffer slots per stage the pipeline reads, and how many bytes of each.
+    [[nodiscard]] const std::array<u32, 5>& UniformBufferMasks() const noexcept {
+        return enabled_uniform_buffer_masks;
+    }
+    [[nodiscard]] const VideoCommon::UniformBufferSizes& UniformSizes() const noexcept {
+        return uniform_buffer_sizes;
+    }
+
+    /// Whether any stage samples a texture or reads an image or texel buffer (the pools matter).
+    [[nodiscard]] bool UsesTexturePools() const noexcept {
+        return num_image_elements != 0 || num_textures != 0;
+    }
+
+    /// Whether the vertex stage reads any generic attribute (the vertex streams matter).
+    [[nodiscard]] bool ReadsVertexAttributes() const noexcept {
+        for (size_t index = 0; index < 32; ++index) {
+            if (stage_infos[0].loads.Generic(index)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     /// Resolves and binds every buffer as Configure does (storage buffer addresses are read from
     /// the constant buffers again) and records the draw's descriptors with the image views,
     /// samplers and texture buffers the last captured Configure resolved. False when the draw

@@ -19,6 +19,7 @@
 #include "video_core/renderer_null/null_rasterizer.h"
 #include "video_core/renderer_vulkan/fixed_pipeline_state.h"
 #include "video_core/renderer_vulkan/vk_state_tracker.h"
+#include "video_core/v2/continued_draw.h"
 #include "video_core/v2/pipeline_lookup.h"
 #include "video_core/v2/regsem.h"
 #include "video_core/v2/v2_switches.h"
@@ -262,4 +263,37 @@ TEST_CASE("V2 P3 group sinks accumulate until taken", "[video_core][v2_p3]") {
     REQUIRE(tracker.TakeSink(GroupSink::ContinuedDraw) ==
             (GroupBit(RegGroup::Viewport) | GroupBit(RegGroup::Pipeline) |
              GroupBit(RegGroup::CbufData)));
+}
+
+TEST_CASE("V2 P3 continued draws classify changed groups as light or heavy",
+          "[video_core][v2_p3]") {
+    using VideoCommon::V2::ClassifyGroups;
+    using VideoCommon::V2::GroupBit;
+    using VideoCommon::V2::GroupClass;
+    using VideoCommon::V2::RegGroup;
+    REQUIRE(ClassifyGroups(0, true) == GroupClass::Light);
+    REQUIRE(ClassifyGroups(GroupBit(RegGroup::DrawParams) | GroupBit(RegGroup::CbufData) |
+                               GroupBit(RegGroup::CbufBind) | GroupBit(RegGroup::IndexBuffer) |
+                               GroupBit(RegGroup::Misc),
+                           true) == GroupClass::Light);
+    for (const RegGroup group : {RegGroup::Pipeline, RegGroup::Shaders, RegGroup::Viewport,
+                                 RegGroup::VertexStreams}) {
+        REQUIRE(ClassifyGroups(GroupBit(group) | GroupBit(RegGroup::CbufData), true) ==
+                GroupClass::PipelineCheck);
+    }
+    REQUIRE(ClassifyGroups(GroupBit(RegGroup::RenderTargets), false) == GroupClass::Heavy);
+    REQUIRE(ClassifyGroups(GroupBit(RegGroup::RenderTargets) | GroupBit(RegGroup::Pipeline),
+                           false) == GroupClass::Heavy);
+    // The pools only matter to pipelines that read them (relevance by shader use).
+    REQUIRE(ClassifyGroups(GroupBit(RegGroup::TexPools), true) == GroupClass::Heavy);
+    REQUIRE(ClassifyGroups(GroupBit(RegGroup::TexPools), false) == GroupClass::Light);
+    // Every group has a class: light, checked or heavy.
+    for (u32 group = 0; group < VideoCommon::V2::NumRegGroups; ++group) {
+        const u32 bit = 1U << group;
+        const bool known = (bit & VideoCommon::V2::LightGroups) != 0 ||
+                           (bit & VideoCommon::V2::PipelineCheckGroups) != 0 ||
+                           bit == GroupBit(RegGroup::RenderTargets) ||
+                           bit == GroupBit(RegGroup::TexPools);
+        REQUIRE(known);
+    }
 }
