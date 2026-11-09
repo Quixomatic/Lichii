@@ -702,7 +702,7 @@ struct Data {
     std::atomic<u64> writeback_dropped{};
     std::atomic<u64> rt_skipped{};     ///< replays whose render targets needed no request
     std::atomic<u64> rt_requests{};
-    std::atomic<u64> verify_draws{};
+    std::atomic<u64> verify_draws{}; ///< verify comparisons (commit points, lookups, samples)
     std::atomic<u64> verify_mismatches{};
     std::atomic<u64> verify_dependent{};
 };

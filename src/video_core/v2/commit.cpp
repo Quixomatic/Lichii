@@ -131,7 +131,7 @@ void Report(const char* thread_name, u64 window_ns) {
              "| external ops (per s):{}; before an owner {}, floods {}, owner calls {:.0f}/s, "
              "fence batches to the owner {:.0f}/s | hoistable uploads {:.0f}/s | writebacks "
              "queued {:.0f}/s, flushed {:.0f}/s, dropped {:.0f}/s | replay render targets: no "
-             "request {:.0f}/s, requests {:.0f}/s | verify {} draws, {} mismatches, {} dependent "
+             "request {:.0f}/s, requests {:.0f}/s | verify {} checks, {} mismatches, {} dependent "
              "(compare the request rates with the P0 'cache mutations' line)",
              thread_name, kinds, effects, PerSecond(commits, window_ns),
              commits == 0 ? 0.0 : static_cast<double>(commit_ns) / 1e3 / static_cast<double>(commits),
