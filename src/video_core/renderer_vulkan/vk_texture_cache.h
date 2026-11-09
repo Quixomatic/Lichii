@@ -316,6 +316,10 @@ public:
     std::optional<BlockLinearUnswizzle3DPass> bl3d_unswizzle_pass;
 
 public:
+    /// EDEN_NX2_V2_DYNRENDER: a draw/dispatch uses `image` (pending attachment writes it overlaps
+    /// need a barrier first).
+    void NoteImageUse(const Image& image);
+
     /// EDEN_NX2_V2_GPUDECODE: whether `image` can be untiled by the compute path.
     [[nodiscard]] bool GpuDecodeAvailable(const Image& image) const noexcept;
     /// Untiles `raw` (the guest bytes) with compute into a fence-tracked scratch ring and copies
@@ -474,6 +478,21 @@ public:
     /// once it ends.
     void MarkResolveShadowsUpToDate() const;
 
+    /// EDEN_NX2_V2_DYNRENDER: attachments for vkCmdBeginRendering (no resolve attachments).
+    [[nodiscard]] bool DynamicRenderingCapable() const noexcept {
+        return num_resolve_shadows == 0;
+    }
+    [[nodiscard]] const std::array<VkImageView, NUM_RT>& ColorViews() const noexcept {
+        return color_views;
+    }
+    [[nodiscard]] VkImageView DepthView() const noexcept {
+        return depth_view;
+    }
+    /// Guest GPU address range of each image (Images() order), for the barrier tracker.
+    [[nodiscard]] const std::array<std::pair<u64, u64>, 9>& GuestRanges() const noexcept {
+        return guest_ranges;
+    }
+
 private:
     static constexpr size_t NUM_MEMOIZED_RENDER_PASS_VARIANTS = 8;
 
@@ -486,6 +505,9 @@ private:
     u32 num_images = 0;
     std::array<VkImage, 9> images{};
     std::array<VkImageSubresourceRange, 9> image_ranges{};
+    std::array<VkImageView, NUM_RT> color_views{};
+    VkImageView depth_view{};
+    std::array<std::pair<u64, u64>, 9> guest_ranges{};
     std::array<size_t, NUM_RT> rt_map{};
     bool has_depth{};
     bool has_stencil{};

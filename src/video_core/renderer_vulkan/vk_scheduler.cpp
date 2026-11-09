@@ -163,6 +163,12 @@ Scheduler::Scheduler(const Device& device_, StateTracker& state_tracker_)
         LOG_INFO(Render_Vulkan, "EDEN_NX2_V2_SUBMITTHREAD needs timeline semaphores and "
                                 "synchronization2; the worker keeps submitting");
     }
+    dynamic_rendering = device.IsDynamicRenderingEnabled();
+    track_barriers = VideoCommon::V2::On(VideoCommon::V2::Switch::DynRender);
+    if (track_barriers) {
+        LOG_INFO(Render_Vulkan, "EDEN_NX2_V2_DYNRENDER: {} rendering, range barrier tracker",
+                 dynamic_rendering ? "dynamic" : "render pass (fallback)");
+    }
     if (submit_thread || transfer_queue) {
         submit_engine = std::make_unique<SubmitEngine>(device, *master_semaphore, submit_mutex,
                                                        submit_thread, transfer_queue.get());
@@ -393,10 +399,34 @@ void Scheduler::BeginRenderPassImpl(const Framebuffer* framebuffer, VkRenderPass
     }
     const VkFramebuffer framebuffer_handle = framebuffer->Handle();
     const VkExtent2D render_area = framebuffer->RenderArea();
+    if (track_barriers) [[unlikely]] {
+        // Only the pending writes this pass's attachments overlap need a barrier first; the
+        // read hazards its first draw noted go with it.
+        for (u32 i = 0; i < framebuffer->NumImages(); ++i) {
+            const auto [begin, end] = framebuffer->GuestRanges()[i];
+            const auto hazard = barrier_tracker.Take(reinterpret_cast<u64>(framebuffer->Images()[i]),
+                                                     begin, end);
+            read_hazard.stages |= hazard.stages;
+            read_hazard.access |= hazard.access;
+            read_hazard.count += hazard.count;
+        }
+        if (read_hazard.Any()) {
+            const auto hazard = std::exchange(read_hazard, {});
+            RecordHazardBarrier(hazard.stages, hazard.access, VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT,
+                                VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
+                                    VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                                    VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+                                    VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT);
+        }
+        renderpass_guest_ranges = framebuffer->GuestRanges();
+    }
+    VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::Passes);
     ++render_pass_serial;
     state.renderpass = renderpass;
     state.framebuffer = framebuffer_handle;
     state.render_area = render_area;
+    state.dynamic = next_pass_dynamic;
+    auto_flush = false;
 
     if (GPU::Logging::IsActive() && Settings::values.gpu_log_vulkan_calls.GetValue()) {
         const std::string render_pass_info =
@@ -411,7 +441,7 @@ void Scheduler::BeginRenderPassImpl(const Framebuffer* framebuffer, VkRenderPass
     }
     const bool after_compute = std::exchange(compute_writes_pending, false);
     Record([renderpass, framebuffer_handle, render_area, values, clear_value_count,
-            after_compute](vk::CommandBuffer cmdbuf) {
+            after_compute, dynamic = next_pass_dynamic](vk::CommandBuffer cmdbuf) {
         const VkRenderPassBeginInfo renderpass_bi{
             .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
             .pNext = nullptr,
@@ -437,7 +467,9 @@ void Scheduler::BeginRenderPassImpl(const Framebuffer* framebuffer, VkRenderPass
             cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                                    VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT, 0, COMPUTE_TO_GRAPHICS);
         }
-        cmdbuf.BeginRenderPass(renderpass_bi, VK_SUBPASS_CONTENTS_INLINE);
+        if (!dynamic) {
+            cmdbuf.BeginRenderPass(renderpass_bi, VK_SUBPASS_CONTENTS_INLINE);
+        }
     });
     num_renderpass_images = framebuffer->NumImages();
     renderpass_images = framebuffer->Images();
@@ -526,7 +558,7 @@ void Scheduler::RequestRenderpass(const Framebuffer* framebuffer, std::source_lo
     // clear restart the pass and re-LOAD what was just CLEARed (~118 MB of attachment traffic per
     // world-target turn). The framebuffer handle already fixes the attachment structure and key,
     // so it is the correct identity to compare.
-    if (state.renderpass && framebuffer_handle == state.framebuffer &&
+    if (state.renderpass && !state.dynamic && framebuffer_handle == state.framebuffer &&
         render_area.width == state.render_area.width &&
         render_area.height == state.render_area.height) {
         return;
@@ -539,11 +571,209 @@ void Scheduler::RequestRenderpass(const Framebuffer* framebuffer, std::source_lo
     BeginRenderPassImpl(framebuffer, renderpass, nullptr, 0);
 }
 
+void Scheduler::RequestRendering(const Framebuffer* framebuffer, u32 color_count,
+                                 std::source_location location) {
+    if (!dynamic_rendering || !framebuffer->DynamicRenderingCapable()) {
+        if (state.renderpass && state.dynamic) {
+            EndRenderPass();
+        }
+        RequestRenderpass(framebuffer, location);
+        return;
+    }
+    if (read_hazard.Any() && state.renderpass) [[unlikely]] {
+        // A draw of the active pass reads a pending write: end the pass for its barrier.
+        VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::HazardBreaks);
+        EndRenderPass();
+    }
+    if (deferred_clear.framebuffer == framebuffer) {
+        // The deferred clear becomes the pass's clear load ops.
+        const DeferredClear dc = std::exchange(deferred_clear, DeferredClear{});
+        EndRenderPass();
+        BeginRenderingImpl(framebuffer, color_count, dc.color_clear_mask, dc.color_values,
+                           dc.depth_stencil,
+                           dc.depth_stencil_value);
+        return;
+    }
+    const VkExtent2D render_area = framebuffer->RenderArea();
+    if (state.renderpass && state.dynamic && framebuffer->Handle() == state.framebuffer &&
+        (color_count == 0 || color_count == dynamic_color_count) &&
+        render_area.width == state.render_area.width &&
+        render_area.height == state.render_area.height) {
+        ++pass_draws;
+        return;
+    }
+    if (state.renderpass) {
+        CountRenderPassEnd(location.file_name(), location.line());
+    }
+    EndRenderPass();
+    BeginRenderingImpl(framebuffer, color_count, 0, {}, false, {});
+}
+
+void Scheduler::BeginRenderingImpl(const Framebuffer* framebuffer, u32 color_count,
+                                   u32 color_clear_mask,
+                                   const std::array<VkClearValue, 8>& color_values,
+                                   bool depth_clear, const VkClearValue& depth_value) {
+    // The same bookkeeping as a render pass (tracker, serials, queries), then BeginRendering.
+    next_pass_dynamic = true;
+    BeginRenderPassImpl(framebuffer, framebuffer->RenderPass(), nullptr, 0);
+    next_pass_dynamic = false;
+    VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::DynamicPasses);
+    ++pass_draws;
+    struct Attachments {
+        std::array<VkRenderingAttachmentInfo, 8> colors{};
+        u32 num_colors = 0;
+        VkRenderingAttachmentInfo depth{};
+        bool has_depth = false;
+        bool has_stencil = false;
+    } attachments;
+    const auto& views = framebuffer->ColorViews();
+    const RenderPassKey& key = framebuffer->RenderPassKeyBase();
+    for (u32 slot = 0; slot < 8; ++slot) {
+        if (key.color_formats[slot] == VideoCore::Surface::PixelFormat::Invalid) {
+            attachments.colors[slot] = VkRenderingAttachmentInfo{
+                .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+                .pNext = nullptr,
+                .imageView = VK_NULL_HANDLE,
+            };
+            continue;
+        }
+        const bool clear = (color_clear_mask & (1u << slot)) != 0;
+        attachments.colors[slot] = VkRenderingAttachmentInfo{
+            .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+            .pNext = nullptr,
+            .imageView = views[slot],
+            .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+            .resolveMode = VK_RESOLVE_MODE_NONE,
+            .resolveImageView = VK_NULL_HANDLE,
+            .resolveImageLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+            .loadOp = clear ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD,
+            .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+            .clearValue = color_values[slot],
+        };
+        attachments.num_colors = slot + 1;
+    }
+    // The bound pipeline's count (its blend attachments) decides, unused slots are null views.
+    if (color_count != 0) {
+        attachments.num_colors = (std::min)(color_count, 8U);
+    }
+    dynamic_color_count = attachments.num_colors;
+    if (key.depth_format != VideoCore::Surface::PixelFormat::Invalid) {
+        attachments.depth = VkRenderingAttachmentInfo{
+            .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+            .pNext = nullptr,
+            .imageView = framebuffer->DepthView(),
+            .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+            .resolveMode = VK_RESOLVE_MODE_NONE,
+            .resolveImageView = VK_NULL_HANDLE,
+            .resolveImageLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+            .loadOp = depth_clear ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD,
+            .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+            .clearValue = depth_value,
+        };
+        attachments.has_depth = framebuffer->HasAspectDepthBit();
+        attachments.has_stencil = framebuffer->HasAspectStencilBit();
+    }
+    const VkExtent2D render_area = framebuffer->RenderArea();
+    const u32 layers = framebuffer->Layers();
+    Record([attachments, render_area, layers](vk::CommandBuffer cmdbuf) {
+        const VkRenderingInfo rendering_info{
+            .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .renderArea = {.offset = {0, 0}, .extent = render_area},
+            .layerCount = layers,
+            .viewMask = 0,
+            .colorAttachmentCount = attachments.num_colors,
+            .pColorAttachments = attachments.colors.data(),
+            .pDepthAttachment = attachments.has_depth ? &attachments.depth : nullptr,
+            .pStencilAttachment = attachments.has_stencil ? &attachments.depth : nullptr,
+        };
+        cmdbuf.BeginRendering(rendering_info);
+    });
+}
+
+void Scheduler::NoteImageReadTracked(VkImage image, u64 begin, u64 end) {
+    const auto hazard = barrier_tracker.Take(reinterpret_cast<u64>(image), begin, end);
+    if (hazard.Any()) {
+        read_hazard.stages |= hazard.stages;
+        read_hazard.access |= hazard.access;
+        read_hazard.count += hazard.count;
+        UpdateAutoFlush();
+    }
+}
+
+void Scheduler::FlushReadHazards() {
+    if (!read_hazard.Any()) {
+        return;
+    }
+    if (state.renderpass) {
+        VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::HazardBreaks);
+        EndRenderPass();
+    }
+    const auto hazard = std::exchange(read_hazard, {});
+    RecordHazardBarrier(hazard.stages, hazard.access,
+                        VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                        VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
+                            VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
+                            VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                            VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+                            VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT);
+}
+
+void Scheduler::FlushAllPendingWrites() {
+    const auto hazard = barrier_tracker.TakeAll();
+    auto_flush = false;
+    const auto reads = std::exchange(read_hazard, {});
+    VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::FullBarriers);
+    RecordHazardBarrier(hazard.stages | reads.stages, hazard.access | reads.access,
+                        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                        VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+}
+
+void Scheduler::RecordHazardBarrier(u32 src_stages, u32 src_access, u32 dst_stages,
+                                    u32 dst_access) {
+    // Recorded straight into the chunk: Record's auto flush must not run again for it.
+    if (src_stages == 0) {
+        return;
+    }
+    VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::TargetedBarriers);
+    const bool saved = std::exchange(auto_flush, false);
+    Record([src_stages, src_access, dst_stages, dst_access](vk::CommandBuffer cmdbuf) {
+        const VkMemoryBarrier barrier{
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .pNext = nullptr,
+            .srcAccessMask = src_access,
+            .dstAccessMask = dst_access,
+        };
+        cmdbuf.PipelineBarrier(src_stages, dst_stages, 0, barrier);
+    });
+    auto_flush = saved && !barrier_tracker.Empty();
+}
+
 void Scheduler::RequestOutsideRenderPassOperationContext(std::source_location location) {
     if (state.renderpass) {
         CountRenderPassEnd(location.file_name(), location.line());
     }
     EndRenderPass();
+    if (track_barriers && (!barrier_tracker.Empty() || read_hazard.Any())) [[unlikely]] {
+        // An operation the tracker doesn't follow: every pending write before it, as the old
+        // pass-end barrier gave it (one barrier for every pass that ended since).
+        FlushAllPendingWrites();
+    }
+}
+
+void Scheduler::RequestOutsideRenderPassForDispatch(std::source_location location) {
+    if (!track_barriers) {
+        RequestOutsideRenderPassOperationContext(location);
+        return;
+    }
+    if (state.renderpass) {
+        CountRenderPassEnd(location.file_name(), location.line());
+    }
+    EndRenderPass();
+    // The dispatch's own read barrier (graphics, compute and transfer writes -> compute reads)
+    // covers its reads of pending attachment writes; they stay pending for graphics readers.
+    read_hazard = {};
 }
 
 bool Scheduler::UpdateGraphicsPipeline(GraphicsPipeline* pipeline) {
@@ -910,6 +1140,7 @@ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_se
         SubmitExecutionEngine(signal_semaphore, wait_semaphore, signal_value);
         return signal_value;
     }
+    auto_flush = false; // The submit closure touches no image: pending writes stay pending
     RecordWithUploadBuffer([signal_semaphore, wait_semaphore, signal_value,
                             this](vk::CommandBuffer cmdbuf, vk::CommandBuffer upload_cmdbuf) {
         static constexpr VkMemoryBarrier WRITE_BARRIER{
@@ -973,6 +1204,7 @@ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_se
     });
     chunk->MarkSubmit();
     DispatchWork();
+    UpdateAutoFlush();
     return signal_value;
 }
 
@@ -981,6 +1213,7 @@ void Scheduler::SubmitExecutionEngine(VkSemaphore signal_semaphore, VkSemaphore 
     // P5b: as the closure above, but the submission (with the transfer batch and the joins the
     // recording thread decided) goes to the submit engine: the submit thread, or inline.
     const VideoCommon::V2::TimelineJoin::Batch batch = timeline_join.Close(signal_value);
+    auto_flush = false; // The submit closure touches no image: pending writes stay pending
     RecordWithUploadBuffer([signal_semaphore, wait_semaphore, signal_value, batch,
                             this](vk::CommandBuffer cmdbuf, vk::CommandBuffer upload_cmdbuf) {
         static constexpr VkMemoryBarrier WRITE_BARRIER{
@@ -1043,6 +1276,7 @@ void Scheduler::SubmitExecutionEngine(VkSemaphore signal_semaphore, VkSemaphore 
     });
     chunk->MarkSubmit();
     DispatchWork();
+    UpdateAutoFlush();
 }
 
 void Scheduler::AllocateNewContext() {
@@ -1085,6 +1319,57 @@ void Scheduler::EndRenderPass()
 
         query_cache->CounterEnable(VideoCommon::QueryType::ZPassPixelCount64, false);
         query_cache->NotifySegment(false);
+        VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::PassDraws,
+                                       std::exchange(pass_draws, 0));
+
+        if (track_barriers) [[unlikely]] {
+            // No barrier now: the attachments' writes stay pending, keyed by image and guest
+            // range, until something overlapping reads or writes them (or an untracked
+            // operation flushes them all).
+            for (u32 i = 0; i < num_renderpass_images; ++i) {
+                const bool is_color =
+                    (renderpass_image_ranges[i].aspectMask & VK_IMAGE_ASPECT_COLOR_BIT) != 0;
+                const u32 stages = is_color ? VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT
+                                            : VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
+                                                  VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+                const u32 access = is_color ? VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT
+                                            : VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+                barrier_tracker.NoteWrite(reinterpret_cast<u64>(renderpass_images[i]),
+                                          renderpass_guest_ranges[i].first,
+                                          renderpass_guest_ranges[i].second,
+                                          stages | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                                          access | VK_ACCESS_SHADER_WRITE_BIT);
+            }
+            const bool dynamic = state.dynamic;
+            Record([dynamic, has_transform_feedback = device.IsExtTransformFeedbackSupported()](
+                       vk::CommandBuffer cmdbuf) {
+                if (dynamic) {
+                    cmdbuf.EndRendering();
+                } else {
+                    cmdbuf.EndRenderPass();
+                }
+                if (has_transform_feedback) {
+                    static constexpr VkMemoryBarrier XFB_OUTPUT_BARRIER{
+                        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                        .pNext = nullptr,
+                        .srcAccessMask = VK_ACCESS_TRANSFORM_FEEDBACK_WRITE_BIT_EXT,
+                        .dstAccessMask =
+                            VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT,
+                    };
+                    cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFORM_FEEDBACK_BIT_EXT,
+                                           VK_PIPELINE_STAGE_VERTEX_INPUT_BIT |
+                                               VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                           0, XFB_OUTPUT_BARRIER);
+                }
+            });
+            VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::SkippedBarriers);
+            state.renderpass = VkRenderPass{};
+            state.dynamic = false;
+            num_renderpass_images = 0;
+            UpdateAutoFlush();
+            return;
+        }
+        VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::PassEndBarriers);
 
         Record([num_images = num_renderpass_images,
                        images = renderpass_images,

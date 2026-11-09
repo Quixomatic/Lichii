@@ -4467,6 +4467,11 @@ void TextureCache<P>::PrepareImage(ImageId image_id, bool is_modification, bool 
             image.v2_track_id = (std::max)(image.v2_track_id, runtime.CurrentTick());
         }
     }
+    if constexpr (requires { runtime.NoteImageUse(image); }) {
+        if (v2_track_uses) [[unlikely]] {
+            runtime.NoteImageUse(image); // EDEN_NX2_V2_DYNRENDER: read hazards
+        }
+    }
 }
 
 template <class P>

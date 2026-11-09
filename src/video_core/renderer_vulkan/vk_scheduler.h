@@ -27,6 +27,7 @@
 #include "video_core/gpu_split.h"
 #include "video_core/renderer_vulkan/fragment_barrier_state.h"
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
+#include "video_core/v2/barrier_tracker.h"
 #include "video_core/v2/timeline_join.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
@@ -109,6 +110,37 @@ public:
     /// Requests to begin a renderpass.
     void RequestRenderpass(const Framebuffer* framebuffer,
                            std::source_location location = std::source_location::current());
+
+    /// Game draws and clears: dynamic rendering with EDEN_NX2_V2_DYNRENDER (when the
+    /// framebuffer has no resolve attachments), else RequestRenderpass. Pipelines made for
+    /// dynamic rendering only run in such passes.
+    void RequestRendering(const Framebuffer* framebuffer, u32 color_count = 0,
+                          std::source_location location = std::source_location::current());
+
+    /// EDEN_NX2_V2_DYNRENDER: a draw or dispatch is about to read `image` (guest range
+    /// [begin, end)): pending attachment writes it overlaps get a barrier before its pass or
+    /// dispatch.
+    void NoteImageRead(VkImage image, u64 begin, u64 end) {
+        if (track_barriers) [[unlikely]] {
+            NoteImageReadTracked(image, begin, end);
+        }
+    }
+    /// Records the read hazards noted so far (ends an active pass first). Dispatches call it
+    /// before recording; render pass begins do it themselves.
+    void FlushReadHazards();
+    /// While set, recording outside a pass doesn't flush every pending write (the dispatch the
+    /// caller checked with FlushReadHazards).
+    void SetTargetedScope(bool active) {
+        targeted_scope = active;
+        UpdateAutoFlush();
+    }
+    /// Dispatches: ends a pass without flushing the tracked writes (the dispatch's own barrier
+    /// orders its reads).
+    void RequestOutsideRenderPassForDispatch(
+        std::source_location location = std::source_location::current());
+    [[nodiscard]] bool TracksBarriers() const noexcept {
+        return track_barriers;
+    }
 
     /// Defers a full-attachment color clear so it becomes the next render pass.
     bool DeferColorClear(const Framebuffer* framebuffer, u32 rt_slot, const VkClearValue& value);
@@ -203,6 +235,11 @@ public:
     void RecordWithUploadBuffer(T&& command) {
         if (VideoCommon::GpuSplit::check_owner) [[unlikely]] {
             VideoCommon::GpuSplit::CheckOwner("Scheduler::Record");
+        }
+        if (auto_flush) [[unlikely]] {
+            // EDEN_NX2_V2_DYNRENDER: an untracked operation outside a pass sees every pending
+            // attachment write (what the old pass-end barrier gave it).
+            FlushAllPendingWrites();
         }
         if (chunk->Record(command)) {
             return;
@@ -479,6 +516,7 @@ private:
         bool needs_state_enable_refresh = false;
         u32 descriptor_buffer_chunk = 0;
         bool descriptor_buffer_bound = false;
+        bool dynamic = false; ///< the active pass is dynamic rendering (EDEN_NX2_V2_DYNRENDER)
     };
 
     struct DeferredClear {
@@ -488,6 +526,18 @@ private:
         bool depth_stencil = false;
         VkClearValue depth_stencil_value{};
     };
+
+    /// EDEN_NX2_V2_DYNRENDER
+    void BeginRenderingImpl(const Framebuffer* framebuffer, u32 color_count, u32 color_clear_mask,
+                            const std::array<VkClearValue, 8>& color_values, bool depth_clear,
+                            const VkClearValue& depth_value);
+    void NoteImageReadTracked(VkImage image, u64 begin, u64 end);
+    void FlushAllPendingWrites();
+    void RecordHazardBarrier(u32 src_stages, u32 src_access, u32 dst_stages, u32 dst_access);
+    void UpdateAutoFlush() {
+        auto_flush = track_barriers && !targeted_scope && !state.renderpass &&
+                     !barrier_tracker.Empty();
+    }
 
     /// Begins a render pass for the given framebuffer, optionally with clear values.
     void BeginRenderPassImpl(const Framebuffer* framebuffer, VkRenderPass renderpass,
@@ -595,6 +645,18 @@ private:
     std::unique_ptr<BackgroundReadback> background_readback;
     SubmitContext* current_context{}; ///< worker thread
     VideoCommon::V2::TimelineJoin timeline_join; ///< recording thread
+    /// EDEN_NX2_V2_DYNRENDER: dynamic rendering for game passes, and pending attachment writes
+    /// tracked by resource and guest range instead of the all-attachment pass-end barrier.
+    bool dynamic_rendering = false;
+    bool track_barriers = false;
+    bool targeted_scope = false;
+    bool auto_flush = false;
+    VideoCommon::V2::RangeBarrierTracker barrier_tracker;
+    VideoCommon::V2::RangeBarrierTracker::Hazard read_hazard{};
+    std::array<std::pair<u64, u64>, 9> renderpass_guest_ranges{};
+    u32 pass_draws = 0;
+    bool next_pass_dynamic = false;
+    u32 dynamic_color_count = 0; ///< colorAttachmentCount of the active dynamic pass
 
     std::queue<std::unique_ptr<CommandChunk>> work_queue;
     std::vector<std::unique_ptr<CommandChunk>> chunk_reserve;

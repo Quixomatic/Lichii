@@ -971,6 +971,16 @@ bool RasterizerVulkan::NoMeshDebug() {
 
 template <typename Func>
 void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_indirect) {
+    // EDEN_NX2_V2_DYNRENDER: the draw's reads are checked at its pass begin; untracked transfers
+    // still flush through RequestOutsideRenderPassOperationContext.
+    if (scheduler.TracksBarriers()) [[unlikely]] {
+        scheduler.SetTargetedScope(true);
+    }
+    SCOPE_EXIT {
+        if (scheduler.TracksBarriers()) [[unlikely]] {
+            scheduler.SetTargetedScope(false);
+        }
+    };
 
     if (Common::DkbFrameTrace::Enabled()) {
         ++trace_draws;
@@ -1441,7 +1451,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
             recorded |= FrameDumpBuffers(false, pipeline->ShaderHashes());
         }
         if (recorded) {
-            scheduler.RequestRenderpass(texture_cache.GetFramebuffer());
+            scheduler.RequestRendering(texture_cache.GetFramebuffer());
         }
     }
     if (VideoCommon::RenderTrace::SampleFrame(render_trace_frame) && render_trace_draws <= 2048) {
@@ -2144,7 +2154,7 @@ void RasterizerVulkan::CaptureIndirectTrace() {
     });
     slot->tick = scheduler.CurrentTick();
     slot->pending = true;
-    scheduler.RequestRenderpass(texture_cache.GetFramebuffer());
+    scheduler.RequestRendering(texture_cache.GetFramebuffer());
     scheduler.NoteRenderPassStores();
 }
 
@@ -2377,7 +2387,7 @@ void RasterizerVulkan::Clear(u32 layer_count) {
                                  !scheduler.IsRenderPassActive() &&
                                  (!use_color || color_full_channels) && ds_deferrable;
     if (!can_defer_clear) {
-        scheduler.RequestRenderpass(framebuffer);
+        scheduler.RequestRendering(framebuffer);
     }
 
     query_cache.NotifySegment(true);
@@ -2470,6 +2480,14 @@ void RasterizerVulkan::Clear(u32 layer_count) {
 
 void RasterizerVulkan::DispatchCompute() {
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Compute};
+    if (scheduler.TracksBarriers()) [[unlikely]] {
+        scheduler.SetTargetedScope(true);
+    }
+    SCOPE_EXIT {
+        if (scheduler.TracksBarriers()) [[unlikely]] {
+            scheduler.SetTargetedScope(false);
+        }
+    };
     if (commit_lock_free) [[unlikely]] {
         CommitPoint();
     }
@@ -2676,7 +2694,7 @@ void RasterizerVulkan::DispatchCompute() {
     if (dim[0] > max_dim[0] || dim[1] > max_dim[1] || dim[2] > max_dim[2]) {
         return;
     }
-    scheduler.RequestOutsideRenderPassOperationContext();
+    scheduler.RequestOutsideRenderPassForDispatch();
     record_read_barrier();
 #ifdef EGLANTINE_STREAMLINE
     const auto* const replacement =
@@ -3872,7 +3890,7 @@ void RasterizerVulkan::FrameDumpPass(const Framebuffer* framebuffer) {
         }
     }
     if (frame_dump.BeginPass(framebuffer, colors)) {
-        scheduler.RequestRenderpass(framebuffer);
+        scheduler.RequestRendering(framebuffer);
     }
 }
 

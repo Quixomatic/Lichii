@@ -51,7 +51,8 @@ VK_DEFINE_HANDLE(VmaPool)
             shader_demote_to_helper_invocation)                                                    \
     FEATURE(EXT, SubgroupSizeControl, SUBGROUP_SIZE_CONTROL, subgroup_size_control)                \
     FEATURE(KHR, Maintenance4, MAINTENANCE_4, maintenance4)                                        \
-    FEATURE(KHR, Synchronization2, SYNCHRONIZATION_2, synchronization2)
+    FEATURE(KHR, Synchronization2, SYNCHRONIZATION_2, synchronization2)                           \
+    FEATURE(KHR, DynamicRendering, DYNAMIC_RENDERING, dynamic_rendering)
 
 #define FOR_EACH_VK_FEATURE_1_4(FEATURE)
 
@@ -1057,6 +1058,12 @@ FN_MAX_LIMIT_LIST
     /// Returns true if the device supports VK_KHR_synchronization2.
     bool HasSynchronization2() const {
         return extensions.synchronization2;
+    }
+
+    /// EDEN_NX2_V2_DYNRENDER: game draws use dynamic rendering (supported, switch on, not a tiler:
+    /// tilers keep render passes for their MSAA resolve attachments).
+    bool IsDynamicRenderingEnabled() const {
+        return extensions.dynamic_rendering;
     }
 
     /// Returns the minimum supported version of SPIR-V.

@@ -1361,6 +1361,13 @@ TextureCacheRuntime::TextureCacheRuntime(const Device& device_, Scheduler& sched
     }
 }
 
+void TextureCacheRuntime::NoteImageUse(const Image& image) {
+    if (image.OutOfMemory()) {
+        return;
+    }
+    scheduler.NoteImageRead(image.Handle(), image.gpu_addr, image.gpu_addr + image.guest_size_bytes);
+}
+
 bool TextureCacheRuntime::GpuDecodeAvailable(const Image& image) const noexcept {
     using VideoCommon::ImageFlagBits;
     return linear_unswizzle_pass.has_value() && image.info.num_samples == 1 &&
@@ -5213,8 +5220,14 @@ void Framebuffer::CreateFramebuffer(TextureCacheRuntime& runtime,
         height = (std::min)(height, is_rescaled ? resolution.ScaleUp(color_buffer->size.height)
                                               : color_buffer->size.height);
         attachments.push_back(color_buffer->RenderTarget());
+        color_views[index] = color_buffer->RenderTarget();
         renderpass_key.color_formats[index] = color_buffer->format;
         num_layers = (std::min)(num_layers, color_buffer->range.extent.layers);
+        guest_ranges[num_images] = {color_buffer->gpu_addr,
+                                    color_buffer->gpu_addr +
+                                        u64{color_buffer->size.width} * color_buffer->size.height *
+                                            VideoCore::Surface::BytesPerBlock(color_buffer->format) *
+                                            (std::max<s32>)(color_buffer->range.extent.layers, 1)};
         images[num_images] = color_buffer->ImageHandle();
         image_ranges[num_images] = MakeSubresourceRange(color_buffer);
         rt_map[index] = num_images;
@@ -5230,6 +5243,12 @@ void Framebuffer::CreateFramebuffer(TextureCacheRuntime& runtime,
         height = (std::min)(height, is_rescaled ? resolution.ScaleUp(depth_buffer->size.height)
                                               : depth_buffer->size.height);
         attachments.push_back(depth_buffer->RenderTarget());
+        depth_view = depth_buffer->RenderTarget();
+        guest_ranges[num_images] = {depth_buffer->gpu_addr,
+                                    depth_buffer->gpu_addr +
+                                        u64{depth_buffer->size.width} * depth_buffer->size.height *
+                                            VideoCore::Surface::BytesPerBlock(depth_buffer->format) *
+                                            (std::max<s32>)(depth_buffer->range.extent.layers, 1)};
         renderpass_key.depth_format = depth_buffer->format;
         num_layers = (std::min)(num_layers, depth_buffer->range.extent.layers);
         images[num_images] = depth_buffer->ImageHandle();

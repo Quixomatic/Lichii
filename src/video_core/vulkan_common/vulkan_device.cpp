@@ -1868,6 +1868,13 @@ void Device::RemoveUnsuitableExtensions() {
     extensions.synchronization2 = features.synchronization2.synchronization2;
     RemoveExtensionFeatureIfUnsuitable(extensions.synchronization2, features.synchronization2,
                                        VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME);
+
+    // VK_KHR_dynamic_rendering (EDEN_NX2_V2_DYNRENDER only)
+    extensions.dynamic_rendering = features.dynamic_rendering.dynamicRendering &&
+                                   VideoCommon::V2::On(VideoCommon::V2::Switch::DynRender) &&
+                                   !IsTiler();
+    RemoveExtensionFeatureIfUnsuitable(extensions.dynamic_rendering, features.dynamic_rendering,
+                                       VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME);
 }
 
 void Device::SetupFamilies(VkSurfaceKHR surface) {
