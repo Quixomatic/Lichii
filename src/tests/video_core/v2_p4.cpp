@@ -83,11 +83,10 @@ TEST_CASE("V2 P4: versions are safe to bump from many threads", "[video_core][v2
     REQUIRE(versions.Unchanged(0x900000, 4, versions.Stamp()));
 }
 
-TEST_CASE("V2 P4: the epoch memo answers repeats and sees stream writes", "[video_core][v2_p4]") {
+TEST_CASE("V2 P4: the epoch memo answers repeats and sees writes to its range only",
+          "[video_core][v2_p4]") {
     PageVersions versions;
-    Versions::StreamLog log;
-    Versions::CollectEpoch epoch;
-    Versions::EpochMemo memo{versions, log, epoch};
+    Versions::EpochMemo memo{versions};
     const u64 v = versions.Stamp();
     const DAddr image = 0x400000;
     const u64 size = 64 * Page;
@@ -98,54 +97,93 @@ TEST_CASE("V2 P4: the epoch memo answers repeats and sees stream writes", "[vide
     REQUIRE(counters.hits == 1);
     REQUIRE(counters.walks == 1);
 
-    // A guest CPU write in the epoch is deferred to the next epoch (it was not ordered).
+    // A guest CPU write to the range is seen at the next query, as a walk sees it.
     versions.NoteCpuWrite(image + 5 * Page, 4);
-    REQUIRE(memo.Unchanged(image, size, v));
-    REQUIRE_FALSE(memo.UnchangedNow(image, size, v));
-    epoch.Advance(Versions::EpochReason::Entry);
     REQUIRE_FALSE(memo.Unchanged(image, size, v));
+    REQUIRE_FALSE(memo.UnchangedNow(image, size, v));
 
     // A stream write (inline upload, DMA, GPU) is seen at once.
     const u64 w = versions.Stamp();
     REQUIRE(memo.Unchanged(image, size, w));
     versions.Note(image + 7 * Page, 16, Source::Dma);
-    log.Note(image + 7 * Page, image + 7 * Page + 16);
     REQUIRE_FALSE(memo.Unchanged(image, size, w));
 
-    // A stream write elsewhere keeps the memo answering without a walk.
+    // Thousands of writes elsewhere (per-draw constant buffer data) keep it answering without a
+    // walk: it looks only at the range's own write buckets.
     const u64 x = versions.Stamp();
     REQUIRE(memo.Unchanged(image, size, x));
     static_cast<void>(memo.TakeCounters());
-    log.Note(0x9000000, 0x9000010);
-    REQUIRE(memo.Unchanged(image, size, x));
+    for (u32 i = 0; i < 5000; ++i) {
+        versions.Note(0x9000000 + (i % 64) * 16, 16, Source::Inline);
+        versions.NoteCpuWrite(0x9800000 + (i % 16) * Page, 4);
+        REQUIRE(memo.Unchanged(image, size, x));
+    }
     counters = memo.TakeCounters();
-    REQUIRE(counters.hits == 1);
+    REQUIRE(counters.walks == 0);
+    REQUIRE(counters.hits == 5000);
+    // An epoch change alone keeps it too.
+    Versions::Epochs().Advance(Versions::EpochReason::Submit);
+    REQUIRE(memo.Unchanged(image, size, x));
+    REQUIRE(memo.TakeCounters().walks == 0);
 
-    // More stream writes elsewhere than the range has pages: the walk answers, the same way.
-    for (u32 i = 0; i < 40; ++i) {
-        log.Note(0x9000000, 0x9000010);
-    }
-    REQUIRE(memo.Unchanged(image, size, x));
-    counters = memo.TakeCounters();
-    REQUIRE(counters.walks == 1);
-    // One of them over the range: still seen.
+    // A write over the range among them: seen, then answered from the new walk.
     versions.Note(image + 3 * Page, 16, Source::Inline);
-    log.Note(image + 3 * Page, image + 3 * Page + 16);
-    for (u32 i = 0; i < 40; ++i) {
-        log.Note(0x9000000, 0x9000010);
-    }
     REQUIRE_FALSE(memo.Unchanged(image, size, x));
     const u64 y = versions.Stamp();
     REQUIRE(memo.Unchanged(image, size, y));
-    static_cast<void>(memo.TakeCounters());
-
-    // More stream writes than the log holds: walk again.
-    for (u32 i = 0; i < Versions::StreamLog::Size + 4; ++i) {
-        log.Note(0x9000000, 0x9000010);
-    }
     REQUIRE(memo.Unchanged(image, size, y));
     counters = memo.TakeCounters();
     REQUIRE(counters.walks == 1);
+    REQUIRE(counters.hits == 2);
+
+    // Long writes (region slots) and floor writes reach every range they cover.
+    versions.Note(image - 64 * Page, 256 * Page, Source::Gpu);
+    REQUIRE_FALSE(memo.Unchanged(image, size, y));
+    const u64 z = versions.Stamp();
+    REQUIRE(memo.Unchanged(image, size, z));
+    versions.Note(0, u64{1} << 40, Source::Host);
+    REQUIRE_FALSE(memo.Unchanged(image, size, z));
+
+    // A long range (over 4 MiB): checked at 4 MiB, the same answers.
+    const DAddr big = 0x10000000;
+    const u64 big_size = 16ULL << 20;
+    const u64 s = versions.Stamp();
+    REQUIRE(memo.Unchanged(big, big_size, s));
+    versions.Note(0x20000000, 16, Source::Inline);
+    REQUIRE(memo.Unchanged(big, big_size, s));
+    versions.Note(big + (9ULL << 20), 16, Source::Inline);
+    REQUIRE_FALSE(memo.Unchanged(big, big_size, s));
+    REQUIRE(memo.Unchanged(big, big_size, versions.Stamp()));
+}
+
+TEST_CASE("V2 P4: the epoch memo agrees with a walk on random writes and ranges",
+          "[video_core][v2_p4]") {
+    PageVersions versions;
+    Versions::EpochMemo memo{versions};
+    std::mt19937_64 rng{7};
+    std::vector<std::pair<DAddr, u64>> ranges;
+    for (u32 i = 0; i < 64; ++i) {
+        const DAddr address = (rng() % 4096) * Page + (rng() % 2 == 0 ? 0 : 0x123);
+        const u64 size = (rng() % 4 == 0) ? (1 + rng() % 2048) * Page : 1 + rng() % (8 * Page);
+        ranges.emplace_back(address, size);
+    }
+    u64 stamp = versions.Stamp();
+    for (u32 step = 0; step < 200000; ++step) {
+        const u32 kind = static_cast<u32>(rng() % 100);
+        if (kind < 30) {
+            const DAddr address = (rng() % 4096) * Page + rng() % Page;
+            const u64 size = rng() % 8 == 0 ? (1 + rng() % 600) * Page : 1 + rng() % 256;
+            versions.Note(address, size, Source::Inline);
+        } else if (kind < 40) {
+            versions.NoteCpuWrite((rng() % 4096) * Page + rng() % 4000, 4);
+        } else if (kind < 42) {
+            stamp = versions.Stamp();
+        } else {
+            const auto& [address, size] = ranges[rng() % ranges.size()];
+            REQUIRE(memo.Unchanged(address, size, stamp) ==
+                    memo.UnchangedNow(address, size, stamp));
+        }
+    }
 }
 
 TEST_CASE("V2 P4: page watch holds and lets go of tracked pages", "[video_core][v2_p4]") {
@@ -209,9 +247,7 @@ TEST_CASE("V2 P4: generations invalidate weak handles", "[video_core][v2_p4]") {
 
 TEST_CASE("V2 P4: captured words are compared with memory on every check", "[video_core][v2_p4]") {
     PageVersions versions;
-    Versions::StreamLog log;
-    Versions::CollectEpoch epoch;
-    Versions::EpochMemo memo{versions, log, epoch};
+    Versions::EpochMemo memo{versions};
     // Guest memory stand-ins: a constant buffer page with a handle and a TIC entry.
     std::array<u8, 64> cbuf{};
     std::array<u8, 32> tic{};
@@ -237,7 +273,6 @@ TEST_CASE("V2 P4: captured words are compared with memory on every check", "[vid
 
     // Per-draw uniforms written on the handle page, the handle itself untouched: still equal.
     versions.Note(0x10020, 16, Source::Inline);
-    log.Note(0x10020, 0x10030);
     REQUIRE(DC::ValidateInputs(inputs, memo, versions) == DC::Miss::Count);
 
     // The handle rewritten by a write no page version saw (an untrapped CPU write): a miss.
@@ -255,7 +290,6 @@ TEST_CASE("V2 P4: captured words are compared with memory on every check", "[vid
     // Buffer pages written: reported, never a miss.
     bool buffers = false;
     versions.Note(0x800010, 4, Source::Dma);
-    log.Note(0x800010, 0x800014);
     REQUIRE(DC::ValidateInputs(inputs, memo, versions, true, nullptr, &buffers) ==
             DC::Miss::Count);
     REQUIRE(buffers);

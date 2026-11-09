@@ -9,8 +9,73 @@ namespace VideoCommon::V2::Versions {
 
 PageVersions::PageVersions()
     : pages{std::make_unique<std::atomic<u64>[]>(PageSlots)},
-      regions{std::make_unique<std::atomic<u64>[]>(RegionSlots)} {
+      regions{std::make_unique<std::atomic<u64>[]>(RegionSlots)},
+      fine{std::make_unique<std::atomic<u64>[]>(FineSlots)},
+      coarse_all{std::make_unique<std::atomic<u64>[]>(CoarseSlots)},
+      coarse_long{std::make_unique<std::atomic<u64>[]>(CoarseSlots)} {
     Reset();
+}
+
+void PageVersions::LogWrite(u64 first_byte, u64 last_byte) {
+    // After the version raises (seq_cst): a walk that missed them read the sequence before this.
+    const u64 value = sequence.fetch_add(1, std::memory_order_seq_cst) + 1;
+    if ((last_byte >> RegionBits) - (first_byte >> RegionBits) >= MaxRegionWrite) {
+        Raise(all_written, value);
+        return;
+    }
+    const u64 first_coarse = first_byte >> CoarseBits;
+    const u64 last_coarse = last_byte >> CoarseBits;
+    const u64 first_fine = first_byte >> FineBits;
+    const u64 last_fine = last_byte >> FineBits;
+    if (last_fine - first_fine < MaxFineBuckets) {
+        for (u64 bucket = first_fine; bucket <= last_fine; ++bucket) {
+            Raise(fine[FineSlot(bucket)], value);
+        }
+        for (u64 bucket = first_coarse; bucket <= last_coarse; ++bucket) {
+            Raise(coarse_all[CoarseSlot(bucket)], value);
+        }
+        return;
+    }
+    for (u64 bucket = first_coarse; bucket <= last_coarse; ++bucket) {
+        Raise(coarse_all[CoarseSlot(bucket)], value);
+        Raise(coarse_long[CoarseSlot(bucket)], value);
+    }
+}
+
+bool PageVersions::WrittenSince(u64 since, DAddr begin, DAddr end) const {
+    if (all_written.load(std::memory_order_seq_cst) > since) {
+        return true;
+    }
+    if (end <= begin) {
+        return false;
+    }
+    const u64 last_byte = end - 1;
+    if ((last_byte >> RegionBits) - (begin >> RegionBits) >= MaxRegionWrite) {
+        return true;
+    }
+    const u64 first_coarse = begin >> CoarseBits;
+    const u64 last_coarse = last_byte >> CoarseBits;
+    const u64 first_fine = begin >> FineBits;
+    const u64 last_fine = last_byte >> FineBits;
+    if (last_fine - first_fine < MaxFineBuckets) {
+        for (u64 bucket = first_fine; bucket <= last_fine; ++bucket) {
+            if (fine[FineSlot(bucket)].load(std::memory_order_seq_cst) > since) {
+                return true;
+            }
+        }
+        for (u64 bucket = first_coarse; bucket <= last_coarse; ++bucket) {
+            if (coarse_long[CoarseSlot(bucket)].load(std::memory_order_seq_cst) > since) {
+                return true;
+            }
+        }
+        return false;
+    }
+    for (u64 bucket = first_coarse; bucket <= last_coarse; ++bucket) {
+        if (coarse_all[CoarseSlot(bucket)].load(std::memory_order_seq_cst) > since) {
+            return true;
+        }
+    }
+    return false;
 }
 
 void PageVersions::Note(DAddr address, u64 size, Source source) {
@@ -22,21 +87,20 @@ void PageVersions::Note(DAddr address, u64 size, Source source) {
     const u64 last_byte = size > ~address ? ~u64{0} : address + size - 1;
     const u64 first_page = address >> PageBits;
     const u64 last_page = last_byte >> PageBits;
+    const u64 first_region = address >> RegionBits;
+    const u64 last_region = last_byte >> RegionBits;
     if (last_page - first_page < MaxPageWrite) {
         for (u64 page = first_page; page <= last_page; ++page) {
             Raise(pages[PageSlot(page)], value);
         }
-        return;
-    }
-    const u64 first_region = address >> RegionBits;
-    const u64 last_region = last_byte >> RegionBits;
-    if (last_region - first_region < MaxRegionWrite) {
+    } else if (last_region - first_region < MaxRegionWrite) {
         for (u64 region = first_region; region <= last_region; ++region) {
             Raise(regions[RegionSlot(region)], value);
         }
-        return;
+    } else {
+        Raise(floor, value);
     }
-    Raise(floor, value);
+    LogWrite(address, last_byte);
 }
 
 u64 PageVersions::Newest(DAddr address, u64 size) const {
@@ -104,49 +168,17 @@ void PageVersions::Reset() {
         regions[i].store(0, std::memory_order_relaxed);
     }
     floor.store(0, std::memory_order_relaxed);
+    for (size_t i = 0; i < FineSlots; ++i) {
+        fine[i].store(0, std::memory_order_relaxed);
+    }
+    for (size_t i = 0; i < CoarseSlots; ++i) {
+        coarse_all[i].store(0, std::memory_order_relaxed);
+        coarse_long[i].store(0, std::memory_order_relaxed);
+    }
+    all_written.store(0, std::memory_order_relaxed);
     clock.store(1, std::memory_order_release);
     for (auto& count : counts) {
         count.store(0, std::memory_order_relaxed);
-    }
-}
-
-void StreamLog::Note(DAddr begin, DAddr end) {
-    const u64 position = head.fetch_add(1, std::memory_order_acq_rel);
-    Slot& slot = slots[position % Size];
-    // Mark the slot as being written first: a reader that sees this sequence treats it as an
-    // overlap.
-    slot.sequence.store(0, std::memory_order_release);
-    slot.begin.store(begin, std::memory_order_relaxed);
-    slot.end.store(end, std::memory_order_relaxed);
-    slot.sequence.store(position + 1, std::memory_order_release);
-}
-
-bool StreamLog::WrittenSince(u64 since, DAddr begin, DAddr end) const {
-    const u64 now = head.load(std::memory_order_acquire);
-    if (now - since > Size) {
-        return true;
-    }
-    for (u64 position = since; position < now; ++position) {
-        const Slot& slot = slots[position % Size];
-        if (slot.sequence.load(std::memory_order_acquire) != position + 1) {
-            return true;
-        }
-        const DAddr write_begin = slot.begin.load(std::memory_order_relaxed);
-        const DAddr write_end = slot.end.load(std::memory_order_relaxed);
-        if (slot.sequence.load(std::memory_order_acquire) != position + 1) {
-            return true;
-        }
-        if (write_begin < end && begin < write_end) {
-            return true;
-        }
-    }
-    return false;
-}
-
-void StreamLog::Reset() {
-    head.store(0, std::memory_order_relaxed);
-    for (Slot& slot : slots) {
-        slot.sequence.store(0, std::memory_order_relaxed);
     }
 }
 
@@ -164,31 +196,26 @@ bool EpochMemo::Unchanged(DAddr address, u64 size, u64 since) {
     u64 key = (address >> PageVersions::PageBits) ^ (size << 37);
     key *= 0x9e3779b97f4a7c15ULL;
     Entry& entry = entries[static_cast<size_t>(key >> 56) % Entries];
-    const u64 current_epoch = epoch->Current();
-    if (entry.epoch == current_epoch && entry.begin == address && entry.end == end) {
-        // Every draw logs its constant buffer data: once more writes were logged since the
-        // memo than the range has pages, the walk below (a load per region and page) costs
-        // less than scanning the log (three loads per write), with the same answer (Perf fix D).
-        const u64 walk_loads = (size >> PageVersions::PageBits) + 2;
-        const u64 head = log->Head();
-        if (entry.log_head == head ||
-            ((head - entry.log_head) * 3 <= walk_loads + 48 &&
-             !log->WrittenSince(entry.log_head, address, end))) {
-            entry.log_head = head;
-            ++counters.hits;
-            return entry.newest <= since;
-        }
+    // No write reached the range's buckets since the walk: its newest version still holds. The
+    // entry keeps its walk's sequence (a write numbered before a later query may still be
+    // raising its buckets).
+    if (entry.valid && entry.begin == address && entry.end == end &&
+        !versions->WrittenSince(entry.sequence, address, end)) {
+        ++counters.hits;
+        return entry.newest <= since;
     }
     ++counters.walks;
-    // The log position before the walk: a write logged during it is seen by the next query.
-    const u64 head = log->Head();
+    // The sequence before the walk (seq_cst, as LogWrite): a write the walk missed is numbered
+    // after it, so the next query sees it in its buckets.
+    const u64 sequence = versions->Sequence();
+    std::atomic_thread_fence(std::memory_order_seq_cst);
     const u64 newest = versions->Newest(address, size);
     entry = Entry{
         .begin = address,
         .end = end,
-        .epoch = current_epoch,
-        .log_head = head,
+        .sequence = sequence,
         .newest = newest,
+        .valid = true,
     };
     return newest <= since;
 }
@@ -292,11 +319,6 @@ Generations::~Generations() {
 PageVersions& Pages() {
     static PageVersions versions;
     return versions;
-}
-
-StreamLog& Stream() {
-    static StreamLog log;
-    return log;
 }
 
 CollectEpoch& Epochs() {

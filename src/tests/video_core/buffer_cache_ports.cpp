@@ -700,8 +700,7 @@ TEST_CASE("Draw cache buffer replay binds unchanged cached uniforms without sync
     const auto id = Access::Add(*f.cache, 0x20000, 0x10000);
     Access::UseChannel(*f.cache, channel);
     channel.uniform_buffers[0][0] = {.device_addr = 0x20000, .size = 0x2000, .buffer_id = id};
-    V2::Versions::EpochMemo memo{V2::Versions::Pages(), V2::Versions::Stream(),
-                                 V2::Versions::Epochs()};
+    V2::Versions::EpochMemo memo{V2::Versions::Pages()};
 
     // A resolve: the guest wrote the range, the bind uploads it; the recipe records it.
     std::memset(f.bytes + 0x10000, 0x11, 0x2000);

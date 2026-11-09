@@ -165,7 +165,7 @@ DC::Counters& ComputeCounters() {
 
 DrawCacheGlue::DrawCacheGlue(Tegra::MaxwellDeviceMemoryManager&)
     : graphics_table{GraphicsSets}, compute_table{ComputeSets},
-      memo{Versions::Pages(), Versions::Stream(), Versions::Epochs()},
+      memo{Versions::Pages()},
       graphics_sampler{DC::VerifyN()}, compute_sampler{DC::VerifyN()} {
     // EDEN_NX2_V2_PARALLEL: the shards compute shapes and keys with the same code.
     V2::Resolve::g_shard_key = &ShardKeyOf;

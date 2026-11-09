@@ -30,11 +30,12 @@
 //     first write since a sync, storage buffers, copies) and inline uploads (cbuf data, I2M).
 //
 // Collect epochs. The epoch moves at ordering points: submits, semaphore acquires, the split's
-// drains and targeted waits, and GP entry boundaries. A guest CPU write is only ordered before
-// GPU work by one of those, so "unchanged since V" answers for a range are memoised per epoch
-// (EpochMemo): a repeat check in the same epoch costs one probe. Writes made by the GPU stream
-// itself (inline uploads, DMA, GPU writes, host invalidations) are not deferred: they also go to
-// the stream log, and a memo entry is only reused while no logged write since it overlaps it.
+// drains and targeted waits, and GP entry boundaries (statistics; recipes may key on it).
+// "Unchanged since V" answers for a range are memoised (EpochMemo): every write that raises a
+// version, guest CPU writes included, also marks its write buckets with a sequence number, and a
+// memo entry is reused while none of the range's own buckets moved: a repeat check costs a probe
+// and a load or a few, never a page walk, and writes elsewhere (per-draw constant buffer data)
+// don't touch it.
 //
 // Generations. Resources referenced by a draw recipe are weak handles {slot id, generation}: the
 // owning cache bumps a slot's generation when it frees, recreates or rescales the object, so a
@@ -104,11 +105,22 @@ public:
                 return;
             }
             Raise(slot, value);
+            LogWrite(address, address + size - 1);
             counts[static_cast<size_t>(Source::Cpu)].fetch_add(1, std::memory_order_relaxed);
             return;
         }
         Note(address, size, Source::Cpu);
     }
+
+    /// Write sequence (EpochMemo, F2-00): every write that raised a version, counted. Read it
+    /// before walking a range; WrittenSince then tells whether a write since may have reached it.
+    [[nodiscard]] u64 Sequence() const {
+        return sequence.load(std::memory_order_seq_cst);
+    }
+    /// Whether a write noted after Sequence() returned `since` may overlap [begin, end): looks
+    /// only at the write buckets the range covers (64 KiB, or 4 MiB for long ranges), never at
+    /// writes elsewhere.
+    [[nodiscard]] bool WrittenSince(u64 since, DAddr begin, DAddr end) const;
 
     /// Whether nothing wrote [address, address + size) after stamp `since`.
     [[nodiscard]] bool Unchanged(DAddr address, u64 size, u64 since) const;
@@ -130,46 +142,43 @@ public:
         return static_cast<size_t>(key >> (64 - 14));
     }
 
+    static constexpr u64 FineBits = 16;   ///< Write buckets of 64 KiB
+    static constexpr u64 CoarseBits = 22; ///< and of 4 MiB
+    static constexpr size_t FineSlots = size_t{1} << 15;
+    static constexpr size_t CoarseSlots = size_t{1} << 12;
+    /// Ranges up to this many fine buckets are checked at 64 KiB.
+    static constexpr u64 MaxFineBuckets = 64;
+
 private:
     static void Raise(std::atomic<u64>& slot, u64 value) {
         u64 current = slot.load(std::memory_order_relaxed);
         while (current < value &&
-               !slot.compare_exchange_weak(current, value, std::memory_order_release,
+               !slot.compare_exchange_weak(current, value, std::memory_order_seq_cst,
                                            std::memory_order_relaxed)) {
         }
     }
+    [[nodiscard]] static size_t FineSlot(u64 bucket) {
+        return static_cast<size_t>((bucket * 0x9e3779b97f4a7c15ULL) >> (64 - 15));
+    }
+    [[nodiscard]] static size_t CoarseSlot(u64 bucket) {
+        return static_cast<size_t>((bucket * 0xbf58476d1ce4e5b9ULL) >> (64 - 12));
+    }
+    /// After a write raised its versions: a new sequence number in the buckets it covers.
+    /// Short writes mark 64 KiB buckets and the 4 MiB buckets around them (checked by long
+    /// ranges); long writes mark 4 MiB buckets twice (all writes, and long writes, which short
+    /// ranges check); writes that move the floor mark everything.
+    void LogWrite(u64 first_byte, u64 last_byte);
 
     std::atomic<u64> clock{1};
     std::atomic<u64> floor{0};
     std::unique_ptr<std::atomic<u64>[]> pages;
     std::unique_ptr<std::atomic<u64>[]> regions;
     std::array<std::atomic<u64>, NumSources> counts{};
-};
-
-/// Ring of the stream's own writes (every source but guest CPU writes), for EpochMemo. Lock free
-/// for many writers; a slot being rewritten reads as an overlap.
-class StreamLog {
-public:
-    static constexpr size_t Size = 256;
-
-    void Note(DAddr begin, DAddr end);
-    [[nodiscard]] u64 Head() const {
-        return head.load(std::memory_order_acquire);
-    }
-    /// Whether a write logged at or after position `since` may overlap [begin, end): true when one
-    /// does, when a slot is being written, or when the ring no longer holds them all.
-    [[nodiscard]] bool WrittenSince(u64 since, DAddr begin, DAddr end) const;
-
-    void Reset();
-
-private:
-    struct Slot {
-        std::atomic<u64> sequence{}; ///< position + 1 once written
-        std::atomic<DAddr> begin{};
-        std::atomic<DAddr> end{};
-    };
-    std::atomic<u64> head{};
-    std::array<Slot, Size> slots{};
+    std::atomic<u64> sequence{0};
+    std::atomic<u64> all_written{0}; ///< Floor writes
+    std::unique_ptr<std::atomic<u64>[]> fine;        ///< Short writes, per 64 KiB
+    std::unique_ptr<std::atomic<u64>[]> coarse_all;  ///< Every write, per 4 MiB
+    std::unique_ptr<std::atomic<u64>[]> coarse_long; ///< Long writes, per 4 MiB
 };
 
 /// The collect epoch: moved at ordering points (any thread).
@@ -189,9 +198,10 @@ private:
     std::array<std::atomic<u64>, NumEpochReasons> counts{};
 };
 
-/// "Unchanged since V" answers memoised per collect epoch (owned by one thread). An entry holds the
-/// newest version a walk of its range found; within its epoch, and while no stream write since
-/// overlaps it, it answers without walking.
+/// "Unchanged since V" answers memoised per range (owned by one thread). An entry holds the newest
+/// version a walk of its range found and the write sequence before that walk; while no write since
+/// reached the range's own write buckets (PageVersions::WrittenSince: one or a few loads, whatever
+/// is written elsewhere and whatever the collect epoch did), it answers without walking.
 class EpochMemo {
 public:
     static constexpr size_t Entries = 256;
@@ -202,8 +212,7 @@ public:
         u64 walks{};
     };
 
-    EpochMemo(PageVersions& versions_, StreamLog& log_, CollectEpoch& epoch_)
-        : versions{&versions_}, log{&log_}, epoch{&epoch_} {}
+    explicit EpochMemo(PageVersions& versions_) : versions{&versions_} {}
 
     [[nodiscard]] bool Unchanged(DAddr address, u64 size, u64 since);
     /// The same without the memo (verify).
@@ -220,14 +229,12 @@ private:
     struct Entry {
         DAddr begin{};
         DAddr end{};
-        u64 epoch{};
-        u64 log_head{};
+        u64 sequence{};
         u64 newest{};
+        bool valid{};
     };
 
     PageVersions* versions;
-    StreamLog* log;
-    CollectEpoch* epoch;
     std::array<Entry, Entries> entries{};
     Counters counters{};
 };
@@ -335,17 +342,15 @@ struct WeakRef {
 
 /// The process-wide tables (one GPU).
 [[nodiscard]] PageVersions& Pages();
-[[nodiscard]] StreamLog& Stream();
 [[nodiscard]] CollectEpoch& Epochs();
 [[nodiscard]] Generations& Gens();
 
-/// A write from any source but guest CPU writes: page versions and the stream log.
+/// A write from any source but guest CPU writes.
 inline void NoteWrite(DAddr address, u64 size, Source source) {
     if (size == 0) {
         return;
     }
     Pages().Note(address, size, source);
-    Stream().Note(address, address + size);
 }
 
 /// Hook helpers: one cached-flag branch when the draw cache is off.
