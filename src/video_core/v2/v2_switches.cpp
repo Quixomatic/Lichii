@@ -84,7 +84,6 @@ void ReadSwitches() {
         }
         g_modes[i] = mode;
     }
-    g_track_groups = Detail::TracksGroups(g_modes);
 }
 
 } // namespace VideoCommon::V2

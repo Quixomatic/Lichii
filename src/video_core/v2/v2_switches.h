@@ -71,22 +71,6 @@ std::array<Mode, static_cast<size_t>(Switch::Count)> ReadAll();
 
 inline std::array<Mode, static_cast<size_t>(Switch::Count)> g_modes = Detail::ReadAll();
 
-namespace Detail {
-[[nodiscard]] inline bool TracksGroups(
-    const std::array<Mode, static_cast<size_t>(Switch::Count)>& m) {
-    const auto on = [&](Switch name) { return m[static_cast<size_t>(name)] != Mode::Off; };
-    return on(Switch::RegSem) || on(Switch::PipeKey) || on(Switch::ContDraw);
-}
-} // namespace Detail
-
-/// Whether the executing Maxwell3D keeps its register group tracker (V2::GroupTracker):
-/// EDEN_NX2_V2_REGSEM, or a P3 consumer of the dirty groups (PIPEKEY, CONTDRAW). Cached with the
-/// modes, so the per-write hooks test one bool.
-inline bool g_track_groups = Detail::TracksGroups(g_modes);
-[[nodiscard]] inline bool TrackGroups() {
-    return g_track_groups;
-}
-
 /// The switch's cached mode.
 [[nodiscard]] inline Mode Get(Switch name) {
     return g_modes[static_cast<size_t>(name)];
@@ -97,6 +81,13 @@ inline bool g_track_groups = Detail::TracksGroups(g_modes);
 }
 [[nodiscard]] inline bool Verify(Switch name) {
     return g_modes[static_cast<size_t>(name)] == Mode::Verify;
+}
+
+/// Whether the executing Maxwell3D keeps its register group tracker (V2::GroupTracker):
+/// EDEN_NX2_V2_REGSEM, or a P3 consumer of the dirty groups (PIPEKEY, CONTDRAW): three bytes of
+/// the cached modes, tested per register write.
+[[nodiscard]] inline bool TrackGroups() {
+    return On(Switch::RegSem) || On(Switch::PipeKey) || On(Switch::ContDraw);
 }
 
 /// Reads every switch again and logs the ones set. Called by VideoCore::CreateGPU.

@@ -37,14 +37,15 @@ namespace {
 
 using Tegra::Engines::Maxwell3D;
 
-/// Turns the group tracker on for the test and restores the switch afterwards.
+/// Turns the group tracker on (through EDEN_NX2_V2_PIPEKEY) for the test and restores the switch.
 struct TrackGroupsScope {
-    bool previous = VideoCommon::V2::g_track_groups;
+    static constexpr size_t index = static_cast<size_t>(VideoCommon::V2::Switch::PipeKey);
+    VideoCommon::V2::Mode previous = VideoCommon::V2::g_modes[index];
     TrackGroupsScope() {
-        VideoCommon::V2::g_track_groups = true;
+        VideoCommon::V2::g_modes[index] = VideoCommon::V2::Mode::On;
     }
     ~TrackGroupsScope() {
-        VideoCommon::V2::g_track_groups = previous;
+        VideoCommon::V2::g_modes[index] = previous;
     }
 };
 
