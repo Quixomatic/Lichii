@@ -46,6 +46,15 @@ enum class Switch : u32 {
     CommitLocked, ///< EDEN_NX2_V2_COMMIT_LOCKED: with COMMIT=1, keep the global cache locks
     Writeback, ///< EDEN_NX2_V2_WRITEBACK: deferred GPU->guest writebacks queued in commit (P5a)
     HeapTexel, ///< EDEN_NX2_V2_HEAP_TEXEL: texel buffers in the bindless heap (P5a)
+    XferQ,     ///< EDEN_NX2_V2_XFERQ: dedicated transfer queue for uploads, timeline joins (P5b)
+    XReadback, ///< EDEN_NX2_V2_XREADBACK: readbacks on the transfer queue, downloads in the
+               ///< writer's submission (P5b)
+    QmdSched,  ///< EDEN_NX2_V2_QMDSCHED: front QMD scheduler, exact scheduled dispatch counts
+    GpuDecode, ///< EDEN_NX2_V2_GPUDECODE: compute untile as the default texture upload (P5b)
+    DynRender, ///< EDEN_NX2_V2_DYNRENDER: dynamic rendering + guest-range barrier tracker (P5b)
+    AdaptSubmit,  ///< EDEN_NX2_V2_ADAPTSUBMIT: adaptive flush heuristic instead of 128 draws
+    SubmitThread, ///< EDEN_NX2_V2_SUBMITTHREAD: submit thread + finish thread (P5b)
+    PresentPace,  ///< EDEN_NX2_V2_PRESENTPACE: bounded frames ahead with present wait (P5b)
     Count,
 };
 
@@ -73,6 +82,14 @@ inline constexpr std::array<const char*, static_cast<size_t>(Switch::Count)> swi
     "COMMIT_LOCKED",
     "WRITEBACK",
     "HEAP_TEXEL",
+    "XFERQ",
+    "XREADBACK",
+    "QMDSCHED",
+    "GPUDECODE",
+    "DYNRENDER",
+    "ADAPTSUBMIT",
+    "SUBMITTHREAD",
+    "PRESENTPACE",
 };
 
 namespace Detail {

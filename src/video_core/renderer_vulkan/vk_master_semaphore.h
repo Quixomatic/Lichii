@@ -12,6 +12,7 @@
 #include <mutex>
 #include <thread>
 #include <queue>
+#include <span>
 
 #include "common/common_types.h"
 #include "common/polyfill_thread.h"
@@ -54,14 +55,27 @@ public:
     /// Waits for a tick to be hit on the GPU
     void Wait(u64 tick);
 
-    /// Submits the device graphics queue, updating the tick as necessary
+    /// Submits the device graphics queue, updating the tick as necessary. `extra_waits`
+    /// (P5b: the transfer timeline and readback jobs) needs timeline semaphores and
+    /// synchronization2.
     VkResult SubmitQueue(vk::CommandBuffer& cmdbuf, vk::CommandBuffer& upload_cmdbuf,
-                         VkSemaphore signal_semaphore, VkSemaphore wait_semaphore, u64 host_tick);
+                         VkSemaphore signal_semaphore, VkSemaphore wait_semaphore, u64 host_tick,
+                         std::span<const VkSemaphoreSubmitInfo> extra_waits = {});
+
+    /// The timeline semaphore (null without timeline semaphore support).
+    [[nodiscard]] VkSemaphore TimelineHandle() const noexcept {
+        return semaphore ? *semaphore : VkSemaphore{};
+    }
+
+    /// Whether the GPU reached `tick`, asking the driver (finish thread).
+    bool WaitFor(u64 tick, u64 timeout_ns) {
+        return semaphore.Wait(tick, timeout_ns);
+    }
 
 private:
     VkResult SubmitQueueTimeline(vk::CommandBuffer& cmdbuf, vk::CommandBuffer& upload_cmdbuf,
                                  VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
-                                 u64 host_tick);
+                                 u64 host_tick, std::span<const VkSemaphoreSubmitInfo> extra_waits);
     VkResult SubmitQueueFence(vk::CommandBuffer& cmdbuf, vk::CommandBuffer& upload_cmdbuf,
                               VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
                               u64 host_tick);

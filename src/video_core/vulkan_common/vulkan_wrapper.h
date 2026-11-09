@@ -239,6 +239,8 @@ struct DeviceDispatch : InstanceDispatch {
     PFN_vkCmdEndDebugUtilsLabelEXT vkCmdEndDebugUtilsLabelEXT{};
     PFN_vkCmdEndQuery vkCmdEndQuery{};
     PFN_vkCmdEndRenderPass vkCmdEndRenderPass{};
+    PFN_vkCmdBeginRendering vkCmdBeginRendering{};
+    PFN_vkCmdEndRendering vkCmdEndRendering{};
     PFN_vkCmdEndTransformFeedbackEXT vkCmdEndTransformFeedbackEXT{};
     PFN_vkCmdFillBuffer vkCmdFillBuffer{};
     PFN_vkCmdPipelineBarrier vkCmdPipelineBarrier{};
@@ -355,6 +357,8 @@ struct DeviceDispatch : InstanceDispatch {
     PFN_vkQueueSubmit vkQueueSubmit{};
     PFN_vkQueueSubmit2 vkQueueSubmit2{};
     PFN_vkResetFences vkResetFences{};
+    PFN_vkResetCommandPool vkResetCommandPool{};
+    PFN_vkWaitForPresentKHR vkWaitForPresentKHR{};
     PFN_vkResetQueryPool vkResetQueryPool{};
     PFN_vkSetDebugUtilsObjectNameEXT vkSetDebugUtilsObjectNameEXT{};
     PFN_vkSetDebugUtilsObjectTagEXT vkSetDebugUtilsObjectTagEXT{};
@@ -1267,6 +1271,15 @@ public:
     void BeginRenderPass(const VkRenderPassBeginInfo& renderpass_bi,
                          VkSubpassContents contents) const noexcept {
         dld->vkCmdBeginRenderPass(handle, &renderpass_bi, contents);
+    }
+
+    /// EDEN_NX2_V2_DYNRENDER (Vulkan 1.3 / VK_KHR_dynamic_rendering).
+    void BeginRendering(const VkRenderingInfo& rendering_info) const noexcept {
+        dld->vkCmdBeginRendering(handle, &rendering_info);
+    }
+
+    void EndRendering() const noexcept {
+        dld->vkCmdEndRendering(handle);
     }
 
     void EndRenderPass() const noexcept {

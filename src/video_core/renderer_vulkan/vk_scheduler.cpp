@@ -31,7 +31,10 @@
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_state_tracker.h"
+#include "video_core/renderer_vulkan/vk_submit_engine.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
+#include "video_core/v2/p5b_stats.h"
+#include "video_core/v2/v2_switches.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/v2/versions.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
@@ -146,6 +149,22 @@ Scheduler::Scheduler(const Device& device_, StateTracker& state_tracker_)
             LOG_INFO(Render_Vulkan, "DKB gpu_timestamp unsupported: valid_bits={} period_ns={}",
                      trace_timestamp_bits, trace_timestamp_period);
         }
+    }
+
+    // P5b: the transfer queue (EDEN_NX2_V2_XFERQ) and the submit/finish threads
+    // (EDEN_NX2_V2_SUBMITTHREAD) share one submission path; with both off nothing changes.
+    if (device.HasTransferQueue()) {
+        transfer_queue = std::make_unique<TransferQueue>(device);
+    }
+    const bool submit_thread = VideoCommon::V2::On(VideoCommon::V2::Switch::SubmitThread) &&
+                               device.HasTimelineSemaphore() && device.HasSynchronization2();
+    if (VideoCommon::V2::On(VideoCommon::V2::Switch::SubmitThread) && !submit_thread) {
+        LOG_INFO(Render_Vulkan, "EDEN_NX2_V2_SUBMITTHREAD needs timeline semaphores and "
+                                "synchronization2; the worker keeps submitting");
+    }
+    if (submit_thread || transfer_queue) {
+        submit_engine = std::make_unique<SubmitEngine>(device, *master_semaphore, submit_mutex,
+                                                       submit_thread, transfer_queue.get());
     }
 
     AcquireNewChunk();
@@ -274,6 +293,63 @@ void Scheduler::WaitWorker() {
 
     // Now wait for execution to finish.
     std::scoped_lock el{execution_mutex};
+    WaitSubmitThread();
+}
+
+void Scheduler::WaitSubmitThread() {
+    if (submit_engine) [[unlikely]] {
+        submit_engine->WaitSubmitted();
+    }
+}
+
+void Scheduler::RetireAfter(u64 tick, std::function<void()>&& func) {
+    if (submit_engine) {
+        submit_engine->RetireAfter(tick, std::move(func));
+        return;
+    }
+    master_semaphore->Wait(tick);
+    func();
+}
+
+bool Scheduler::TryHoistTransfer(u64 track) {
+    if (!transfer_queue) {
+        return false;
+    }
+    const u64 open_tick = master_semaphore->CurrentTick();
+    if (!timeline_join.CanHoist(track, open_tick)) {
+        VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::TransferFallbacks);
+        return false;
+    }
+    timeline_join.Hoist(track, open_tick);
+    return true;
+}
+
+void Scheduler::NoteAcquireJoin() {
+    if (transfer_queue) {
+        timeline_join.NoteAcquire(master_semaphore->CurrentTick());
+        VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::AcquireJoins);
+    }
+}
+
+bool Scheduler::AddGraphicsWait(VkSemaphore semaphore, u64 value) {
+    if (!submit_engine) {
+        return false;
+    }
+    return timeline_join.AddGraphicsWait(reinterpret_cast<u64>(semaphore), value);
+}
+
+vk::CommandBuffer Scheduler::WorkerTransferCmdbuf() {
+    const vk::CommandBuffer cmdbuf{current_context->Transfer(), device.GetDispatchLoader()};
+    if (!current_context->xfer_begun) {
+        current_context->xfer_begun = true;
+        cmdbuf.Begin({
+            .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+            .pNext = nullptr,
+            .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+            .pInheritanceInfo = nullptr,
+        });
+    }
+    return cmdbuf;
 }
 
 void Scheduler::MarkFrameEnd(u64 frame) {
@@ -569,6 +645,28 @@ void Scheduler::WorkerThread(std::stop_token stop_token) {
 }
 
 void Scheduler::AllocateWorkerCommandBuffer() {
+    if (submit_engine) {
+        current_context = submit_engine->Acquire();
+        current_cmdbuf = vk::CommandBuffer(current_context->Main(), device.GetDispatchLoader());
+        current_upload_cmdbuf =
+            vk::CommandBuffer(current_context->Upload(), device.GetDispatchLoader());
+        current_cmdbuf.Begin({
+            .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+            .pNext = nullptr,
+            .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+            .pInheritanceInfo = nullptr,
+        });
+        current_upload_cmdbuf.Begin({
+            .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+            .pNext = nullptr,
+            .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+            .pInheritanceInfo = nullptr,
+        });
+        if (trace_query_pool && !trace_gpu_failed) {
+            TraceGpuSubmission();
+        }
+        return;
+    }
     current_cmdbuf = vk::CommandBuffer(command_pool->Commit(), device.GetDispatchLoader());
     current_cmdbuf.Begin({
         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
@@ -794,6 +892,13 @@ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_se
     InvalidateState();
 
     const u64 signal_value = master_semaphore->NextTick();
+    if (VideoCommon::V2::P5bStats::Enabled()) {
+        VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::Submits);
+    }
+    if (submit_engine) [[unlikely]] {
+        SubmitExecutionEngine(signal_semaphore, wait_semaphore, signal_value);
+        return signal_value;
+    }
     RecordWithUploadBuffer([signal_semaphore, wait_semaphore, signal_value,
                             this](vk::CommandBuffer cmdbuf, vk::CommandBuffer upload_cmdbuf) {
         static constexpr VkMemoryBarrier WRITE_BARRIER{
@@ -858,6 +963,75 @@ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_se
     chunk->MarkSubmit();
     DispatchWork();
     return signal_value;
+}
+
+void Scheduler::SubmitExecutionEngine(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
+                                      u64 signal_value) {
+    // P5b: as the closure above, but the submission (with the transfer batch and the joins the
+    // recording thread decided) goes to the submit engine: the submit thread, or inline.
+    const VideoCommon::V2::TimelineJoin::Batch batch = timeline_join.Close(signal_value);
+    RecordWithUploadBuffer([signal_semaphore, wait_semaphore, signal_value, batch,
+                            this](vk::CommandBuffer cmdbuf, vk::CommandBuffer upload_cmdbuf) {
+        static constexpr VkMemoryBarrier WRITE_BARRIER{
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .pNext = nullptr,
+            .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+        };
+        upload_cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                      VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, WRITE_BARRIER);
+        upload_cmdbuf.End();
+        if (trace_gpu_recording) {
+            cmdbuf.WriteTimestamp(VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, *trace_query_pool,
+                                  trace_gpu_count * 2 + 1);
+            trace_gpu_tick = signal_value;
+            trace_work.tick = signal_value;
+            trace_submissions[trace_gpu_count] = trace_work;
+            ++trace_gpu_count;
+            trace_gpu_recording = false;
+        } else if (trace_gpu_sampling) {
+            ++trace_gpu_skipped;
+        }
+        if (trace_query_pool) {
+            trace_work = {};
+        }
+        cmdbuf.End();
+        const bool transfer = batch.transfer && current_context->xfer_begun;
+        if (current_context->xfer_begun) {
+            WorkerTransferCmdbuf().End();
+        }
+        if (on_submit) {
+            on_submit();
+        }
+        SubmitWork work{};
+        work.context = current_context;
+        work.signal_semaphore = signal_semaphore;
+        work.wait_semaphore = wait_semaphore;
+        work.tick = signal_value;
+        work.transfer = transfer;
+        work.transfer_wait = batch.transfer_wait;
+        work.graphics_waits_transfer = transfer && batch.graphics_waits_transfer;
+        work.num_extra_waits = batch.num_extra_waits;
+        for (u32 i = 0; i < batch.num_extra_waits; ++i) {
+            work.extra_waits[i] = {reinterpret_cast<VkSemaphore>(batch.extra_waits[i].semaphore),
+                                   batch.extra_waits[i].value};
+        }
+        submit_engine->Submit(std::move(work));
+        if (trace_frame_end != 0) {
+            if (trace_gpu_sampling) {
+                trace_gpu_pending = true;
+                trace_gpu_sampling = false;
+            }
+            if (trace_query_pool && !trace_gpu_failed && !trace_gpu_pending &&
+                trace_gpu_rate.Ready(std::chrono::steady_clock::now())) {
+                trace_sample_frame = trace_frame_end + 1;
+                trace_gpu_sampling = true;
+            }
+            trace_frame_end = 0;
+        }
+    });
+    chunk->MarkSubmit();
+    DispatchWork();
 }
 
 void Scheduler::AllocateNewContext() {

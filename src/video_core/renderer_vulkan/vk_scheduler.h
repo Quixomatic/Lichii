@@ -27,6 +27,7 @@
 #include "video_core/gpu_split.h"
 #include "video_core/renderer_vulkan/fragment_barrier_state.h"
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
+#include "video_core/v2/timeline_join.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
 namespace VideoCommon {
@@ -41,6 +42,9 @@ class Device;
 class Framebuffer;
 class GraphicsPipeline;
 class StateTracker;
+class SubmitEngine;
+class TransferQueue;
+struct SubmitContext;
 
 struct QueryCacheParams;
 
@@ -207,6 +211,52 @@ public:
             [command = std::move(c)](vk::CommandBuffer cmdbuf, vk::CommandBuffer) {
                 command(cmdbuf);
             });
+    }
+
+    /// P5b (EDEN_NX2_V2_XFERQ): whether the device's dedicated transfer queue is in use.
+    [[nodiscard]] bool HasTransferQueue() const noexcept {
+        return transfer_queue != nullptr;
+    }
+    [[nodiscard]] TransferQueue* GetTransferQueue() const noexcept {
+        return transfer_queue.get();
+    }
+
+    /// Recording thread: whether a transfer op on a resource last used by graphics tick `track`
+    /// may run on the transfer queue ahead of the open submission (DXVK's rule). When true the
+    /// op must be recorded with RecordTransfer before the next Flush.
+    bool TryHoistTransfer(u64 track);
+
+    /// Records a closure into the open submission's transfer command buffer (worker thread).
+    template <typename T>
+        requires std::is_invocable_v<T, vk::CommandBuffer>
+    void RecordTransfer(T&& c) {
+        Record([this, command = std::move(c)](vk::CommandBuffer) {
+            command(WorkerTransferCmdbuf());
+        });
+    }
+
+    /// Recording thread: an acquire's position executed (class A/B with the transfer queue on):
+    /// later transfer work must wait for the graphics work before it (MASTER_PLAN §6).
+    void NoteAcquireJoin();
+
+    /// Recording thread: the next graphics submission waits for `value` on `semaphore`.
+    bool AddGraphicsWait(VkSemaphore semaphore, u64 value);
+
+    /// Stops hoisting to the transfer queue until the next submission.
+    void BlockTransferHoisting() {
+        timeline_join.BlockHoisting();
+    }
+
+    /// Any thread: with the submit thread, waits until every handed submission reached the
+    /// queue (before waiting on a binary semaphore such a submission signals).
+    void WaitSubmitThread();
+
+    /// Any thread: runs `func` once the GPU finished `tick` (the finish thread with
+    /// EDEN_NX2_V2_SUBMITTHREAD, else the worker or the caller).
+    void RetireAfter(u64 tick, std::function<void()>&& func);
+
+    [[nodiscard]] SubmitEngine* GetSubmitEngine() const noexcept {
+        return submit_engine.get();
     }
 
     /// Whether the recording thread submitted `tick` within 20 ms.
@@ -444,6 +494,12 @@ private:
 
     u64 SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore);
 
+    void SubmitExecutionEngine(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
+                               u64 signal_value);
+
+    /// Worker thread: the open submission's transfer command buffer, begun on first use.
+    vk::CommandBuffer WorkerTransferCmdbuf();
+
     void AllocateNewContext();
 
     void EndPendingOperations();
@@ -518,6 +574,13 @@ private:
     u32 num_renderpass_images = 0;
     std::array<VkImage, 9> renderpass_images{};
     std::array<VkImageSubresourceRange, 9> renderpass_image_ranges{};
+
+    /// P5b: the transfer queue (EDEN_NX2_V2_XFERQ) and the submission engine
+    /// (EDEN_NX2_V2_SUBMITTHREAD, or contexts for the transfer queue). Destroyed after the worker.
+    std::unique_ptr<TransferQueue> transfer_queue;
+    std::unique_ptr<SubmitEngine> submit_engine;
+    SubmitContext* current_context{}; ///< worker thread
+    VideoCommon::V2::TimelineJoin timeline_join; ///< recording thread
 
     std::queue<std::unique_ptr<CommandChunk>> work_queue;
     std::vector<std::unique_ptr<CommandChunk>> chunk_reserve;

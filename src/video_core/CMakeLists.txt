@@ -148,6 +148,14 @@ add_library(video_core STATIC
     v2/macro_hle.h
     v2/p3_stats.cpp
     v2/p3_stats.h
+    v2/p5b_stats.cpp
+    v2/p5b_stats.h
+    v2/barrier_tracker.h
+    v2/flush_heuristic.h
+    v2/frame_pacer.h
+    v2/qmd_front.h
+    v2/tick_ring.h
+    v2/timeline_join.h
     v2/pipeline_lookup.h
     v2/regsem.cpp
     v2/shader_writes.cpp
@@ -273,6 +281,8 @@ add_library(video_core STATIC
     renderer_vulkan/vk_resource_pool.cpp
     renderer_vulkan/vk_resource_pool.h
     renderer_vulkan/vk_scheduler.cpp
+    renderer_vulkan/vk_submit_engine.cpp
+    renderer_vulkan/vk_submit_engine.h
     renderer_vulkan/vk_scheduler.h
     renderer_vulkan/fragment_barrier_state.h
     renderer_vulkan/vk_shader_util.cpp

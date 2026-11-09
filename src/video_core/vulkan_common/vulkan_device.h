@@ -324,6 +324,27 @@ public:
         return present_family;
     }
 
+    /// EDEN_NX2_V2_XFERQ: a dedicated transfer queue (a family with transfer and neither graphics
+    /// nor compute), with timeline semaphores and synchronization2 to join it.
+    bool HasTransferQueue() const {
+        return has_transfer_queue;
+    }
+    vk::Queue GetTransferQueue() const {
+        return transfer_queue;
+    }
+    u32 GetTransferFamily() const {
+        return transfer_family;
+    }
+    /// Buffers the transfer queue may copy are shared by both families (no ownership transfers);
+    /// images stay exclusive and move with queue family ownership transfers.
+    void ApplyTransferSharing(VkBufferCreateInfo& ci) const {
+        if (has_transfer_queue) {
+            ci.sharingMode = VK_SHARING_MODE_CONCURRENT;
+            ci.queueFamilyIndexCount = static_cast<u32>(transfer_sharing_families.size());
+            ci.pQueueFamilyIndices = transfer_sharing_families.data();
+        }
+    }
+
     /// Returns the current Vulkan API version provided in Vulkan-formatted version numbers.
     u32 ApiVersion() const {
         return properties.properties.apiVersion;
@@ -1301,6 +1322,10 @@ private:
     vk::Device logical;          ///< Logical device.
     vk::Queue graphics_queue;    ///< Main graphics queue.
     vk::Queue present_queue;     ///< Main present queue.
+    vk::Queue transfer_queue;    ///< EDEN_NX2_V2_XFERQ dedicated transfer queue.
+    u32 transfer_family{};
+    bool has_transfer_queue{};
+    std::array<u32, 2> transfer_sharing_families{};
     vk::PipelineCache static_pipeline_cache;
     bool owns_static_pipeline_cache{};
     u32 instance_version{};      ///< Vulkan instance version.

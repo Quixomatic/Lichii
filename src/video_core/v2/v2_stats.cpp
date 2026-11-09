@@ -12,6 +12,7 @@
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/gpu_split.h"
 #include "video_core/nx2_profile.h"
+#include "video_core/v2/p5b_stats.h"
 #include "video_core/v2/regsem.h"
 #include "video_core/v2/ir.h"
 #include "video_core/v2/commit.h"
@@ -768,6 +769,7 @@ void ReportSlow(const char* thread_name) {
     }
     P3Stats::Report(thread_name, window_ns);
     Commit::Stats::Report(thread_name, window_ns);
+    P5bStats::Report(thread_name, window_ns);
     window.start_ns = now;
     window.start_ticks = now_ticks;
 }

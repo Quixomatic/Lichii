@@ -189,6 +189,9 @@ Frame* PresentManager::GetRenderFrame() {
 void PresentManager::Present(Frame* frame) {
     if (use_present_thread) {
         scheduler.Record([this, frame](vk::CommandBuffer) {
+            // EDEN_NX2_V2_SUBMITTHREAD: the submission signalling render_ready must reach the
+            // queue before the present thread waits on it.
+            scheduler.WaitSubmitThread();
             std::unique_lock lock{queue_mutex};
             present_queue.push_back(frame);
             frame_cv.notify_one();

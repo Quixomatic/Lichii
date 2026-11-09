@@ -56,6 +56,14 @@ public:
     }
     template <typename Read, typename Release, typename Dispatch>
     std::string_view Signal(Address address, Word argument, Read read, Release release, Dispatch dispatch) {
+        return SignalOn(states, address, argument, read, release, dispatch);
+    }
+    struct State;
+    using Table = std::unordered_map<Address, State>;
+    /// Signal on another table (EDEN_NX2_V2_QMDSCHED: the split front's model of this scheduler).
+    template <typename Read, typename Release, typename Dispatch>
+    std::string_view SignalOn(Table& states, Address address, Word argument, Read read,
+                              Release release, Dispatch dispatch) {
         struct Pending { Address address; Word action; Word count; };
         std::string_view error;
         std::array<Pending, 256> pending{};
@@ -111,7 +119,14 @@ public:
             if ((qmd[18] & 0xff) != 0x30 || (qmd[4] & 0x100)) return "unsupported QMD version or queue";
             // A program Eden can't run is skipped, but the QMD still completes: its releases
             // are what other queues and the CPU wait on (the console never fails a launch).
-            const bool dispatched = !(qmd[12] && (qmd[13] & 0xffff) && (qmd[14] & 0xffff)) || dispatch(qmd);
+            bool dispatched = !(qmd[12] && (qmd[13] & 0xffff) && (qmd[14] & 0xffff));
+            if (!dispatched) {
+                if constexpr (std::is_invocable_v<Dispatch&, Address, const Descriptor&>) {
+                    dispatched = dispatch(request.address, qmd);
+                } else {
+                    dispatched = dispatch(qmd);
+                }
+            }
             if (!dispatched) error = "native shader dispatch required";
             if (trace) trace("run", request.address, dispatched ? 1 : 0);
             state.completed = true;
@@ -138,7 +153,6 @@ public:
         }
         return error;
     }
-private:
     // Release slots (address low, flags | address high, payload). NVN2 patches a third one at
     // word 52 for queue syncs (e.g. a compute queue releasing a semaphore another queue waits on).
     static constexpr std::array<Word, 3> ReleaseSlots{24, 28, 52};
@@ -154,6 +168,12 @@ private:
     // One table for every channel: a QMD's dependency counter is state of the QMD itself, and
     // title 1 schedules a QMD on one channel while another decrements it (a decrement that
     // arrived first was kept by the other channel's scheduler and the QMD never launched).
-    static inline std::unordered_map<Address, State> states;
+    /// The back's table (the split front copies it to resync its model at a drain).
+    [[nodiscard]] static const Table& BackTable() {
+        return states;
+    }
+
+private:
+    static inline Table states;
 };
 } // namespace Tegra

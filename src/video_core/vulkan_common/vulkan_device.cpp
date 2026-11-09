@@ -33,6 +33,7 @@
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 #include "video_core/gpu_logging/gpu_logging.h"
+#include "video_core/v2/v2_switches.h"
 #ifdef EGLANTINE_STREAMLINE
 #include "video_core/vulkan_common/streamline.h"
 #endif
@@ -797,6 +798,17 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
 
     graphics_queue = logical.GetQueue(graphics_family);
     present_queue = logical.GetQueue(present_family);
+    if (has_transfer_queue) {
+        if (HasTimelineSemaphore() && HasSynchronization2()) {
+            transfer_queue = logical.GetQueue(transfer_family);
+            transfer_sharing_families = {graphics_family, transfer_family};
+            LOG_INFO(Render_Vulkan, "EDEN_NX2_V2_XFERQ: transfer queue family {}", transfer_family);
+        } else {
+            has_transfer_queue = false;
+            LOG_INFO(Render_Vulkan, "EDEN_NX2_V2_XFERQ: needs timeline semaphores and "
+                                    "synchronization2; uploads stay on the upload command buffer");
+        }
+    }
 
 #ifdef EGLANTINE_STREAMLINE
     if (streamline_extensions) {
@@ -1893,6 +1905,25 @@ void Device::SetupFamilies(VkSurfaceKHR surface) {
     if (present) {
         present_family = *present;
     }
+    // EDEN_NX2_V2_XFERQ: a family the copy engine owns alone (no graphics, no compute).
+    has_transfer_queue = false;
+    if (VideoCommon::V2::On(VideoCommon::V2::Switch::XferQ)) {
+        for (u32 index = 0; index < static_cast<u32>(queue_family_properties.size()); ++index) {
+            const VkQueueFlags flags = queue_family_properties[index].queueFlags;
+            if (queue_family_properties[index].queueCount != 0 &&
+                (flags & VK_QUEUE_TRANSFER_BIT) != 0 &&
+                (flags & (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT)) == 0) {
+                transfer_family = index;
+                has_transfer_queue = true;
+                break;
+            }
+        }
+        if (!has_transfer_queue) {
+            LOG_INFO(Render_Vulkan,
+                     "EDEN_NX2_V2_XFERQ: no dedicated transfer queue; uploads stay on the upload "
+                     "command buffer");
+        }
+    }
 }
 
 bool Device::TryReserveCustomBorderColorSamplers(size_t count) const {
@@ -2065,6 +2096,9 @@ std::vector<VkDeviceQueueCreateInfo> Device::GetDeviceQueueCreateInfos() const {
     static constexpr float QUEUE_PRIORITY = 1.0f;
 
     ::Common::unordered_set<u32> unique_queue_families{graphics_family, present_family};
+    if (has_transfer_queue) {
+        unique_queue_families.insert(transfer_family);
+    }
     std::vector<VkDeviceQueueCreateInfo> queue_cis;
     queue_cis.reserve(unique_queue_families.size());
 
