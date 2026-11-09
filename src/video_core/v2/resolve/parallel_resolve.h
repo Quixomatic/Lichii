@@ -71,6 +71,8 @@ struct Stats {
     std::array<std::atomic<u64>, MaxShards> shard_busy_ns{};
     std::array<std::atomic<u64>, MaxShards> shard_segments{};
     std::atomic<u64> refused{};       ///< submissions refused by back pressure
+    std::atomic<u64> stolen_unsubmitted{}; ///< the commit reached a segment not submitted yet
+    std::atomic<u64> stolen_queued{};      ///< the commit took a submitted segment no shard began
     std::atomic<u64> verify_segments{};
     std::atomic<u64> verify_mismatches{};
     std::atomic<u64> verify_dependent{}; ///< request differences an earlier commit explains
@@ -304,6 +306,7 @@ public:
             u64 word = slot.word.load(std::memory_order_acquire);
             if (IdOf(word) != id) {
                 // The slot still holds an older segment: the producer never reached this one.
+                Count(GetStats().stolen_unsubmitted);
                 StealEmpty(slot, id, SerialReason::Stolen);
                 return result;
             }
@@ -311,6 +314,7 @@ public:
             case State::Free:
                 if (slot.word.compare_exchange_strong(word, Pack(id, State::Stolen),
                                                       std::memory_order_acq_rel)) {
+                    Count(GetStats().stolen_unsubmitted);
                     const bool refused = attempted.load(std::memory_order_acquire) > id;
                     StealEmpty(slot, id,
                                refused ? SerialReason::BackPressure : SerialReason::Stolen);
@@ -324,6 +328,9 @@ public:
                     continue;
                 }
                 const bool serial_up_front = StateOf(word) == State::SerialQueued;
+                if (!serial_up_front) {
+                    Count(GetStats().stolen_queued);
+                }
                 ResetResult(result, id);
                 result.stolen = !serial_up_front;
                 result.serial = serial_up_front ? slot.reason : SerialReason::Stolen;

@@ -133,7 +133,7 @@ void ReportStats(const char* thread_name, u64 window_ns) {
         "V2 stats {} P6 parallel resolve | segments {:.0f}/s ({:.1f} draws each), by shards "
         "{:.1f}%, serial {:.1f}% ({}) | cuts: {} | size {} | shards {} ({:.1f}% busy overall): {} | "
         "commit {:.2f} ms/s, merge wait {:.2f} ms/s ({} waits), serial resolve on commit {:.2f} "
-        "ms/s | refused {} | snapshot blocks copied {:.0f}/s, shared {:.1f}% | pre-resolved draws "
+        "ms/s | refused {}, stolen before submit {}, while queued {} | snapshot blocks copied {:.0f}/s, shared {:.1f}% | pre-resolved draws "
         "{:.0f}/s, unmatched {:.0f}/s, drift {}, no shape {:.0f}/s | verify: {} segments, {} "
         "mismatches ({} dependent); {} draws, {} mismatches; {} snapshots, {} mismatches | determinism: {} "
         "in order, {} out of order | steps on shards: {} | commit per draw {:.2f} us ({:.0f} "
@@ -151,6 +151,7 @@ void ReportStats(const char* thread_name, u64 window_ns) {
         shard_line, static_cast<double>(commit_ns) / 1e6 / seconds,
         static_cast<double>(wait_ns) / 1e6 / seconds, waits,
         static_cast<double>(stolen_ns) / 1e6 / seconds, Take(stats.refused),
+        Take(stats.stolen_unsubmitted), Take(stats.stolen_queued),
         static_cast<double>(copied) / seconds,
         copied + shared != 0 ? 100.0 * static_cast<double>(shared) /
                                    static_cast<double>(copied + shared)
