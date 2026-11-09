@@ -258,10 +258,22 @@ public:
 
     /// Producer: hands segment `id` (consecutive ids) to the shards. `reason` != None makes it
     /// serial up front (no shard touches it). False when refused: no free slot (back pressure) or
-    /// the commit already took it; the commit then resolves it serially.
-    bool Submit(u64 id, Input&& input, SerialReason reason = SerialReason::None) {
+    /// the commit already took it; the commit then resolves it serially. `retry` (optional): set
+    /// when refused only because the slot still holds an older segment; `input` is then left
+    /// as it was and the producer submits it again later (AP6 T0: back pressure is not
+    /// serialisation).
+    bool Submit(u64 id, Input&& input, SerialReason reason = SerialReason::None,
+                bool* retry = nullptr) {
         Slot& slot = slots[id & mask];
         const u64 expected_word = Pack(id, State::Free);
+        if (retry != nullptr) {
+            const u64 word = slot.word.load(std::memory_order_acquire);
+            *retry = IdOf(word) < id;
+            if (*retry) {
+                Count(GetStats().refused);
+                return false;
+            }
+        }
         bool accepted = false;
         if (slot.word.load(std::memory_order_acquire) == expected_word) {
             slot.input = std::move(input);

@@ -117,14 +117,24 @@ TEST_CASE("V2 P6: segmenter serial classification keeps the first reason and iso
     segmenter.OnRecord(RecordClass::Transfer); // before the first draw: nothing open
     CHECK(segmenter.OnDraw(Draw()) == CutReason::First);
     CHECK(segmenter.OpenReason() == SerialReason::None);
-    segmenter.OnRecord(RecordClass::Neutral);
-    CHECK(segmenter.OpenReason() == SerialReason::None);
+    // Register-only resolvers read no record's effects: no cut, no serial segment.
     segmenter.OnRecord(RecordClass::Transfer);
+    segmenter.OnRecord(RecordClass::Readback);
     segmenter.OnRecord(RecordClass::Map);
-    CHECK(segmenter.OpenReason() == SerialReason::Transfer); // the first one
-    // The next draw starts a clean segment.
+    segmenter.OnRecord(RecordClass::CacheInvalidate);
+    CHECK(segmenter.OpenReason() == SerialReason::None);
+    CHECK(segmenter.OnDraw(Draw()) == CutReason::None);
+    // Resolvers that read memory: the draws after a transfer start a segment, the open one
+    // stays parallel (no isolate cascade).
+    segmenter.SetRecordCapabilities(1U << static_cast<u32>(RecordClass::Transfer));
+    segmenter.OnRecord(RecordClass::Neutral);
+    segmenter.OnRecord(RecordClass::Map);
+    CHECK(segmenter.OnDraw(Draw()) == CutReason::None);
+    segmenter.OnRecord(RecordClass::Transfer);
+    CHECK(segmenter.OpenReason() == SerialReason::None);
     CHECK(segmenter.OnDraw(Draw()) == CutReason::Isolate);
     CHECK(segmenter.OpenReason() == SerialReason::None);
+    CHECK(segmenter.OnDraw(Draw()) == CutReason::None);
 
     Resolve::DrawEvent indirect = Draw();
     indirect.indirect = true;
@@ -134,12 +144,6 @@ TEST_CASE("V2 P6: segmenter serial classification keeps the first reason and iso
     inline_index.inline_index = true;
     CHECK(segmenter.OnDraw(inline_index) == CutReason::Isolate);
     CHECK(segmenter.OpenReason() == SerialReason::InlineIndex);
-    segmenter.OnDraw(Draw());
-    segmenter.OnRecord(RecordClass::Readback);
-    CHECK(segmenter.OpenReason() == SerialReason::Readback);
-    segmenter.OnDraw(Draw());
-    segmenter.OnRecord(RecordClass::CacheInvalidate);
-    CHECK(segmenter.OpenReason() == SerialReason::CacheInvalidate);
     segmenter.OnDraw(Draw());
     segmenter.MarkSerial(SerialReason::GpuWrittenHandles);
     CHECK(segmenter.OpenReason() == SerialReason::GpuWrittenHandles);

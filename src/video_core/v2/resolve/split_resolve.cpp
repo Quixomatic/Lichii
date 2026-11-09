@@ -433,11 +433,14 @@ void SplitResolve::FrontDraw(const FrontView& view, const EngineInfo& engine,
 
 void SplitResolve::OnPublish(u64 position) {
     while (!closed.empty() && closed.front().end <= position) {
-        SegmentInput input = std::move(closed.front());
-        closed.pop_front();
+        SegmentInput& input = closed.front();
         const u64 id = input.id;
         const SerialReason reason = input.serial;
-        resolver->Submit(id, std::move(input), reason);
+        bool retry = false;
+        if (!resolver->Submit(id, std::move(input), reason, &retry) && retry) {
+            break; // every slot busy: submitted again at the next publish
+        }
+        closed.pop_front();
     }
 }
 

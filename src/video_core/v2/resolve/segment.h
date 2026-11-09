@@ -124,7 +124,7 @@ public:
         CutReason cut = CutReason::None;
         if (!started) {
             cut = CutReason::First;
-        } else if (isolate_next) {
+        } else if (isolate_next || cut_next) {
             cut = CutReason::Isolate;
         } else if (draw.engine != engine) {
             cut = CutReason::EngineSwitch;
@@ -146,23 +146,19 @@ public:
     }
 
     /// A record between draws, in stream order (records before the first draw are ignored).
+    /// Only the classes the resolvers read (SetRecordCapabilities) matter, and a record only
+    /// affects the draws after it: they start a new segment, the open one stays parallel
+    /// (AP6 T0: no isolate cascade). Shards that read only registers see none of them.
     void OnRecord(RecordClass record) {
-        switch (record) {
-        case RecordClass::Neutral:
-            return;
-        case RecordClass::Transfer:
-            MarkSerial(SerialReason::Transfer);
-            return;
-        case RecordClass::Readback:
-            MarkSerial(SerialReason::Readback);
-            return;
-        case RecordClass::Map:
-            MarkSerial(SerialReason::Map);
-            return;
-        case RecordClass::CacheInvalidate:
-            MarkSerial(SerialReason::CacheInvalidate);
+        if (record == RecordClass::Neutral || !started ||
+            (capabilities & (1U << static_cast<u32>(record))) == 0) {
             return;
         }
+        cut_next = true;
+    }
+    /// The record classes whose effects the resolvers read (bits of 1 << RecordClass).
+    void SetRecordCapabilities(u32 mask) {
+        capabilities = mask;
     }
 
     /// The open segment must be resolved serially (the first reason is kept). The next draw then
@@ -210,6 +206,7 @@ public:
         draws = 0;
         reason = SerialReason::None;
         isolate_next = false;
+        cut_next = false;
     }
 
 private:
@@ -220,12 +217,15 @@ private:
         draws = 0;
         reason = SerialReason::None;
         isolate_next = false;
+        cut_next = false;
     }
 
     SegmentPolicy policy;
     u32 k;
     bool started = false;
-    bool isolate_next = false;
+    bool isolate_next = false; ///< The open segment is serial: the next draw starts a clean one
+    bool cut_next = false;     ///< A record the resolvers read: the next draw starts a segment
+    u32 capabilities = 0;      ///< SetRecordCapabilities
     u64 id = ~u64{0}; ///< the first Open makes it 0 unless Reset set another start
     u64 engine = 0;
     u32 draws = 0;
@@ -253,9 +253,8 @@ public:
             // More than 10% of segments made the commit wait: shorter segments finish sooner.
             size = (std::max)(SegmentPolicy::MinK, current * 3 / 4);
         } else if (steals * 2 > count) {
-            // Most segments are reached before a shard starts them: the producer is barely ahead,
-            // shorter segments get handed out earlier.
-            size = (std::max)(SegmentPolicy::MinK, current * 3 / 4);
+            // Most segments are reached before a shard starts them: the producer lags, and
+            // shorter segments would only add per-segment cost (AP6 §1.3(e)). Keep the size.
         } else if (waits == 0 && steals * 10 < count) {
             // Shards are ahead and the commit never waits: longer segments cost less overhead.
             size = (std::min)(SegmentPolicy::MaxK, current * 5 / 4 + 1);
