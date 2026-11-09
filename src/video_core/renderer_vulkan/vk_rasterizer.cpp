@@ -4479,6 +4479,27 @@ void RasterizerVulkan::UpdateDynamicStates(const GraphicsPipeline* pipeline) {
         flags[Dirty::DepthBiasEnable] = true;
         flags[Dirty::PrimitiveRestartEnable] = true;
     }
+    // Pipeline v2 F2-08 (§7 dynamic state 0.05 µs): every update below records only when one of
+    // its dirty flags is set (a new command buffer sets them all), the topology moved or the
+    // pipeline outputs other colour components: with none of that, one mask test skips them.
+    if (VideoCommon::V2::On(VideoCommon::V2::Switch::DrawCache) && !emulated_mesh &&
+        !topology_changed) [[unlikely]] {
+        static const auto dynamic_flags = [] {
+            Tegra::Engines::Maxwell3D::DirtyState::Flags mask;
+            for (u32 flag = Dirty::VertexInput; flag < Dirty::VertexInputKey; ++flag) {
+                mask.set(flag);
+            }
+            mask.set(VideoCommon::Dirty::RescaleViewports);
+            mask.set(VideoCommon::Dirty::RescaleScissors);
+            mask.set(VideoCommon::Dirty::DepthBiasGlobal);
+            mask.set(VideoCommon::Dirty::VertexBuffers);
+            return mask;
+        }();
+        const u32 color_output_mask = pipeline ? pipeline->ColorOutputMask() : ~0U;
+        if ((flags & dynamic_flags).none() && color_output_mask == last_color_output_mask) {
+            return;
+        }
+    }
 
     UpdateViewportsState(regs);
     UpdateScissorsState(regs);
