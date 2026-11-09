@@ -122,6 +122,10 @@ add_library(video_core STATIC
     nx2_profile.h
     nx2_perf.h
     nx2_download_trace.h
+    v2/front_writes.cpp
+    v2/front_writes.h
+    v2/hazard.cpp
+    v2/hazard.h
     v2/ir.h
     v2/regsem.cpp
     v2/regsem.h

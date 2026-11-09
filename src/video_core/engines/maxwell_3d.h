@@ -3447,6 +3447,14 @@ private:
     void FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& state, u32 macro, u32 method,
                       u32 count);
     void FrontVerify(VideoCommon::GpuSplit& split, FrontState& state);
+    /// EDEN_NX2_V2_ACQUIRE/HAZARD: records the guest memory writes of `amount` words just sent
+    /// to `method` (GpuSplit::TracksWrites).
+    void FrontNoteWrites(VideoCommon::GpuSplit& split, const FrontState& state, u32 method,
+                         u32 amount);
+    /// EDEN_NX2_V2_HAZARD: FrontDmaRead without the drain where the hazard table allows it.
+    /// Returns false when the old path must read.
+    bool FrontDmaReadHazard(VideoCommon::GpuSplit& split, GPUVAddr source, size_t bytes,
+                            std::span<u32> out);
     void FinishFrontMacro(Core::System& system);
     std::unique_ptr<FrontState> front;
     bool front_macros{};

@@ -85,6 +85,18 @@ struct FrontData {
     u64 literal_releases{};
     u64 gpu_valued_releases{};
     u64 table_evictions{};
+    // P2 decisions.
+    std::array<std::array<u64, static_cast<size_t>(Decision::Count)>, NumSites> decisions{};
+    std::array<std::array<u64, static_cast<size_t>(Reason::Count)>, NumSites> reasons{};
+    std::array<u64, NumSites> mismatches{};
+};
+
+constexpr std::array<const char*, static_cast<size_t>(Decision::Count)> decision_names{
+    "avoided", "forwarded", "narrowed", "waited",
+};
+constexpr std::array<const char*, static_cast<size_t>(Reason::Count)> reason_names{
+    "-",         "settings",      "operation",   "unmapped", "gpu-written", "unknown write",
+    "queued not met", "not met", "report page", "overflow", "valve",
 };
 
 constexpr size_t NumReleases = 4096;
@@ -331,6 +343,45 @@ void ReportFront(const FrontData& data, const char* thread_name, u64 window_ns,
              PerSecond(data.table_evictions, window_ns));
 }
 
+void ReportDecisions(const FrontData& data, const char* thread_name, u64 window_ns) {
+    std::string sites;
+    for (size_t site = 0; site < NumSites; ++site) {
+        u64 total = data.mismatches[site];
+        for (const u64 count : data.decisions[site]) {
+            total += count;
+        }
+        if (total == 0) {
+            continue;
+        }
+        std::string line;
+        for (size_t d = 0; d < data.decisions[site].size(); ++d) {
+            line += fmt::format(" {} {:.0f},", decision_names[d],
+                                PerSecond(data.decisions[site][d], window_ns));
+        }
+        line.pop_back();
+        std::string reasons;
+        for (size_t r = 1; r < data.reasons[site].size(); ++r) {
+            if (data.reasons[site][r] != 0) {
+                reasons += fmt::format(" {} {:.0f},", reason_names[r],
+                                       PerSecond(data.reasons[site][r], window_ns));
+            }
+        }
+        if (!reasons.empty()) {
+            reasons.pop_back();
+            line += fmt::format(" (waited for:{})", reasons);
+        }
+        if (data.mismatches[site] != 0) {
+            line += fmt::format(", verify mismatches {}", data.mismatches[site]);
+        }
+        sites += fmt::format(" {}:{};", drain_site_names[site], line);
+    }
+    if (sites.empty()) {
+        return;
+    }
+    sites.pop_back();
+    LOG_INFO(HW_GPU, "V2 stats {} P2 wait decisions (per s):{}", thread_name, sites);
+}
+
 void ReportDraws(const DrawData& data, const char* thread_name, u64 window_ns) {
     std::string groups;
     for (size_t g = 0; g < NumGroups; ++g) {
@@ -467,6 +518,25 @@ void NoteDrain(DrainSite site, u64 start) {
     FrontData& data = Front().data;
     data.drain_ticks[s][c] += Nx2Profile::Ticks() - start;
     ++data.drain_count[s][c];
+}
+
+void NoteDecision(DrainSite site, Decision decision, Reason reason) {
+    if (!Enabled()) [[likely]] {
+        return;
+    }
+    FrontData& data = Front().data;
+    const auto s = static_cast<size_t>(site);
+    ++data.decisions[s][static_cast<size_t>(decision)];
+    if (reason != Reason::None) {
+        ++data.reasons[s][static_cast<size_t>(reason)];
+    }
+}
+
+void NoteMismatch(DrainSite site) {
+    if (!Enabled()) [[likely]] {
+        return;
+    }
+    ++Front().data.mismatches[static_cast<size_t>(site)];
 }
 
 AcquireContext::AcquireContext(SyncClass sync_class) : enabled{Enabled()} {
@@ -625,6 +695,7 @@ void ReportSlow(const char* thread_name) {
         if (active) {
             ReportFront(front, thread_name, window_ns, window_ticks);
         }
+        ReportDecisions(front, thread_name, window_ns);
         front = {};
     }
     if (t_draw_data) {

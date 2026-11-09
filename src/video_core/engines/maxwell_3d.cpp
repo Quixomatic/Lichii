@@ -32,6 +32,7 @@
 #include "video_core/query_dma.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/textures/texture.h"
+#include "video_core/v2/front_writes.h"
 #include "video_core/v2/regsem_3d.h"
 #ifdef ARCHITECTURE_x86_64
 #include "video_core/macro_turing_jit.h"
@@ -1322,6 +1323,9 @@ void Maxwell3D::FrontWriteRegSem(VideoCommon::GpuSplit& split, FrontState& fs, u
     } else {
         split.Method(this, method, argument, is_last_call, nullptr);
     }
+    if (split.TracksWrites()) [[unlikely]] {
+        FrontNoteWrites(split, fs, method, 1);
+    }
     if ((table.flags[method] & RegSem::ReportSemaphore) != 0 &&
         VideoCommon::V2::Stats::Enabled()) [[unlikely]] {
         VideoCommon::V2::Stats::NoteReportSemaphore(memory_manager.GetID(), fs.regs.data());
@@ -1461,6 +1465,9 @@ void Maxwell3D::FrontWriteV1(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
         split.Method(this, method, argument, is_last_call, nullptr);
         fs.sink_pending = !execution_mask[method];
     }
+    if (split.TracksWrites()) [[unlikely]] {
+        FrontNoteWrites(split, fs, method, 1);
+    }
     if (method == MAXWELL3D_REG_INDEX(report_semaphore.query) &&
         VideoCommon::V2::Stats::Enabled()) [[unlikely]] {
         VideoCommon::V2::Stats::NoteReportSemaphore(memory_manager.GetID(), fs.regs.data());
@@ -1500,6 +1507,9 @@ void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit
     if (fs.v2 != nullptr && fs.v2->mode == VideoCommon::V2::Mode::On) [[unlikely]] {
         FrontMultiRegSem(fs, method, base_start, amount, true);
         split.MultiMethod(this, method, base_start, amount, methods_pending, nullptr);
+        if (split.TracksWrites()) [[unlikely]] {
+            FrontNoteWrites(split, fs, method, amount);
+        }
         return;
     }
     // What CallMultiMethod does to the registers on the back, then one entry for all the words.
@@ -1581,6 +1591,30 @@ void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit
         FrontMultiRegSem(fs, method, base_start, amount, false); // Verify
     }
     split.MultiMethod(this, method, base_start, amount, methods_pending, nullptr);
+    if (split.TracksWrites()) [[unlikely]] {
+        FrontNoteWrites(split, fs, method, amount);
+    }
+}
+
+void Maxwell3D::FrontNoteWrites(VideoCommon::GpuSplit& split, const FrontState& fs, u32 method,
+                                u32 amount) {
+    namespace V2 = VideoCommon::V2;
+    const u32 flags = V2::RegSem::GetTable3D().flags[method];
+    if ((flags & V2::RegSem::CbData) != 0) {
+        // The words went to the constant buffer at the offset before they advanced it.
+        const GPUVAddr buffer =
+            (GPUVAddr{fs.regs[MAXWELL3D_REG_INDEX(const_buffer.address_high)]} << 32) |
+            fs.regs[MAXWELL3D_REG_INDEX(const_buffer.address_low)];
+        const u64 bytes = u64{amount} * sizeof(u32);
+        const u32 offset = fs.regs[MAXWELL3D_REG_INDEX(const_buffer.offset)];
+        V2::NoteRangeWriteGpu(split, memory_manager, buffer + offset - bytes, bytes,
+                              V2::Producer::CbData);
+    } else if ((flags & V2::RegSem::ReportSemaphore) != 0 && amount != 0) {
+        V2::NoteReport3D(split, memory_manager, fs.regs.data());
+    } else if ((flags & V2::RegSem::InlineData) != 0 ||
+               method == MAXWELL3D_REG_INDEX(launch_dma)) {
+        split.NoteUnboundedWrite(V2::Producer::Upload);
+    }
 }
 
 void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split,

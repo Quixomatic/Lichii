@@ -99,6 +99,11 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                     // present waited ~17 ms a frame in Kokiri village, with 50 us ~1 ms. A channel
                     // still waiting after 2 s (menus, loading) goes back to 1 ms sleeps.
                     Profile::Scope scope{Profile::Zone::PendingSleep};
+                    if (split.AcquireMode() != V2::Mode::Off) [[unlikely]] {
+                        // Polls no longer drain: hand the back what the front holds before
+                        // sleeping (0758309bcc), or it waits out the sleep without work.
+                        split.Publish();
+                    }
                     const auto waited = std::chrono::steady_clock::now() - last_progress;
                     if (waited < std::chrono::microseconds{500}) {
                         std::this_thread::yield();

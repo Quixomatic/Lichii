@@ -79,6 +79,8 @@ public:
         u32 operation;
         std::chrono::steady_clock::time_point since;
         std::chrono::steady_clock::time_point last_fences; ///< When it last released fences
+        /// EDEN_NX2_V2_ACQUIRE: when an unmet poll last drained the split
+        std::chrono::steady_clock::time_point last_drain;
         bool reported;
 
         [[nodiscard]] bool Matches(u32 current) const;
@@ -100,6 +102,8 @@ public:
 private:
     /// CanResumeAcquire's check (CanResumeAcquire also counts it for EDEN_NX2_V2_STATS).
     [[nodiscard]] bool PollAcquire(DmaPusher& dma_pusher);
+    /// EDEN_NX2_V2_ACQUIRE: PollAcquire decided by the front's semaphore view.
+    [[nodiscard]] bool PollAcquireView(DmaPusher& dma_pusher);
 
     static constexpr std::size_t NUM_REGS = 0x800;
     struct Regs {

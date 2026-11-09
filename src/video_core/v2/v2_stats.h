@@ -68,6 +68,35 @@ void NoteAcquire(SyncClass sync_class, bool poll, bool met);
 /// The front waited for the back since `start` (Nx2Profile::Ticks) for `site`.
 void NoteDrain(DrainSite site, u64 start);
 
+/// P2 (EDEN_NX2_V2_ACQUIRE / HAZARD): how a wait site was decided.
+enum class Decision : u8 {
+    Avoided,   ///< No wait: the value was known or nothing queued writes the range
+    Forwarded, ///< No wait: decided by a queued write the front knows (class B, store forwarding)
+    Narrowed,  ///< A targeted wait for one producer instead of the old wait
+    Waited,    ///< The old wait, for the Reason
+    Count,
+};
+
+/// Why a site still took the old wait (or what verify found).
+enum class Reason : u8 {
+    None,
+    Settings,     ///< Accuracy or fence settings, macros on the back
+    Operation,    ///< An acquire the view doesn't decide alone
+    Unmapped,     ///< Unmapped or not contiguous in device memory
+    GpuWritten,   ///< Pages the buffer cache may hold newer than memory
+    UnknownWrite, ///< A queued write of unknown bytes (counter report, reduction)
+    QueuedNotMet, ///< The queued write doesn't meet the acquire
+    NotMet,       ///< Not met by memory (the acquire suspends as before)
+    ReportPage,   ///< Pages reports write (query results may be held back)
+    Overflow,     ///< The hazard table overflowed or a lookup was too long
+    Valve,        ///< A waiting acquire's drain once per 1 ms
+    Count,
+};
+
+void NoteDecision(DrainSite site, Decision decision, Reason reason = Reason::None);
+/// Verify: the new decision disagreed with the old path at `site`.
+void NoteMismatch(DrainSite site);
+
 /// Attributes the waits for the back made while it lives (acquire sites) to `sync_class`.
 class AcquireContext {
 public:

@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstring>
@@ -12,7 +13,9 @@
 #include <type_traits>
 
 #include "common/common_types.h"
+#include "video_core/v2/hazard.h"
 #include "video_core/v2/ir.h"
+#include "video_core/v2/v2_switches.h"
 
 namespace Core {
 class System;
@@ -97,6 +100,64 @@ public:
     /// Whether the front runs the engines' macros (EDEN_NX2_SPLIT=2).
     [[nodiscard]] bool FrontMacros() const {
         return front_macros;
+    }
+
+    // Pipeline v2 P2 (fixed at each start): EDEN_NX2_V2_ACQUIRE, EDEN_NX2_V2_HAZARD.
+    /// Whether the front records the guest memory writes it sends (either switch on).
+    [[nodiscard]] bool TracksWrites() const {
+        return tracks_writes;
+    }
+    [[nodiscard]] V2::Mode AcquireMode() const {
+        return acquire_mode;
+    }
+    [[nodiscard]] V2::Mode HazardMode() const {
+        return hazard_mode;
+    }
+    /// Front: the back's consumed position now.
+    [[nodiscard]] u64 ConsumedNow() const {
+        return consumed.load(std::memory_order_acquire);
+    }
+    /// Front, TracksWrites: the write just sent (its record ends at the write position) stores
+    /// `size` known bytes, or unknown bytes, at a device address; or a range it can't bound.
+    void NoteKnownWrite(u64 device_address, const void* bytes, u32 size, V2::Producer producer) {
+        PrepareHazardNote();
+        hazards.NoteKnown(device_address, bytes, size, write_position, producer);
+    }
+    void NoteRangeWrite(u64 device_address, u64 size, V2::Producer producer) {
+        PrepareHazardNote();
+        hazards.NoteRange(device_address, size, write_position, producer);
+    }
+    void NoteUnboundedWrite(V2::Producer producer) {
+        hazards.NoteUnbounded(producer, write_position);
+    }
+    /// Front: the queued writes to a device range that `filter` orders against (V2::HazardTable).
+    [[nodiscard]] V2::HazardResult FindWrites(u64 device_address, u64 size,
+                                              const V2::HazardFilter& filter, u8* out = nullptr) {
+        const u64 done = ConsumedNow();
+        hazards.Retire(done);
+        return hazards.Find(device_address, size, done, filter, out);
+    }
+    [[nodiscard]] u64 PendingUnboundedWrite(V2::Producer producer) const {
+        return hazards.PendingUnbounded(producer, ConsumedNow());
+    }
+    /// Front: waits until the back consumed `position` (a HazardResult's). Returns whether any
+    /// of it was still queued.
+    bool WaitForPosition(u64 position, DrainSite site) {
+        return WaitFor(std::min(position, write_position), site);
+    }
+    /// Front: the newest compute/copy work sent before the last host-level sync (NoteSync).
+    [[nodiscard]] u64 SyncedWriterPosition() const {
+        return std::min(last_writer_position, last_sync_position);
+    }
+    /// Any thread, EDEN_NX2_V2_CPULANE: has the back run `hook` after its current entry (or at
+    /// once if it waits for work).
+    void SetCpuLaneHook(void (*hook)(void*), void* argument) {
+        cpu_lane_hook = hook;
+        cpu_lane_argument = argument;
+    }
+    void RequestCpuLane() {
+        cpu_lane_requested.store(true, std::memory_order_seq_cst);
+        RequestIdleHook();
     }
 
     /// Whether the calling thread is the back.
@@ -253,6 +314,9 @@ public:
     /// commands after it are fetched.
     void NoteSync() {
         last_sync_position = write_position;
+        if (tracks_writes) [[unlikely]] {
+            hazards.NoteSync(write_position);
+        }
     }
     /// Waits until the back executed the work sent before the last NoteSync. Returns whether any
     /// of it was still queued.
@@ -283,6 +347,8 @@ private:
     static constexpr size_t RingMask = RingWords - 1;
     static constexpr u32 MaxMultiWords = 8192;
     static constexpr size_t PublishEvery = 256;
+    /// Words a back waiting for work gets without a full publish_every (Commit).
+    static constexpr size_t PublishAfterWait = 8;
     /// Most words in one IR StateRun (each publish closes the open run earlier).
     static constexpr size_t MaxRunWords = 1024;
 
@@ -303,8 +369,21 @@ private:
     u64* ReserveSlow(size_t words);
     void Commit(size_t words) {
         write_position += words;
-        if (write_position - published_local >= publish_every) {
+        const u64 unpublished = write_position - published_local;
+        if (unpublished >= publish_every) {
             Publish();
+            return;
+        }
+        // EDEN_NX2_V2_ACQUIRE: the back waits for work at the last position published: it gets
+        // these words after a few (drains used to restart it like that; acquires no longer drain).
+        if (feed_idle_back && unpublished >= PublishAfterWait &&
+            back_idle_at.load(std::memory_order_relaxed) == published_local) [[unlikely]] {
+            Publish();
+        }
+    }
+    void PrepareHazardNote() {
+        if (hazards.Size() == V2::HazardTable::Capacity) [[unlikely]] {
+            hazards.Retire(consumed.load(std::memory_order_acquire));
         }
     }
     void WaitForSpace(size_t words);
@@ -357,6 +436,16 @@ private:
 
     /// One step of a front wait for the back to consume `target`.
     void Backoff(u32 spins, u64 target);
+    /// EDEN_NX2_V2_SPIN: whether a wait that started spinning at `start` (ns) still spins.
+    [[nodiscard]] bool SpinWindowOpen(u32 spins, u64& start) const;
+    /// Back: runs the CPU lane hook if one was asked for (EDEN_NX2_V2_CPULANE).
+    void ServeCpuLane() {
+        if (cpu_lane_requested.load(std::memory_order_relaxed) &&
+            cpu_lane_requested.exchange(false, std::memory_order_seq_cst) &&
+            cpu_lane_hook != nullptr) {
+            cpu_lane_hook(cpu_lane_argument);
+        }
+    }
     /// After the back stored `consumed`: wakes a front sleeping in Backoff.
     void NotifyFront() {
         if (front_waiting.load(std::memory_order_seq_cst)) {
@@ -393,6 +482,15 @@ private:
     u64 ir_sequence{};
     u64* ir_run{}; ///< Header of the open StateRun
     size_t ir_run_words{};
+    // Pipeline v2 P2 (fixed at each start).
+    bool tracks_writes{};
+    bool feed_idle_back{};
+    bool spin_window{};
+    V2::Mode acquire_mode{};
+    V2::Mode hazard_mode{};
+    u64 spin_window_ns{};
+    u64 front_spin_start{};
+    V2::HazardTable hazards;
 
     // Back side.
     Tegra::Engines::EngineInterface* back_engine{};
@@ -403,6 +501,9 @@ private:
     static inline thread_local bool on_back_thread{};
     void (*idle_hook)(void*){};
     void* idle_argument{};
+    void (*cpu_lane_hook)(void*){};
+    void* cpu_lane_argument{};
+    std::atomic<bool> cpu_lane_requested{};
     alignas(64) std::atomic<bool> hook_requested{};
     std::atomic<bool> back_running{};
 
@@ -419,6 +520,9 @@ private:
     /// The front sleeps in Backoff (#161: instead of yielding).
     alignas(128) std::atomic<bool> front_waiting{};
     std::atomic<u32> front_wake{};
+    /// The back's position when it last ran out of work (EDEN_NX2_V2_ACQUIRE, Commit). Port of
+    /// the publish part of 62db242b34 (jpkto, PR #805) via a20471e48c.
+    alignas(128) std::atomic<u64> back_idle_at{~u64{0}};
     std::jthread back_thread;
 };
 

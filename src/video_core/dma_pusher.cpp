@@ -494,6 +494,9 @@ void DmaPusher::CallMethod(u32 argument) {
             if (writer) {
                 split.NoteWriter();
             }
+            if (split.TracksWrites()) [[unlikely]] {
+                NoteTrackedWrite(*subchannel, engine_type, dma_state.method, argument, writer);
+            }
         };
         if (split.Active()) {
             const GPUVAddr segment = dma_state.dma_get + dma_state.dma_word_offset;
@@ -552,6 +555,12 @@ void DmaPusher::CallMultiMethod(const u32* base_start, u32 num_methods) {
             if (writer) {
                 split.NoteWriter();
             }
+            if (split.TracksWrites()) [[unlikely]] {
+                for (u32 i = 0; i < num_methods; ++i) {
+                    NoteTrackedWrite(*subchannel, engine_type, dma_state.method, base_start[i],
+                                     writer);
+                }
+            }
         };
         if (split.Active()) {
             const GPUVAddr segment = dma_state.dma_get + dma_state.dma_word_offset;
@@ -581,6 +590,41 @@ void DmaPusher::CallMultiMethod(const u32* base_start, u32 num_methods) {
         subchannel->ConsumeSink(system);
         subchannel->current_dma_segment = dma_state.dma_get + dma_state.dma_word_offset;
         subchannel->CallMultiMethod(system, dma_state.method, base_start, num_methods, dma_state.method_count);
+    }
+}
+
+void DmaPusher::NoteTrackedWrite(Engines::EngineInterface& engine, Engines::EngineTypes type,
+                                 u32 method, u32 argument, bool writer) {
+    // The 3D engine (FrontNoteWrites), the compute engine's reports and the puller's releases
+    // note their own writes.
+    using VideoCommon::V2::Producer;
+    auto& split = VideoCommon::GpuSplit::Get();
+    switch (type) {
+    case Engines::EngineTypes::MaxwellDMA:
+        dma_writes.Note(split, memory_manager, method, argument);
+        if (writer && method != VideoCommon::V2::DmaWriteTracker::LaunchMethod) {
+            split.NoteUnboundedWrite(Producer::Copy); // A macro or another executed method
+        }
+        break;
+    case Engines::EngineTypes::KeplerCompute:
+        // Dispatches write where their shaders store (and release what their QMDs say).
+        if (writer) {
+            split.NoteUnboundedWrite(Producer::Dispatch);
+        }
+        break;
+    case Engines::EngineTypes::KeplerMemory:
+        if (method < engine.execution_mask.size() && engine.execution_mask[method]) {
+            split.NoteUnboundedWrite(Producer::Upload);
+        }
+        break;
+    case Engines::EngineTypes::Fermi2D:
+        if (method >= MacroRegistersStart ||
+            (method < engine.execution_mask.size() && engine.execution_mask[method])) {
+            split.NoteUnboundedWrite(Producer::Copy);
+        }
+        break;
+    default:
+        break;
     }
 }
 

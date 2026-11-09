@@ -132,6 +132,23 @@ void GpuSplit::MaybeStart(Core::System& system_) {
     // Fixed until the next start: the back decodes both encodings, the front writes one.
     ir = V2::On(V2::Switch::Ir);
     ir_verify = V2::Verify(V2::Switch::Ir);
+    acquire_mode = V2::Get(V2::Switch::Acquire);
+    hazard_mode = V2::Get(V2::Switch::Hazard);
+    tracks_writes = acquire_mode != V2::Mode::Off || hazard_mode != V2::Mode::Off;
+    feed_idle_back = acquire_mode != V2::Mode::Off;
+    hazards.Clear();
+    // AnyPS5's hand-off spin (HandoffSpin.hpp): spin before a kernel wait only with more than 8
+    // logical CPUs, where the waiting thread does not take the other one's core.
+    spin_window = V2::On(V2::Switch::Spin);
+    if (spin_window) {
+        u64 microseconds = 150;
+        if (const char* value = std::getenv("EDEN_NX2_V2_SPIN_US")) {
+            microseconds = std::strtoull(value, nullptr, 10);
+        }
+        spin_window_ns = std::thread::hardware_concurrency() > 8 ? microseconds * 1000 : 0;
+        LOG_INFO(HW_GPU, "GPU thread split: hand-off spin window {} us ({} logical CPUs)",
+                 spin_window_ns / 1000, std::thread::hardware_concurrency());
+    }
     LOG_INFO(HW_GPU, "GPU thread split: engine methods run on a second thread{}{}",
              front_macros ? ", macros on the first" : "",
              ir ? (ir_verify ? ", typed IR (verified)" : ", typed IR") : "");
@@ -165,6 +182,13 @@ void GpuSplit::Stop() {
     ir_sequence = 0;
     ir_run = nullptr;
     ir_run_words = 0;
+    tracks_writes = false;
+    feed_idle_back = false;
+    spin_window = false;
+    acquire_mode = V2::Mode::Off;
+    hazard_mode = V2::Mode::Off;
+    hazards.Clear();
+    back_idle_at.store(~u64{0}, std::memory_order_relaxed);
     back_sequence = 0;
     consumed_sequence.store(0, std::memory_order_relaxed);
     published.store(0, std::memory_order_relaxed);
@@ -277,8 +301,25 @@ bool GpuSplit::WaitFor(u64 target, DrainSite site) {
     }
 }
 
+bool GpuSplit::SpinWindowOpen(u32 spins, u64& start) const {
+    // Without spinning: a few hundred pauses for a back that is about to finish, then sleep.
+    if (spin_window_ns == 0) {
+        return spins < 256;
+    }
+    if (spins == 0) {
+        start = Nx2Profile::Now();
+        return true;
+    }
+    return (spins & 63) != 0 || Nx2Profile::Now() - start < spin_window_ns;
+}
+
 void GpuSplit::Backoff(u32 spins, u64 target) {
-    if (spins < 16384) {
+    if (spin_window) [[unlikely]] {
+        if (SpinWindowOpen(spins, front_spin_start)) {
+            Pause();
+            return;
+        }
+    } else if (spins < 16384) {
         Pause();
         return;
     }
@@ -582,15 +623,22 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
         u64 available = published.load(std::memory_order_acquire);
         if (available == read_position) {
             Nx2Profile::Scope scope{Nx2Profile::Zone::SplitWait};
+            if (feed_idle_back) [[unlikely]] {
+                // The front publishes what it holds after a few more words from now on.
+                back_idle_at.store(read_position, std::memory_order_relaxed);
+            }
             // The front usually sends more within microseconds: spin briefly before sleeping.
-            for (u32 spins = 0; spins < 8192 && available == read_position &&
-                                !hook_requested.load(std::memory_order_relaxed);
+            u64 spin_start = 0;
+            for (u32 spins = 0;
+                 (spin_window ? SpinWindowOpen(spins, spin_start) : spins < 8192) &&
+                 available == read_position && !hook_requested.load(std::memory_order_relaxed);
                  ++spins) {
                 Pause();
                 available = published.load(std::memory_order_acquire);
             }
             if (available == read_position && idle_hook != nullptr) {
                 hook_requested.store(false, std::memory_order_seq_cst);
+                ServeCpuLane();
                 idle_hook(idle_argument);
                 available = published.load(std::memory_order_acquire);
             }
@@ -618,6 +666,8 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
             if (hook_requested.load(std::memory_order_relaxed) &&
                 idle_hook != nullptr) [[unlikely]] {
                 hook_requested.store(false, std::memory_order_seq_cst);
+                // EDEN_NX2_V2_CPULANE: a guest CPU flush runs here, after the current entry.
+                ServeCpuLane();
                 idle_hook(idle_argument);
             }
             // Hand ring space back now and then while working through a long batch, and at once

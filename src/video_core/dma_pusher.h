@@ -22,6 +22,7 @@
 #include "common/scratch_buffer.h"
 #include "video_core/engines/engine_interface.h"
 #include "video_core/engines/puller.h"
+#include "video_core/v2/front_writes.h"
 
 namespace Core {
 class System;
@@ -189,6 +190,10 @@ public:
 private:
     friend struct DmaPusherTestAccess;
 
+    /// EDEN_NX2_V2_ACQUIRE/HAZARD: records the guest memory writes of an engine method just sent
+    /// to the split's back (GpuSplit::TracksWrites). `writer`: IsMemoryWriter.
+    void NoteTrackedWrite(Engines::EngineInterface& engine, Engines::EngineTypes type, u32 method,
+                          u32 argument, bool writer);
     static bool IsMemoryWriter(const Engines::EngineInterface& engine, Engines::EngineTypes type,
                                u32 method);
 
@@ -299,6 +304,8 @@ public:
     GPUVAddr split_method_end{}; ///< End of the last entry that ended inside a method
 
     std::array<Engines::EngineInterface*, max_subchannels> subchannels{};
+    /// The copy engine's registers its launches read, as sent (NoteTrackedWrite).
+    VideoCommon::V2::DmaWriteTracker dma_writes;
     std::array<Engines::EngineTypes, max_subchannels> subchannel_type;
 
     Engines::Puller puller;

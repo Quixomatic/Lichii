@@ -38,6 +38,7 @@
 #endif
 #include "video_core/rasterizer_interface.h"
 #include "video_core/textures/decoders.h"
+#include "video_core/v2/front_writes.h"
 #include "video_core/v2/regsem_3d.h"
 
 namespace Tegra::Engines {
@@ -1604,6 +1605,9 @@ void KeplerCompute::FrontCallMethod(Core::System& system, VideoCommon::GpuSplit&
     }
     FrontApply(fs, method, argument);
     split.Method(this, method, argument, is_last_call, segment);
+    if (method == 0x6c3 && split.TracksWrites()) [[unlikely]] {
+        VideoCommon::V2::NoteReportCompute(split, memory_manager, fs.registers.data(), argument);
+    }
 }
 
 void KeplerCompute::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit& split,
@@ -1622,6 +1626,13 @@ void KeplerCompute::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuS
         }
     }
     split.MultiMethod(this, method, base_start, amount, methods_pending, segment);
+    if (method == 0x6c3 && split.TracksWrites()) [[unlikely]] {
+        // Each word triggers one; the registers it reads are not among these words.
+        for (u32 i = 0; i < amount; ++i) {
+            VideoCommon::V2::NoteReportCompute(split, memory_manager, fs.registers.data(),
+                                               base_start[i]);
+        }
+    }
 }
 
 void KeplerCompute::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split,
@@ -1643,6 +1654,9 @@ void KeplerCompute::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& s
         }
         FrontApply(fs, address, value);
         split.MacroWrite(this, address, value);
+        if (address == 0x6c3 && split.TracksWrites()) [[unlikely]] {
+            VideoCommon::V2::NoteReportCompute(split, memory_manager, fs.registers.data(), value);
+        }
         return true;
     };
 #ifdef ARCHITECTURE_x86_64
