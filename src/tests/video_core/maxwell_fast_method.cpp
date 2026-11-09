@@ -1278,6 +1278,41 @@ TEST_CASE("V2 front Draw records predict every draw the back performs",
     }
 }
 
+// Fix pass 1 (Ocarina of Time, "dispatches N in 0 windows, N unexpected"): the back's executor
+// must open the dispatch window for a Dispatch record it runs (only the never-called
+// IrExec::IsInformational did).
+TEST_CASE("V2 IR dispatch records open the check's window on the back",
+          "[video_core][v2_ir][maxwell_fast_method]") {
+    namespace Ir = VideoCommon::V2::Ir;
+    namespace IrCheck = VideoCommon::V2::IrCheck;
+    using Access = VideoCommon::GpuSplitTestAccess;
+    Fixture f;
+    f.system.Initialize();
+    VideoCommon::GpuSplit split;
+    Access::Initialize(split, f.system);
+    Access::SetIr(split, true);
+    Access::SetDrawRecords(split, true);
+    Ir::DispatchBody body{};
+    body.method = 0x107;
+    body.min_dispatches = 1;
+    body.max_dispatches = ~0U;
+    split.Note(Ir::Kind::Dispatch, body);
+    split.Publish();
+    Access::SetBackThread(true);
+    u64 read = 0;
+    while (read != Access::End(split)) {
+        read = Access::Execute(split, read, Access::End(split));
+    }
+    IrCheck::NoteDispatch(0x1000); // the launch the record predicted
+    Access::SetBackThread(false);
+    const IrCheck::Counters counters = IrCheck::GetCounters();
+    CHECK(counters.dispatch_windows == 1);
+    CHECK(counters.dispatches == 1);
+    CHECK(counters.dispatches_unexpected == 0);
+    CHECK(Access::IrBadRecords(split) == 0);
+    IrCheck::Stop();
+}
+
 TEST_CASE("V2 draw trigger table and the back's draw/dispatch checks",
           "[video_core][v2_ir]") {
     namespace Ir = VideoCommon::V2::Ir;

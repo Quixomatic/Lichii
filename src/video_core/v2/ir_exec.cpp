@@ -164,10 +164,6 @@ void Draw(const Ir::RecordView& record, const Ir::DrawBody& body, const Context&
 bool IsInformational(const Ir::RecordView& record) {
     switch (record.kind) {
     case Ir::Kind::Dispatch:
-        if (IrCheck::g_active) {
-            IrCheck::NoteDispatchRecord(record.As<Ir::DispatchBody>());
-        }
-        return true;
     case Ir::Kind::Copy:
     case Ir::Kind::Acquire:
         return true;
@@ -225,6 +221,13 @@ bool Execute(const Ir::RecordView& record, const Context& context) {
         Draw(record, record.As<Ir::DrawBody>(), context);
         return true;
     case Ir::Kind::Dispatch:
+        // EDEN_NX2_V2_IR_DRAWS verify: the window the next records' dispatches count in (Fix
+        // pass 1: only the never-called IsInformational noted it, so no window ever opened and
+        // every dispatch the back performed counted as unexpected).
+        if (IrCheck::g_active) {
+            IrCheck::NoteDispatchRecord(record.As<Ir::DispatchBody>());
+        }
+        return true;
     case Ir::Kind::Copy:
     case Ir::Kind::Acquire:
     case Ir::Kind::Present:
