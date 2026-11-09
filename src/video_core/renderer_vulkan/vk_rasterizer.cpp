@@ -3273,7 +3273,10 @@ void RasterizerVulkan::OnCacheInvalidation(DAddr addr, u64 size) {
                 .kind = VideoCommon::V2::Commit::ExternalKind::CacheInvalidate,
             },
             [&] { InvalidateRegionCaches(addr, size, VideoCommon::CacheType::All); });
-        pipeline_cache.InvalidateRegion(addr, size);
+        // U-11: pages that never held a program skip the shader cache's lock.
+        if (pipeline_cache.page_filter.Any(addr, size)) {
+            pipeline_cache.InvalidateRegion(addr, size);
+        }
         return;
     }
 
@@ -3307,7 +3310,7 @@ bool RasterizerVulkan::TryCacheInvalidation(DAddr addr, u64 size) {
                 texture_cache.WriteMemory(addr, size);
                 buffer_cache.WriteMemory(addr, size);
             });
-            if (done) {
+            if (done && pipeline_cache.page_filter.Any(addr, size)) {
                 pipeline_cache.InvalidateRegion(addr, size);
             }
             return done;
@@ -3324,7 +3327,9 @@ bool RasterizerVulkan::TryCacheInvalidation(DAddr addr, u64 size) {
                 .kind = VideoCommon::V2::Commit::ExternalKind::CacheInvalidate,
             },
             [&] { InvalidateRegionCaches(addr, size, VideoCommon::CacheType::All); });
-        pipeline_cache.InvalidateRegion(addr, size);
+        if (pipeline_cache.page_filter.Any(addr, size)) {
+            pipeline_cache.InvalidateRegion(addr, size);
+        }
         return true;
     }
     {
