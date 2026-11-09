@@ -806,6 +806,16 @@ void Scheduler::RequestOutsideRenderPassOperationContext(std::source_location lo
     }
 }
 
+bool Scheduler::BeginBufferOperation(std::source_location location) {
+    if (state.renderpass) {
+        CountRenderPassEnd(location.file_name(), location.line());
+    }
+    EndRenderPass();
+    const bool saved = std::exchange(targeted_scope, true);
+    UpdateAutoFlush();
+    return saved;
+}
+
 void Scheduler::RequestOutsideRenderPassForDispatch(std::source_location location) {
     if (!track_barriers) {
         RequestOutsideRenderPassOperationContext(location);

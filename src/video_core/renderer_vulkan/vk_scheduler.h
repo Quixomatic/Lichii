@@ -158,16 +158,14 @@ public:
             Record(std::forward<T>(command));
             return;
         }
-        if (state.renderpass) {
-            CountRenderPassEnd(location.file_name(), location.line());
-        }
-        EndRenderPass();
-        const bool saved = std::exchange(targeted_scope, true);
-        UpdateAutoFlush();
+        const bool saved = BeginBufferOperation(location);
         Record(std::forward<T>(command));
         targeted_scope = saved;
         UpdateAutoFlush();
     }
+    /// RecordBufferOperation's start with the tracker: ends the pass, opens the targeted scope
+    /// and returns the scope's previous state.
+    bool BeginBufferOperation(std::source_location location);
     /// Dispatches: ends a pass without flushing the tracked writes (the dispatch's own barrier
     /// orders its reads).
     void RequestOutsideRenderPassForDispatch(
