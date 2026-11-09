@@ -4521,6 +4521,7 @@ void RasterizerVulkan::UpdateDynamicStates(const GraphicsPipeline* pipeline) {
 
     if (device.IsExtExtendedDynamicState3EnablesSupported()) {
         using namespace Tegra::Engines;
+        bool logic_op_enable = regs.logic_op.enable != 0;
         // AMD Workaround: LogicOp incompatible with float render targets
         if (device.GetDriverID() == VkDriverIdKHR::VK_DRIVER_ID_AMD_OPEN_SOURCE ||
             device.GetDriverID() == VkDriverIdKHR::VK_DRIVER_ID_AMD_PROPRIETARY) {
@@ -4530,17 +4531,24 @@ void RasterizerVulkan::UpdateDynamicStates(const GraphicsPipeline* pipeline) {
                     return attrib.type == Maxwell3D::Regs::VertexAttribute::Type::Float;
                 }
             );
-            if (regs.logic_op.enable) {
-                if (VideoCommon::V2::TrackGroups()) [[unlikely]] {
-                    // A register write outside the engine: the group tracker must see it.
-                    VideoCommon::V2::RegSem::NoteWrite3D(
-                        maxwell3d->v2_groups, MAXWELL3D_REG_INDEX(logic_op),
-                        regs.logic_op.enable, static_cast<u32>(!has_float));
+            if (logic_op_enable) {
+                if (VideoCommon::V2::On(VideoCommon::V2::Switch::RegSem)) [[unlikely]] {
+                    // Pipeline v2 (G3): the effective enable, the guest register untouched (the
+                    // front owns the registers; a back-only write would hide from it).
+                    logic_op_enable = !has_float;
+                } else {
+                    if (VideoCommon::V2::TrackGroups()) [[unlikely]] {
+                        // A register write outside the engine: the group tracker must see it.
+                        VideoCommon::V2::RegSem::NoteWrite3D(
+                            maxwell3d->v2_groups, MAXWELL3D_REG_INDEX(logic_op),
+                            regs.logic_op.enable, static_cast<u32>(!has_float));
+                    }
+                    regs.logic_op.enable = static_cast<u32>(!has_float);
+                    logic_op_enable = !has_float;
                 }
-                regs.logic_op.enable = static_cast<u32>(!has_float);
             }
         }
-        UpdateLogicOpEnable(regs);
+        UpdateLogicOpEnable(logic_op_enable);
         UpdateDepthClampEnable(regs);
         UpdateLineRasterizationMode(regs);
         UpdateLineStippleEnable(regs);
@@ -5058,16 +5066,19 @@ void RasterizerVulkan::UpdateDepthBiasEnable(Tegra::Engines::Maxwell3D::Regs& re
     scheduler.Record([enable](vk::CommandBuffer cmdbuf) { cmdbuf.SetDepthBiasEnableEXT(enable != 0); });
 }
 
-void RasterizerVulkan::UpdateLogicOpEnable(Tegra::Engines::Maxwell3D::Regs& regs) {
-    if (!state_tracker.TouchLogicOpEnable()) {
+void RasterizerVulkan::UpdateLogicOpEnable(bool enable) {
+    // Pipeline v2: the effective enable also follows the vertex formats (AMD), not only its
+    // register, so a change of it records too.
+    const bool touched = state_tracker.TouchLogicOpEnable();
+    if (!touched && (enable == logic_op_enable_recorded ||
+                     !VideoCommon::V2::On(VideoCommon::V2::Switch::RegSem))) {
         return;
     }
     if (!device.SupportsDynamicState3LogicOpEnable()) {
         return;
     }
-    scheduler.Record([enable = regs.logic_op.enable](vk::CommandBuffer cmdbuf) {
-        cmdbuf.SetLogicOpEnableEXT(enable != 0);
-    });
+    logic_op_enable_recorded = enable;
+    scheduler.Record([enable](vk::CommandBuffer cmdbuf) { cmdbuf.SetLogicOpEnableEXT(enable); });
 }
 
 void RasterizerVulkan::UpdateDepthClampEnable(Tegra::Engines::Maxwell3D::Regs& regs) {

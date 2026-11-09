@@ -290,7 +290,7 @@ private:
     void UpdateLineStipple(Tegra::Engines::Maxwell3D::Regs& regs);
     void UpdateLineRasterizationMode(Tegra::Engines::Maxwell3D::Regs& regs);
     void UpdateDepthBiasEnable(Tegra::Engines::Maxwell3D::Regs& regs);
-    void UpdateLogicOpEnable(Tegra::Engines::Maxwell3D::Regs& regs);
+    void UpdateLogicOpEnable(bool enable);
     void UpdateDepthClampEnable(Tegra::Engines::Maxwell3D::Regs& regs);
     void UpdateAlphaToCoverageEnable(Tegra::Engines::Maxwell3D::Regs& regs);
     void UpdateAlphaToOneEnable(Tegra::Engines::Maxwell3D::Regs& regs);
@@ -513,6 +513,7 @@ private:
     /// a second lookup), valid while cont_lookup_valid.
     GraphicsPipeline* cont_lookup{};
     bool cont_lookup_valid{};
+    bool logic_op_enable_recorded{}; ///< The last SetLogicOpEnableEXT value (UpdateLogicOpEnable)
     /// Serial() when TakeReusableDraw took a continued draw (register changes allowed).
     u64 cont_take_serial{};
     /// The delta TakeReusableDraw took, kept for the relevance stats.

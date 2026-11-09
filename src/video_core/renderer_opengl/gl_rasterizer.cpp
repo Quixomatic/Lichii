@@ -29,6 +29,7 @@
 #include "video_core/renderer_opengl/gl_shader_cache.h"
 #include "video_core/renderer_opengl/gl_staging_buffer_pool.h"
 #include "video_core/renderer_opengl/gl_texture_cache.h"
+#include "video_core/v2/v2_switches.h"
 #include "video_core/renderer_opengl/maxwell_to_gl.h"
 #include "video_core/renderer_opengl/renderer_opengl.h"
 #include "video_core/shader_cache.h"
@@ -1217,6 +1218,7 @@ void RasterizerOpenGL::SyncLogicOpState() {
 
     auto& regs = maxwell3d->regs;
 
+    bool enable = regs.logic_op.enable != 0;
     if (device.IsAmd()) {
         using namespace Tegra::Engines;
 
@@ -1228,10 +1230,14 @@ void RasterizerOpenGL::SyncLogicOpState() {
             }
         );
 
-        regs.logic_op.enable = static_cast<u32>(!has_float);
+        // Pipeline v2 (G3): the effective value only; the guest register is the front's.
+        if (!VideoCommon::V2::On(VideoCommon::V2::Switch::RegSem)) {
+            regs.logic_op.enable = static_cast<u32>(!has_float);
+        }
+        enable = !has_float;
     }
 
-    if (regs.logic_op.enable) {
+    if (enable) {
         glEnable(GL_COLOR_LOGIC_OP);
         glLogicOp(MaxwellToGL::LogicOp(regs.logic_op.op));
     } else {
