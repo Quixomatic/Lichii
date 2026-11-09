@@ -154,4 +154,24 @@ private:
     size_t next = 0;
 };
 
+/// The split front's model and forwarded inline QMDs (front thread only; one table for every
+/// channel, as the back's).
+[[nodiscard]] inline Model& FrontModel() {
+    static Model model;
+    return model;
+}
+[[nodiscard]] inline InlineQmds& FrontInline() {
+    static InlineQmds inline_qmds;
+    return inline_qmds;
+}
+
+/// The front drained (the back is idle and has run everything): an unknown model resyncs from
+/// the back's table, and every inline QMD sent is in memory now.
+inline void OnDrain() {
+    if (!FrontModel().Valid()) {
+        FrontModel().Resync(Scheduler::BackTable());
+    }
+    FrontInline().Clear();
+}
+
 } // namespace VideoCommon::V2::QmdFront

@@ -302,6 +302,12 @@ private:
     void FrontDispatchRecord(VideoCommon::GpuSplit& split, FrontState& state, u32 method,
                              const u32* arguments, u32 amount);
     void FrontNoteInlineQmd(VideoCommon::GpuSplit& split, FrontState& state);
+    /// EDEN_NX2_V2_QMDSCHED: runs the front's QMD scheduler model on the signals of a write.
+    void FrontModelQmd(VideoCommon::GpuSplit& split, FrontState& state, u32 method,
+                       const u32* arguments, u32 amount);
+    /// The storage buffer ranges a QMD's program writes (false: unknown, unbounded).
+    bool FrontQmdWriteRanges(VideoCommon::GpuSplit& split, const u32* qmd,
+                             std::vector<std::pair<GPUVAddr, u64>>& out);
     std::unique_ptr<FrontState> front;
     bool front_macros{}; ///< The front owns the macro code and bindings (the back skips them)
 

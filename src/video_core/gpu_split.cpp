@@ -30,6 +30,8 @@
 #include "video_core/nx2.h"
 #include "video_core/nx2_fast_draw.h"
 #include "video_core/nx2_profile.h"
+#include "video_core/v2/p5b_stats.h"
+#include "video_core/v2/qmd_front.h"
 #include "video_core/v2/ir_check.h"
 #include "video_core/v2/ir_exec.h"
 #include "video_core/v2/v2_stats.h"
@@ -302,6 +304,13 @@ void GpuSplit::Drain(DrainSite site) {
                 V2::Stats::NoteDrain(site, start);
             }
             V2::Versions::HookEpoch(V2::Versions::EpochReason::Wait);
+            if (V2::On(V2::Switch::QmdSched)) [[unlikely]] {
+                const bool resync = !V2::QmdFront::FrontModel().Valid();
+                V2::QmdFront::OnDrain();
+                if (resync) {
+                    V2::P5bStats::Add(V2::P5bStats::Counter::QmdResyncs);
+                }
+            }
             return;
         }
         Backoff(spins, write_position);

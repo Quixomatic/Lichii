@@ -4,6 +4,7 @@
 // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <deque>
 #include <algorithm>
 #include <atomic>
 #include <bit>
@@ -38,6 +39,8 @@
 #endif
 #include "video_core/rasterizer_interface.h"
 #include "video_core/textures/decoders.h"
+#include "video_core/v2/p5b_stats.h"
+#include "video_core/v2/qmd_front.h"
 #include "video_core/v2/front_writes.h"
 #include "common/scope_exit.h"
 #include "video_core/v2/shader_writes.h"
@@ -1609,6 +1612,17 @@ struct KeplerCompute::FrontState {
     std::optional<std::pair<GPUVAddr, u64>> v2_upload; ///< The upload being sent (P2)
     /// EDEN_NX2_V2_REGSEM=1: compute register groups and fingerprints of `registers`.
     VideoCommon::V2::ComputeGroupTracker v2_groups;
+    /// EDEN_NX2_V2_QMDSCHED: on (1) or checked (verify: exact Dispatch records, old hazard
+    /// notes). Needs the front's write tracking (EDEN_NX2_V2_ACQUIRE or _HAZARD).
+    VideoCommon::V2::Mode qmd_model{};
+    struct QmdSignal {
+        bool valid{};
+        u32 dispatches{};
+        bool unbounded{}; ///< a launched QMD writes where the front can't bound it
+        std::vector<std::pair<GPUVAddr, u64>> writes;   ///< storage buffer ranges
+        std::vector<std::pair<GPUVAddr, u64>> releases; ///< release words
+    };
+    std::deque<QmdSignal> qmd_signals; ///< this write's signals, consumed by the notes
 };
 
 KeplerCompute::FrontState& KeplerCompute::Front(VideoCommon::GpuSplit& split) {
@@ -1625,6 +1639,13 @@ KeplerCompute::FrontState& KeplerCompute::Front(VideoCommon::GpuSplit& split) {
         front->bind_pointer = native_bind_pointer;
         front->macro = native_macro;
         front_macros = true;
+        front->qmd_model = split.TracksWrites()
+                               ? VideoCommon::V2::Get(VideoCommon::V2::Switch::QmdSched)
+                               : VideoCommon::V2::Mode::Off;
+        if (front->qmd_model != VideoCommon::V2::Mode::Off) {
+            // Drained above: the back's table is current.
+            VideoCommon::V2::QmdFront::FrontModel().Resync(Tegra::NativeQmdScheduler::BackTable());
+        }
         front->v2_mode = VideoCommon::V2::Get(VideoCommon::V2::Switch::RegSem);
         if (front->v2_mode == VideoCommon::V2::Mode::Verify) [[unlikely]] {
             front->v2_mirror = std::make_unique<VideoCommon::V2::RegSem::MirrorCompute>();
@@ -1787,6 +1808,9 @@ void KeplerCompute::FrontCallMethod(Core::System& system, VideoCommon::GpuSplit&
         return;
     }
     FrontApply(fs, method, argument);
+    if (fs.qmd_model != VideoCommon::V2::Mode::Off) [[unlikely]] {
+        FrontModelQmd(split, fs, method, &argument, 1);
+    }
     if (split.DrawRecords()) [[unlikely]] {
         FrontDispatchRecord(split, fs, method, &argument, 1);
     }
@@ -1806,6 +1830,10 @@ void KeplerCompute::FrontDispatchRecord(VideoCommon::GpuSplit& split, FrontState
     Ir::DispatchBody body{};
     body.method = method;
     body.max_dispatches = 0;
+    size_t model_index = 0;
+    u32 exact_sum = 0;
+    bool inexact = false;
+    bool any_signal = false;
     for (u32 i = 0; i < amount; ++i) {
         const u32 argument = arguments[i];
         body.argument = argument;
@@ -1820,22 +1848,31 @@ void KeplerCompute::FrontDispatchRecord(VideoCommon::GpuSplit& split, FrontState
             body.max_dispatches = ~0U;
             break;
         case 0xaf:
-            if ((argument & 2) == 0) {
+        case 0xb0: {
+            if (method == 0xaf ? (argument & 2) == 0
+                               : ((argument & 15) == 0 || (argument & 15) == 1)) {
                 continue;
             }
             body.qmd_address = GPUVAddr{r[0xad]} << 8;
-            body.max_dispatches = ~0U;
-            break;
-        case 0xb0:
-            if ((argument & 15) == 0 || (argument & 15) == 1) {
-                continue;
+            // EDEN_NX2_V2_QMDSCHED: the front's model knows how many QMDs launch.
+            if (model_index < fs.qmd_signals.size() && fs.qmd_signals[model_index].valid) {
+                exact_sum += fs.qmd_signals[model_index].dispatches;
+            } else {
+                inexact = true;
             }
-            body.qmd_address = GPUVAddr{r[0xad]} << 8;
+            any_signal = true;
             body.max_dispatches = ~0U;
+            ++model_index;
             break;
+        }
         default:
             continue;
         }
+    }
+    if (any_signal && !inexact && fs.qmd_model != VideoCommon::V2::Mode::Off) {
+        // Exact (EDEN_NX2_V2_QMDSCHED): a signal that launches nothing needs no record.
+        body.min_dispatches = exact_sum;
+        body.max_dispatches = exact_sum;
     }
     if (body.max_dispatches == 0) {
         return;
@@ -1876,11 +1913,38 @@ void KeplerCompute::FrontNoteWrites(VideoCommon::GpuSplit& split, FrontState& fs
         return;
     case 0xae:
     case 0xaf:
-    case 0xb0:
+    case 0xb0: {
+        const bool runs = !(method == 0xae || (method == 0xaf && !(argument & 2)) ||
+                            (method == 0xb0 && ((argument & 15) == 0 || (argument & 15) == 1)));
+        if (runs && fs.qmd_model == VideoCommon::V2::Mode::On && !fs.qmd_signals.empty())
+            [[unlikely]] {
+            // EDEN_NX2_V2_QMDSCHED: the QMDs this signal launches, as the front's model knows
+            // them: their storage ranges and release words instead of unbounded writes.
+            FrontState::QmdSignal signal = std::move(fs.qmd_signals.front());
+            fs.qmd_signals.pop_front();
+            if (signal.valid) {
+                if (signal.unbounded) {
+                    split.NoteUnboundedWrite(Producer::Dispatch);
+                } else {
+                    for (const auto& [address, size] : signal.writes) {
+                        VideoCommon::V2::NoteRangeWriteGpu(split, memory_manager, address, size,
+                                                           Producer::Dispatch);
+                    }
+                }
+                for (const auto& [address, size] : signal.releases) {
+                    VideoCommon::V2::NoteRangeWriteGpu(split, memory_manager, address, size,
+                                                       Producer::QmdRelease);
+                }
+                VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::QmdBoundedWrites,
+                                               signal.writes.size() + signal.releases.size());
+                return;
+            }
+        }
         // QMD signals: the scheduler launches QMDs from memory the front doesn't read.
         split.NoteUnboundedWrite(Producer::Dispatch);
         split.NoteUnboundedWrite(Producer::QmdRelease);
         return;
+    }
     case 0x45: // Macro code and bindings
     case 0x46:
     case 0x47:
@@ -1893,6 +1957,127 @@ void KeplerCompute::FrontNoteWrites(VideoCommon::GpuSplit& split, FrontState& fs
         }
         return;
     }
+}
+
+void KeplerCompute::FrontModelQmd(VideoCommon::GpuSplit& split, FrontState& fs, u32 method,
+                                  const u32* arguments, u32 amount) {
+    namespace QmdFront = VideoCommon::V2::QmdFront;
+    namespace P5b = VideoCommon::V2::P5bStats;
+    using Descriptor = Tegra::NativeQmdScheduler::Descriptor;
+    const u32* const r = fs.registers.data();
+    if (method == 0x107) {
+        // An inline QMD stored for a later signal (or launched now: then its words are in memory
+        // before any signal names it, the same either way).
+        Descriptor words{};
+        std::copy_n(r + 0xc8, words.size(), words.begin());
+        QmdFront::FrontInline().Note(((GPUVAddr{r[0xc6]} << 32) | r[0xc7]) << 8, words);
+        return;
+    }
+    if (method != 0xae && method != 0xaf && method != 0xb0) {
+        return;
+    }
+    fs.qmd_signals.clear();
+    auto& model = QmdFront::FrontModel();
+    for (u32 i = 0; i < amount; ++i) {
+        const u32 argument = arguments[i];
+        if (method == 0xae || (method == 0xaf && !(argument & 2)) ||
+            (method == 0xb0 && ((argument & 15) == 0 || (argument & 15) == 1))) {
+            continue; // The back skips these too
+        }
+        FrontState::QmdSignal& signal = fs.qmd_signals.emplace_back();
+        const GPUVAddr qmd_address = GPUVAddr{r[0xad]} << 8;
+        const auto read = [&](u64 address, Descriptor& descriptor) {
+            if (const Descriptor* forwarded = QmdFront::FrontInline().Find(address)) {
+                descriptor = *forwarded;
+                return QmdFront::ReadResult::Ok;
+            }
+            if (!memory_manager.IsFullyMappedRange(address, sizeof(descriptor))) {
+                return QmdFront::ReadResult::Unmapped;
+            }
+            const auto device = memory_manager.GpuToCpuAddress(address);
+            if (!device || !memory_manager.IsContinuousRange(address, sizeof(descriptor)) ||
+                Tegra::Nx2MayBeGpuWritten(*device, sizeof(descriptor))) {
+                return QmdFront::ReadResult::Unknown;
+            }
+            memory_manager.ReadBlockUnsafe(address, descriptor.data(), sizeof(descriptor));
+            // Queued writes (copies, uploads, dispatches) that may change these words: unknown.
+            const auto pending =
+                split.FindWrites(*device, sizeof(descriptor), VideoCommon::V2::HazardFilter{},
+                                 reinterpret_cast<u8*>(descriptor.data()));
+            return pending.kind == VideoCommon::V2::HazardResult::Kind::Wait
+                       ? QmdFront::ReadResult::Unknown
+                       : QmdFront::ReadResult::Ok;
+        };
+        const auto mapped = [&](u64 address, u64 size) {
+            return memory_manager.IsFullyMappedRange(address, size);
+        };
+        const auto on_dispatch = [&](u64, const Descriptor& qmd) {
+            if (!signal.unbounded && !FrontQmdWriteRanges(split, qmd.data(), signal.writes)) {
+                signal.unbounded = true;
+            }
+        };
+        const auto on_release = [&](u64 address, u32, u32 flags) {
+            signal.releases.emplace_back(address, (flags >> 30) == 0 ? 16U : 4U);
+        };
+        const auto result = model.Signal(qmd_address, argument, read, mapped, on_dispatch,
+                                         on_release);
+        signal.valid = result.valid;
+        signal.dispatches = result.dispatches;
+        if (P5b::Enabled()) {
+            P5b::Add(P5b::Counter::QmdSignals);
+            P5b::Add(result.valid ? P5b::Counter::QmdExact : P5b::Counter::QmdUnknown);
+            P5b::Add(P5b::Counter::QmdDispatches, result.dispatches);
+            if (!result.valid && model.Invalidations() != 0) {
+                P5b::Add(P5b::Counter::QmdInvalidations, model.Valid() ? 0 : 1);
+            }
+        }
+    }
+}
+
+bool KeplerCompute::FrontQmdWriteRanges(VideoCommon::GpuSplit& split, const u32* qmd,
+                                        std::vector<std::pair<GPUVAddr, u64>>& out) {
+    // As FrontNoteInlineQmd: the program's storage buffer stores, bounded by the descriptors in
+    // the QMD's constant buffers when no queued write can change them.
+    namespace V2 = VideoCommon::V2;
+    using V2::Producer;
+    const GPUVAddr program = (GPUVAddr{qmd[49] & 0x1ffff} << 32) | qmd[48];
+    const auto program_device = memory_manager.GpuToCpuAddress(program);
+    const auto summary = program_device ? V2::ShaderWrites::Lookup(*program_device)
+                                        : std::optional<V2::ShaderWrites::Summary>{};
+    if (!summary || summary->unbounded) {
+        return false;
+    }
+    V2::HazardFilter descriptor_filter;
+    descriptor_filter.unbounded = V2::ProducerBit(Producer::Upload) |
+                                  V2::ProducerBit(Producer::Copy) |
+                                  V2::ProducerBit(Producer::Dispatch) |
+                                  V2::ProducerBit(Producer::Draw);
+    for (u32 i = 0; i < summary->num_storage; ++i) {
+        const auto& storage = summary->storage[i];
+        if (storage.cbuf_index >= NumConstBuffers || ((qmd[20] >> storage.cbuf_index) & 1) == 0) {
+            return false;
+        }
+        const u32 high = qmd[33 + storage.cbuf_index * 2];
+        const GPUVAddr cbuf = (GPUVAddr{high & 0xff} << 32) | qmd[32 + storage.cbuf_index * 2];
+        const u32 cbuf_size = ((high >> 19) & 0x1fff) << 4;
+        for (u32 element = 0; element < storage.count; ++element) {
+            const u32 offset = storage.cbuf_offset + element * 16;
+            const auto device = memory_manager.GpuToCpuAddress(cbuf + offset);
+            if (offset + 16 > cbuf_size || !device || out.size() >= 64) {
+                return false;
+            }
+            std::array<u32, 4> descriptor;
+            memory_manager.ReadBlockUnsafe(cbuf + offset, descriptor.data(), sizeof(descriptor));
+            const V2::HazardResult pending =
+                split.FindWrites(*device, sizeof(descriptor), descriptor_filter,
+                                 reinterpret_cast<u8*>(descriptor.data()));
+            if (pending.kind == V2::HazardResult::Kind::Wait) {
+                return false;
+            }
+            out.emplace_back((GPUVAddr{descriptor[1]} << 32) | descriptor[0], descriptor[2]);
+        }
+    }
+    return true;
 }
 
 void KeplerCompute::FrontNoteInlineQmd(VideoCommon::GpuSplit& split, FrontState& fs) {
@@ -1977,6 +2162,9 @@ void KeplerCompute::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuS
             FrontApply(fs, method, base_start[i]);
         }
     }
+    if (fs.qmd_model != VideoCommon::V2::Mode::Off) [[unlikely]] {
+        FrontModelQmd(split, fs, method, base_start, amount);
+    }
     if (split.DrawRecords()) [[unlikely]] {
         FrontDispatchRecord(split, fs, method, base_start, amount);
     }
@@ -2025,6 +2213,9 @@ void KeplerCompute::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& s
             return false;
         }
         FrontApply(fs, address, value);
+        if (fs.qmd_model != VideoCommon::V2::Mode::Off) [[unlikely]] {
+            FrontModelQmd(split, fs, address, &value, 1);
+        }
         if (split.DrawRecords()) [[unlikely]] {
             FrontDispatchRecord(split, fs, address, &value, 1);
         }
