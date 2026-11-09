@@ -122,6 +122,7 @@ add_library(video_core STATIC
     nx2_profile.h
     nx2_perf.h
     nx2_download_trace.h
+    v2/ir.h
     v2/v2_stats.cpp
     v2/v2_stats.h
     v2/v2_switches.cpp

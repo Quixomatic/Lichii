@@ -49,6 +49,12 @@ void Pause() {
 
 [[maybe_unused]] std::atomic<u32> g_back_thread_id{};
 
+#if defined(_MSC_VER) && !defined(__clang__)
+#define SPLIT_FORCE_INLINE __forceinline
+#else
+#define SPLIT_FORCE_INLINE inline __attribute__((always_inline))
+#endif
+
 } // Anonymous namespace
 
 void GpuSplit::CheckOwner(const char* where) {
@@ -123,8 +129,12 @@ void GpuSplit::MaybeStart(Core::System& system_) {
     ++starts;
     const char* jit = std::getenv("EDEN_NX2_MME_JIT");
     front_macros = mode == '2' && (jit == nullptr || jit[0] != '0');
-    LOG_INFO(HW_GPU, "GPU thread split: engine methods run on a second thread{}",
-             front_macros ? ", macros on the first" : "");
+    // Fixed until the next start: the back decodes both encodings, the front writes one.
+    ir = V2::On(V2::Switch::Ir);
+    ir_verify = V2::Verify(V2::Switch::Ir);
+    LOG_INFO(HW_GPU, "GPU thread split: engine methods run on a second thread{}{}",
+             front_macros ? ", macros on the first" : "",
+             ir ? (ir_verify ? ", typed IR (verified)" : ", typed IR") : "");
 }
 
 void GpuSplit::Stop() {
@@ -150,6 +160,13 @@ void GpuSplit::Stop() {
     front_engine = nullptr;
     back_engine = nullptr;
     front_macros = false;
+    ir = false;
+    ir_verify = false;
+    ir_sequence = 0;
+    ir_run = nullptr;
+    ir_run_words = 0;
+    back_sequence = 0;
+    consumed_sequence.store(0, std::memory_order_relaxed);
     published.store(0, std::memory_order_relaxed);
     consumed.store(0, std::memory_order_relaxed);
     back_waiting.store(false, std::memory_order_relaxed);
@@ -190,6 +207,9 @@ void GpuSplit::WaitForSpace(size_t words) {
 }
 
 void GpuSplit::Publish() {
+    if (ir_run != nullptr) {
+        IrCloseRun();
+    }
     if (published_local == write_position) {
         return;
     }
@@ -278,15 +298,57 @@ void GpuSplit::Backoff(u32 spins, u64 target) {
 
 void GpuSplit::SwitchEngine(Tegra::Engines::EngineInterface* engine) {
     front_engine = engine;
+    if (ir) {
+        constexpr size_t words = V2::Ir::HeaderWords + V2::Ir::BodyWordsOf<V2::Ir::EngineBody>;
+        u64* const record = IrBegin(V2::Ir::Kind::Engine, 1, words, 0);
+        record[V2::Ir::HeaderWords] = reinterpret_cast<u64>(engine);
+        Commit(words);
+        return;
+    }
     u64* const entry = Reserve(2);
     entry[0] = static_cast<u64>(Kind::Engine);
     entry[1] = reinterpret_cast<u64>(engine);
     Commit(2);
 }
 
+void GpuSplit::IrOpenRun(u64 word, const GPUVAddr* segment) {
+    const size_t words = V2::Ir::HeaderWords + (segment != nullptr ? 2 : 1);
+    u64* const record = IrBegin(V2::Ir::Kind::StateRun, 0, words, 0);
+    record[2] = word;
+    if (segment != nullptr) {
+        record[3] = *segment;
+    }
+    ir_run = record;
+    ir_run_words = words;
+    Commit(words);
+}
+
 void GpuSplit::MultiMethod(Tegra::Engines::EngineInterface* engine, u32 method, const u32* words,
                            u32 amount, u32 methods_pending, const GPUVAddr* segment) {
     SelectEngine(engine);
+    if (ir) {
+        // MethodData records, in pieces as below.
+        while (amount > 0) {
+            const u32 piece = std::min(amount, MaxMultiWords);
+            const size_t body = segment != nullptr ? 3 : 2;
+            const size_t head = V2::Ir::HeaderWords + body;
+            const size_t size = head + (piece + 1) / 2;
+            u64* const record = IrBegin(V2::Ir::Kind::MethodData, body, size,
+                                        segment != nullptr ? V2::Ir::HasSegment : 0);
+            const V2::Ir::MethodDataBody data{method & 0xffff, piece, methods_pending, 0};
+            std::memcpy(record + V2::Ir::HeaderWords, &data, sizeof(data));
+            if (segment != nullptr) {
+                record[V2::Ir::HeaderWords + 2] = *segment;
+            }
+            record[size - 1] = 0;
+            std::memcpy(record + head, words, size_t{piece} * sizeof(u32));
+            Commit(size);
+            words += piece;
+            amount -= piece;
+            methods_pending -= piece;
+        }
+        return;
+    }
     // Long runs (constant buffer and inline uploads) go in pieces, as when a method's data
     // continues in the next GPFIFO entry.
     while (amount > 0) {
@@ -317,6 +379,147 @@ void GpuSplit::DeferFunction(std::function<void()>&& func) {
     });
 }
 
+SPLIT_FORCE_INLINE size_t GpuSplit::ExecuteMethod(const u64* entry, size_t words) {
+    const u64 head = entry[0];
+    const u32 method = static_cast<u32>((head >> 8) & 0xffff);
+    const u32 argument = static_cast<u32>(head >> 32);
+    auto* const engine = back_engine;
+    if (engine->fast_maxwell3d) {
+        // Nx2Perf: as below without the profile zones (off with fast_maxwell3d) and the
+        // virtual call.
+        using Tegra::Engines::Maxwell3D;
+        auto* const maxwell3d = static_cast<Maxwell3D*>(engine);
+        constexpr u32 cb_data = MAXWELL3D_REG_INDEX(const_buffer.buffer);
+        if (method - cb_data < 16 && (head & HasSegment) == 0) {
+            // Single constant buffer words in a row (macros write them one by one) go up in
+            // one write. They are executable: each entry would only consume the sink first.
+            std::array<u32, 64> methods;
+            std::array<u32, 64> arguments;
+            methods[0] = method;
+            arguments[0] = argument;
+            u32 count = 1;
+            while (count < methods.size() && count < words) {
+                const u64 next = entry[count];
+                const u32 next_method = static_cast<u32>((next >> 8) & 0xffff);
+                if (static_cast<Kind>(next & 0xf) != Kind::Method || (next & HasSegment) != 0 ||
+                    next_method - cb_data >= 16) {
+                    break;
+                }
+                methods[count] = next_method;
+                arguments[count] = static_cast<u32>(next >> 32);
+                ++count;
+            }
+            maxwell3d->ConsumeSink(*system);
+            if (count == 1) {
+                maxwell3d->CallMethod(*system, method, argument, true);
+            } else {
+                maxwell3d->CallConstBufferWords(*system, methods.data(), arguments.data(),
+                                                count);
+            }
+            return count;
+        }
+        if ((head & Direct) != 0) {
+            maxwell3d->ConsumeSink(*system);
+            maxwell3d->CallMethod(*system, method, argument, true);
+        } else if (!maxwell3d->execution_mask[method]) {
+            maxwell3d->method_sink.emplace_back(method, argument);
+        } else {
+            maxwell3d->ConsumeSink(*system);
+            if ((head & HasSegment) != 0) {
+                maxwell3d->current_dma_segment = entry[1];
+            }
+            maxwell3d->CallMethod(*system, method, argument, (head & IsLast) != 0);
+        }
+        return (head & HasSegment) != 0 ? 2 : 1;
+    }
+    if (!engine->reports_fast_draw_breaks) {
+        Nx2FastDraw::Break(Nx2FastDraw::Reason::OtherEngine);
+    }
+    if ((head & Direct) != 0) {
+        Nx2Profile::Scope method_scope{Nx2Profile::Zone::Method};
+        engine->ConsumeSink(*system);
+        engine->CallMethod(*system, method, argument, true);
+    } else if (!engine->execution_mask[method]) {
+        engine->method_sink.emplace_back(method, argument);
+    } else {
+        Nx2Profile::Scope method_scope{Nx2Profile::Zone::Method};
+        engine->ConsumeSink(*system);
+        if ((head & HasSegment) != 0) {
+            engine->current_dma_segment = entry[1];
+        }
+        engine->CallMethod(*system, method, argument, (head & IsLast) != 0);
+    }
+    return (head & HasSegment) != 0 ? 2 : 1;
+}
+
+void GpuSplit::CheckIrRecord(const u64* entry) {
+    // EDEN_NX2_V2_IR=verify: sequence numbers go up by one, kinds and sizes are sane.
+    const V2::Ir::RecordView record = V2::Ir::Decode(entry);
+    const bool bad = record.sequence != back_sequence + 1 || record.kind == V2::Ir::Kind::Invalid ||
+                     record.kind >= V2::Ir::Kind::Count || record.words < V2::Ir::HeaderWords ||
+                     record.body_words > record.words - V2::Ir::HeaderWords;
+    if (bad && ir_bad_records++ < 16) {
+        LOG_ERROR(HW_GPU, "V2 IR record check: kind {} sequence {} (expected {}) size {} body {}",
+                  static_cast<u32>(record.kind), record.sequence, back_sequence + 1, record.words,
+                  record.body_words);
+    }
+    if ((record.sequence & 0xfffff) == 0) {
+        LOG_INFO(HW_GPU, "V2 IR record check: {} records, {} bad", record.sequence, ir_bad_records);
+    }
+}
+
+size_t GpuSplit::ExecuteIr(const u64* entry) {
+    const u64 head = entry[0];
+    const size_t size = V2::Ir::RecordWords(head);
+    if (ir_verify) [[unlikely]] {
+        CheckIrRecord(entry);
+    }
+    back_sequence = entry[1];
+    switch (V2::Ir::KindOf(head)) {
+    case V2::Ir::Kind::Engine:
+        back_engine = reinterpret_cast<Tegra::Engines::EngineInterface*>(entry[2]);
+        break;
+    case V2::Ir::Kind::StateRun: {
+        const u64* it = entry + V2::Ir::HeaderWords;
+        const u64* const end = entry + size;
+        while (it < end) {
+            it += ExecuteMethod(it, static_cast<size_t>(end - it));
+        }
+        break;
+    }
+    case V2::Ir::Kind::MethodData: {
+        V2::Ir::MethodDataBody data;
+        std::memcpy(&data, entry + V2::Ir::HeaderWords, sizeof(data));
+        auto* const engine = back_engine;
+        if (!engine->reports_fast_draw_breaks) {
+            Nx2FastDraw::Break(Nx2FastDraw::Reason::OtherEngine);
+        }
+        Nx2Profile::Scope method_scope{Nx2Profile::Zone::Method};
+        engine->ConsumeSink(*system);
+        if ((head & V2::Ir::HasSegment) != 0) {
+            engine->current_dma_segment = entry[V2::Ir::HeaderWords + 2];
+        }
+        engine->CallMultiMethod(
+            *system, data.method,
+            reinterpret_cast<const u32*>(entry + V2::Ir::HeaderWords + V2::Ir::BodyWords(head)),
+            data.amount, data.methods_pending);
+        break;
+    }
+    default:
+        // Callback and the typed kinds that still carry the function that runs them.
+        if ((head & V2::Ir::HasThunk) != 0) {
+            if ((head & FastDrawNeutral) == 0) {
+                Nx2FastDraw::Break(Nx2FastDraw::Reason::Call);
+            }
+            const size_t body = V2::Ir::BodyWords(head);
+            reinterpret_cast<void (*)(const u64*)>(entry[V2::Ir::HeaderWords + body])(
+                entry + V2::Ir::HeaderWords + body + 1);
+        }
+        break;
+    }
+    return size;
+}
+
 size_t GpuSplit::Execute(const u64* entry, size_t words) {
     const u64 head = entry[0];
     switch (static_cast<Kind>(head & 0xf)) {
@@ -325,77 +528,10 @@ size_t GpuSplit::Execute(const u64* entry, size_t words) {
     case Kind::Engine:
         back_engine = reinterpret_cast<Tegra::Engines::EngineInterface*>(entry[1]);
         return 2;
-    case Kind::Method: {
-        const u32 method = static_cast<u32>((head >> 8) & 0xffff);
-        const u32 argument = static_cast<u32>(head >> 32);
-        auto* const engine = back_engine;
-        if (engine->fast_maxwell3d) {
-            // Nx2Perf: as below without the profile zones (off with fast_maxwell3d) and the
-            // virtual call.
-            using Tegra::Engines::Maxwell3D;
-            auto* const maxwell3d = static_cast<Maxwell3D*>(engine);
-            constexpr u32 cb_data = MAXWELL3D_REG_INDEX(const_buffer.buffer);
-            if (method - cb_data < 16 && (head & HasSegment) == 0) {
-                // Single constant buffer words in a row (macros write them one by one) go up in
-                // one write. They are executable: each entry would only consume the sink first.
-                std::array<u32, 64> methods;
-                std::array<u32, 64> arguments;
-                methods[0] = method;
-                arguments[0] = argument;
-                u32 count = 1;
-                while (count < methods.size() && count < words) {
-                    const u64 next = entry[count];
-                    const u32 next_method = static_cast<u32>((next >> 8) & 0xffff);
-                    if (static_cast<Kind>(next & 0xf) != Kind::Method || (next & HasSegment) != 0 ||
-                        next_method - cb_data >= 16) {
-                        break;
-                    }
-                    methods[count] = next_method;
-                    arguments[count] = static_cast<u32>(next >> 32);
-                    ++count;
-                }
-                maxwell3d->ConsumeSink(*system);
-                if (count == 1) {
-                    maxwell3d->CallMethod(*system, method, argument, true);
-                } else {
-                    maxwell3d->CallConstBufferWords(*system, methods.data(), arguments.data(),
-                                                    count);
-                }
-                return count;
-            }
-            if ((head & Direct) != 0) {
-                maxwell3d->ConsumeSink(*system);
-                maxwell3d->CallMethod(*system, method, argument, true);
-            } else if (!maxwell3d->execution_mask[method]) {
-                maxwell3d->method_sink.emplace_back(method, argument);
-            } else {
-                maxwell3d->ConsumeSink(*system);
-                if ((head & HasSegment) != 0) {
-                    maxwell3d->current_dma_segment = entry[1];
-                }
-                maxwell3d->CallMethod(*system, method, argument, (head & IsLast) != 0);
-            }
-            return (head & HasSegment) != 0 ? 2 : 1;
-        }
-        if (!engine->reports_fast_draw_breaks) {
-            Nx2FastDraw::Break(Nx2FastDraw::Reason::OtherEngine);
-        }
-        if ((head & Direct) != 0) {
-            Nx2Profile::Scope method_scope{Nx2Profile::Zone::Method};
-            engine->ConsumeSink(*system);
-            engine->CallMethod(*system, method, argument, true);
-        } else if (!engine->execution_mask[method]) {
-            engine->method_sink.emplace_back(method, argument);
-        } else {
-            Nx2Profile::Scope method_scope{Nx2Profile::Zone::Method};
-            engine->ConsumeSink(*system);
-            if ((head & HasSegment) != 0) {
-                engine->current_dma_segment = entry[1];
-            }
-            engine->CallMethod(*system, method, argument, (head & IsLast) != 0);
-        }
-        return (head & HasSegment) != 0 ? 2 : 1;
-    }
+    case Kind::Method:
+        return ExecuteMethod(entry, words);
+    case Kind::Ir:
+        return ExecuteIr(entry);
     case Kind::Multi: {
         const u32 method = static_cast<u32>((head >> 8) & 0xffff);
         const u32 amount = static_cast<u32>(head >> 32);
@@ -489,15 +625,18 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
             if ((read_position - last_store >= 4096 ||
                  read_position >= wait_target.load(std::memory_order_relaxed)) &&
                 read_position != available) {
+                consumed_sequence.store(back_sequence, std::memory_order_release);
                 consumed.store(read_position, std::memory_order_seq_cst);
                 last_store = read_position;
                 NotifyFront();
             }
         }
+        consumed_sequence.store(back_sequence, std::memory_order_release);
         consumed.store(read_position, std::memory_order_seq_cst);
         NotifyFront();
     }
     back_running.store(false, std::memory_order_seq_cst);
+
     front_wake.fetch_add(1, std::memory_order_seq_cst);
     front_wake.notify_all();
 }

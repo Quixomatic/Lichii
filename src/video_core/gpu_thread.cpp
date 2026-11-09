@@ -132,7 +132,8 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                 } else if (std::holds_alternative<GPUTickCommand>(next.data)) {
                     // TickWork ends fast draw reuse itself when it runs a request.
                     split.Defer([gpu = &system.GPU()] { gpu->TickWork(); },
-                                VideoCommon::GpuSplit::FastDrawNeutral);
+                                VideoCommon::GpuSplit::FastDrawNeutral |
+                                    VideoCommon::GpuSplit::Hint(VideoCommon::V2::Ir::Kind::Barrier));
                 } else if (auto* run = std::get_if<RunCommand>(&next.data)) {
                     if (run->before_later_reads) {
                         // GPU memory maps unmap caches (UnmapMemory downloads): the back's state.
@@ -142,19 +143,23 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                         split.DeferFunction(std::move(run->func));
                     }
                 } else if (const auto* flush = std::get_if<FlushRegionCommand>(&next.data)) {
-                    split.Defer([rasterizer_ptr, addr = flush->addr, size = flush->size] {
+                    split.DeferTyped(VideoCommon::V2::Ir::Kind::Readback,
+                                     VideoCommon::V2::Ir::ReadbackBody{flush->addr, flush->size},
+                                     [rasterizer_ptr, addr = flush->addr, size = flush->size] {
                         rasterizer_ptr->FlushRegion(addr, size);
                     });
                 } else if (const auto* invalidate = std::get_if<InvalidateRegionCommand>(&next.data)) {
                     split.Defer([rasterizer_ptr, addr = invalidate->addr, size = invalidate->size] {
                         rasterizer_ptr->OnCacheInvalidation(addr, size);
-                    });
+                    }, VideoCommon::GpuSplit::Hint(VideoCommon::V2::Ir::Kind::Barrier));
                 } else {
                     ASSERT(false);
                 }
                 split.Defer([state_ptr = &state, fence = next.fence, block = next.block] {
                     SignalCommand(*state_ptr, fence, block);
-                }, VideoCommon::GpuSplit::FastDrawNeutral);
+                }, VideoCommon::GpuSplit::FastDrawNeutral |
+                       VideoCommon::GpuSplit::Hint(VideoCommon::V2::Ir::Kind::SyncPoint));
+
                 split.Publish();
                 last_progress = std::chrono::steady_clock::now();
                 continue;

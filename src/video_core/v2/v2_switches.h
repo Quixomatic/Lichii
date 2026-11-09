@@ -23,12 +23,16 @@ enum class Mode : u8 {
 
 /// One entry per switch; add new ones before Count and their name to switch_names.
 enum class Switch : u32 {
-    Stats, ///< EDEN_NX2_V2_STATS: P0 measurement counters (v2_stats.h)
+    Stats,  ///< EDEN_NX2_V2_STATS: P0 measurement counters (v2_stats.h)
+    Ir,     ///< EDEN_NX2_V2_IR: typed IR records in the split ring (v2/ir.h, P1)
+    RegSem, ///< EDEN_NX2_V2_REGSEM: table-driven register semantics (v2/regsem.h, P1)
     Count,
 };
 
 inline constexpr std::array<const char*, static_cast<size_t>(Switch::Count)> switch_names{
     "STATS",
+    "IR",
+    "REGSEM",
 };
 
 namespace Detail {

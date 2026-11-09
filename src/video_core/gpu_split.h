@@ -12,6 +12,7 @@
 #include <type_traits>
 
 #include "common/common_types.h"
+#include "video_core/v2/ir.h"
 
 namespace Core {
 class System;
@@ -78,6 +79,21 @@ public:
     [[nodiscard]] u64 ConsumedPosition() const {
         return consumed.load(std::memory_order_relaxed);
     }
+    /// Whether the ring carries typed IR records (EDEN_NX2_V2_IR, fixed at each start).
+    [[nodiscard]] bool TypedIr() const {
+        return ir;
+    }
+    /// Front thread: the last IR record sent and the ring position after it. Waiting for the
+    /// ticket (WaitFor) waits until the back executed that record. Without the IR the sequence
+    /// stays 0 and only the position is meaningful.
+    [[nodiscard]] V2::Ir::Ticket Mark() const {
+        return {ir_sequence, write_position};
+    }
+    /// Any thread: the sequence number of the last IR record the back finished (updated when it
+    /// hands ring space back, so it may lag).
+    [[nodiscard]] u64 ExecutedSequence() const {
+        return consumed_sequence.load(std::memory_order_acquire);
+    }
     /// Whether the front runs the engines' macros (EDEN_NX2_SPLIT=2).
     [[nodiscard]] bool FrontMacros() const {
         return front_macros;
@@ -112,6 +128,14 @@ public:
     /// `segment`: the engine's current_dma_segment for the call, when the engine reads it.
     void Method(Tegra::Engines::EngineInterface* engine, u32 method, u32 argument, bool is_last,
                 const GPUVAddr* segment) {
+        if (ir) {
+            IrMethod(engine,
+                     static_cast<u64>(Kind::Method) | (is_last ? IsLast : 0) |
+                         (segment != nullptr ? HasSegment : 0) | (u64{method & 0xffff} << 8) |
+                         (u64{argument} << 32),
+                     segment);
+            return;
+        }
         SelectEngine(engine);
         const size_t words = segment != nullptr ? 2 : 1;
         u64* const entry = Reserve(words);
@@ -127,6 +151,13 @@ public:
                      u32 amount, u32 methods_pending, const GPUVAddr* segment);
     /// A write made by a macro: CallMethod without the method sink, as the engines' macros do.
     void MacroWrite(Tegra::Engines::EngineInterface* engine, u32 method, u32 argument) {
+        if (ir) {
+            IrMethod(engine,
+                     static_cast<u64>(Kind::Method) | IsLast | Direct |
+                         (u64{method & 0xffff} << 8) | (u64{argument} << 32),
+                     nullptr);
+            return;
+        }
         SelectEngine(engine);
         u64* const entry = Reserve(1);
         entry[0] = static_cast<u64>(Kind::Method) | IsLast | Direct | (u64{method & 0xffff} << 8) |
@@ -137,17 +168,54 @@ public:
     /// Defer flag: the call doesn't end fast draw reuse (nx2_fast_draw.h).
     static constexpr u64 FastDrawNeutral = 1 << 7;
 
+    /// Defer flag: with the typed IR, the record kind that describes the deferred call (it
+    /// still travels as a callback, without a body). The word stream ignores it.
+    static constexpr u64 Hint(V2::Ir::Kind kind) {
+        return u64{static_cast<u8>(kind)} << 32;
+    }
+
     /// Runs `func` on the back after everything sent before it. Must be trivially copyable.
-    /// `flags`: FastDrawNeutral when `func` can't change what a draw resolves to.
+    /// `flags`: FastDrawNeutral when `func` can't change what a draw resolves to, and a Hint.
     template <typename Func>
     void Defer(const Func& func, u64 flags = 0) {
         static_assert(std::is_trivially_copyable_v<Func> && alignof(Func) <= alignof(u64));
         constexpr size_t payload = (sizeof(Func) + sizeof(u64) - 1) / sizeof(u64);
+        if (ir) {
+            const auto hint = static_cast<V2::Ir::Kind>((flags >> 32) & 0xff);
+            constexpr size_t words = V2::Ir::HeaderWords + 1 + payload;
+            u64* const record =
+                IrBegin(hint != V2::Ir::Kind::Invalid ? hint : V2::Ir::Kind::Callback, 0, words,
+                        V2::Ir::HasThunk | (flags & FastDrawNeutral));
+            record[V2::Ir::HeaderWords] = reinterpret_cast<u64>(&CallThunk<Func>);
+            std::memcpy(record + V2::Ir::HeaderWords + 1, &func, sizeof(Func));
+            Commit(words);
+            return;
+        }
         u64* const entry = Reserve(2 + payload);
-        entry[0] = static_cast<u64>(Kind::Call) | flags | (u64{payload} << 8);
+        entry[0] = static_cast<u64>(Kind::Call) | (flags & FastDrawNeutral) | (u64{payload} << 8);
         entry[1] = reinterpret_cast<u64>(&CallThunk<Func>);
         std::memcpy(entry + 2, &func, sizeof(Func));
         Commit(2 + payload);
+    }
+    /// As Defer; with the typed IR the record is of `kind` and carries `body` (ir.h), which
+    /// later stages can inspect without running `func`.
+    template <typename Body, typename Func>
+    void DeferTyped(V2::Ir::Kind kind, const Body& body, const Func& func, u64 flags = 0) {
+        if (!ir) {
+            Defer(func, flags);
+            return;
+        }
+        static_assert(V2::Ir::IsBody<Body>);
+        static_assert(std::is_trivially_copyable_v<Func> && alignof(Func) <= alignof(u64));
+        constexpr size_t body_words = V2::Ir::BodyWordsOf<Body>;
+        constexpr size_t payload = (sizeof(Func) + sizeof(u64) - 1) / sizeof(u64);
+        constexpr size_t words = V2::Ir::HeaderWords + body_words + 1 + payload;
+        u64* const record =
+            IrBegin(kind, body_words, words, V2::Ir::HasThunk | (flags & FastDrawNeutral));
+        std::memcpy(record + V2::Ir::HeaderWords, &body, sizeof(Body));
+        record[V2::Ir::HeaderWords + body_words] = reinterpret_cast<u64>(&CallThunk<Func>);
+        std::memcpy(record + V2::Ir::HeaderWords + body_words + 1, &func, sizeof(Func));
+        Commit(words);
     }
     void DeferFunction(std::function<void()>&& func);
     /// Runs `func` on the back and waits for it: for work on back-owned state, such as a buffer
@@ -189,6 +257,11 @@ public:
     /// Waits until the back executed the work sent before the last NoteSync. Returns whether any
     /// of it was still queued.
     bool WaitForSync();
+    /// Waits until the back executed everything up to `ticket` (Mark). Returns whether any of
+    /// it was still queued.
+    bool WaitFor(const V2::Ir::Ticket& ticket, DrainSite site) {
+        return WaitFor(std::min(ticket.position, write_position), site);
+    }
 
 private:
     friend struct GpuSplitTestAccess;
@@ -199,7 +272,9 @@ private:
         Method, ///< Bits 8-23 method, 32-63 argument; flags IsLast, HasSegment (word 1)
         Multi,  ///< Bits 8-23 method, 32-63 amount; word 1 methods pending, [segment], words
         Call,   ///< Bits 8-31 payload size in words; word 1 thunk, then the payload
+        Ir,     ///< A typed IR record (v2/ir.h, EDEN_NX2_V2_IR)
     };
+    static_assert(static_cast<u64>(Kind::Ir) == V2::Ir::RingKind);
     static constexpr u64 IsLast = 1 << 4;
     static constexpr u64 HasSegment = 1 << 5;
     static constexpr u64 Direct = 1 << 6; ///< Method: call it even if not executable (macros)
@@ -208,6 +283,8 @@ private:
     static constexpr size_t RingMask = RingWords - 1;
     static constexpr u32 MaxMultiWords = 8192;
     static constexpr size_t PublishEvery = 256;
+    /// Most words in one IR StateRun (each publish closes the open run earlier).
+    static constexpr size_t MaxRunWords = 1024;
 
     template <typename Func>
     static void CallThunk(const u64* payload) {
@@ -239,6 +316,45 @@ private:
     void SwitchEngine(Tegra::Engines::EngineInterface* engine);
     bool WaitFor(u64 target, DrainSite site);
 
+    // Typed IR (front). A StateRun stays open while method writes to one engine follow each
+    // other: each appends its entry, and the run's header gets its size when it closes, which
+    // happens before any other record and before every publish (the back never sees an open
+    // run).
+    void IrMethod(Tegra::Engines::EngineInterface* engine, u64 word, const GPUVAddr* segment) {
+        SelectEngine(engine);
+        const size_t words = segment != nullptr ? 2 : 1;
+        const size_t index = write_position & RingMask;
+        if (ir_run != nullptr && ir_run_words + words <= MaxRunWords &&
+            index + words <= RingWords && write_position + words - consumed_cache <= RingWords)
+            [[likely]] {
+            u64* const entry = &ring[index];
+            entry[0] = word;
+            if (segment != nullptr) {
+                entry[1] = *segment;
+            }
+            ir_run_words += words;
+            Commit(words);
+            return;
+        }
+        IrOpenRun(word, segment);
+    }
+    void IrOpenRun(u64 word, const GPUVAddr* segment);
+    void IrCloseRun() {
+        ir_run[0] = V2::Ir::MakeHeader(V2::Ir::Kind::StateRun, 0, ir_run_words, 0);
+        ir_run = nullptr;
+    }
+    /// Closes the open run and reserves a record of `words` with its header and sequence
+    /// number written. The caller fills in the rest and commits `words`.
+    u64* IrBegin(V2::Ir::Kind kind, size_t body_words, size_t words, u64 flags) {
+        if (ir_run != nullptr) {
+            IrCloseRun();
+        }
+        u64* const record = Reserve(words);
+        record[0] = V2::Ir::MakeHeader(kind, body_words, words, flags);
+        record[1] = ++ir_sequence;
+        return record;
+    }
+
     /// One step of a front wait for the back to consume `target`.
     void Backoff(u32 spins, u64 target);
     /// After the back stored `consumed`: wakes a front sleeping in Backoff.
@@ -252,11 +368,17 @@ private:
     void BackLoop(std::stop_token stop_token);
     /// Runs the entry at `entry` (of the `words` published before the ring's end), returns its size.
     size_t Execute(const u64* entry, size_t words);
+    /// One method entry (the old Method entry, or one in an IR StateRun), returns its size.
+    size_t ExecuteMethod(const u64* entry, size_t words);
+    size_t ExecuteIr(const u64* entry);
+    void CheckIrRecord(const u64* entry);
 
     Core::System* system{};
     bool active{};
     u32 starts{};
     bool front_macros{};
+    bool ir{};        ///< EDEN_NX2_V2_IR on at this start
+    bool ir_verify{}; ///< EDEN_NX2_V2_IR=verify: the back checks every record header
     std::unique_ptr<u64[]> ring;
 
     // Front side.
@@ -268,9 +390,14 @@ private:
     /// Words between publishes: small right after a drain, while the back has nothing to do.
     size_t publish_every{PublishEvery};
     Tegra::Engines::EngineInterface* front_engine{};
+    u64 ir_sequence{};
+    u64* ir_run{}; ///< Header of the open StateRun
+    size_t ir_run_words{};
 
     // Back side.
     Tegra::Engines::EngineInterface* back_engine{};
+    u64 back_sequence{};
+    u64 ir_bad_records{};
 
     static GpuSplit instance;
     static inline thread_local bool on_back_thread{};
@@ -283,6 +410,8 @@ private:
     // always touched together by both threads, so they share a block.
     alignas(128) std::atomic<u64> published{};
     alignas(128) std::atomic<u64> consumed{};
+    std::atomic<u64> consumed_sequence{}; ///< IR sequence of the last record before `consumed`
+
     /// A position the front waits for (WaitFor): the back stores `consumed` once past it.
     alignas(128) std::atomic<u64> wait_target{~u64{0}};
     alignas(128) std::atomic<bool> back_waiting{};
