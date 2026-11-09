@@ -514,8 +514,10 @@ GraphicsPipeline::GraphicsPipeline(
     }
     // Mesh emulation binds one descriptor set to both the compute dispatch and the draw.
     uses_push_descriptor = !mesh_emulation && builder.CanUsePushDescriptor();
-    // A layout with descriptor buffer sets can't take the heap's update-after-bind set.
-    uses_descriptor_buffer = !mesh_emulation && !heap_pipeline &&
+    // A layout with descriptor buffer sets can't take the heap's update-after-bind set. While the
+    // heap exists no pipeline uses descriptor buffers: a command buffer then never switches
+    // between descriptor buffers and the heap pipelines' sets (a heap switch on some GPUs).
+    uses_descriptor_buffer = !mesh_emulation && heap == nullptr &&
                              builder.CanUseDescriptorBuffer() && descriptor_buffer_ring.IsValid();
     // After every stage's descriptors: the output buffer, then with a task program its payload,
     // offset and map buffers.

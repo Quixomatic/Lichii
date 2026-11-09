@@ -270,7 +270,9 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
     }
 
     uses_push_descriptor = builder.CanUsePushDescriptor();
-    uses_descriptor_buffer = !heap_pipeline && builder.CanUseDescriptorBuffer() &&
+    // While the heap exists no pipeline uses descriptor buffers (one descriptor model per
+    // command buffer, see GraphicsPipeline).
+    uses_descriptor_buffer = heap == nullptr && builder.CanUseDescriptorBuffer() &&
                              descriptor_buffer_ring.IsValid();
     descriptor_set_layout =
         builder.CreateDescriptorSetLayout(uses_push_descriptor, uses_descriptor_buffer);
