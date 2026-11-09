@@ -3716,9 +3716,11 @@ BufferId BufferCache<P>::FindBuffer(DAddr device_addr, u32 size, bool sparse_com
         return NULL_BUFFER_ID;
     }
     if (commit != nullptr) [[unlikely]] {
-        // EDEN_NX2_V2_COMMIT: the pure lookup through the lock-free page map. A miss is a
-        // BufferCreate request, committed on demand: the caller binds the buffer at once.
-        const BufferId found = LookupBuffer(device_addr, size);
+        // EDEN_NX2_V2_COMMIT: the pure lookup. A miss is a BufferCreate request, committed on
+        // demand: the caller binds the buffer at once. F2-20: FindBuffer runs where the caches
+        // are owned (the owner, or under their locks), so it reads the owner's page table; the
+        // published map (LookupBuffer) is the shard readers' copy of it.
+        const BufferId found = page_table[page];
         const bool usable = [&] {
             if (!found || !slot_buffers[found].IsInBounds(device_addr, size)) {
                 return false;
