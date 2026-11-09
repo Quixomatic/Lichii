@@ -34,6 +34,13 @@ enum class Switch : u32 {
     MacroDump, ///< EDEN_NX2_V2_MACRO_DUMP: log NVN2 macros' hash and code (v2/macro_hle.h)
     MacroHle,  ///< EDEN_NX2_V2_MACROHLE: NVN2 macro HLE from nx2_macro_hle.txt entries
     IrDraws,   ///< EDEN_NX2_V2_IR_DRAWS: front Draw/Dispatch IR records, checked by the back
+    PipeKey,   ///< EDEN_NX2_V2_PIPEKEY: incremental pipeline key, two-level lookup (P3)
+    ContDraw,  ///< EDEN_NX2_V2_CONTDRAW: continued draws decided from the register groups (P3)
+    DescCache, ///< EDEN_NX2_V2_DESCCACHE: content-keyed descriptor reuse (P3)
+    Bindless,  ///< EDEN_NX2_V2_BINDLESS: TIC/TSC pools mirrored as a host descriptor heap (P3)
+    CbufVer,   ///< EDEN_NX2_V2_CBUFVER: constant buffer versions instead of per-draw copies (P3)
+    MarkDirty, ///< EDEN_NX2_V2_MARKDIRTY: a submit only marks command buffer state dirty (P3)
+    LeanDraw,  ///< EDEN_NX2_V2_LEANDRAW: per-draw debug hooks behind one cached gate (P3)
     Count,
 };
 
@@ -49,6 +56,13 @@ inline constexpr std::array<const char*, static_cast<size_t>(Switch::Count)> swi
     "MACRO_DUMP",
     "MACROHLE",
     "IR_DRAWS",
+    "PIPEKEY",
+    "CONTDRAW",
+    "DESCCACHE",
+    "BINDLESS",
+    "CBUFVER",
+    "MARKDIRTY",
+    "LEANDRAW",
 };
 
 namespace Detail {
@@ -56,6 +70,22 @@ std::array<Mode, static_cast<size_t>(Switch::Count)> ReadAll();
 }
 
 inline std::array<Mode, static_cast<size_t>(Switch::Count)> g_modes = Detail::ReadAll();
+
+namespace Detail {
+[[nodiscard]] inline bool TracksGroups(
+    const std::array<Mode, static_cast<size_t>(Switch::Count)>& m) {
+    const auto on = [&](Switch name) { return m[static_cast<size_t>(name)] != Mode::Off; };
+    return on(Switch::RegSem) || on(Switch::PipeKey) || on(Switch::ContDraw);
+}
+} // namespace Detail
+
+/// Whether the executing Maxwell3D keeps its register group tracker (V2::GroupTracker):
+/// EDEN_NX2_V2_REGSEM, or a P3 consumer of the dirty groups (PIPEKEY, CONTDRAW). Cached with the
+/// modes, so the per-write hooks test one bool.
+inline bool g_track_groups = Detail::TracksGroups(g_modes);
+[[nodiscard]] inline bool TrackGroups() {
+    return g_track_groups;
+}
 
 /// The switch's cached mode.
 [[nodiscard]] inline Mode Get(Switch name) {

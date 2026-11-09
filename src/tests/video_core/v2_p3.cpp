@@ -1,0 +1,265 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+#include <array>
+#include <cstring>
+#include <memory>
+#include <random>
+#include <vector>
+
+#include <catch2/catch_test_macros.hpp>
+
+#include "core/core.h"
+#include "core/device_memory.h"
+#include "tests/core/system_test_context.h"
+#include "video_core/dirty_flags.h"
+#include "video_core/engines/maxwell_3d.h"
+#include "video_core/gpu.h"
+#include "video_core/memory_manager.h"
+#include "video_core/renderer_null/null_rasterizer.h"
+#include "video_core/renderer_vulkan/fixed_pipeline_state.h"
+#include "video_core/renderer_vulkan/vk_state_tracker.h"
+#include "video_core/v2/pipeline_lookup.h"
+#include "video_core/v2/regsem.h"
+#include "video_core/v2/v2_switches.h"
+
+namespace {
+
+using Tegra::Engines::Maxwell3D;
+
+/// Turns the group tracker on for the test and restores the switch afterwards.
+struct TrackGroupsScope {
+    bool previous = VideoCommon::V2::g_track_groups;
+    TrackGroupsScope() {
+        VideoCommon::V2::g_track_groups = true;
+    }
+    ~TrackGroupsScope() {
+        VideoCommon::V2::g_track_groups = previous;
+    }
+};
+
+Vulkan::DynamicFeatures RandomFeatures(std::mt19937& rng) {
+    const auto coin = [&] { return (rng() & 1) != 0; };
+    Vulkan::DynamicFeatures features{};
+    features.driver_id = 4;
+    features.driver_version = 0x1234;
+    features.has_extended_dynamic_state = coin();
+    features.has_extended_dynamic_state_2 = features.has_extended_dynamic_state && coin();
+    features.has_extended_dynamic_state_2_logic_op = features.has_extended_dynamic_state_2 && coin();
+    features.has_extended_dynamic_state_3_blend = features.has_extended_dynamic_state_2 && coin();
+    features.has_extended_dynamic_state_3_enables = features.has_extended_dynamic_state_2 && coin();
+    features.has_dynamic_state3_depth_clamp_enable =
+        features.has_extended_dynamic_state_3_enables && coin();
+    features.has_dynamic_state3_logic_op_enable =
+        features.has_extended_dynamic_state_3_enables && coin();
+    features.has_dynamic_state3_line_stipple_enable =
+        features.has_extended_dynamic_state_3_enables && coin();
+    features.has_dynamic_state3_conservative_raster =
+        features.has_extended_dynamic_state_3_enables && coin();
+    features.has_dynamic_state3_line_rasterization_mode =
+        features.has_extended_dynamic_state_3_enables && coin();
+    features.has_dynamic_state3_alpha_to_coverage =
+        features.has_extended_dynamic_state_3_enables && coin();
+    features.has_dynamic_state3_alpha_to_one =
+        features.has_extended_dynamic_state_3_enables && coin();
+    features.has_dynamic_vertex_input = coin();
+    features.has_static_vertex_repack = !features.has_dynamic_vertex_input && coin();
+    features.has_color_write_enable = coin();
+    features.has_provoking_vertex = coin();
+    features.has_provoking_vertex_first_mode = coin();
+    features.has_provoking_vertex_last_mode = coin();
+    features.has_provoking_vertex_tf_preserve = coin();
+    return features;
+}
+
+struct KeyFixture {
+    ScopedSystemTestContext context;
+    Core::System system;
+    Core::DeviceMemory physical;
+    Tegra::MaxwellDeviceMemoryManager device_memory{physical};
+    Tegra::MemoryManager memory{system, device_memory, 32, 1ULL << 31};
+    Tegra::GPU gpu{system, false, false};
+    Null::RasterizerNull rasterizer{gpu};
+    Maxwell3D engine{memory};
+    std::vector<u32> state_methods;
+
+    KeyFixture() {
+        engine.BindRasterizer(&rasterizer);
+        VideoCommon::Dirty::SetupDirtyFlags(engine.dirty.tables);
+        for (u32 method = 0; method < Maxwell3D::Regs::NUM_REGS; ++method) {
+            if (!engine.execution_mask[method]) {
+                state_methods.push_back(method);
+            }
+        }
+    }
+};
+
+} // Anonymous namespace
+
+TEST_CASE("V2 P3 incremental pipeline key equals a full refresh", "[video_core][v2_p3]") {
+    TrackGroupsScope track;
+    KeyFixture f;
+    std::mt19937 rng{0x5eed'0003};
+    // Registers the key reads, written far more often than the rest so every block re-packs.
+    std::vector<u32> key_registers;
+    for (size_t block = 0; block < Vulkan::NumKeyBlocks; ++block) {
+        for (const auto& [first, count] :
+             Vulkan::KeyBlockRegisters(static_cast<Vulkan::KeyBlock>(block))) {
+            for (u32 reg = first; reg < first + count; ++reg) {
+                key_registers.push_back(reg);
+            }
+        }
+    }
+    for (int round = 0; round < 24; ++round) {
+        Vulkan::DynamicFeatures features = RandomFeatures(rng);
+        Vulkan::FixedPipelineState full{};
+        Vulkan::FixedPipelineState incremental{};
+        std::memset(&full, 0, sizeof(full));
+        std::memset(&incremental, 0, sizeof(incremental));
+        Vulkan::KeyInputs inputs{};
+        bool first = true;
+        // A new key starts from flagged state, as after StateTracker::InvalidateState.
+        f.engine.dirty.flags[Vulkan::Dirty::VertexInput] = true;
+        f.engine.dirty.flags[Vulkan::Dirty::ViewportSwizzles] = true;
+        for (int step = 0; step < 1500; ++step) {
+            const int writes = static_cast<int>(rng() % 6);
+            for (int w = 0; w < writes; ++w) {
+                const bool key_register = (rng() % 4) != 0;
+                const u32 method = key_register ? key_registers[rng() % key_registers.size()]
+                                                : f.state_methods[rng() % f.state_methods.size()];
+                // Small values hit the enums and booleans the key packs, large ones the rest.
+                const u32 value = (rng() & 1) != 0 ? rng() % 4 : static_cast<u32>(rng());
+                f.engine.CallMethod(f.system, method, value, true);
+            }
+            if (rng() % 8 == 0) {
+                f.engine.draw_manager.draw_state.topology =
+                    static_cast<Maxwell3D::Regs::PrimitiveTopology>(rng() % 15);
+            }
+            if (rng() % 16 == 0) {
+                f.engine.engine_state =
+                    static_cast<Maxwell3D::EngineHint>(rng() % 3);
+            }
+            if (rng() % 4 == 0) {
+                f.engine.dirty.flags[Vulkan::Dirty::VertexInput] = true;
+            }
+            if (rng() % 4 == 0) {
+                f.engine.dirty.flags[Vulkan::Dirty::ViewportSwizzles] = true;
+            }
+            const u32 groups =
+                f.engine.v2_groups.TakeSink(VideoCommon::V2::GroupSink::PipelineKey);
+            incremental.RefreshIncremental(f.engine, features, groups, inputs, first, false);
+            incremental.CanonicalizeDynamic(features);
+            inputs = Vulkan::FixedPipelineState::CurrentInputs(f.engine);
+            first = false;
+            full.Refresh(f.engine, features);
+            full.CanonicalizeDynamic(features);
+            REQUIRE(full.Size() == incremental.Size());
+            size_t offset = 0;
+            const auto* const a = reinterpret_cast<const u8*>(&full);
+            const auto* const b = reinterpret_cast<const u8*>(&incremental);
+            while (offset < full.Size() && a[offset] == b[offset]) {
+                ++offset;
+            }
+            CAPTURE(round, step, offset, groups, full.Size());
+            REQUIRE(offset == full.Size());
+        }
+    }
+}
+
+TEST_CASE("V2 P3 key blocks read registers of the groups their masks hold",
+          "[video_core][v2_p3]") {
+    KeyFixture f; // builds the register semantics table
+    const auto& masks = Vulkan::KeyBlockGroups();
+    const auto& table = VideoCommon::V2::RegSem::GetTable3D();
+    for (size_t block = 0; block < Vulkan::NumKeyBlocks; ++block) {
+        for (const auto& [first, count] :
+             Vulkan::KeyBlockRegisters(static_cast<Vulkan::KeyBlock>(block))) {
+            REQUIRE(count != 0);
+            for (u32 reg = first; reg < first + count; ++reg) {
+                REQUIRE((masks[block] & VideoCommon::V2::GroupBit(table.groups[reg])) != 0);
+            }
+        }
+    }
+    // The core block reads pipeline state and the render target formats.
+    REQUIRE((masks[0] & VideoCommon::V2::GroupBit(VideoCommon::V2::RegGroup::Pipeline)) != 0);
+}
+
+TEST_CASE("V2 P3 two-level pipeline lookup", "[video_core][v2_p3]") {
+    using Lookup = VideoCommon::V2::PipelineLookup<int>;
+    Lookup lookup;
+    std::mt19937 rng{7};
+    struct Entry {
+        Lookup::Hashes hashes;
+        std::array<u8, 40> key;
+        u64 hash;
+        int value;
+    };
+    std::vector<std::unique_ptr<Entry>> entries;
+    for (int set = 0; set < 50; ++set) {
+        Lookup::Hashes hashes{};
+        for (auto& h : hashes) {
+            h = (static_cast<u64>(rng()) << 32) | rng();
+        }
+        // Up to 40 variants per set: past the linear part into the hashed table. Every third
+        // shares its hash with the previous one, with other bytes.
+        const int variants = 1 + static_cast<int>(rng() % 40);
+        for (int v = 0; v < variants; ++v) {
+            auto entry = std::make_unique<Entry>();
+            entry->hashes = hashes;
+            for (auto& byte : entry->key) {
+                byte = static_cast<u8>(rng());
+            }
+            entry->hash = (v % 3 == 2 && !entries.empty()) ? entries.back()->hash
+                                                           : (static_cast<u64>(rng()) << 32) | rng();
+            entry->value = static_cast<int>(entries.size());
+            REQUIRE(lookup.Find(hashes, entry->hash, entry->key.data(), entry->key.size()) ==
+                    nullptr);
+            lookup.Insert(hashes, entry->hash, entry->key.data(), entry->key.size(),
+                          &entry->value);
+            entries.push_back(std::move(entry));
+        }
+    }
+    for (const auto& entry : entries) {
+        int* const found =
+            lookup.Find(entry->hashes, entry->hash, entry->key.data(), entry->key.size());
+        REQUIRE(found == &entry->value);
+        // One byte off, or a different length: not found.
+        auto other = entry->key;
+        other[5] ^= 1;
+        REQUIRE(lookup.Find(entry->hashes, entry->hash, other.data(), other.size()) == nullptr);
+        REQUIRE(lookup.Find(entry->hashes, entry->hash, entry->key.data(), 39) == nullptr);
+    }
+    REQUIRE(lookup.NumSets() == 50);
+    lookup.Clear();
+    REQUIRE(lookup.NumSets() == 0);
+    REQUIRE(lookup.Find(entries[0]->hashes, entries[0]->hash, entries[0]->key.data(),
+                        entries[0]->key.size()) == nullptr);
+}
+
+TEST_CASE("V2 P3 group sinks accumulate until taken", "[video_core][v2_p3]") {
+    VideoCommon::V2::GroupTracker tracker;
+    using VideoCommon::V2::GroupBit;
+    using VideoCommon::V2::GroupSink;
+    using VideoCommon::V2::RegGroup;
+    REQUIRE(tracker.TakeSink(GroupSink::PipelineKey) == VideoCommon::V2::AllGroups);
+    tracker.dirty = 0;
+    tracker.sinks.fill(0);
+    tracker.Change(RegGroup::Viewport, 1, 0, 1);
+    tracker.BeginDraw();
+    tracker.Change(RegGroup::Pipeline, 2, 0, 1);
+    tracker.BeginDraw();
+    tracker.Touch(RegGroup::CbufData);
+    // A sink taken between draws sees the changes no draw took yet too.
+    REQUIRE(tracker.PeekSink(GroupSink::ContinuedDraw) ==
+            (GroupBit(RegGroup::Viewport) | GroupBit(RegGroup::Pipeline) |
+             GroupBit(RegGroup::CbufData)));
+    REQUIRE(tracker.TakeSink(GroupSink::PipelineKey) ==
+            (GroupBit(RegGroup::Viewport) | GroupBit(RegGroup::Pipeline) |
+             GroupBit(RegGroup::CbufData)));
+    tracker.BeginDraw();
+    REQUIRE(tracker.TakeSink(GroupSink::PipelineKey) == GroupBit(RegGroup::CbufData));
+    REQUIRE(tracker.TakeSink(GroupSink::PipelineKey) == 0);
+    REQUIRE(tracker.TakeSink(GroupSink::ContinuedDraw) ==
+            (GroupBit(RegGroup::Viewport) | GroupBit(RegGroup::Pipeline) |
+             GroupBit(RegGroup::CbufData)));
+}

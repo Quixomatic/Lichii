@@ -59,6 +59,8 @@
 #include "video_core/shader_environment.h"
 #include "video_core/shader_notify.h"
 #include "video_core/shader_warm/shader_warm_builder.h"
+#include "video_core/v2/p3_stats.h"
+#include "video_core/v2/v2_switches.h"
 #include "video_core/surface.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
@@ -696,6 +698,18 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
     dynamic_features.has_dynamic_state3_line_stipple_enable =
         dynamic_features.has_extended_dynamic_state_3_enables &&
         device.SupportsDynamicState3LineStippleEnable();
+    dynamic_features.has_dynamic_state3_conservative_raster =
+        dynamic_features.has_extended_dynamic_state_3_enables &&
+        device.SupportsDynamicState3ConservativeRasterizationMode();
+    dynamic_features.has_dynamic_state3_line_rasterization_mode =
+        dynamic_features.has_extended_dynamic_state_3_enables &&
+        device.SupportsDynamicState3LineRasterizationMode();
+    dynamic_features.has_dynamic_state3_alpha_to_coverage =
+        dynamic_features.has_extended_dynamic_state_3_enables &&
+        device.SupportsDynamicState3AlphaToCoverageEnable();
+    dynamic_features.has_dynamic_state3_alpha_to_one =
+        dynamic_features.has_extended_dynamic_state_3_enables &&
+        device.SupportsDynamicState3AlphaToOneEnable();
 
     // VIDS: Independent toggle (not affected by dyna_state levels)
     dynamic_features.has_dynamic_vertex_input =
@@ -789,6 +803,7 @@ PipelineCache::~PipelineCache() {
         SerializeVulkanPipelineCache(vulkan_pipeline_cache_filename, vulkan_pipeline_cache,
                                      CACHE_VERSION);
     }
+    ClearV2Lookup();
     graphics_cache.clear();
     evicted_pipelines.clear();
 }
@@ -827,7 +842,9 @@ void PipelineCache::SaveUsedPipelines() {
 }
 
 GraphicsPipeline* PipelineCache::CurrentGraphicsPipeline() {
-
+    if (VideoCommon::V2::On(VideoCommon::V2::Switch::PipeKey)) [[unlikely]] {
+        return CurrentGraphicsPipelineV2();
+    }
     if (!RefreshStages(graphics_key.unique_hashes)) {
         current_pipeline = nullptr;
         return nullptr;
@@ -1631,6 +1648,15 @@ void ReportUnsupportedMeshPipeline(const GraphicsPipelineCacheKey& key, const Pr
 } // Anonymous namespace
 
 GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineSlowPath() {
+    GraphicsPipeline* const pipeline = FindOrCreateGraphicsPipeline();
+    if (!pipeline) {
+        return nullptr;
+    }
+    ActivateGraphicsPipeline(pipeline, true);
+    return BuiltPipeline(current_pipeline);
+}
+
+GraphicsPipeline* PipelineCache::FindOrCreateGraphicsPipeline() {
     const auto [pair, is_new]{graphics_cache.try_emplace(graphics_key)};
     auto& pipeline{pair->second};
     if (is_new) {
@@ -1640,20 +1666,119 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineSlowPath() {
             pipeline = CreateGraphicsPipeline();
         }
     }
-    if (!pipeline) {
-        return nullptr;
-    }
+    return pipeline.get();
+}
+
+void PipelineCache::ActivateGraphicsPipeline(GraphicsPipeline* pipeline, bool add_transition) {
     constexpr auto save_interval = std::chrono::seconds{15};
-    if (used_this_session.insert(pipeline.get()).second &&
+    if (used_this_session.insert(pipeline).second &&
         std::chrono::steady_clock::now() - used_pipelines_saved > save_interval) {
         SaveUsedPipelines();
     }
-    if (current_pipeline) {
-        current_pipeline->AddTransition(pipeline.get());
+    if (current_pipeline && add_transition) {
+        current_pipeline->AddTransition(pipeline);
     }
-    current_pipeline = pipeline.get();
+    current_pipeline = pipeline;
     current_pipeline->MarkUsed(frame_count);
+}
+
+GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineV2() {
+    namespace V2 = VideoCommon::V2;
+    if (!RefreshStages(graphics_key.unique_hashes)) {
+        current_pipeline = nullptr;
+        v2_key.pipeline = nullptr;
+        return nullptr;
+    }
+    const bool stats = V2::P3Stats::Enabled();
+    const bool verify = V2::Verify(V2::Switch::PipeKey);
+    // What changed since the key was last refreshed: the register groups of this engine, or
+    // everything when the key was built for another channel's engine.
+    const bool force = !v2_key.valid || v2_key.engine != maxwell3d;
+    const u32 groups = maxwell3d->v2_groups.TakeSink(V2::GroupSink::PipelineKey);
+    FixedPipelineState& incremental = verify ? v2_key.shadow : graphics_key.state;
+    const u32 repacked = incremental.RefreshIncremental(*maxwell3d, dynamic_features, groups,
+                                                        v2_key.inputs, force, !verify);
+    if (repacked != 0) {
+        incremental.CanonicalizeDynamic(dynamic_features);
+    }
+    v2_key.inputs = FixedPipelineState::CurrentInputs(*maxwell3d);
+    v2_key.engine = maxwell3d;
+    v2_key.valid = true;
+    bool key_may_differ = repacked != 0;
+    if (verify) {
+        // Refresh decides; the incremental key must equal it.
+        graphics_key.state.Refresh(*maxwell3d, dynamic_features);
+        graphics_key.state.CanonicalizeDynamic(dynamic_features);
+        auto& data = V2::P3Stats::Get();
+        ++data.key_verify;
+        if (graphics_key.state != incremental) {
+            ++data.key_mismatches;
+            static std::atomic<u32> logged{};
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+                const auto* const a = reinterpret_cast<const u8*>(&graphics_key.state);
+                const auto* const b = reinterpret_cast<const u8*>(&incremental);
+                size_t offset = 0;
+                const size_t size = graphics_key.state.Size();
+                while (offset < size && a[offset] == b[offset]) {
+                    ++offset;
+                }
+                LOG_WARNING(Render_Vulkan,
+                            "V2 pipeline key verify: the incremental key differs from Refresh at "
+                            "byte {:#x} of {:#x} (groups {:#x}, blocks re-packed {:#x})",
+                            offset, size, groups, repacked);
+            }
+            v2_key.shadow = graphics_key.state;
+        }
+        key_may_differ = true;
+    }
+    if (stats) {
+        auto& data = V2::P3Stats::Get();
+        ++data.key_lookups;
+        data.key_unchanged += repacked == 0 ? 1 : 0;
+        data.key_blocks += static_cast<u64>(std::popcount(repacked));
+    }
+    // Same shaders and an unchanged key: the last pipeline, without a lookup.
+    GraphicsPipeline* pipeline = v2_key.pipeline;
+    if (pipeline != nullptr && v2_key.hashes == graphics_key.unique_hashes &&
+        (!key_may_differ || pipeline->Key().state == graphics_key.state)) {
+        if (stats) {
+            ++V2::P3Stats::Get().key_same;
+        }
+        current_pipeline = pipeline;
+        current_pipeline->MarkUsed(frame_count);
+        return BuiltPipeline(current_pipeline);
+    }
+    const u64 state_hash = graphics_key.state.Hash();
+    pipeline = v2_lookup.Find(graphics_key.unique_hashes, state_hash, &graphics_key.state,
+                              graphics_key.state.Size());
+    if (pipeline != nullptr) {
+        if (stats) {
+            ++V2::P3Stats::Get().key_variant_hits;
+        }
+        current_pipeline = pipeline;
+        current_pipeline->MarkUsed(frame_count);
+    } else {
+        if (stats) {
+            ++V2::P3Stats::Get().key_slow;
+        }
+        pipeline = FindOrCreateGraphicsPipeline();
+        if (pipeline == nullptr) {
+            v2_key.pipeline = nullptr;
+            return nullptr;
+        }
+        ActivateGraphicsPipeline(pipeline, false);
+        const FixedPipelineState& stored = pipeline->Key().state;
+        v2_lookup.Insert(graphics_key.unique_hashes, state_hash, &stored, stored.Size(),
+                         pipeline);
+    }
+    v2_key.pipeline = pipeline;
+    v2_key.hashes = graphics_key.unique_hashes;
     return BuiltPipeline(current_pipeline);
+}
+
+void PipelineCache::ClearV2Lookup() {
+    v2_lookup.Clear();
+    v2_key.pipeline = nullptr;
 }
 
 void PipelineCache::TickFrame() {
@@ -1732,6 +1857,7 @@ void PipelineCache::EvictUnusedPipelines() {
             pipeline->ClearTransitions();
         }
     }
+    ClearV2Lookup();
     LOG_INFO(Render_Vulkan, "Evicted {} graphics pipelines unused for {} frames, {} left", evicted,
              EvictAfterFrames, graphics_cache.size());
 }

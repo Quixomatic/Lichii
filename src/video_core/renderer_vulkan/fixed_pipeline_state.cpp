@@ -17,6 +17,7 @@
 #include "video_core/renderer_vulkan/fixed_pipeline_state.h"
 #include "video_core/renderer_vulkan/vertex_repack.h"
 #include "video_core/renderer_vulkan/vk_state_tracker.h"
+#include "video_core/v2/regsem.h"
 
 namespace Vulkan {
 namespace {
@@ -107,6 +108,35 @@ void FixedPipelineState::Refresh(Tegra::Engines::Maxwell3D& maxwell3d, DynamicFe
     const Maxwell& regs = maxwell3d.regs;
     const auto topology_ = maxwell3d.draw_manager.draw_state.topology;
 
+    RefreshCore(maxwell3d, features);
+    if (maxwell3d.dirty.flags[Dirty::VertexInput]) {
+        RefreshVertexInput(maxwell3d, features, true);
+    }
+    if (maxwell3d.dirty.flags[Dirty::ViewportSwizzles]) {
+        maxwell3d.dirty.flags[Dirty::ViewportSwizzles] = false;
+        RefreshSwizzles(regs);
+    }
+    RefreshDynamic(regs, topology_, features);
+    if (!extended_dynamic_state_3_blend) {
+        // Always rebuilt: a blend register written without raising Dirty::Blending (native
+        // Switch 2 command paths) left a stale state in the key (Ocarina forest fog drawn
+        // without blending = black screen on GPUs without dynamic blend state, e.g. AMD).
+        maxwell3d.dirty.flags[Dirty::Blending] = false;
+        RefreshBlend(regs);
+    }
+    if (xfb_enabled) {
+        RefreshXfbState(xfb_state, regs);
+    }
+    if (!dynamic_vertex_input && features.has_static_vertex_repack) {
+        RefreshRepack(regs);
+    }
+}
+
+void FixedPipelineState::RefreshCore(const Tegra::Engines::Maxwell3D& maxwell3d,
+                                     const DynamicFeatures& features) {
+    const Maxwell& regs = maxwell3d.regs;
+    const auto topology_ = maxwell3d.draw_manager.draw_state.topology;
+
     driver_id = features.driver_id;
     driver_version = features.driver_version;
 
@@ -194,54 +224,62 @@ void FixedPipelineState::Refresh(Tegra::Engines::Maxwell3D& maxwell3d, DynamicFe
                          ? std::bit_cast<u32>(std::round(regs.alpha_test_ref * 255.0f) / 255.0f)
                          : 0;
     point_size = std::bit_cast<u32>(regs.point_size);
+}
 
-    if (maxwell3d.dirty.flags[Dirty::VertexInput]) {
-        if (features.has_dynamic_vertex_input) {
-            // Dirty flag will be reset by the command buffer update
-            static constexpr std::array LUT{
-                0u, // Invalid
-                1u, // SignedNorm
-                1u, // UnsignedNorm
-                2u, // SignedInt
-                3u, // UnsignedInt
-                1u, // UnsignedScaled
-                1u, // SignedScaled
-                1u, // Float
-            };
-            const auto& attrs = regs.vertex_attrib_format;
-            attribute_types = 0;
-            for (size_t i = 0; i < Maxwell::NumVertexAttributes; ++i) {
-                const u32 mask = attrs[i].constant != 0 ? 0 : 3;
-                const u32 type = LUT[static_cast<size_t>(attrs[i].type.Value())];
-                attribute_types |= static_cast<u64>(type & mask) << (i * 2);
-            }
-        } else {
-            maxwell3d.dirty.flags[Dirty::VertexInput] = false;
-            enabled_divisors = 0;
-            for (size_t index = 0; index < Maxwell::NumVertexArrays; ++index) {
-                const bool is_enabled = regs.vertex_stream_instances.IsInstancingEnabled(index);
-                binding_divisors[index] = is_enabled ? regs.vertex_streams[index].frequency : 0;
-                enabled_divisors |= (is_enabled ? u64{1} : 0) << index;
-            }
-            for (size_t index = 0; index < Maxwell::NumVertexAttributes; ++index) {
-                const auto& input = regs.vertex_attrib_format[index];
-                auto& attribute = attributes[index];
-                attribute.raw = 0;
-                attribute.enabled.Assign(input.constant ? 0 : 1);
-                attribute.buffer.Assign(input.buffer);
-                attribute.offset.Assign(input.offset);
-                attribute.type.Assign(static_cast<u32>(input.type.Value()));
-                attribute.size.Assign(static_cast<u32>(input.size.Value()));
-            }
+void FixedPipelineState::RefreshVertexInput(Tegra::Engines::Maxwell3D& maxwell3d,
+                                            const DynamicFeatures& features, bool touch_flags) {
+    const Maxwell& regs = maxwell3d.regs;
+    if (features.has_dynamic_vertex_input) {
+        // Dirty flag will be reset by the command buffer update
+        static constexpr std::array LUT{
+            0u, // Invalid
+            1u, // SignedNorm
+            1u, // UnsignedNorm
+            2u, // SignedInt
+            3u, // UnsignedInt
+            1u, // UnsignedScaled
+            1u, // SignedScaled
+            1u, // Float
+        };
+        const auto& attrs = regs.vertex_attrib_format;
+        attribute_types = 0;
+        for (size_t i = 0; i < Maxwell::NumVertexAttributes; ++i) {
+            const u32 mask = attrs[i].constant != 0 ? 0 : 3;
+            const u32 type = LUT[static_cast<size_t>(attrs[i].type.Value())];
+            attribute_types |= static_cast<u64>(type & mask) << (i * 2);
         }
+        return;
     }
-    if (maxwell3d.dirty.flags[Dirty::ViewportSwizzles]) {
-        maxwell3d.dirty.flags[Dirty::ViewportSwizzles] = false;
-        const auto& transform = regs.viewport_transform;
-        std::ranges::transform(transform, viewport_swizzles.begin(), [](const auto& viewport) {
-            return static_cast<u16>(viewport.swizzle.raw);
-        });
+    if (touch_flags) {
+        maxwell3d.dirty.flags[Dirty::VertexInput] = false;
     }
+    enabled_divisors = 0;
+    for (size_t index = 0; index < Maxwell::NumVertexArrays; ++index) {
+        const bool is_enabled = regs.vertex_stream_instances.IsInstancingEnabled(index);
+        binding_divisors[index] = is_enabled ? regs.vertex_streams[index].frequency : 0;
+        enabled_divisors |= (is_enabled ? u64{1} : 0) << index;
+    }
+    for (size_t index = 0; index < Maxwell::NumVertexAttributes; ++index) {
+        const auto& input = regs.vertex_attrib_format[index];
+        auto& attribute = attributes[index];
+        attribute.raw = 0;
+        attribute.enabled.Assign(input.constant ? 0 : 1);
+        attribute.buffer.Assign(input.buffer);
+        attribute.offset.Assign(input.offset);
+        attribute.type.Assign(static_cast<u32>(input.type.Value()));
+        attribute.size.Assign(static_cast<u32>(input.size.Value()));
+    }
+}
+
+void FixedPipelineState::RefreshSwizzles(const Maxwell& regs) {
+    const auto& transform = regs.viewport_transform;
+    std::ranges::transform(transform, viewport_swizzles.begin(), [](const auto& viewport) {
+        return static_cast<u16>(viewport.swizzle.raw);
+    });
+}
+
+void FixedPipelineState::RefreshDynamic(const Maxwell& regs, Maxwell::PrimitiveTopology topology_,
+                                        const DynamicFeatures& features) {
     dynamic_state.raw1 = 0;
     dynamic_state.raw2 = 0;
     if (!extended_dynamic_state) {
@@ -253,42 +291,241 @@ void FixedPipelineState::Refresh(Tegra::Engines::Maxwell3D& maxwell3d, DynamicFe
     if (!extended_dynamic_state_2_logic_op) {
         dynamic_state.Refresh2(regs, topology_, extended_dynamic_state_2);
     }
-    if (!extended_dynamic_state_3_blend) {
-        // Always rebuilt: a blend register written without raising Dirty::Blending (native
-        // Switch 2 command paths) left a stale state in the key (Ocarina forest fog drawn
-        // without blending = black screen on GPUs without dynamic blend state, e.g. AMD).
-        {
+    dynamic_state.Refresh3(regs, features);
+}
+
+void FixedPipelineState::RefreshBlend(const Maxwell& regs) {
+    for (size_t index = 0; index < attachments.size(); ++index) {
+        attachments[index].Refresh(regs, index);
+        auto& attachment = attachments[index];
+        if (color_write_enable_dynamic && attachment.mask_r == 0 && attachment.mask_g == 0 &&
+            attachment.mask_b == 0 && attachment.mask_a == 0) {
+            attachment.mask_r.Assign(1);
+            attachment.mask_g.Assign(1);
+            attachment.mask_b.Assign(1);
+            attachment.mask_a.Assign(1);
+        }
+    }
+}
+
+void FixedPipelineState::RefreshRepack(const Maxwell& regs) {
+    const u32 repack_mask = VertexRepackMask(regs);
+    // Refresh from guest values even when only the stride changed: offsets must not accumulate.
+    for (size_t index = 0; index < attributes.size(); ++index) {
+        const auto& input = regs.vertex_attrib_format[index];
+        attributes[index].offset.Assign(
+            RepackedVertexOffset(repack_mask, input.buffer, input.offset));
+    }
+    for (u32 binding = 0; binding < vertex_strides.size(); ++binding) {
+        vertex_strides[binding] = static_cast<u16>(
+            RepackedVertexStride(repack_mask, binding, regs.vertex_streams[binding].stride));
+    }
+}
+
+KeyInputs FixedPipelineState::CurrentInputs(const Tegra::Engines::Maxwell3D& maxwell3d) {
+    return KeyInputs{
+        .topology = maxwell3d.draw_manager.draw_state.topology,
+        .engine_state = maxwell3d.engine_state,
+        .squashed_iterated_blend = Settings::values.use_squashed_iterated_blend ? true : false,
+    };
+}
+
+u32 FixedPipelineState::RefreshIncremental(Tegra::Engines::Maxwell3D& maxwell3d,
+                                           const DynamicFeatures& features, u32 groups,
+                                           const KeyInputs& previous, bool force,
+                                           bool touch_flags) {
+    const Maxwell& regs = maxwell3d.regs;
+    const KeyInputs inputs = CurrentInputs(maxwell3d);
+    const auto& masks = KeyBlockGroups();
+    const auto block_dirty = [&](KeyBlock block) {
+        return force || (groups & masks[static_cast<size_t>(block)]) != 0;
+    };
+    const bool topology_changed = inputs.topology != previous.topology;
+    u32 repacked = 0;
+    // In Refresh's order: later blocks read what earlier ones write (xfb_enabled, the attribute
+    // offsets and strides the repack rewrites).
+    if (block_dirty(KeyBlock::Core) || topology_changed ||
+        inputs.engine_state != previous.engine_state) {
+        RefreshCore(maxwell3d, features);
+        repacked |= KeyBlockBit(KeyBlock::Core);
+    }
+    // These two followed their Maxwell3D dirty flags in Refresh already.
+    if (force || maxwell3d.dirty.flags[Dirty::VertexInput]) {
+        RefreshVertexInput(maxwell3d, features, touch_flags);
+        repacked |= KeyBlockBit(KeyBlock::VertexInput);
+    }
+    if (force || maxwell3d.dirty.flags[Dirty::ViewportSwizzles]) {
+        if (touch_flags) {
+            maxwell3d.dirty.flags[Dirty::ViewportSwizzles] = false;
+        }
+        RefreshSwizzles(regs);
+        repacked |= KeyBlockBit(KeyBlock::Swizzles);
+    }
+    if (block_dirty(KeyBlock::Dynamic) || topology_changed) {
+        RefreshDynamic(regs, inputs.topology, features);
+        repacked |= KeyBlockBit(KeyBlock::Dynamic);
+    }
+    if (!extended_dynamic_state_3_blend &&
+        (block_dirty(KeyBlock::Blend) ||
+         inputs.squashed_iterated_blend != previous.squashed_iterated_blend)) {
+        if (touch_flags) {
             maxwell3d.dirty.flags[Dirty::Blending] = false;
-            for (size_t index = 0; index < attachments.size(); ++index) {
-                attachments[index].Refresh(regs, index);
-                auto& attachment = attachments[index];
-                if (color_write_enable_dynamic && attachment.mask_r == 0 &&
-                    attachment.mask_g == 0 && attachment.mask_b == 0 &&
-                    attachment.mask_a == 0) {
-                    attachment.mask_r.Assign(1);
-                    attachment.mask_g.Assign(1);
-                    attachment.mask_b.Assign(1);
-                    attachment.mask_a.Assign(1);
+        }
+        RefreshBlend(regs);
+        repacked |= KeyBlockBit(KeyBlock::Blend);
+    }
+    if (xfb_enabled && (block_dirty(KeyBlock::Xfb) || (repacked & KeyBlockBit(KeyBlock::Core)))) {
+        RefreshXfbState(xfb_state, regs);
+        repacked |= KeyBlockBit(KeyBlock::Xfb);
+    }
+    if (!dynamic_vertex_input && features.has_static_vertex_repack &&
+        (block_dirty(KeyBlock::Repack) ||
+         (repacked & (KeyBlockBit(KeyBlock::VertexInput) | KeyBlockBit(KeyBlock::Dynamic))))) {
+        RefreshRepack(regs);
+        repacked |= KeyBlockBit(KeyBlock::Repack);
+    }
+    return repacked;
+}
+
+void FixedPipelineState::CanonicalizeDynamic(const DynamicFeatures& features) {
+    if (!extended_dynamic_state_3_enables) {
+        return;
+    }
+    if (features.has_dynamic_state3_conservative_raster) {
+        conservative_raster_enable.Assign(0);
+    }
+    if (features.has_dynamic_state3_line_rasterization_mode) {
+        smooth_lines.Assign(0);
+    }
+    if (features.has_dynamic_state3_alpha_to_coverage) {
+        alpha_to_coverage_enabled.Assign(0);
+    }
+    if (features.has_dynamic_state3_alpha_to_one) {
+        alpha_to_one_enabled.Assign(0);
+    }
+}
+
+namespace {
+using Tegra::Engines::Maxwell3D;
+
+#define KEY_FIELD(field)                                                                           \
+    std::pair<u32, u32> {                                                                          \
+        static_cast<u32>(MAXWELL3D_REG_INDEX(field)),                                              \
+            static_cast<u32>((sizeof(Maxwell::field) + sizeof(u32) - 1) / sizeof(u32))             \
+    }
+
+const std::array CORE_FIELDS{
+    KEY_FIELD(transform_feedback_enabled),
+    KEY_FIELD(depth_mode),
+    KEY_FIELD(polygon_mode_front),
+    KEY_FIELD(tessellation),
+    KEY_FIELD(patch_vertices),
+    KEY_FIELD(anti_alias_samples_mode),
+    KEY_FIELD(blend),
+    KEY_FIELD(blend_per_target_enabled),
+    KEY_FIELD(blend_per_target),
+    KEY_FIELD(alpha_test_enabled),
+    KEY_FIELD(alpha_test_func),
+    KEY_FIELD(mandated_early_z),
+    KEY_FIELD(zeta_enable),
+    KEY_FIELD(zeta),
+    KEY_FIELD(window_origin),
+    KEY_FIELD(provoking_vertex),
+    KEY_FIELD(conservative_raster_enable),
+    KEY_FIELD(line_anti_alias_enable),
+    KEY_FIELD(anti_alias_alpha_control),
+    KEY_FIELD(depth_bounds),
+    KEY_FIELD(line_stipple_params),
+    KEY_FIELD(rt),
+    KEY_FIELD(alpha_test_ref),
+    KEY_FIELD(point_size),
+};
+const std::array VERTEX_INPUT_FIELDS{
+    KEY_FIELD(vertex_attrib_format),
+    KEY_FIELD(vertex_stream_instances),
+    KEY_FIELD(vertex_streams),
+};
+const std::array SWIZZLE_FIELDS{
+    KEY_FIELD(viewport_transform),
+};
+const std::array DYNAMIC_FIELDS{
+    KEY_FIELD(gl_front_face),
+    KEY_FIELD(window_origin),
+    KEY_FIELD(stencil_front_op),
+    KEY_FIELD(stencil_two_side_enable),
+    KEY_FIELD(stencil_back_op),
+    KEY_FIELD(stencil_enable),
+    KEY_FIELD(depth_write_enabled),
+    KEY_FIELD(depth_bounds_enable),
+    KEY_FIELD(depth_test_enable),
+    KEY_FIELD(depth_test_func),
+    KEY_FIELD(gl_cull_face),
+    KEY_FIELD(gl_cull_test_enabled),
+    KEY_FIELD(vertex_streams),
+    KEY_FIELD(logic_op),
+    KEY_FIELD(polygon_offset_point_enable),
+    KEY_FIELD(polygon_offset_line_enable),
+    KEY_FIELD(polygon_offset_fill_enable),
+    KEY_FIELD(rasterize_enable),
+    KEY_FIELD(primitive_restart),
+    KEY_FIELD(viewport_clip_control),
+    KEY_FIELD(line_stipple_enable),
+};
+const std::array BLEND_FIELDS{
+    KEY_FIELD(color_mask),
+    KEY_FIELD(color_mask_common),
+    KEY_FIELD(blend),
+    KEY_FIELD(blend_per_target_enabled),
+    KEY_FIELD(iterated_blend),
+    KEY_FIELD(blend_per_target),
+};
+const std::array XFB_FIELDS{
+    KEY_FIELD(transform_feedback),
+    KEY_FIELD(stream_out_layout),
+};
+const std::array REPACK_FIELDS{
+    KEY_FIELD(vertex_attrib_format),
+    KEY_FIELD(vertex_streams),
+};
+#undef KEY_FIELD
+} // Anonymous namespace
+
+std::span<const std::pair<u32, u32>> KeyBlockRegisters(KeyBlock block) {
+    switch (block) {
+    case KeyBlock::Core:
+        return CORE_FIELDS;
+    case KeyBlock::VertexInput:
+        return VERTEX_INPUT_FIELDS;
+    case KeyBlock::Swizzles:
+        return SWIZZLE_FIELDS;
+    case KeyBlock::Dynamic:
+        return DYNAMIC_FIELDS;
+    case KeyBlock::Blend:
+        return BLEND_FIELDS;
+    case KeyBlock::Xfb:
+        return XFB_FIELDS;
+    case KeyBlock::Repack:
+        return REPACK_FIELDS;
+    case KeyBlock::Count:
+        break;
+    }
+    return {};
+}
+
+const std::array<u32, NumKeyBlocks>& KeyBlockGroups() {
+    static const std::array<u32, NumKeyBlocks> masks = [] {
+        const auto& table = VideoCommon::V2::RegSem::GetTable3D();
+        std::array<u32, NumKeyBlocks> result{};
+        for (size_t block = 0; block < NumKeyBlocks; ++block) {
+            for (const auto& [first, count] : KeyBlockRegisters(static_cast<KeyBlock>(block))) {
+                for (u32 reg = first; reg < first + count && reg < table.groups.size(); ++reg) {
+                    result[block] |= VideoCommon::V2::GroupBit(table.groups[reg]);
                 }
             }
         }
-    }
-    dynamic_state.Refresh3(regs, features);
-    if (xfb_enabled) {
-        RefreshXfbState(xfb_state, regs);
-    }
-    if (!dynamic_vertex_input && features.has_static_vertex_repack) {
-        const u32 repack_mask = VertexRepackMask(regs);
-        // Refresh from guest values even when only the stride changed: offsets must not accumulate.
-        for (size_t index = 0; index < attributes.size(); ++index) {
-            const auto& input = regs.vertex_attrib_format[index];
-            attributes[index].offset.Assign(RepackedVertexOffset(repack_mask, input.buffer, input.offset));
-        }
-        for (u32 binding = 0; binding < vertex_strides.size(); ++binding) {
-            vertex_strides[binding] = static_cast<u16>(RepackedVertexStride(
-                repack_mask, binding, regs.vertex_streams[binding].stride));
-        }
-    }
+        return result;
+    }();
+    return masks;
 }
 
 void FixedPipelineState::BlendingAttachment::Refresh(const Maxwell& regs, size_t index) {

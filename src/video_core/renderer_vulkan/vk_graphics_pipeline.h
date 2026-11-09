@@ -117,6 +117,10 @@ public:
     static std::chrono::nanoseconds TakeHoldTime() noexcept;
 
     bool HasDynamicVertexInput() const noexcept { return key.state.dynamic_vertex_input; }
+    /// The pipeline's cache key (the pipeline cache's v2 lookup tables point into it).
+    const GraphicsPipelineCacheKey& Key() const noexcept {
+        return key;
+    }
     const std::array<u64, 6>& ShaderHashes() const noexcept {
         return key.unique_hashes;
     }

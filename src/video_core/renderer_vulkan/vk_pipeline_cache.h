@@ -32,6 +32,7 @@
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/renderer_vulkan/fixed_pipeline_state.h"
+#include "video_core/v2/pipeline_lookup.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
@@ -143,6 +144,17 @@ public:
 private:
     [[nodiscard]] GraphicsPipeline* CurrentGraphicsPipelineSlowPath();
 
+    /// EDEN_NX2_V2_PIPEKEY: CurrentGraphicsPipeline with the incremental key and the two-level
+    /// lookup.
+    [[nodiscard]] GraphicsPipeline* CurrentGraphicsPipelineV2();
+
+    /// The pipeline for graphics_key from graphics_cache, created when it is new; nullptr when
+    /// its creation failed.
+    [[nodiscard]] GraphicsPipeline* FindOrCreateGraphicsPipeline();
+
+    /// Makes `pipeline` the current one (the slow path's bookkeeping).
+    void ActivateGraphicsPipeline(GraphicsPipeline* pipeline, bool add_transition);
+
     /// Returns `pipeline` when it is built or its draw must wait for it, nullptr when the draw
     /// may be skipped while it builds (asynchronous shaders, CanDiscardPendingDraw).
     [[nodiscard]] GraphicsPipeline* BuiltPipeline(GraphicsPipeline* pipeline) noexcept;
@@ -215,6 +227,20 @@ private:
 
     GraphicsPipelineCacheKey graphics_key{};
     GraphicsPipeline* current_pipeline{};
+
+    /// EDEN_NX2_V2_PIPEKEY state: what the persistent key was built from and the last result.
+    struct V2Key {
+        const Tegra::Engines::Maxwell3D* engine{}; ///< The channel's engine the key belongs to
+        KeyInputs inputs{};
+        bool valid{};
+        FixedPipelineState shadow{}; ///< verify: the incremental key (graphics_key has Refresh's)
+        std::array<u64, 6> hashes{};
+        GraphicsPipeline* pipeline{}; ///< The last pipeline found for (hashes, key)
+    };
+    V2Key v2_key{};
+    VideoCommon::V2::PipelineLookup<GraphicsPipeline> v2_lookup;
+    /// Forgets the v2 lookup tables (pipelines were destroyed).
+    void ClearV2Lookup();
 
     /// Destroys graphics pipelines unused for a while, once the GPU is done with them.
     void EvictUnusedPipelines();

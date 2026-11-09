@@ -380,7 +380,7 @@ void Maxwell3D::ProcessDirtyRegisters(u32 method, u32 argument) {
         VideoCommon::V2::Stats::NoteWrite(v2_draw_tracker, method, regs.reg_array[method],
                                           argument);
     }
-    if (VideoCommon::V2::On(VideoCommon::V2::Switch::RegSem)) [[unlikely]] {
+    if (VideoCommon::V2::TrackGroups()) [[unlikely]] {
         VideoCommon::V2::RegSem::NoteWrite3D(v2_groups, method, regs.reg_array[method], argument);
     }
     regs.reg_array[method] = argument;
@@ -1345,7 +1345,7 @@ void Maxwell3D::ProcessCBMultiData(const u32* start_base, u32 amount) {
     if (VideoCommon::V2::Stats::Enabled()) [[unlikely]] {
         VideoCommon::V2::Stats::NoteConstantData(v2_draw_tracker);
     }
-    if (VideoCommon::V2::On(VideoCommon::V2::Switch::RegSem)) [[unlikely]] {
+    if (VideoCommon::V2::TrackGroups()) [[unlikely]] {
         v2_groups.Touch(VideoCommon::V2::RegGroup::CbufData);
     }
     // Write the input value to the current const buffer at the current position.

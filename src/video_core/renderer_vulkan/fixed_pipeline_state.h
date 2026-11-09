@@ -7,7 +7,9 @@
 #pragma once
 
 #include <array>
+#include <span>
 #include <type_traits>
+#include <utility>
 
 #include "common/bit_field.h"
 #include "common/common_types.h"
@@ -39,7 +41,46 @@ struct DynamicFeatures {
     bool has_provoking_vertex_first_mode;
     bool has_provoking_vertex_last_mode;
     bool has_provoking_vertex_tf_preserve;
+    // EDS3 enables the device sets per draw (UpdateDynamicStates): with EDEN_NX2_V2_PIPEKEY their
+    // key fields are left out (FixedPipelineState::CanonicalizeDynamic).
+    bool has_dynamic_state3_conservative_raster;
+    bool has_dynamic_state3_line_rasterization_mode;
+    bool has_dynamic_state3_alpha_to_coverage;
+    bool has_dynamic_state3_alpha_to_one;
 };
+
+/// Pipeline v2 (EDEN_NX2_V2_PIPEKEY): the key in blocks that FixedPipelineState::RefreshIncremental
+/// re-packs one by one, each only when what it reads changed.
+enum class KeyBlock : u32 {
+    Core,        ///< raw1, raw2, colour formats, alpha test, point size, depth bounds, stipple
+    VertexInput, ///< attribute types or attributes and divisors (follows Dirty::VertexInput)
+    Swizzles,    ///< viewport swizzles (follows Dirty::ViewportSwizzles)
+    Dynamic,     ///< dynamic_state and, without EDS1, vertex strides
+    Blend,       ///< attachments, without EDS3 blending
+    Xfb,         ///< transform feedback layouts, while it is enabled
+    Repack,      ///< static vertex repack offsets and strides
+    Count,
+};
+inline constexpr size_t NumKeyBlocks = static_cast<size_t>(KeyBlock::Count);
+[[nodiscard]] constexpr u32 KeyBlockBit(KeyBlock block) {
+    return 1U << static_cast<u32>(block);
+}
+inline constexpr u32 AllKeyBlocks = (1U << NumKeyBlocks) - 1;
+
+/// Inputs of the key that are not Maxwell3D registers.
+struct KeyInputs {
+    Maxwell::PrimitiveTopology topology{};
+    Tegra::Engines::Maxwell3D::EngineHint engine_state{};
+    bool squashed_iterated_blend{};
+
+    bool operator==(const KeyInputs&) const = default;
+};
+
+/// The registers each block reads, as (first register, count) whole fields.
+[[nodiscard]] std::span<const std::pair<u32, u32>> KeyBlockRegisters(KeyBlock block);
+/// For each block, the V2::RegGroup bits of the registers it reads (register semantics table,
+/// which a Maxwell3D constructor must have built).
+[[nodiscard]] const std::array<u32, NumKeyBlocks>& KeyBlockGroups();
 
 struct FixedPipelineState {
     static u32 PackComparisonOp(Maxwell::ComparisonOp op) noexcept;
@@ -263,6 +304,21 @@ struct FixedPipelineState {
 
     void Refresh(Tegra::Engines::Maxwell3D& maxwell3d, DynamicFeatures& features);
 
+    /// EDEN_NX2_V2_PIPEKEY: Refresh, re-packing only the blocks whose inputs changed since the
+    /// last call: `groups` are the V2::RegGroup bits changed since then, `previous` the inputs
+    /// then; `force` re-packs every block. The result equals Refresh's (verify compares). With
+    /// `touch_flags` false the Maxwell3D dirty flags are only read (verify runs Refresh next).
+    /// Returns the KeyBlock bits re-packed.
+    u32 RefreshIncremental(Tegra::Engines::Maxwell3D& maxwell3d, const DynamicFeatures& features,
+                           u32 groups, const KeyInputs& previous, bool force, bool touch_flags);
+
+    /// The non-register inputs Refresh reads now.
+    [[nodiscard]] static KeyInputs CurrentInputs(const Tegra::Engines::Maxwell3D& maxwell3d);
+
+    /// EDEN_NX2_V2_PIPEKEY: clears the fields of state the device sets dynamically (EDS3
+    /// enables), so draws that only differ there share a pipeline.
+    void CanonicalizeDynamic(const DynamicFeatures& features);
+
     size_t Hash() const noexcept;
 
     bool operator==(const FixedPipelineState& rhs) const noexcept;
@@ -294,6 +350,16 @@ struct FixedPipelineState {
     u32 DynamicAttributeType(size_t index) const noexcept {
         return (attribute_types >> (index * 2)) & 0b11;
     }
+
+private:
+    void RefreshCore(const Tegra::Engines::Maxwell3D& maxwell3d, const DynamicFeatures& features);
+    void RefreshVertexInput(Tegra::Engines::Maxwell3D& maxwell3d, const DynamicFeatures& features,
+                            bool touch_flags);
+    void RefreshSwizzles(const Maxwell& regs);
+    void RefreshDynamic(const Maxwell& regs, Maxwell::PrimitiveTopology topology,
+                        const DynamicFeatures& features);
+    void RefreshBlend(const Maxwell& regs);
+    void RefreshRepack(const Maxwell& regs);
 };
 static_assert(std::has_unique_object_representations_v<FixedPipelineState>);
 static_assert(std::is_trivially_copyable_v<FixedPipelineState>);

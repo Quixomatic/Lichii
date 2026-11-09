@@ -60,7 +60,10 @@
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_query_cache.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
+#include "video_core/v2/p3_stats.h"
+#include "video_core/v2/regsem.h"
 #include "video_core/v2/shader_writes.h"
+#include "video_core/v2/v2_switches.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 #include "video_core/renderer_vulkan/vk_state_tracker.h"
@@ -3584,6 +3587,12 @@ void RasterizerVulkan::UpdateDynamicStates(const GraphicsPipeline* pipeline) {
                 }
             );
             if (regs.logic_op.enable) {
+                if (VideoCommon::V2::TrackGroups()) [[unlikely]] {
+                    // A register write outside the engine: the group tracker must see it.
+                    VideoCommon::V2::RegSem::NoteWrite3D(
+                        maxwell3d->v2_groups, MAXWELL3D_REG_INDEX(logic_op),
+                        regs.logic_op.enable, static_cast<u32>(!has_float));
+                }
                 regs.logic_op.enable = static_cast<u32>(!has_float);
             }
         }

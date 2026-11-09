@@ -89,6 +89,16 @@ inline constexpr u32 HashedComputeGroups = AllComputeGroups &
                                            ~ComputeGroupBit(ComputeGroup::Upload) &
                                            ~ComputeGroupBit(ComputeGroup::Misc);
 
+/// P3 consumers of the dirty groups that don't run on every draw (a skipped or continued draw
+/// doesn't look at the pipeline key): each takes what changed since it last looked.
+enum class GroupSink : u8 {
+    PipelineKey,   ///< The incremental pipeline key (EDEN_NX2_V2_PIPEKEY)
+    ContinuedDraw, ///< The continued-draw decision (EDEN_NX2_V2_CONTDRAW)
+    Count,
+};
+inline constexpr size_t NumGroupSinks = static_cast<size_t>(GroupSink::Count);
+static_assert(NumGroupSinks == 2, "BasicGroupTracker::sinks initializes every sink");
+
 /// Dirty bits and incremental hashes per group, for one engine's register file.
 template <typename Group, size_t NumGroups, u32 Hashed>
 struct BasicGroupTracker {
@@ -100,6 +110,8 @@ struct BasicGroupTracker {
     u32 draws{};
     bool valid{}; ///< The hashes were computed from the registers once
     std::array<u64, NumGroups> hashes{};
+    /// `dirty` accumulated per GroupSink since the sink last took it (BeginDraw adds to all).
+    std::array<u32, NumGroupSinks> sinks{All, All};
 
     /// A register of `group` changes from `old_value` to `value` (callers compare first).
     void Change(Group group, u32 index, u32 old_value, u32 value) {
@@ -123,8 +135,26 @@ struct BasicGroupTracker {
     /// Per draw: moves the dirty bits to draw_dirty for the draw's consumers.
     void BeginDraw() {
         draw_dirty = dirty;
+        for (u32& sink : sinks) {
+            sink |= dirty;
+        }
         dirty = 0;
         ++draws;
+    }
+    /// The groups changed since `sink` last took them, including changes no draw took yet.
+    u32 TakeSink(GroupSink sink) {
+        u32& bits = sinks[static_cast<size_t>(sink)];
+        const u32 result = bits | dirty;
+        bits = 0;
+        return result;
+    }
+    /// What TakeSink would return, without taking it.
+    [[nodiscard]] u32 PeekSink(GroupSink sink) const {
+        return sinks[static_cast<size_t>(sink)] | dirty;
+    }
+    /// Everything changed for every sink (the consumer's state is unknown, e.g. a new channel).
+    void DirtyAllSinks() {
+        sinks.fill(All);
     }
     /// A fingerprint of the hashed groups in `mask`.
     [[nodiscard]] u64 Fingerprint(u32 mask) const {

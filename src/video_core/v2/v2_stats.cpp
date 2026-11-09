@@ -14,6 +14,7 @@
 #include "video_core/nx2_profile.h"
 #include "video_core/v2/regsem.h"
 #include "video_core/v2/ir.h"
+#include "video_core/v2/p3_stats.h"
 #include "video_core/v2/v2_stats.h"
 
 #define OFF(field_name) MAXWELL3D_REG_INDEX(field_name)
@@ -764,6 +765,7 @@ void ReportSlow(const char* thread_name) {
         }
         ir = {};
     }
+    P3Stats::Report(thread_name, window_ns);
     window.start_ns = now;
     window.start_ticks = now_ticks;
 }

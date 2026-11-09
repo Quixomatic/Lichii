@@ -137,6 +137,9 @@ add_library(video_core STATIC
     v2/landing.h
     v2/macro_hle.cpp
     v2/macro_hle.h
+    v2/p3_stats.cpp
+    v2/p3_stats.h
+    v2/pipeline_lookup.h
     v2/regsem.cpp
     v2/shader_writes.cpp
     v2/shader_writes.h
