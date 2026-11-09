@@ -302,6 +302,57 @@ TEST_CASE("V2 P4: captured words are compared with memory on every check", "[vid
     REQUIRE(DC::ValidateInputs(inputs, memo, versions, false) == DC::Miss::ImagePages);
 }
 
+TEST_CASE("V2 F2: a buffer recipe validates its merged ranges once", "[video_core][v2_p4]") {
+    PageVersions versions;
+    Versions::EpochMemo memo{versions};
+    DC::BufferRecipe recipe;
+    recipe.has_index = true;
+    recipe.index = {.device_addr = 0x100000, .size = 0x100};
+    recipe.vertex.push_back({.device_addr = 0x100080, .size = 0x200}); // overlaps the index
+    recipe.uniform.push_back({.stage = 4, .index = 3, .device_addr = 0x900000, .size = 0x40});
+    recipe.storage.push_back({.device_addr = 0x900040, .size = 0x40}); // adjacent
+    recipe.stamp = versions.Stamp();
+    recipe.valid = true;
+    recipe.MergeRanges();
+    REQUIRE(recipe.merged.size() == 2);
+    REQUIRE(recipe.merged[0] == std::pair<DAddr, DAddr>{0x100000, 0x100280});
+    REQUIRE(recipe.merged[1] == std::pair<DAddr, DAddr>{0x900000, 0x900080});
+
+    // Clean: the first check walks, later ones answer from the write buckets alone.
+    REQUIRE(recipe.AllUnchanged(memo, versions));
+    REQUIRE(recipe.checked);
+    static_cast<void>(memo.TakeCounters());
+    for (u64 i = 0; i < 16; ++i) {
+        versions.Note(0x40000000 + i * 0x100000, 4, Source::Inline); // writes elsewhere
+    }
+    REQUIRE(recipe.AllUnchanged(memo, versions));
+    REQUIRE(memo.TakeCounters().queries == 0);
+
+    // A write into one of its ranges: changed, and stays changed for this stamp.
+    versions.Note(0x900048, 4, Source::Inline);
+    REQUIRE_FALSE(recipe.AllUnchanged(memo, versions));
+    REQUIRE_FALSE(recipe.checked);
+    REQUIRE_FALSE(recipe.AllUnchanged(memo, versions));
+
+    // Re-recorded with a new stamp: clean again.
+    recipe.stamp = versions.Stamp();
+    REQUIRE(recipe.AllUnchanged(memo, versions));
+    recipe.Clear();
+    REQUIRE(recipe.merged.empty());
+    REQUIRE(recipe.alive_deletions == ~0ULL);
+}
+
+TEST_CASE("V2 F2: a recipe's residency and heap stamps reset with it", "[video_core][v2_p4]") {
+    DC::Recipe recipe;
+    recipe.residency = {.epoch = 5, .frame = 2, .submission = 9, .barriers = 0};
+    recipe.heap_releases = 3;
+    recipe.heap_tick = 7;
+    recipe.Clear();
+    REQUIRE(recipe.residency == VideoCommon::V2::ResidencyStamp{});
+    REQUIRE(recipe.heap_releases == ~0ULL);
+    REQUIRE(recipe.heap_tick == 0);
+}
+
 TEST_CASE("V2 P4: a key gets a recipe on its second sighting", "[video_core][v2_p4]") {
     DC::SeenFilter seen;
     REQUIRE(!seen.Admit(0x1234));
