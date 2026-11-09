@@ -250,8 +250,13 @@ struct AcquireDecision {
 ///     first wait for a dispatch queued after it.
 ///   Nothing pending: memory decides; equal and mask acquires first wait for queued dispatches
 ///     (a word that only advances can't be moved back by them).
+/// `unlanded`: the fence-flagged releases to the word not in memory yet (GpuSplit::FindUnlanded,
+/// queued or run by the back). They land only when their fence runs, so they never meet the
+/// acquire (Fix pass 1: forwarding them passed acquires the drained path waits on). With one
+/// pending, other queued writes give Fallback and memory alone decides otherwise.
 [[nodiscard]] AcquireDecision DecideAcquire(SemaphoreOp op, u32 value, const HazardResult& word,
                                             u32 forwarded, u32 memory_word,
-                                            u64 pending_dispatch);
+                                            u64 pending_dispatch,
+                                            const HazardResult& unlanded = {});
 
 } // namespace VideoCommon::V2

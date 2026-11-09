@@ -208,17 +208,16 @@ ViewCheck CheckWithView(DmaPusher& dma_pusher, GPUVAddr address, u32 value, V2::
     V2::HazardFilter filter;
     filter.ranged = V2::ProducerBit(V2::Producer::Release) | V2::ProducerBit(V2::Producer::Report);
     u32 forwarded = 0;
-    V2::HazardResult word =
+    const V2::HazardResult word =
         split.FindWrites(*device, sizeof(u32), filter, reinterpret_cast<u8*>(&forwarded));
-    if (word.kind == V2::HazardResult::Kind::Clear) {
-        // A fence-flagged release the back ran whose fence hasn't: memory doesn't hold it yet,
-        // but the host runs it before this channel goes on, as for a queued one.
-        word = split.FindUnlanded(*device, sizeof(u32), reinterpret_cast<u8*>(&forwarded));
-    }
+    // Fence-flagged releases (queued, or run by the back) whose fence hasn't run: memory gets them
+    // only then, so the drained path doesn't see them either (V2::DecideAcquire never passes on
+    // them).
+    const V2::HazardResult unlanded = split.FindUnlanded(*device, sizeof(u32), nullptr);
     const u32 memory_word = memory.Read<u32>(address);
     const V2::AcquireDecision decision =
         V2::DecideAcquire(op, value, word, forwarded, memory_word,
-                          split.PendingUnboundedWrite(V2::Producer::QmdRelease));
+                          split.PendingUnboundedWrite(V2::Producer::QmdRelease), unlanded);
     switch (decision.verdict) {
     case V2::AcquireVerdict::Met:
     case V2::AcquireVerdict::MetByQueued:
@@ -237,6 +236,9 @@ ViewCheck CheckWithView(DmaPusher& dma_pusher, GPUVAddr address, u32 value, V2::
     }
     case V2::AcquireVerdict::Fallback:
         break;
+    }
+    if (unlanded.kind != V2::HazardResult::Kind::Clear) {
+        return {V2::AcquireVerdict::Fallback, Reason::Unlanded, false};
     }
     const Reason reason = word.kind == V2::HazardResult::Kind::Forward && word.covered
                               ? Reason::QueuedNotMet
@@ -272,9 +274,13 @@ void ReportViewMismatch(DmaPusher& dma_pusher, GPUVAddr address, u32 value, u32 
     if (view_passes == old_passed) {
         return;
     }
-    V2Stats::NoteMismatch(VideoCommon::DrainSite::Acquire);
+    // The view waiting where the drained path goes on is benign: a release landed between the two
+    // checks (the drain ran it, or its fence ran meanwhile). Counted apart, logged less.
+    const bool benign = !view_passes;
+    V2Stats::NoteMismatch(VideoCommon::DrainSite::Acquire, benign);
     static std::atomic<u32> logged{};
-    if (logged.fetch_add(1) < 32) {
+    static std::atomic<u32> logged_benign{};
+    if ((benign ? logged_benign : logged).fetch_add(1) < (benign ? 4U : 32U)) {
         LOG_WARNING(HW_GPU,
                     "V2 acquire verify ({}): channel {} semaphore {:#x} op {} value {:#x}: the "
                     "view {}, the drained path {} (word now {:#x})",

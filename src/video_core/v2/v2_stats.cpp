@@ -93,6 +93,7 @@ struct FrontData {
     std::array<std::array<u64, static_cast<size_t>(Decision::Count)>, NumSites> decisions{};
     std::array<std::array<u64, static_cast<size_t>(Reason::Count)>, NumSites> reasons{};
     std::array<u64, NumSites> mismatches{};
+    std::array<u64, NumSites> benign_mismatches{};
 };
 
 constexpr std::array<const char*, static_cast<size_t>(Decision::Count)> decision_names{
@@ -100,7 +101,7 @@ constexpr std::array<const char*, static_cast<size_t>(Decision::Count)> decision
 };
 constexpr std::array<const char*, static_cast<size_t>(Reason::Count)> reason_names{
     "-",         "settings",      "operation",   "unmapped", "gpu-written", "unknown write",
-    "queued not met", "not met", "report page", "overflow", "valve",
+    "queued not met", "not met", "report page", "overflow", "valve", "unlanded",
 };
 
 constexpr size_t NumReleases = 4096;
@@ -358,7 +359,7 @@ void ReportFront(const FrontData& data, const char* thread_name, u64 window_ns,
 void ReportDecisions(const FrontData& data, const char* thread_name, u64 window_ns) {
     std::string sites;
     for (size_t site = 0; site < NumSites; ++site) {
-        u64 total = data.mismatches[site];
+        u64 total = data.mismatches[site] + data.benign_mismatches[site];
         for (const u64 count : data.decisions[site]) {
             total += count;
         }
@@ -384,6 +385,10 @@ void ReportDecisions(const FrontData& data, const char* thread_name, u64 window_
         }
         if (data.mismatches[site] != 0) {
             line += fmt::format(", verify mismatches {}", data.mismatches[site]);
+        }
+        if (data.benign_mismatches[site] != 0) {
+            line += fmt::format(", benign verify mismatches (new path waits) {}",
+                                data.benign_mismatches[site]);
         }
         sites += fmt::format(" {}:{};", drain_site_names[site], line);
     }
@@ -544,11 +549,12 @@ void NoteDecision(DrainSite site, Decision decision, Reason reason) {
     }
 }
 
-void NoteMismatch(DrainSite site) {
+void NoteMismatch(DrainSite site, bool benign) {
     if (!Enabled()) [[likely]] {
         return;
     }
-    ++Front().data.mismatches[static_cast<size_t>(site)];
+    auto& data = Front().data;
+    ++(benign ? data.benign_mismatches : data.mismatches)[static_cast<size_t>(site)];
 }
 
 AcquireContext::AcquireContext(SyncClass sync_class) : enabled{Enabled()} {

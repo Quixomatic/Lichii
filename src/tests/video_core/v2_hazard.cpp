@@ -372,6 +372,47 @@ TEST_CASE("V2 acquire decisions", "[video_core][v2_hazard]") {
         CHECK(DecideAcquire(SemaphoreOp::Equal, 5, unknown, 0, 5, 0).verdict ==
               AcquireVerdict::Fallback);
     }
+
+    // Fix pass 1 (Ocarina of Time, "the view passes, the drained path waits (word now 0xe)" for
+    // value 0xf): a fence-flagged release reaches memory only when its fence runs, after the back
+    // ran it. Forwarding it passed acquires the drained path waits on.
+    SECTION("fence-flagged releases never meet an acquire before they land") {
+        HazardTable table;
+        HazardTable unlanded;
+        const HazardFilter filter{};
+        constexpr u64 word_address = 0x2'1070'2a00;
+        const u32 payload = 0xf;
+        table.NoteKnown(word_address, &payload, sizeof(payload), 60, Producer::Release);
+        unlanded.NoteKnown(word_address, &payload, sizeof(payload), 60, Producer::Release);
+        for (const SemaphoreOp op :
+             {SemaphoreOp::Gequal, SemaphoreOp::Equal, SemaphoreOp::CircularGequal}) {
+            // Queued: the main table forwards 0xf, but it is fence-flagged.
+            u32 forwarded = 0;
+            const HazardResult queued = table.Find(word_address, 4, 0, filter,
+                                                   reinterpret_cast<u8*>(&forwarded));
+            REQUIRE(queued.kind == Kind::Forward);
+            REQUIRE(forwarded == 0xf);
+            const HazardResult pending = unlanded.Find(word_address, 4, 0, filter, nullptr);
+            REQUIRE(pending.kind == Kind::Forward);
+            const AcquireVerdict queued_verdict =
+                DecideAcquire(op, 0xf, queued, forwarded, 0xe, 0, pending).verdict;
+            CHECK(queued_verdict != AcquireVerdict::Met);
+            CHECK(queued_verdict != AcquireVerdict::MetByQueued);
+            // Run by the back (retired from the main table), fence not run: memory decides.
+            const HazardResult ran = table.Find(word_address, 4, 60, filter, nullptr);
+            REQUIRE(ran.kind == Kind::Clear);
+            CHECK(DecideAcquire(op, 0xf, ran, 0, 0xe, 0, pending).verdict ==
+                  AcquireVerdict::NotMet);
+            // Landed: memory holds it.
+            const HazardResult landed = unlanded.Find(word_address, 4, 60, filter, nullptr);
+            REQUIRE(landed.kind == Kind::Clear);
+            CHECK(DecideAcquire(op, 0xf, ran, 0, 0xf, 0, landed).verdict == AcquireVerdict::Met);
+        }
+        // Without a pending fence-flagged release (a 16-byte release lands when the back runs it)
+        // the queued value still decides.
+        CHECK(DecideAcquire(SemaphoreOp::Gequal, 5, forward, 6, 0, 0, clear).verdict ==
+              AcquireVerdict::MetByQueued);
+    }
 }
 
 TEST_CASE("V2 hazard table: wide writes and draw targets", "[video_core][v2_hazard]") {

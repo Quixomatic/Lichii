@@ -403,7 +403,23 @@ HazardResult HazardTable::Find(u64 address, u64 size, u64 consumed, const Hazard
 }
 
 AcquireDecision DecideAcquire(SemaphoreOp op, u32 value, const HazardResult& word, u32 forwarded,
-                              u32 memory_word, u64 pending_dispatch) {
+                              u32 memory_word, u64 pending_dispatch,
+                              const HazardResult& unlanded) {
+    if (unlanded.kind != HazardResult::Kind::Clear) {
+        // A fence-flagged release to the word that isn't in memory: the query cache writes it when
+        // its fence runs on the host (after the GPU work before it), not when the back runs it. The
+        // drained path waits for that too, so it never meets the acquire here. With other writes
+        // queued the drained path decides; with none, memory does (as the drained path reads it).
+        if (word.kind != HazardResult::Kind::Clear) {
+            return {AcquireVerdict::Fallback, word.position};
+        }
+        if (!SemaphoreWaitsToReach(op) && pending_dispatch != 0) {
+            return {AcquireVerdict::WaitFor, pending_dispatch};
+        }
+        return {SemaphoreMet(op, memory_word, value) ? AcquireVerdict::Met
+                                                     : AcquireVerdict::NotMet,
+                0};
+    }
     switch (word.kind) {
     case HazardResult::Kind::Wait:
         // A queued counter report or reduction: the front can't tell what it leaves.

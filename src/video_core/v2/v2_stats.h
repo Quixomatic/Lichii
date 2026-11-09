@@ -90,12 +90,14 @@ enum class Reason : u8 {
     ReportPage,   ///< Pages reports write (query results may be held back)
     Overflow,     ///< The hazard table overflowed or a lookup was too long
     Valve,        ///< A waiting acquire's drain once per 1 ms
+    Unlanded,     ///< A fence-flagged release to the word isn't in memory yet
     Count,
 };
 
 void NoteDecision(DrainSite site, Decision decision, Reason reason = Reason::None);
-/// Verify: the new decision disagreed with the old path at `site`.
-void NoteMismatch(DrainSite site);
+/// Verify: the new decision disagreed with the old path at `site`. `benign`: the new path waits
+/// where the old one went on (it costs time, never ordering); counted apart.
+void NoteMismatch(DrainSite site, bool benign = false);
 
 /// Attributes the waits for the back made while it lives (acquire sites) to `sync_class`.
 class AcquireContext {
