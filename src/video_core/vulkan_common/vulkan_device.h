@@ -80,6 +80,8 @@ VK_DEFINE_HANDLE(VmaPool)
     FEATURE(KHR, CooperativeMatrix, COOPERATIVE_MATRIX, cooperative_matrix)                        \
     FEATURE(KHR, Maintenance5, MAINTENANCE_5, maintenance5)                                        \
     FEATURE(KHR, Maintenance6, MAINTENANCE_6, maintenance6)                                        \
+    FEATURE(KHR, PresentId, PRESENT_ID, present_id)                                                \
+    FEATURE(KHR, PresentWait, PRESENT_WAIT, present_wait)                                          \
     FEATURE(KHR, PipelineExecutableProperties, PIPELINE_EXECUTABLE_PROPERTIES,                     \
             pipeline_executable_properties)                                                        \
     FEATURE(KHR, ShaderQuadControl, SHADER_QUAD_CONTROL, shader_quad_control)                      \
@@ -1064,6 +1066,11 @@ FN_MAX_LIMIT_LIST
     /// tilers keep render passes for their MSAA resolve attachments).
     bool IsDynamicRenderingEnabled() const {
         return extensions.dynamic_rendering;
+    }
+
+    /// EDEN_NX2_V2_PRESENTPACE: VK_KHR_present_id + VK_KHR_present_wait.
+    bool HasPresentWait() const {
+        return extensions.present_id && extensions.present_wait;
     }
 
     /// Returns the minimum supported version of SPIR-V.

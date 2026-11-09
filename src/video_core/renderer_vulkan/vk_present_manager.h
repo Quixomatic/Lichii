@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <deque>
 #include <atomic>
 #include <condition_variable>
 #include <mutex>
@@ -13,6 +14,7 @@
 
 #include "common/common_types.h"
 #include "common/polyfill_thread.h"
+#include "video_core/v2/frame_pacer.h"
 #include "video_core/vulkan_common/vulkan_memory_allocator.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
@@ -85,6 +87,10 @@ private:
 
     void SetImageCount();
 
+    /// EDEN_NX2_V2_PRESENTPACE: retires frames as the display shows them (present wait) or the
+    /// GPU finishes them.
+    void PaceThread(std::stop_token token);
+
 private:
     const vk::Instance& instance;
     Core::Frontend::EmuWindow& render_window;
@@ -103,6 +109,20 @@ private:
     std::mutex queue_mutex;
     std::mutex free_mutex;
     std::jthread present_thread;
+
+    struct PaceEntry {
+        u64 frame{};
+        u64 tick{};       ///< the composite's GPU tick
+        u64 present_id{}; ///< 0 until presented (or never: discarded frame)
+        u64 generation{};
+        bool presented{};
+    };
+    bool pace{};
+    std::mutex pace_mutex;
+    std::condition_variable_any pace_cv;
+    VideoCommon::V2::FramePacer pacer;
+    std::deque<PaceEntry> pace_queue;
+    std::jthread pace_thread;
     bool blit_supported;
     bool storage_supported;
     bool use_present_thread;

@@ -8,6 +8,9 @@
 #include "common/thread.h"
 #include "core/frontend/emu_window.h"
 #ifdef HAS_LSFG
+#include "core/core.h"
+#include "video_core/v2/p5b_stats.h"
+#include "video_core/v2/v2_switches.h"
 #include "video_core/renderer_vulkan/present/lsfg_common.h"
 #endif
 #include "video_core/renderer_vulkan/vk_present_manager.h"
@@ -165,11 +168,81 @@ PresentManager::PresentManager(const vk::Instance& instance_,
     if (use_present_thread) {
         present_thread = std::jthread([this](std::stop_token token) { PresentThread(token); });
     }
+    pace = VideoCommon::V2::On(VideoCommon::V2::Switch::PresentPace);
+    if (pace) {
+        LOG_INFO(Render_Vulkan, "EDEN_NX2_V2_PRESENTPACE: frames retire by {}",
+                 device.HasPresentWait() ? "present wait" : "GPU completion");
+        pace_thread = std::jthread([this](std::stop_token token) { PaceThread(token); });
+    }
+}
+
+void PresentManager::PaceThread(std::stop_token token) {
+    Common::SetCurrentThreadName("VulkanPace");
+    while (!token.stop_requested()) {
+        PaceEntry entry;
+        {
+            std::unique_lock lock{pace_mutex};
+            pace_cv.wait(lock, token, [this] { return !pace_queue.empty(); });
+            if (pace_queue.empty()) {
+                return;
+            }
+            entry = pace_queue.front();
+        }
+        scheduler.GetMasterSemaphore().Wait(entry.tick);
+        if (device.HasPresentWait()) {
+            // Shown on the display: wait for the present (its id comes from the present thread;
+            // a frame that is never presented retires after 100 ms).
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds{100};
+            {
+                std::unique_lock lock{pace_mutex};
+                pace_cv.wait_until(lock, token, deadline,
+                                   [this] { return pace_queue.empty() || pace_queue.front().presented; });
+                if (!pace_queue.empty()) {
+                    entry = pace_queue.front();
+                }
+            }
+            if (entry.present_id != 0 && entry.generation == swapchain.Generation()) {
+                if (swapchain.WaitForPresent(entry.present_id, 100'000'000)) {
+                    VideoCommon::V2::P5bStats::Add(
+                        VideoCommon::V2::P5bStats::Counter::PresentWaits);
+                }
+            }
+        }
+        {
+            std::scoped_lock lock{pace_mutex};
+            if (!pace_queue.empty()) {
+                pace_queue.pop_front();
+            }
+            pacer.NoteRetired(entry.frame);
+        }
+        pace_cv.notify_all();
+    }
 }
 
 PresentManager::~PresentManager() = default;
 
 Frame* PresentManager::GetRenderFrame() {
+    if (pace) [[unlikely]] {
+        // Bounded frames in flight, from vi2's frames-ahead setting for the title. It only adds
+        // waits: vi2's own fence waits (the command memory rule) stay as they are.
+        std::unique_lock lock{pace_mutex};
+        pacer.SetLimit(VideoCommon::V2::FramesInFlightLimit(
+            Core::g_nx2_frames_ahead.load(std::memory_order_relaxed)));
+        VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::FramesInFlight,
+                                       pacer.InFlight());
+        if (pacer.MustWait()) {
+            const auto start = std::chrono::steady_clock::now();
+            // Never stall for good: a frame that can't retire (lost swapchain) lets go at 250 ms.
+            pace_cv.wait_for(lock, std::chrono::milliseconds{250},
+                             [this] { return !pacer.MustWait(); });
+            VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::PaceWaits);
+            VideoCommon::V2::P5bStats::Add(
+                VideoCommon::V2::P5bStats::Counter::PaceWaitUs,
+                static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                     std::chrono::steady_clock::now() - start)
+                                     .count()));
+        }
+    }
 
     // Wait for free presentation frames
     std::unique_lock lock{free_mutex};
@@ -187,6 +260,15 @@ Frame* PresentManager::GetRenderFrame() {
 }
 
 void PresentManager::Present(Frame* frame) {
+    if (pace) [[unlikely]] {
+        // The composite's submission was flushed just before (render_ready).
+        std::scoped_lock lock{pace_mutex};
+        PaceEntry entry{};
+        entry.frame = pacer.NoteComposite();
+        entry.tick = scheduler.CurrentTick() - 1;
+        pace_queue.push_back(entry);
+        pace_cv.notify_all();
+    }
     if (use_present_thread) {
         scheduler.Record([this, frame](vk::CommandBuffer) {
             // EDEN_NX2_V2_SUBMITTHREAD: the submission signalling render_ready must reach the
@@ -591,7 +673,19 @@ void PresentManager::CopyToSwapchainImpl(Frame* frame) {
     }
 
     // Present
-    swapchain.Present(render_semaphore);
+    const u64 present_id = swapchain.Present(render_semaphore);
+    if (pace) [[unlikely]] {
+        std::scoped_lock lock{pace_mutex};
+        for (PaceEntry& entry : pace_queue) {
+            if (!entry.presented) {
+                entry.presented = true;
+                entry.present_id = present_id;
+                entry.generation = swapchain.Generation();
+                break;
+            }
+        }
+        pace_cv.notify_all();
+    }
 }
 
 } // namespace Vulkan

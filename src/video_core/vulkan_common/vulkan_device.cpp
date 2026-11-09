@@ -1875,6 +1875,16 @@ void Device::RemoveUnsuitableExtensions() {
                                    !IsTiler();
     RemoveExtensionFeatureIfUnsuitable(extensions.dynamic_rendering, features.dynamic_rendering,
                                        VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME);
+
+    // VK_KHR_present_id / VK_KHR_present_wait (EDEN_NX2_V2_PRESENTPACE only)
+    const bool present_pace = VideoCommon::V2::On(VideoCommon::V2::Switch::PresentPace);
+    extensions.present_id = present_pace && features.present_id.presentId;
+    RemoveExtensionFeatureIfUnsuitable(extensions.present_id, features.present_id,
+                                       VK_KHR_PRESENT_ID_EXTENSION_NAME);
+    extensions.present_wait =
+        present_pace && extensions.present_id && features.present_wait.presentWait;
+    RemoveExtensionFeatureIfUnsuitable(extensions.present_wait, features.present_wait,
+                                       VK_KHR_PRESENT_WAIT_EXTENSION_NAME);
 }
 
 void Device::SetupFamilies(VkSurfaceKHR surface) {
