@@ -1046,7 +1046,11 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     {
         Profile::Scope scope{Profile::Zone::FlushWork};
         FlushWork();
-        gpu_memory->FlushCaching();
+        // U-04: inline writes reach the caches before the first draw after them (their ordering
+        // point); without any, no call.
+        if (gpu_memory->HasPendingInvalidation()) {
+            gpu_memory->FlushCaching();
+        }
     }
     if (frame_dump.Capturing()) {
         frame_dump.DrainIfFull();

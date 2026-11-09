@@ -196,6 +196,10 @@ public:
     size_t GetMemoryLayoutSizeUncached(GPUVAddr gpu_addr) const;
 
     void FlushCaching();
+    /// U-04: whether FlushCaching has anything to invalidate (inline writes since the last one).
+    [[nodiscard]] bool HasPendingInvalidation() const noexcept {
+        return !accumulator.Empty();
+    }
 
     /// Leaves the caches' invalidation of a range already written for the next FlushCaching
     /// (before every draw, dispatch, clear and copy), merged with neighbouring ranges.
