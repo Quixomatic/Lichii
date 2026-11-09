@@ -20,7 +20,8 @@
 //
 // Entries are u64 words; bits 0-3 are the tag (the old Method entry, tag 2, never appears in a
 // Classified run, so the shards and checks can tell the two apart in mixed runs):
-//   Delta  [tag][- 4-7][index 8-23][value 32-63]           regs[index] = value
+//   Delta  [tag][Quiet 4][index 8-23][value 32-63]         regs[index] = value (Quiet: no
+//                                                           dirty flag)
 //   Exec   [tag][IsLast 4][index 8-23][value 32-63]        store, then the register's action
 //                                                           (reports, barriers, binds, uploads,
 //                                                           root tables; Action3D)
@@ -49,6 +50,9 @@ enum class Tag : u8 {
 
 inline constexpr u64 TagMask = 0xf;
 inline constexpr u64 IsLast = 1 << 4;
+/// Delta: a side effect's store (macro bind pointer, falcon[4] scratch) that marks no dirty
+/// flag, as the engine's handler stores it.
+inline constexpr u64 DeltaQuiet = 1 << 4;
 inline constexpr u64 CbufStore = 1 << 4;
 inline constexpr u64 CbufInc = 1 << 5;
 inline constexpr u64 GroupsRegisterBreak = 1 << 4;
@@ -166,7 +170,7 @@ inline void ApplyRegisters(const u64* entry, u32 cb_data, u32 cb_offset, Store&&
 /// the register and const_buffer.offset before it; `touch[i]`: the register maps to a v1 dirty
 /// flag, so an executable write with an unchanged value still marks it (v1 runs
 /// ProcessDirtyRegisters for every executable method). The sink takes Delta(index, value),
-/// Exec(index, value, is_last), Cbuf(store, method, buffer, offset, word) and
+/// Quiet(index, value) (DeltaQuiet), Exec(index, value, is_last), Cbuf(store, method, buffer, offset, word) and
 /// Inline(method, words, count).
 template <typename Sink>
 inline void Classify3D(const u32* regs, const RegSem::Table3D& table, const bool* touch,
@@ -203,13 +207,13 @@ inline void Classify3D(const u32* regs, const RegSem::Table3D& table, const bool
         if (changed || touch[method]) {
             sink.Delta(method, value);
         }
-        sink.Delta(table.start_address_ptr, regs[table.start_address_ptr]);
+        sink.Quiet(table.start_address_ptr, regs[table.start_address_ptr]);
         return;
     case Action3D::Falcon4:
         if (changed || touch[method]) {
             sink.Delta(method, value);
         }
-        sink.Delta(table.shadow_scratch, regs[table.shadow_scratch]);
+        sink.Quiet(table.shadow_scratch, regs[table.shadow_scratch]);
         return;
     case Action3D::DrawManager:
         if (changed || touch[method]) {

@@ -960,7 +960,11 @@ void Maxwell3D::ExecuteS1Run(const u64* it, const u64* const end) {
         const u64 word = *it;
         switch (S1::TagOf(word)) {
         case S1::Tag::Delta:
-            store(S1::IndexOf(word), S1::ValueOf(word));
+            if ((word & S1::DeltaQuiet) == 0) [[likely]] {
+                store(S1::IndexOf(word), S1::ValueOf(word));
+            } else {
+                regs.reg_array[S1::IndexOf(word)] = S1::ValueOf(word);
+            }
             ++it;
             break;
         case S1::Tag::Exec: {
@@ -1030,7 +1034,7 @@ void Maxwell3D::S1CbufWrite(GPUVAddr buffer, u32 offset, const u32* words, u32 c
     const size_t copy_size = size_t{count} * sizeof(u32);
     const size_t room = offset < regs.const_buffer.size ? regs.const_buffer.size - offset : 0;
     const size_t write_size = std::min(copy_size, room / sizeof(u32) * sizeof(u32));
-    if (write_size != 0 && buffer != 0) {
+    if (write_size != 0) {
         const GPUVAddr address = buffer + offset;
         if (VideoCommon::Nx2FastDraw::Enabled()) {
             NoteFastDrawConstantData(address, address + write_size);
@@ -1912,6 +1916,10 @@ struct Maxwell3D::S1Sink {
     void Delta(u32 index, u32 value) {
         namespace S1 = VideoCommon::V2::S1;
         split.S1Word(engine, S1::MakeRegister(S1::Tag::Delta, index, value));
+    }
+    void Quiet(u32 index, u32 value) {
+        namespace S1 = VideoCommon::V2::S1;
+        split.S1Word(engine, S1::MakeRegister(S1::Tag::Delta, index, value, S1::DeltaQuiet));
     }
     void Exec(u32 index, u32 value, bool is_last) {
         namespace S1 = VideoCommon::V2::S1;

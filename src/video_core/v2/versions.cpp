@@ -93,14 +93,17 @@ void PageVersions::Note(DAddr address, u64 size, Source source) {
         for (u64 page = first_page; page <= last_page; ++page) {
             Raise(pages[PageSlot(page)], value);
         }
+        LogWrite(address, last_byte);
     } else if (last_region - first_region < MaxRegionWrite) {
         for (u64 region = first_region; region <= last_region; ++region) {
             Raise(regions[RegionSlot(region)], value);
         }
+        // The region slots move for every range in those regions.
+        LogWrite(first_region << RegionBits, ((last_region + 1) << RegionBits) - 1);
     } else {
         Raise(floor, value);
+        LogWrite(address, last_byte);
     }
-    LogWrite(address, last_byte);
 }
 
 u64 PageVersions::Newest(DAddr address, u64 size) const {

@@ -1918,6 +1918,18 @@ TEST_CASE("V2 S1 deltas applied on the back match the method executor on random 
         s1_draws.check_groups = true;
         ref.BindRasterizer(&ref_draws);
         s1.BindRasterizer(&s1_draws);
+        // The split's front drops unchanged instance loop writes (draw.end in a loop, vertex
+        // first/count), as it did before S1: the real tables give them no flag, the fixture's
+        // flag for every register would tell the reference apart.
+        for (auto* engine : {&ref, &s1}) {
+            constexpr std::array<u32, 3> skippable{DrawEnd,
+                                                   MAXWELL3D_REG_INDEX(vertex_buffer.first),
+                                                   MAXWELL3D_REG_INDEX(vertex_buffer.count)};
+            for (const u32 method : skippable) {
+                REQUIRE(engine->dirty.tables[0][method] == 0);
+                engine->dirty.tables[1][method] = 0;
+            }
+        }
         // The engines exist (v1 executors); the front and the split take S1 from here.
         const V2SwitchScope regsem{Switch::RegSem, Mode::On};
         const V2SwitchScope draws{Switch::IrDraws, Mode::On};
@@ -1939,11 +1951,24 @@ TEST_CASE("V2 S1 deltas applied on the back match the method executor on random 
         const auto compare = [&] {
             Access::RunBack(split);
             REQUIRE(s1.regs.reg_array == ref.regs.reg_array);
-            REQUIRE(s1.dirty.flags == ref.dirty.flags);
+            // Flag 0 is the null entry every unmapped register marks; nothing reads it.
+            auto s1_flags = s1.dirty.flags;
+            auto ref_flags = ref.dirty.flags;
+            s1_flags.reset(VideoCommon::Dirty::NullEntry);
+            ref_flags.reset(VideoCommon::Dirty::NullEntry);
+            REQUIRE(s1_flags == ref_flags);
             REQUIRE(s1_draws.draws.size() == ref_draws.draws.size());
             for (size_t i = 0; i < ref_draws.draws.size(); ++i) {
                 CAPTURE(i);
-                REQUIRE(s1_draws.draws[i] == ref_draws.draws[i]);
+                const auto& a = s1_draws.draws[i];
+                const auto& b = ref_draws.draws[i];
+                CAPTURE(a.kind, a.indexed, a.instances, a.topology, a.vertex_first,
+                        a.vertex_count, a.index_first, a.index_count, a.index_format,
+                        a.base_index, a.base_instance, a.inline_bytes);
+                CAPTURE(b.kind, b.indexed, b.instances, b.topology, b.vertex_first,
+                        b.vertex_count, b.index_first, b.index_count, b.index_format,
+                        b.base_index, b.base_instance, b.inline_bytes);
+                REQUIRE(a == b);
             }
             for (size_t stage = 0; stage < s1.state.shader_stages.size(); ++stage) {
                 for (size_t slot = 0; slot < Maxwell3D::Regs::MaxConstBuffers; ++slot) {
@@ -1993,6 +2018,17 @@ TEST_CASE("V2 S1 deltas applied on the back match the method executor on random 
                     : pick == 1 ? MAXWELL3D_REG_INDEX(draw_inline_index)
                     : pick == 2 ? draw_methods[rng() % draw_methods.size()]
                                 : f.state_methods[rng() % f.state_methods.size()];
+                // Topologies are bytes (Ir::PredictedDraw): draw.begin's 16-bit field and the
+                // override hold small values.
+                if (method == MAXWELL3D_REG_INDEX(topology_override)) {
+                    for (u32& word : words) {
+                        word &= 0xff;
+                    }
+                } else if (method == DrawBegin) {
+                    for (u32& word : words) {
+                        word &= ~0xff00U;
+                    }
+                }
                 multi(method, words);
             } else if (kind < 89) {
                 call(ShadowControl, rng() % 4, true);

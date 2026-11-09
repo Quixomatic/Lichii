@@ -296,7 +296,6 @@ TEST_CASE("V2 P4: captured words are compared with memory on every check", "[vid
 
     // A sampled image's pages written: a miss whatever the words say.
     versions.Note(0x400000 + 3 * Page, 64, Source::Dma);
-    log.Note(0x400000 + 3 * Page, 0x400000 + 3 * Page + 64);
     REQUIRE(DC::ValidateInputs(inputs, memo, versions) == DC::Miss::ImagePages);
 }
 
