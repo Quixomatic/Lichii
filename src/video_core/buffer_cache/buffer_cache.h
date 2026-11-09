@@ -2996,6 +2996,7 @@ template <class P>
 void BufferCache<P>::V2BeginBindScope() {
     v2_binds.Reset(v2_segment++);
     v2_written_marks.clear();
+    v2_scope_uploads.clear();
     v2_defer = true;
 }
 
@@ -3102,6 +3103,9 @@ bool BufferCache<P>::V2DeferBind(V2::Commit::Kind kind, Buffer& buffer, DAddr de
     request.size = size;
     request.arg = arg;
     v2_binds.Push(request);
+    if (kind == V2::Commit::Kind::BufferUpload || kind == V2::Commit::Kind::BufferGeometrySync) {
+        v2_scope_uploads.push_back(id.index);
+    }
     return true;
 }
 
@@ -3117,10 +3121,20 @@ bool BufferCache<P>::V2PendingGpuWrite(DAddr device_addr, u64 size) const {
 
 template <class P>
 void BufferCache<P>::V2NoteUsage(Buffer& buffer, u32 offset, u64 size) {
-    if (v2_defer &&
-        V2DeferBind(V2::Commit::Kind::BufferUsage, buffer, buffer.CpuAddr() + offset, size, 0))
-        [[unlikely]] {
-        return;
+    // F2-19: a usage mark orders only against an upload of the same buffer queued in this scope;
+    // without one it applies in place (as at the commit: no request in between reads it).
+    // A creation still queued may merge the buffer: then the mark follows it, as before.
+    if (v2_defer && (!v2_scope_uploads.empty() || !v2_creates.Empty())) [[unlikely]] {
+        const u64 page = buffer.CpuAddr() >> CACHING_PAGEBITS;
+        const BufferId id = page < page_table.size() ? page_table[page] : NULL_BUFFER_ID;
+        const bool ordered =
+            !v2_creates.Empty() ||
+            std::ranges::find(v2_scope_uploads, id.index) != v2_scope_uploads.end();
+        if (ordered &&
+            V2DeferBind(V2::Commit::Kind::BufferUsage, buffer, buffer.CpuAddr() + offset, size,
+                        0)) {
+            return;
+        }
     }
     buffer.MarkUsage(offset, size);
 }
@@ -4049,6 +4063,12 @@ void BufferCache<P>::TouchBuffer(Buffer& buffer, BufferId buffer_id) noexcept {
 
 template <class P>
 bool BufferCache<P>::SynchronizeBuffer(Buffer& buffer, DAddr device_addr, u32 size) {
+    // F2-19 (§5.6 commit at the mutation rate): an upload request only when the pages changed.
+    // Nothing in a bind scope makes a range CPU-modified (uploads clear it, written marks are
+    // GPU writes), so a range clean now would upload nothing when the request applies.
+    if (v2_defer && !memory_tracker.IsRegionCpuModified(device_addr, size)) [[unlikely]] {
+        return false;
+    }
     if (v2_defer &&
         V2DeferBind(V2::Commit::Kind::BufferUpload, buffer, device_addr, size, 0)) [[unlikely]] {
         // EDEN_NX2_V2_COMMIT: an ordered upload request; the bind only needs the buffer and its
