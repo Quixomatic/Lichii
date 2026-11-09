@@ -145,7 +145,13 @@ struct SegmentInput {
     SerialReason serial = SerialReason::None; ///< known up front: no shard resolves it
     const u64* ring = nullptr;
     const Ir::PayloadArena* arena = nullptr;
+    u32 draws = 0; ///< draws the front counted in it (the in-flight draw budget)
 };
+
+/// Draws the shards may have in flight (AP6 T0: depth in draws, not segments): a segment waits
+/// in the producer's queue while the submitted ones hold this many (EDEN_NX2_V2_PARALLEL_DEPTH
+/// bounds the slots).
+inline constexpr u32 InFlightDraws = 128;
 
 struct SplitTraits {
     using Input = SegmentInput;
@@ -256,6 +262,8 @@ private:
     SegmentInput open_input;
     std::deque<SegmentInput> closed;
     u32 applied_size = 0;
+    /// Draws of submitted segments the commit has not taken yet (front adds, back subtracts).
+    std::atomic<u32> in_flight_draws{0};
 
     // Back.
     bool holding = false;

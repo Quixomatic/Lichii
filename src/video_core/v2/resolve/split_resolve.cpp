@@ -418,9 +418,11 @@ void SplitResolve::FrontDraw(const FrontView& view, const EngineInfo& engine,
             if (event.indirect) {
                 segmenter.MarkSerial(SerialReason::IndirectCount);
             }
+            open_input.draws += open ? 1 : 0;
             continue;
         }
         if (cut == CutReason::None) {
+            open_input.draws += open ? 1 : 0;
             continue;
         }
         if (stats) {
@@ -475,6 +477,7 @@ void SplitResolve::FrontDraw(const FrontView& view, const EngineInfo& engine,
         open_input.snapshot = std::move(snapshot);
         open_input.ring = ring;
         open_input.arena = arena;
+        open_input.draws = 1;
     }
 }
 
@@ -483,9 +486,18 @@ void SplitResolve::OnPublish(u64 position) {
         SegmentInput& input = closed.front();
         const u64 id = input.id;
         const SerialReason reason = input.serial;
+        const u32 draws = input.draws;
+        const u32 in_flight = in_flight_draws.load(std::memory_order_acquire);
+        if (in_flight != 0 && in_flight + draws > InFlightDraws) {
+            break; // the shards hold enough draws: submitted at a later publish
+        }
         bool retry = false;
-        if (!resolver->Submit(id, std::move(input), reason, &retry) && retry) {
-            break; // every slot busy: submitted again at the next publish
+        in_flight_draws.fetch_add(draws, std::memory_order_acq_rel); // before the commit sees it
+        if (!resolver->Submit(id, std::move(input), reason, &retry)) {
+            in_flight_draws.fetch_sub(draws, std::memory_order_acq_rel);
+            if (retry) {
+                break; // every slot busy: submitted again at the next publish
+            }
         }
         closed.pop_front();
     }
@@ -502,6 +514,9 @@ void SplitResolve::OnSegment(const Ir::SegmentBody& body, const u32* back_regs,
     }
     taken = nullptr;
     Resolver::Result& result = resolver->Take(body.id);
+    if (result.has_input) {
+        in_flight_draws.fetch_sub(resolver->InputOf(body.id).draws, std::memory_order_acq_rel);
+    }
     resolver->NoteOrder(body.id);
     holding = true;
     held_id = body.id;
