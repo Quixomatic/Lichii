@@ -348,7 +348,7 @@ void ReportFront(const FrontData& data, const char* thread_name, u64 window_ns,
     }
     LOG_INFO(HW_GPU,
              "V2 stats {} waits for the back by class (ms/s, waits/s):{} | by site:{} | "
-             "acquires by class:{} | A/B not met {:.0f}/s | front releases literal {:.0f}/s, "
+             "acquires by class:{} | A/B not met at the first check {:.0f}/s | front releases literal {:.0f}/s, "
              "GPU-valued {:.0f}/s, table evictions {:.0f}/s",
              thread_name, classes, sites, acquires, PerSecond(data.mispredicted, window_ns),
              PerSecond(data.literal_releases, window_ns),
@@ -520,7 +520,9 @@ void NoteAcquire(SyncClass sync_class, bool poll, bool met) {
         ++data.acquires[index];
         data.acquires_met[index] += met ? 1 : 0;
     }
-    if (!met && (sync_class == SyncClass::A || sync_class == SyncClass::B)) {
+    // Fix pass 1 (B7): a suspended channel's polls repeat until met, so they are no prediction;
+    // only an acquire's first check counts (it read 51-98k/s with every feature off).
+    if (!poll && !met && (sync_class == SyncClass::A || sync_class == SyncClass::B)) {
         ++data.mispredicted;
     }
 }
