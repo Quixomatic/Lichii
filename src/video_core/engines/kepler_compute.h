@@ -24,6 +24,7 @@
 #include "video_core/macro.h"
 #include "video_core/native_qmd.h"
 #include "video_core/textures/texture.h"
+#include "video_core/v2/regsem.h"
 
 namespace Core {
 class System;
@@ -269,6 +270,11 @@ public:
                               const u32* base_start, u32 amount, u32 methods_pending,
                               const GPUVAddr* segment);
 
+    /// EDEN_NX2_V2_REGSEM: the executing engine's compute register groups (v2_groups).
+    [[nodiscard]] const VideoCommon::V2::ComputeGroupTracker& V2Groups() const {
+        return v2_groups;
+    }
+
 private:
     struct FrontState;
     FrontState& Front(VideoCommon::GpuSplit& split);
@@ -358,6 +364,10 @@ private:
     NativeMacroContext* native_context{};
     bool native_compute_uploaded{};
     MacroEngine* native_macro{};
+    /// EDEN_NX2_V2_REGSEM: groups and fingerprints of the executing engine's compute registers
+    /// (native_registers, or regs for the Kepler class); draw_dirty is what the current
+    /// dispatch sees changed (NoteDispatchCompute).
+    VideoCommon::V2::ComputeGroupTracker v2_groups;
     std::array<u32, 0x1000> native_registers{};
     /// Native methods that only store their value (no macro, QMD, upload, semaphore or code
     /// side effect): CallMethod writes those directly.
@@ -369,6 +379,8 @@ private:
     u32 native_bind_pointer{};
 
     void ProcessLaunch();
+    /// EDEN_NX2_V2_REGSEM: a dispatch is about to run (compute group dirty bits, hash checks).
+    void NoteV2Dispatch(bool native);
 
     void ConsumeSinkImpl(Core::System& system) override;
 

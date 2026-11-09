@@ -33,6 +33,7 @@ enum class Switch : u32 {
     Readback, ///< EDEN_NX2_V2_READBACK: requester-side readbacks and learned early downloads
     MacroDump, ///< EDEN_NX2_V2_MACRO_DUMP: log NVN2 macros' hash and code (v2/macro_hle.h)
     MacroHle,  ///< EDEN_NX2_V2_MACROHLE: NVN2 macro HLE from nx2_macro_hle.txt entries
+    IrDraws,   ///< EDEN_NX2_V2_IR_DRAWS: front Draw/Dispatch IR records, checked by the back
     Count,
 };
 
@@ -47,6 +48,7 @@ inline constexpr std::array<const char*, static_cast<size_t>(Switch::Count)> swi
     "READBACK",
     "MACRO_DUMP",
     "MACROHLE",
+    "IR_DRAWS",
 };
 
 namespace Detail {

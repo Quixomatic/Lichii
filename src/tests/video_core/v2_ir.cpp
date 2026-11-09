@@ -12,6 +12,7 @@
 
 #include "video_core/v2/ir.h"
 #include "video_core/v2/ir_arena.h"
+#include "video_core/v2/regsem_3d.h"
 
 namespace Ir = VideoCommon::V2::Ir;
 
@@ -167,4 +168,51 @@ TEST_CASE("V2 IR object table interns pointers once", "[video_core][v2_ir]") {
     REQUIRE(table->Intern(&objects.back()) == 0);
     REQUIRE(table->Intern(nullptr) == 1);
     REQUIRE(table->Get(1) == nullptr);
+}
+
+TEST_CASE("V2 compute register groups: compare-on-write and incremental fingerprints",
+          "[video_core][v2_regsem]") {
+    namespace RegSem = VideoCommon::V2::RegSem;
+    using VideoCommon::V2::ComputeGroup;
+    using VideoCommon::V2::ComputeGroupBit;
+    const auto& groups = RegSem::TableComputeGroups();
+    REQUIRE(groups[0x62] == ComputeGroup::Upload);
+    REQUIRE(groups[0xad] == ComputeGroup::Launch);
+    REQUIRE(groups[0xc8] == ComputeGroup::Qmd);
+    REQUIRE(groups[0x106] == ComputeGroup::Qmd);
+    REQUIRE(groups[0x107] == ComputeGroup::Misc); // the inline QMD launch
+    REQUIRE(groups[0xb0] == ComputeGroup::Misc);
+    REQUIRE(groups[0x557] == ComputeGroup::Pools);
+    REQUIRE(groups[0x6c3] == ComputeGroup::Misc);
+    REQUIRE(groups[0x200] == ComputeGroup::Pipeline);
+    auto mirror = std::make_unique<RegSem::MirrorCompute>();
+    RegSem::RehashCompute(mirror->v2_groups, mirror->registers.data());
+    mirror->v2_groups.TakeDirty();
+    const auto none = [](RegSem::Effect, u32, u32) { return true; };
+    // A changed QMD word dirties Qmd and moves its fingerprint; the same value does neither.
+    RegSem::ApplyCompute(*mirror, 0xd0, 5, none);
+    REQUIRE(mirror->v2_groups.TakeDirty() == ComputeGroupBit(ComputeGroup::Qmd));
+    const u64 qmd = mirror->v2_groups.Fingerprint(ComputeGroupBit(ComputeGroup::Qmd));
+    RegSem::ApplyCompute(*mirror, 0xd0, 5, none);
+    REQUIRE(mirror->v2_groups.TakeDirty() == 0);
+    REQUIRE(mirror->v2_groups.Fingerprint(ComputeGroupBit(ComputeGroup::Qmd)) == qmd);
+    // Upload registers are tracked but not hashed.
+    const u64 all = mirror->v2_groups.Fingerprint(VideoCommon::V2::HashedComputeGroups);
+    RegSem::ApplyCompute(*mirror, 0x61, 7, none);
+    REQUIRE(mirror->v2_groups.TakeDirty() == ComputeGroupBit(ComputeGroup::Upload));
+    REQUIRE(mirror->v2_groups.Fingerprint(VideoCommon::V2::HashedComputeGroups) == all);
+    // Random writes: incremental hashes equal a rehash; dispatch takes the dirty bits.
+    std::mt19937 rng{11};
+    for (u32 i = 0; i < 100000; ++i) {
+        u32 method = static_cast<u32>(rng() % 0xe00);
+        if (method >= 0x45 && method <= 0x48) {
+            method = 0x100; // macro uploads and binds need a macro engine
+        }
+        RegSem::ApplyCompute(*mirror, method, static_cast<u32>(rng() % 4), none);
+    }
+    VideoCommon::V2::ComputeGroupTracker check = mirror->v2_groups;
+    REQUIRE(RegSem::RehashCompute(check, mirror->registers.data()) == 0);
+    RegSem::NoteDispatchCompute(mirror->v2_groups, mirror->registers.data(), 0x1000);
+    REQUIRE(mirror->v2_groups.dirty == 0);
+    REQUIRE(mirror->v2_groups.draw_dirty != 0);
 }

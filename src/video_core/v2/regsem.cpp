@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <atomic>
 #include <string>
 
 #include "common/assert.h"
@@ -260,6 +261,66 @@ void NoteDraw3D(GroupTracker& tracker, const u32* regs) {
         if ((data.checks & 63) == 1) {
             LOG_INFO(HW_GPU, "V2 regsem: {} group hash checks, {} drifted", data.checks,
                      data.drifted);
+        }
+    }
+    tracker.BeginDraw();
+}
+
+const std::array<ComputeGroup, 0x1000>& TableComputeGroups() {
+    static const std::array<ComputeGroup, 0x1000> table = [] {
+        std::array<ComputeGroup, 0x1000> groups;
+        groups.fill(ComputeGroup::Pipeline);
+        const auto fill = [&groups](u32 begin, u32 end, ComputeGroup group) {
+            std::fill(groups.begin() + begin, groups.begin() + end, group);
+        };
+        fill(0x60, 0x6e, ComputeGroup::Upload);
+        fill(0xa0, 0xc0, ComputeGroup::Launch);
+        fill(0xc6, 0x108, ComputeGroup::Qmd);
+        fill(0x557, 0x563, ComputeGroup::Pools); // TSC (0x557) and TIC (0x55d) pools
+        fill(0x582, 0x584, ComputeGroup::Pools); // code location
+        fill(0x982, 0x983, ComputeGroup::Pools); // bindless texture constant buffer slot
+        // Triggers and state no dispatch reads.
+        fill(0x45, 0x49, ComputeGroup::Misc);    // macro upload and bind
+        fill(0xae, 0xb1, ComputeGroup::Misc);    // launch, QMD signals
+        fill(0x107, 0x108, ComputeGroup::Misc);  // inline QMD launch
+        fill(0x6c0, 0x6c4, ComputeGroup::Misc);  // report semaphore
+        fill(0xe00, 0x1000, ComputeGroup::Misc); // macro calls
+        return groups;
+    }();
+    return table;
+}
+
+u32 RehashCompute(ComputeGroupTracker& tracker, const u32* registers, u32 count) {
+    const auto& table = TableComputeGroups();
+    std::array<u64, NumComputeGroups> hashes{};
+    for (u32 i = 0; i < count; ++i) {
+        hashes[static_cast<size_t>(table[i])] ^= MixRegister(i, registers[i]);
+    }
+    u32 drifted = 0;
+    for (u32 bits = HashedComputeGroups; bits != 0; bits &= bits - 1) {
+        const u32 group = static_cast<u32>(std::countr_zero(bits));
+        if (tracker.valid && hashes[group] != tracker.hashes[group]) {
+            drifted |= 1U << group;
+        }
+        tracker.hashes[group] = hashes[group];
+    }
+    tracker.valid = true;
+    return drifted;
+}
+
+void NoteDispatchCompute(ComputeGroupTracker& tracker, const u32* registers, u32 count) {
+    if (!tracker.valid) [[unlikely]] {
+        RehashCompute(tracker, registers, count);
+        tracker.dirty = AllComputeGroups;
+    } else if ((Verify(Switch::RegSem) || Stats::Enabled()) && (tracker.draws & 4095) == 4095)
+        [[unlikely]] {
+        static std::atomic<u32> logged{};
+        if (const u32 drifted = RehashCompute(tracker, registers, count);
+            drifted != 0 && logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+            Stats::NoteHashDrift();
+            LOG_WARNING(HW_GPU, "V2 regsem: compute group hashes drifted from the registers, "
+                                "groups {:#x}",
+                        drifted);
         }
     }
     tracker.BeginDraw();

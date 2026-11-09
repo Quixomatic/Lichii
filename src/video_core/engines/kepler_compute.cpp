@@ -274,6 +274,10 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
         native_parameters.clear();
         return true;
     }
+    if (VideoCommon::V2::On(VideoCommon::V2::Switch::RegSem)) [[unlikely]] {
+        VideoCommon::V2::RegSem::NoteWriteCompute(v2_groups, method, native_registers[method],
+                                                  argument);
+    }
     native_registers[method] = argument;
     if (method == 0x6c3) { // SET_REPORT_SEMAPHORE_D: the compute class's semaphore release
         ProcessNativeReportSemaphore(argument);
@@ -463,6 +467,11 @@ void KeplerCompute::CallMethod(Core::System& system, u32 method, u32 method_argu
         // each of thousands of dispatches a second) only store the value: ~4% of title 1's GPU
         // thread went through ProcessNativeMethod's checks for them.
         if (method < native_plain_methods.size() && native_plain_methods[method]) {
+            if (VideoCommon::V2::On(VideoCommon::V2::Switch::RegSem)) [[unlikely]] {
+                VideoCommon::V2::RegSem::NoteWriteCompute(v2_groups, method,
+                                                          native_registers[method],
+                                                          method_argument);
+            }
             native_registers[method] = method_argument;
             if (method < Regs::NUM_REGS) {
                 regs.reg_array[method] = method_argument;
@@ -476,6 +485,10 @@ void KeplerCompute::CallMethod(Core::System& system, u32 method, u32 method_argu
         return;
     }
 
+    if (!native_mode && VideoCommon::V2::On(VideoCommon::V2::Switch::RegSem)) [[unlikely]] {
+        VideoCommon::V2::RegSem::NoteWriteCompute(v2_groups, method, regs.reg_array[method],
+                                                  method_argument);
+    }
     regs.reg_array[method] = method_argument;
 
     switch (method) {
@@ -719,6 +732,7 @@ bool KeplerCompute::DispatchNativeCompute(const NativeQmdScheduler::Descriptor& 
         }
     }
     bool dispatched = true;
+    NoteV2Dispatch(true);
     try {
         rasterizer->DispatchCompute();
     } catch (const VideoCommon::FireEmblemUpscale::DispatchReplaced&) {
@@ -1396,10 +1410,23 @@ bool KeplerCompute::TryFireEmblemUpscale(bool allow_history) {
     return done;
 }
 
+void KeplerCompute::NoteV2Dispatch(bool native) {
+    if (VideoCommon::V2::On(VideoCommon::V2::Switch::RegSem)) [[unlikely]] {
+        if (native) {
+            VideoCommon::V2::RegSem::NoteDispatchCompute(v2_groups, native_registers.data(),
+                                                         static_cast<u32>(native_registers.size()));
+        } else {
+            VideoCommon::V2::RegSem::NoteDispatchCompute(v2_groups, regs.reg_array.data(),
+                                                         Regs::NUM_REGS);
+        }
+    }
+}
+
 void KeplerCompute::ProcessLaunch() {
     const GPUVAddr launch_desc_loc = regs.launch_desc_loc.Address();
     memory_manager.ReadBlockUnsafe(launch_desc_loc, &launch_description,
                                    LaunchParams::NUM_LAUNCH_PARAMETERS * sizeof(u32));
+    NoteV2Dispatch(false);
     rasterizer->DispatchCompute();
 }
 
@@ -1434,6 +1461,8 @@ struct KeplerCompute::FrontState {
     std::unique_ptr<VideoCommon::V2::RegSem::MirrorCompute> v2_mirror;
     u64 v2_writes{};
     std::optional<std::pair<GPUVAddr, u64>> v2_upload; ///< The upload being sent (P2)
+    /// EDEN_NX2_V2_REGSEM=1: compute register groups and fingerprints of `registers`.
+    VideoCommon::V2::ComputeGroupTracker v2_groups;
 };
 
 KeplerCompute::FrontState& KeplerCompute::Front(VideoCommon::GpuSplit& split) {
@@ -1456,6 +1485,10 @@ KeplerCompute::FrontState& KeplerCompute::Front(VideoCommon::GpuSplit& split) {
             front->v2_mirror->registers = front->registers;
             front->v2_mirror->compute_uploaded = front->compute_uploaded;
             front->v2_mirror->bind_pointer = front->bind_pointer;
+            VideoCommon::V2::RegSem::RehashCompute(front->v2_mirror->v2_groups,
+                                                   front->v2_mirror->registers.data());
+        } else if (front->v2_mode == VideoCommon::V2::Mode::On) [[unlikely]] {
+            VideoCommon::V2::RegSem::RehashCompute(front->v2_groups, front->registers.data());
         }
     }
     return *front;
@@ -1535,6 +1568,7 @@ void KeplerCompute::FrontApplyRegSem(FrontState& fs, u32 method, u32 argument) {
         copy.registers = fs.registers;
         copy.compute_uploaded = fs.compute_uploaded;
         copy.bind_pointer = fs.bind_pointer;
+        VideoCommon::V2::RegSem::RehashCompute(copy.v2_groups, copy.registers.data());
     }
 }
 

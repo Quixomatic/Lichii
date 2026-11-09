@@ -273,6 +273,7 @@ struct MirrorCompute {
     std::array<u32, 0x1000> registers{};
     bool compute_uploaded{};
     u32 bind_pointer{};
+    ComputeGroupTracker v2_groups;
 };
 
 /// FrontApply: a native compute register write (all of them go to the back).
@@ -282,6 +283,7 @@ void ApplyCompute(State& s, u32 method, u32 argument, Effects&& effects) {
     if ((flags & ComputeUploaded) != 0) {
         s.compute_uploaded = true;
     }
+    NoteWriteCompute(s.v2_groups, method, s.registers[method], argument);
     s.registers[method] = argument;
     if ((flags & ComputeClearCode) != 0) {
         effects(Effect::ClearCode, argument, 0);

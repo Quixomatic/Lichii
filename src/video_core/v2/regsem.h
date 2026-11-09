@@ -66,26 +66,53 @@ inline constexpr u32 HashedGroups = AllGroups & ~GroupBit(RegGroup::CbufData) &
     return Mix64((u64{index} << 32) | value);
 }
 
+/// Native KeplerCompute register groups (the 0x1000 compute registers, Kepler and native
+/// classes share the index space), in bit order.
+enum class ComputeGroup : u8 {
+    Pipeline, ///< Everything not below
+    Upload,   ///< Inline-to-memory registers 0x60-0x6d (not hashed)
+    Launch,   ///< Launch control and the QMD address 0xa0-0xbf (signals are Misc)
+    Qmd,      ///< The inline QMD: its address 0xc6-0xc7 and words 0xc8-0x107 (native QMD state)
+    Pools,    ///< TSC/TIC pools, code location, bindless texture cbuf slot
+    Misc,     ///< Macro upload/bind, launches and QMD signals, report semaphore (not hashed)
+    Count,
+};
+inline constexpr size_t NumComputeGroups = static_cast<size_t>(ComputeGroup::Count);
+inline constexpr std::array<const char*, NumComputeGroups> compute_group_names{
+    "pipeline", "upload", "launch", "qmd", "pools", "misc",
+};
+[[nodiscard]] constexpr u32 ComputeGroupBit(ComputeGroup group) {
+    return 1U << static_cast<u32>(group);
+}
+inline constexpr u32 AllComputeGroups = (1U << NumComputeGroups) - 1;
+inline constexpr u32 HashedComputeGroups = AllComputeGroups &
+                                           ~ComputeGroupBit(ComputeGroup::Upload) &
+                                           ~ComputeGroupBit(ComputeGroup::Misc);
+
 /// Dirty bits and incremental hashes per group, for one engine's register file.
-struct GroupTracker {
-    u32 dirty{AllGroups}; ///< Groups changed since the last BeginDraw (or TakeDirty)
-    u32 draw_dirty{};     ///< `dirty` as BeginDraw took it: what the current draw sees changed
+template <typename Group, size_t NumGroups, u32 Hashed>
+struct BasicGroupTracker {
+    static constexpr u32 All = (1U << NumGroups) - 1;
+    static constexpr u32 HashedMask = Hashed;
+
+    u32 dirty{All};   ///< Groups changed since the last BeginDraw (or TakeDirty)
+    u32 draw_dirty{}; ///< `dirty` as BeginDraw took it: what the current draw sees changed
     u32 draws{};
     bool valid{}; ///< The hashes were computed from the registers once
-    std::array<u64, NumRegGroups> hashes{};
+    std::array<u64, NumGroups> hashes{};
 
     /// A register of `group` changes from `old_value` to `value` (callers compare first).
-    void Change(RegGroup group, u32 index, u32 old_value, u32 value) {
-        const u32 bit = GroupBit(group);
+    void Change(Group group, u32 index, u32 old_value, u32 value) {
+        const u32 bit = 1U << static_cast<u32>(group);
         dirty |= bit;
-        if ((bit & HashedGroups) != 0) {
+        if ((bit & Hashed) != 0) {
             hashes[static_cast<size_t>(group)] ^=
                 MixRegister(index, old_value) ^ MixRegister(index, value);
         }
     }
     /// The group's data changed without a register value changing (constant buffer data, a bind).
-    void Touch(RegGroup group) {
-        dirty |= GroupBit(group);
+    void Touch(Group group) {
+        dirty |= 1U << static_cast<u32>(group);
     }
     /// Returns and clears the groups changed since the last call.
     u32 TakeDirty() {
@@ -101,7 +128,7 @@ struct GroupTracker {
     }
     /// A fingerprint of the hashed groups in `mask`.
     [[nodiscard]] u64 Fingerprint(u32 mask) const {
-        mask &= HashedGroups;
+        mask &= Hashed;
         u64 result = mask;
         for (u32 bits = mask; bits != 0; bits &= bits - 1) {
             const u32 group = static_cast<u32>(std::countr_zero(bits));
@@ -110,6 +137,10 @@ struct GroupTracker {
         return Mix64(result);
     }
 };
+
+using GroupTracker = BasicGroupTracker<RegGroup, NumRegGroups, HashedGroups>;
+using ComputeGroupTracker =
+    BasicGroupTracker<ComputeGroup, NumComputeGroups, HashedComputeGroups>;
 
 namespace RegSem {
 
@@ -195,6 +226,23 @@ enum FlagsCompute : u8 {
 };
 
 [[nodiscard]] const std::array<u8, 0x1000>& TableCompute();
+/// The group of each compute register.
+[[nodiscard]] const std::array<ComputeGroup, 0x1000>& TableComputeGroups();
+
+/// Recomputes the hashed groups of a compute tracker from the first `count` (<= 0x1000)
+/// registers; returns the groups that had drifted.
+u32 RehashCompute(ComputeGroupTracker& tracker, const u32* registers, u32 count = 0x1000);
+
+/// A compute register write (front mirror or the executing engine), before it stores.
+inline void NoteWriteCompute(ComputeGroupTracker& tracker, u32 method, u32 old_value, u32 value) {
+    if (method < 0x1000 && old_value != value) {
+        tracker.Change(TableComputeGroups()[method], method, old_value, value);
+    }
+}
+
+/// The executing KeplerCompute is about to dispatch: dirty bits move to draw_dirty, and with
+/// EDEN_NX2_V2_REGSEM=verify or EDEN_NX2_V2_STATS the hashes are checked every 4096 dispatches.
+void NoteDispatchCompute(ComputeGroupTracker& tracker, const u32* registers, u32 count);
 
 } // namespace RegSem
 
