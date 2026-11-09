@@ -8,6 +8,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <deque>
 #include <list>
 #include <memory>
 #include <utility>
@@ -42,6 +43,8 @@
 #include "video_core/nx2.h"
 #include "video_core/renderer_base.h"
 #include "video_core/shader_notify.h"
+#include "video_core/gpu_split.h"
+#include "video_core/v2/v2_switches.h"
 
 namespace Tegra {
 
@@ -150,6 +153,52 @@ struct GPU::Impl {
         sync_request_cv.wait(lck, [this, fence] { return CurrentSyncRequestFence() >= fence; });
     }
 
+    // EDEN_NX2_V2_CPULANE (MASTER_PLAN.md section 6): a guest CPU flush (a read of GPU-written
+    // memory, an invalidation that keeps GPU writes) is served by the split's back after the
+    // entry it runs now, instead of after everything queued. The ordering point is that entry:
+    // GPU work the guest waited for (its fence signalled) has run by then, and work still queued
+    // is work the guest hasn't synchronised with, which hardware could also be partway through.
+    // Requests that need everything before them (WaitForIdle, composites, captures) keep the
+    // ordered TickWork path. The lane has its own fences, so the two never reorder each other.
+    [[nodiscard]] bool UseCpuLane() const {
+        return is_async && VideoCommon::V2::On(VideoCommon::V2::Switch::CpuLane) &&
+               VideoCommon::GpuSplit::Get().BackRunning();
+    }
+
+    template <typename Func>
+    void RunOnCpuLane(Func&& action) {
+        u64 fence;
+        {
+            std::scoped_lock lck{lane_mutex};
+            fence = ++lane_last;
+            lane_requests.emplace_back(std::forward<Func>(action));
+            lane_pending.store(true, std::memory_order_release);
+        }
+        VideoCommon::GpuSplit::Get().RequestCpuLane();
+        // Also through the ordered path: TickWork serves the lane too, should the back not.
+        gpu_thread.TickGPU(is_async);
+        std::unique_lock lck{lane_mutex};
+        lane_cv.wait(lck, [this, fence] { return lane_done >= fence; });
+    }
+
+    void TickCpuLane() {
+        if (!lane_pending.load(std::memory_order_acquire)) {
+            return;
+        }
+        std::unique_lock lck{lane_mutex};
+        while (!lane_requests.empty()) {
+            auto request = std::move(lane_requests.front());
+            lane_requests.pop_front();
+            lck.unlock();
+            VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::TickWork);
+            request();
+            lck.lock();
+            ++lane_done;
+            lane_cv.notify_all();
+        }
+        lane_pending.store(false, std::memory_order_release);
+    }
+
     void WaitForIdle() {
         const u64 fence = RequestSyncOperation([] {});
         gpu_thread.TickGPU(is_async);
@@ -158,6 +207,9 @@ struct GPU::Impl {
 
     /// Tick pending requests within the GPU.
     void TickWork() {
+        if (lane_used) [[unlikely]] {
+            TickCpuLane();
+        }
         std::unique_lock lck{sync_request_mutex};
         while (!sync_requests.empty()) {
             auto request = std::move(sync_requests.front());
@@ -254,11 +306,17 @@ struct GPU::Impl {
                      raster_area.start_address, raster_area.end_address,
                      reads.load(std::memory_order_relaxed));
         }
-        const u64 fence = RequestSyncOperation([this, raster_area]() {
+        const auto flush = [this, raster_area]() {
             // Apply collected guest writes before downloading GPU data over guest memory.
             InvalidateGPUCache();
             renderer->ReadRasterizer()->FlushRegion(raster_area.start_address, raster_area.end_address - raster_area.start_address);
-        });
+        };
+        if (UseCpuLane()) [[unlikely]] {
+            lane_used = true;
+            RunOnCpuLane(flush);
+            return raster_area;
+        }
+        const u64 fence = RequestSyncOperation(flush);
         gpu_thread.TickGPU(is_async);
         WaitForSyncOperation(fence);
         return raster_area;
@@ -269,10 +327,16 @@ struct GPU::Impl {
         if (preserve_gpu_writes) {
             VideoCore::RasterizerInterface* rasterizer = renderer->ReadRasterizer();
             if (!rasterizer->TryCacheInvalidation(addr, size)) {
-                const u64 fence = RequestSyncOperation([rasterizer, addr, size] {
+                const auto flush = [rasterizer, addr, size] {
                     rasterizer->FlushRegion(addr, size, VideoCommon::CacheType::BufferCache);
                     rasterizer->OnCacheInvalidation(addr, size);
-                });
+                };
+                if (UseCpuLane()) [[unlikely]] {
+                    lane_used = true;
+                    RunOnCpuLane(flush);
+                    return;
+                }
+                const u64 fence = RequestSyncOperation(flush);
                 gpu_thread.TickGPU(is_async);
                 WaitForSyncOperation(fence);
             }
@@ -386,6 +450,15 @@ struct GPU::Impl {
     std::mutex sync_request_mutex;
     std::condition_variable sync_request_cv;
 
+    // EDEN_NX2_V2_CPULANE (RunOnCpuLane).
+    std::mutex lane_mutex;
+    std::condition_variable lane_cv;
+    std::deque<std::function<void()>> lane_requests;
+    u64 lane_last{};
+    u64 lane_done{};
+    std::atomic<bool> lane_pending{};
+    std::atomic<bool> lane_used{}; ///< Once set, TickWork serves the lane too
+
     const bool is_async;
 
     std::unique_ptr<Core::Frontend::GraphicsContext> cpu_context;
@@ -476,6 +549,10 @@ void GPU::WaitForSyncOperation(u64 fence) {
 
 void GPU::TickWork() {
     impl->TickWork();
+}
+
+void GPU::TickCpuLane() {
+    impl->TickCpuLane();
 }
 
 /// Gets a mutable reference to the Host1x interface

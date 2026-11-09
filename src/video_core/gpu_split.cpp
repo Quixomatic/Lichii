@@ -24,6 +24,7 @@
 #include "core/core.h"
 #include "video_core/engines/engine_interface.h"
 #include "video_core/engines/maxwell_3d.h"
+#include "video_core/gpu.h"
 #include "video_core/gpu_split.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
@@ -132,6 +133,10 @@ void GpuSplit::MaybeStart(Core::System& system_) {
     // Fixed until the next start: the back decodes both encodings, the front writes one.
     ir = V2::On(V2::Switch::Ir);
     ir_verify = V2::Verify(V2::Switch::Ir);
+    if (V2::On(V2::Switch::CpuLane)) {
+        SetCpuLaneHook([](void* gpu) { static_cast<Tegra::GPU*>(gpu)->TickCpuLane(); },
+                       &system->GPU());
+    }
     acquire_mode = V2::Get(V2::Switch::Acquire);
     hazard_mode = V2::Get(V2::Switch::Hazard);
     tracks_writes = acquire_mode != V2::Mode::Off || hazard_mode != V2::Mode::Off;

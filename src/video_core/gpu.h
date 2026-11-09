@@ -182,6 +182,10 @@ public:
     /// Tick pending requests within the GPU.
     void TickWork();
 
+    /// EDEN_NX2_V2_CPULANE: runs the guest CPU flush requests waiting for the CPU lane (the
+    /// split's back calls it after its current entry).
+    void TickCpuLane();
+
     /// Gets a mutable reference to the Host1x interface
     [[nodiscard]] Host1x::Host1x& Host1x();
 
