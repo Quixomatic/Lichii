@@ -6,6 +6,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <deque>
 #include <memory>
 #include <random>
 #include <thread>
@@ -201,6 +202,39 @@ TEST_CASE("V2 P6: copy-on-write snapshots equal the registers at their time",
     taken[3].cow.CopyTo(out.data());
     CHECK(out == taken[3].copy);
     CHECK(loaded.Read(7) == 0xdead);
+}
+
+TEST_CASE("V2 P6: epoch-reclaimed snapshot blocks stay intact while their segment is unreleased",
+          "[video_core][v2_p6]") {
+    constexpr size_t Words = 0xe00;
+    using Snapshot = Resolve::RegisterSnapshot<Words>;
+    std::mt19937 rng{77};
+    std::vector<u32> plain(Words, 0);
+    Resolve::SnapshotBuilder<Words> builder;
+    struct Taken {
+        std::vector<u32> copy;
+        Snapshot snapshot;
+    };
+    std::deque<Taken> live; // the segments the commit has not released
+    u64 released = 0;
+    for (u64 epoch = 1; epoch <= 4000; ++epoch) {
+        for (u32 w = 0; w < 40; ++w) {
+            plain[(rng() % 8) * 64 + rng() % 64] = rng() % 16;
+        }
+        live.push_back(Taken{plain, builder.Take(plain.data(), ~u64{0}, epoch)});
+        // The commit lags by a few segments, then releases some.
+        while (live.size() > 1 + rng() % 6) {
+            live.pop_front();
+            ++released;
+        }
+        builder.Reclaim(released);
+        std::vector<u32> out(Words);
+        for (const Taken& t : live) {
+            t.snapshot.CopyTo(out.data());
+            REQUIRE(out == t.copy);
+        }
+    }
+    CHECK(builder.copied > 4000);
 }
 
 TEST_CASE("V2 P6: a segment's snapshot plus its deltas gives the serial state at every draw",
@@ -852,7 +886,7 @@ TEST_CASE("V2 P6: a shard replays its segment from the IR ring onto the snapshot
     input.id = 1;
     input.begin = begin;
     input.end = ring.position;
-    input.snapshot = snapshot;
+    input.snapshot = snapshot.get();
     input.ring = ring.ring.data();
     input.arena = &ring.arena;
 
@@ -1203,7 +1237,8 @@ TEST_CASE("V2 P6c: shards resolve the draw key and the pipeline key as the seria
             snapshot->regs = builder.Take(front->regs.data());
             snapshot->shadow = shadow_builder.Take(front->shadow.data());
             snapshot->groups = front->v2_groups;
-            snapshot->cbufs = std::make_shared<const Resolve::CbufTable>(front->v2_cbufs);
+            const Resolve::CbufTable snapshot_cbufs = front->v2_cbufs;
+            snapshot->cbufs = &snapshot_cbufs;
             snapshot->engine_ref = 3;
             snapshot->engine = 0x1000;
             snapshot->memory = 0x2000;
@@ -1277,7 +1312,7 @@ TEST_CASE("V2 P6c: shards resolve the draw key and the pipeline key as the seria
             input.id = segment_index + 1;
             input.begin = begin;
             input.end = ring.position;
-            input.snapshot = snapshot;
+            input.snapshot = snapshot.get();
             input.ring = ring.ring.data();
             input.arena = &ring.arena;
             Resolve::SplitTraits::Shard shard;

@@ -86,6 +86,7 @@ inline void BindCbuf3D(Resolve::CbufTable& cbufs, const u32* regs, u32 method) {
         .size = regs[cbuf],
         .enabled = config & 1,
     };
+    ++cbufs.changes;
 }
 
 template <typename State>

@@ -27,8 +27,12 @@ struct CbufBinding {
 
 struct CbufTable {
     std::array<std::array<CbufBinding, CbufSlots>, CbufStages> stages{};
+    /// Bumped by every bind (BindCbuf3D) and resync: snapshots compare this, not the table.
+    u64 changes = 0;
 
-    bool operator==(const CbufTable&) const = default;
+    bool operator==(const CbufTable& other) const {
+        return stages == other.stages;
+    }
 };
 
 } // namespace VideoCommon::V2::Resolve

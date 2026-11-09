@@ -128,7 +128,7 @@ struct FrontSnapshot {
     RegisterSnapshot<0xe00> regs;
     RegisterSnapshot<0xe00> shadow;
     GroupTracker groups;
-    std::shared_ptr<const CbufTable> cbufs; ///< P6c: shared while the bindings don't change
+    const CbufTable* cbufs = nullptr; ///< P6c: shared while the bindings don't change
     u32 control = 0;
     bool instance_loop = false;
     bool sink_pending = false;
@@ -147,15 +147,23 @@ struct SegmentProgress {
     std::atomic<u8> serial{0};        ///< SerialReason found after submission (set before end)
     std::atomic<bool> waiting{false}; ///< the shard waits for the front to publish more
     std::atomic<bool> abandon{false}; ///< the commit reached the segment, or the split stops
+
+    void Reset() {
+        end.store(~u64{0}, std::memory_order_relaxed);
+        serial.store(0, std::memory_order_relaxed);
+        waiting.store(false, std::memory_order_relaxed);
+        abandon.store(false, std::memory_order_relaxed);
+    }
 };
 
 struct SegmentInput {
     u64 id = 0;
     u64 begin = 0; ///< ring position after the segment's Segment record
     u64 end = 0;   ///< ring position after the next Segment record (closed segments)
-    std::shared_ptr<SegmentProgress> progress; ///< submitted before its end was published
+    SegmentProgress* progress = nullptr; ///< submitted before its end was published
     const std::atomic<u64>* published = nullptr; ///< with `progress`: the split's publish position
-    std::shared_ptr<const FrontSnapshot> snapshot;
+    /// From the front's epoch pools (F1-30): valid until the commit released this segment.
+    const FrontSnapshot* snapshot = nullptr;
     SerialReason serial = SerialReason::None; ///< known up front: no shard resolves it
     const u64* ring = nullptr;
     const Ir::PayloadArena* arena = nullptr;
@@ -277,13 +285,19 @@ private:
     Segmenter segmenter;
     SnapshotBuilder<0xe00> regs_builder;
     SnapshotBuilder<0xe00> shadow_builder;
-    std::shared_ptr<const CbufTable> last_cbufs;
+    /// F1-30: what segments point to, reused once the commit released them (`released`).
+    EpochPool<FrontSnapshot> snapshot_pool;
+    EpochPool<CbufTable> cbuf_pool;
+    EpochPool<SegmentProgress> progress_pool;
+    CbufTable* last_cbufs = nullptr;
+    u64 last_cbuf_changes = ~u64{0};
     bool open = false;
     SegmentInput open_input;
     /// The open segment's progress once it was submitted early (null: not submitted yet).
-    std::shared_ptr<SegmentProgress> open_progress;
+    SegmentProgress* open_progress = nullptr;
     /// The last early submission, released at shutdown if its end was never published.
-    std::shared_ptr<SegmentProgress> last_early;
+    SegmentProgress* last_early = nullptr;
+    void ReclaimReleased();
     std::deque<SegmentInput> closed;
     u32 applied_size = 0;
     /// Draws of submitted segments the commit has not taken yet (front adds, back subtracts).
@@ -300,6 +314,8 @@ private:
 
     // Front <- back.
     std::atomic<u32> adaptive_size{SegmentPolicy::DefaultK};
+    /// The newest segment id the commit released: nothing reads its inputs (or older ones).
+    std::atomic<u64> released{0};
 };
 
 } // namespace VideoCommon::V2::Resolve

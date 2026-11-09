@@ -2235,6 +2235,7 @@ void Maxwell3D::FrontRegSemResync(FrontState& fs) {
             fs.v2_cbufs.stages[stage][slot] = {cbuf.address, cbuf.size, cbuf.enabled ? 1U : 0U};
         }
     }
+    ++fs.v2_cbufs.changes;
     if (fs.v2->mode == VideoCommon::V2::Mode::Verify) {
         if (!fs.v2->mirror) {
             fs.v2->mirror = std::make_unique<VideoCommon::V2::RegSem::Mirror3D>();

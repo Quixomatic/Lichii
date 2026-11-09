@@ -506,17 +506,21 @@ void SplitResolve::FrontDraw(const FrontView& view, const EngineInfo& engine,
         if (stats) {
             Count(GetStats().cuts[static_cast<size_t>(cut)]);
         }
-        auto snapshot = std::make_shared<FrontSnapshot>();
+        ReclaimReleased();
+        const u64 epoch = segmenter.OpenId(); // the id of the segment this snapshot starts
+        FrontSnapshot* const snapshot = snapshot_pool.Allocate();
+        snapshot_pool.Retire(snapshot, epoch);
+        *snapshot = FrontSnapshot{};
         const u64 copied_before = regs_builder.copied + shadow_builder.copied;
         const u64 shared_before = regs_builder.shared + shadow_builder.shared;
         if (view.dirty_blocks != nullptr) {
-            snapshot->regs = regs_builder.Take(view.regs, *view.dirty_blocks);
+            snapshot->regs = regs_builder.Take(view.regs, *view.dirty_blocks, epoch);
             *view.dirty_blocks = 0;
         } else {
-            snapshot->regs = regs_builder.Take(view.regs);
+            snapshot->regs = regs_builder.Take(view.regs, ~u64{0}, epoch);
         }
         if (!view.deltas) {
-            snapshot->shadow = shadow_builder.Take(view.shadow);
+            snapshot->shadow = shadow_builder.Take(view.shadow, ~u64{0}, epoch);
         }
         if (stats) {
             Count(GetStats().snapshot_blocks_copied,
@@ -526,9 +530,15 @@ void SplitResolve::FrontDraw(const FrontView& view, const EngineInfo& engine,
         }
         snapshot->groups = *view.groups;
         if (view.cbufs != nullptr) {
-            // Bindings change far less often than segments are cut: share the last copy.
-            if (last_cbufs == nullptr || !(*last_cbufs == *view.cbufs)) {
-                last_cbufs = std::make_shared<const CbufTable>(*view.cbufs);
+            // Bindings change far less often than segments are cut: share the last copy while
+            // no bind happened (a counter compare, not a table compare).
+            if (last_cbufs == nullptr || last_cbuf_changes != view.cbufs->changes) {
+                if (last_cbufs != nullptr) {
+                    cbuf_pool.Retire(last_cbufs, epoch - 1);
+                }
+                last_cbufs = cbuf_pool.Allocate();
+                *last_cbufs = *view.cbufs;
+                last_cbuf_changes = view.cbufs->changes;
             }
             snapshot->cbufs = last_cbufs;
         }
@@ -567,11 +577,25 @@ void SplitResolve::FrontDraw(const FrontView& view, const EngineInfo& engine,
         open_input = SegmentInput{};
         open_input.id = body.id;
         open_input.begin = position;
-        open_input.snapshot = std::move(snapshot);
+        open_input.snapshot = snapshot;
         open_input.ring = ring;
         open_input.arena = arena;
         open_input.draws = 1;
     }
+}
+
+void SplitResolve::ReclaimReleased() {
+    // A submitted input is never read after the commit released its id (Submit refuses it
+    // then), but the front itself still writes the open segment's progress.
+    u64 through = released.load(std::memory_order_acquire);
+    if (open) {
+        through = (std::min)(through, open_input.id - 1);
+    }
+    regs_builder.Reclaim(through);
+    shadow_builder.Reclaim(through);
+    snapshot_pool.Reclaim(through);
+    cbuf_pool.Reclaim(through);
+    progress_pool.Reclaim(through);
 }
 
 void SplitResolve::OnPublish(u64 position) {
@@ -607,14 +631,16 @@ void SplitResolve::OnPublish(u64 position) {
     if (in_flight != 0 && in_flight + draws > InFlightDraws) {
         return;
     }
-    auto progress = std::make_shared<SegmentProgress>();
+    SegmentProgress* const progress = progress_pool.Allocate();
+    progress_pool.Retire(progress, open_input.id);
+    progress->Reset();
     open_input.progress = progress;
     open_input.published = &split.published;
     bool retry = false;
     in_flight_draws.fetch_add(draws, std::memory_order_acq_rel);
     if (resolver->Submit(open_input.id, std::move(open_input), SerialReason::None, &retry)) {
         open_progress = progress;
-        last_early = std::move(progress);
+        last_early = progress;
         if (stats) {
             Count(GetStats().early_submits);
         }
@@ -636,6 +662,11 @@ void SplitResolve::OnSegment(const Ir::SegmentBody& body, const u32* back_regs,
     }
     taken = nullptr;
     Resolver::Result& result = resolver->Take(body.id);
+    // Segments are taken in id order and Take returns once no shard reads `body.id`: every older
+    // one's input is done with (the front reuses their snapshots, F1-30).
+    if (body.id > 1) {
+        released.store(body.id - 1, std::memory_order_release);
+    }
     if (result.has_input) {
         in_flight_draws.fetch_sub(resolver->InputOf(body.id).draws, std::memory_order_acq_rel);
     }
