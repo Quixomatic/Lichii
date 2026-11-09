@@ -173,6 +173,10 @@ public:
     [[nodiscard]] bool TracksBarriers() const noexcept {
         return track_barriers;
     }
+    /// F2-09: 0 while image reads can hazard with nothing; else the tracker's write serial.
+    [[nodiscard]] u64 ReadHazardSerial() const noexcept {
+        return !track_barriers || barrier_tracker.Empty() ? 0 : barrier_tracker.WriteSerial();
+    }
 
     /// Defers a full-attachment color clear so it becomes the next render pass.
     bool DeferColorClear(const Framebuffer* framebuffer, u32 rt_slot, const VkClearValue& value);

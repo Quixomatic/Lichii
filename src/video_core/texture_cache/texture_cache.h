@@ -777,6 +777,42 @@ bool TextureCache<P>::PrepareRecipeViews(std::span<const ImageViewInOut> views) 
 }
 
 template <class P>
+auto TextureCache<P>::CurrentResidency() const noexcept -> ResidencyStamp {
+    ResidencyStamp stamp{
+        .epoch = prepare_epoch,
+        .frame = frame_tick,
+        .submission = commit != nullptr ? commit->submission : 0,
+    };
+    if constexpr (requires { runtime.ReadHazardSerial(); }) {
+        if (v2_track_uses) {
+            stamp.barriers = runtime.ReadHazardSerial();
+        }
+    }
+    return stamp;
+}
+
+template <class P>
+bool TextureCache<P>::PrepareResidentViews(std::span<const ImageViewInOut> views,
+                                           ResidencyStamp& stamp) {
+    // COMMIT=verify compares every prepare with its request: no skipping there.
+    const bool verify = commit != nullptr && commit->verify;
+    ResidencyStamp now = CurrentResidency();
+    if (!verify && stamp.epoch != 0 && stamp.epoch == now.epoch && stamp.frame == now.frame &&
+        stamp.submission == now.submission && (now.barriers == 0 || now.barriers == stamp.barriers)) {
+        return true;
+    }
+    const u64 epoch_before = prepare_epoch;
+    if (!PrepareRecipeViews(views)) {
+        stamp = {};
+        return false;
+    }
+    // A prepare that left work behind (layers still dirty, a failed decode) moved the epoch: the
+    // next use prepares again. Otherwise stamp what holds after them (read hazards taken).
+    stamp = prepare_epoch == epoch_before ? CurrentResidency() : ResidencyStamp{};
+    return true;
+}
+
+template <class P>
 bool TextureCache<P>::CaptureDescriptor(bool compute, bool sampler, u32 index, GPUVAddr& address,
                                         const u8*& host, std::span<u8, 32> bytes) const {
     static_assert(sizeof(TICEntry) == 32 && sizeof(TSCEntry) == 32);
@@ -1389,6 +1425,7 @@ void TextureCache<P>::WriteMemory(DAddr cpu_addr, size_t size) {
     ClearStale(cpu_addr, size);
     ForEachImageInRegion(cpu_addr, size, [this, cpu_addr, size](ImageId image_id, Image& image) {
         VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Invalidation);
+        BumpPrepareEpoch();
         if (True(image.flags & ImageFlagBits::UnwrittenSparse)) {
             // Written at last: a backed image replaces it where it is used next.
             image.flags |= ImageFlagBits::CpuModified | ImageFlagBits::Remapped;
@@ -1540,6 +1577,7 @@ void TextureCache<P>::UnmapGPUMemory(size_t as_id, GPUVAddr gpu_addr, size_t siz
                             [&](ImageId id, Image&) { deleted_images.push_back(id); });
     if (!deleted_images.empty()) {
         VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Map);
+        BumpPrepareEpoch();
     }
     for (const ImageId id : deleted_images) {
         Image& image = slot_images[id];
@@ -2386,6 +2424,7 @@ void TextureCache<P>::MarkLayersWritten(Image& image, DAddr cpu_addr, size_t siz
         return; // all of it is dirty already
     }
     const u32 layers = static_cast<u32>(image.info.resources.layers);
+    BumpPrepareEpoch();
     if (False(image.flags & ImageFlagBits::CpuModified)) {
         image.flags |= ImageFlagBits::CpuModified;
         image.dirty_layers.assign(Common::DivCeil(layers, 64U), 0);
@@ -2413,6 +2452,7 @@ void TextureCache<P>::MarkRangeWritten(Image& image, DAddr cpu_addr, size_t size
     if (end <= begin) {
         return;
     }
+    BumpPrepareEpoch();
     image.flags |= ImageFlagBits::CpuModified;
     image.dirty_ranges.emplace_back(begin - image.cpu_addr, end - begin);
 }
@@ -3070,6 +3110,7 @@ bool TextureCache<P>::ScaleUp(Image& image) {
     if (commit != nullptr) [[unlikely]] {
         V2::Commit::NoteEffect(commit, V2::Commit::EffectRescale);
     }
+    BumpPrepareEpoch();
     InvalidateScale(image);
     return true;
 }
@@ -3084,6 +3125,7 @@ bool TextureCache<P>::ScaleDown(Image& image) {
     if (commit != nullptr) [[unlikely]] {
         V2::Commit::NoteEffect(commit, V2::Commit::EffectRescale);
     }
+    BumpPrepareEpoch();
     InvalidateScale(image);
     return true;
 }
@@ -3942,6 +3984,7 @@ ImageViewId TextureCache<P>::FindOrEmplaceImageView(ImageId image_id, const Imag
 
 template <class P>
 void TextureCache<P>::RegisterImage(ImageId image_id) {
+    BumpPrepareEpoch();
     ImageBase& image = slot_images[image_id];
     ASSERT_MSG(False(image.flags & ImageFlagBits::Registered),
                "Trying to register an already registered image");
@@ -4011,6 +4054,7 @@ void TextureCache<P>::ReportMissingImagePage(ImageId image_id, const Image& imag
 
 template <class P>
 void TextureCache<P>::UnregisterImage(ImageId image_id) {
+    BumpPrepareEpoch();
     Image& image = slot_images[image_id];
     ASSERT_MSG(True(image.flags & ImageFlagBits::Registered),
                "Trying to unregister an already registered image");
@@ -4147,6 +4191,7 @@ void TextureCache<P>::UntrackImage(ImageBase& image, ImageId image_id) {
 
 template <class P>
 void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
+    BumpPrepareEpoch();
     ImageBase& image = slot_images[image_id];
     ++images_deleted;
     VideoCommon::V2::Stats::CountMutation(VideoCommon::V2::Stats::Mutation::ImageDelete);
@@ -4325,6 +4370,9 @@ void TextureCache<P>::MarkModification(ImageBase& image) noexcept {
     }
     image.flags |= ImageFlagBits::GpuModified;
     SetModificationTick(slot_images, image, ++modification_tick);
+    if (!image.aliased_images.empty()) {
+        BumpPrepareEpoch(); // its aliases now have a newer alias to copy in
+    }
     if (commit != nullptr) [[unlikely]] {
         v2_sole_newest = &image;
         V2::Commit::NoteEffect(commit, V2::Commit::EffectModify);
@@ -4374,6 +4422,7 @@ void TextureCache<P>::SynchronizeAliases(ImageId image_id) {
         }
     }
     SetModificationTick(slot_images, image, most_recent_tick);
+    BumpPrepareEpoch();
     v2_sole_newest = nullptr;
     image.newest_alias_tick = most_recent_tick;
     if (any_modified) {
@@ -4417,6 +4466,9 @@ void TextureCache<P>::PrepareImage(ImageId image_id, bool is_modification, bool 
         }
     } else {
         RefreshContents(image, image_id);
+        if (True(image.flags & ImageFlagBits::CpuModified)) [[unlikely]] {
+            BumpPrepareEpoch(); // left dirty (layers, a failed decode): prepared again next use
+        }
         if (!image.aliased_images.empty()) {
             SynchronizeAliases(image_id);
         }
@@ -4454,6 +4506,7 @@ void TextureCache<P>::PrepareImage(ImageId image_id, bool is_modification, bool 
                         image.gpu_addr);
             Tegra::Nx2SparseMarkWritten(image.gpu_addr, image.guest_size_bytes);
             image.flags |= ImageFlagBits::CpuModified | ImageFlagBits::Remapped;
+            BumpPrepareEpoch();
             VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Invalidation);
         }
         MarkModification(image);

@@ -319,6 +319,10 @@ public:
     /// EDEN_NX2_V2_DYNRENDER: a draw/dispatch uses `image` (pending attachment writes it overlaps
     /// need a barrier first).
     void NoteImageUse(const Image& image);
+    /// F2-09: what NoteImageUse could still find (0: nothing).
+    [[nodiscard]] u64 ReadHazardSerial() const noexcept {
+        return scheduler.ReadHazardSerial();
+    }
 
     /// EDEN_NX2_V2_GPUDECODE: whether `image` can be untiled by the compute path.
     [[nodiscard]] bool GpuDecodeAvailable(const Image& image) const noexcept;

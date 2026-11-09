@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "common/common_types.h"
+#include "video_core/v2/residency.h"
 #include "video_core/v2/versions.h"
 
 // Pipeline v2 P4 (EDEN_NX2_V2_DRAWCACHE): fingerprint -> recipe draw cache (MASTER_PLAN §5.3
@@ -357,10 +358,12 @@ struct Recipe {
     std::vector<u32> heap_words; ///< bindless heap words (verify)
     CapturedInputs inputs;
     BufferRecipe buffers;
+    ResidencyStamp residency; ///< F2-09: the views were prepared under this stamp
     u64 uses{};
 
     void Clear() {
         const u64 kept_key = key;
+        residency = {};
         views.clear();
         samplers.clear();
         storage.clear();

@@ -1311,9 +1311,11 @@ GraphicsPipeline::RecipeResult GraphicsPipeline::ConfigureRecipe(
         texture_cache.SynchronizeDescriptors(false);
     }
     {
-        // What FillImageViews does to the views it finds: uploads, alias copies, the LRU.
+        // What FillImageViews does to the views it finds: uploads, alias copies, the LRU. F2-09:
+        // once per residency stamp (nothing in the cache moved, same frame and submission).
         Profile::Scope scope{Profile::Zone::FillImageViews};
-        if (!texture_cache.PrepareRecipeViews(std::span(views.data(), views.size()))) {
+        if (!texture_cache.PrepareResidentViews(std::span(views.data(), views.size()),
+                                                recipe.residency)) {
             return RecipeResult::Rebuild;
         }
     }

@@ -159,6 +159,7 @@ add_library(video_core STATIC
     v2/timeline_join.h
     v2/pipeline_lookup.h
     v2/regsem.cpp
+    v2/residency.h
     v2/resolve/cbuf_table.h
     v2/resolve/cow_regs.h
     v2/resolve/multifront.cpp

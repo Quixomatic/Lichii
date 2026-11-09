@@ -54,6 +54,7 @@ public:
     /// Records a write. Writes to the same resource and range merge their masks. When full, every
     /// pending write folds into one "everything" entry that any access hazards with.
     void NoteWrite(u64 resource, u64 begin, u64 end, u32 stages, u32 access) noexcept {
+        ++write_serial;
         if (everything) {
             all_stages |= stages;
             all_access |= access;
@@ -145,6 +146,10 @@ public:
     [[nodiscard]] bool Folded() const noexcept {
         return everything;
     }
+    /// Moves with every NoteWrite: while it holds, a Take of what was taken before finds nothing.
+    [[nodiscard]] u64 WriteSerial() const noexcept {
+        return write_serial;
+    }
 
 private:
     void FoldAll() noexcept {
@@ -161,6 +166,7 @@ private:
     bool everything = false;
     u32 all_stages = 0;
     u32 all_access = 0;
+    u64 write_serial = 0;
 };
 
 } // namespace VideoCommon::V2

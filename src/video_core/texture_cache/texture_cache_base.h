@@ -51,6 +51,7 @@
 #include "video_core/textures/texture.h"
 #include "video_core/textures/unswizzle_worker.h"
 #include "video_core/v2/commit.h"
+#include "video_core/v2/residency.h"
 
 namespace Tegra {
 namespace Control {
@@ -327,6 +328,20 @@ public:
     /// finds (uploads, alias copies, the LRU), as a texture memo hit does. False when preparing
     /// deleted images: the draw resolves in full.
     [[nodiscard]] bool PrepareRecipeViews(std::span<const ImageViewInOut> views);
+
+    /// Pipeline v2 F2-09 (MASTER_PLAN §5.3 textures, §8): image residency by epoch. The prepare
+    /// epoch moves whenever a PrepareImageView of an image prepared before could do more than the
+    /// LRU touch (a CPU-modified mark, a newer alias, registration, deletion, a rescale). A recipe
+    /// or continued chain that prepared its views under a stamp equal to the current one skips
+    /// every PrepareImageView.
+    using ResidencyStamp = V2::ResidencyStamp;
+    [[nodiscard]] ResidencyStamp CurrentResidency() const noexcept;
+    /// PrepareRecipeViews unless `stamp` still holds; refreshes `stamp` after a prepare.
+    [[nodiscard]] bool PrepareResidentViews(std::span<const ImageViewInOut> views,
+                                            ResidencyStamp& stamp);
+    void BumpPrepareEpoch() noexcept {
+        ++prepare_epoch;
+    }
 
     /// EDEN_NX2_V2_DRAWCACHE: the image (sampler = false) or sampler descriptor `index` of a
     /// handle, as the last resolve read it: its GPU address, its host pointer and its bytes. False
@@ -851,6 +866,7 @@ private:
 
     u64 modification_tick = 0;
     u64 frame_tick = 0;
+    u64 prepare_epoch = 1; ///< F2-09, see ResidencyStamp
 
     Common::ThreadWorker texture_decode_worker{1, "TextureDecoder", {},
                                                Common::ThreadPlacement::Efficiency};
