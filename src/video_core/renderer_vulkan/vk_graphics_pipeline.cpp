@@ -41,6 +41,8 @@
 #include "shader_recompiler/exception.h"
 #include "video_core/nx2_fast_draw.h"
 #include "video_core/nx2_profile.h"
+#include "video_core/v2/p3_stats.h"
+#include "video_core/v2/v2_switches.h"
 
 #if defined(__clang__) && defined(NDEBUG)
 #define LAMBDA_FORCEINLINE __attribute__((always_inline))
@@ -1124,16 +1126,58 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
         return false;
     }
     const void* const descriptor_data{guest_descriptor_queue.UpdateData()};
+    // EDEN_NX2_V2_DESCCACHE: the payload is the content key (view, sampler and buffer handles,
+    // buffer offsets and ranges). Verify decides by its hash alone and counts payloads that
+    // differ behind an equal hash.
+    namespace V2 = VideoCommon::V2;
+    const bool desc_cache = V2::On(V2::Switch::DescCache) && !mesh_emulation &&
+                            descriptor_set_layout;
+    const bool desc_verify = V2::Verify(V2::Switch::DescCache);
+    const std::span<const u8> payload_bytes{static_cast<const u8*>(descriptor_data),
+                                            num_descriptor_entries *
+                                                sizeof(DescriptorUpdateEntry)};
+    const u64 payload_hash = desc_cache ? V2::HashDescriptorBytes(payload_bytes) : 0;
+    const bool desc_stats = desc_cache && V2::P3Stats::Enabled();
+    if (desc_stats) {
+        ++V2::P3Stats::Get().desc_draws;
+    }
 
     VkDeviceSize descriptor_buffer_offset{};
     u32 descriptor_buffer_chunk{};
     if (descriptor_set_layout && uses_descriptor_buffer) {
         const auto* const entries = static_cast<const DescriptorUpdateEntry*>(descriptor_data);
-        const bool reuse_allocation =
+        bool reuse_allocation =
             last_descriptor_buffer_generation == descriptor_buffer_ring.CurrentGeneration() &&
             last_descriptor_payload.size() == num_descriptor_entries &&
             std::memcmp(last_descriptor_payload.data(), entries,
                         num_descriptor_entries * sizeof(DescriptorUpdateEntry)) == 0;
+        if (!reuse_allocation && desc_cache) {
+            // An older payload of this generation: its range is still alive.
+            const u64 generation = descriptor_buffer_ring.CurrentGeneration();
+            if (const DescriptorBufferRange* const range = descriptor_buffer_cache.Find(
+                    payload_bytes, payload_hash, generation, desc_verify)) {
+                bool usable = true;
+                if (desc_verify) {
+                    auto& data = V2::P3Stats::Get();
+                    ++data.desc_verify;
+                    if (descriptor_buffer_cache.Collides(payload_bytes, payload_hash, generation) &&
+                        !descriptor_buffer_cache.Find(payload_bytes, payload_hash, generation)) {
+                        ++data.desc_mismatches;
+                        usable = false;
+                    }
+                }
+                if (usable) {
+                    last_descriptor_buffer_offset = range->offset;
+                    last_descriptor_buffer_chunk = range->chunk;
+                    last_descriptor_buffer_generation = generation;
+                    last_descriptor_payload.assign(entries, entries + num_descriptor_entries);
+                    reuse_allocation = true;
+                    if (desc_stats) {
+                        ++V2::P3Stats::Get().desc_buffer_hits;
+                    }
+                }
+            }
+        }
         if (reuse_allocation) {
             descriptor_buffer_offset = last_descriptor_buffer_offset;
             descriptor_buffer_chunk = last_descriptor_buffer_chunk;
@@ -1146,6 +1190,12 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
                 return false;
             }
             WriteDescriptorBuffer(device, descriptor_buffer_layout, entries, alloc.host);
+            if (desc_cache) {
+                descriptor_buffer_cache.Insert(payload_bytes, payload_hash, alloc.generation) = {
+                    .offset = alloc.offset,
+                    .chunk = alloc.chunk,
+                };
+            }
             descriptor_buffer_offset = alloc.offset;
             descriptor_buffer_chunk = alloc.chunk;
             last_descriptor_buffer_offset = alloc.offset;
@@ -1325,7 +1375,39 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
             last_descriptor_payload.assign(entries, entries + num_descriptor_entries);
         }
     }
-    scheduler.Record([this, descriptor_data, bind_pipeline, update_descriptors,
+    // Push descriptors stay bound while the pipeline does, until the recording epoch moves (a
+    // pass end or a command buffer state reset): an equal payload needs no push.
+    bool push_descriptors = true;
+    if (desc_cache && uses_push_descriptor) {
+        const u64 epoch = scheduler.RecordingEpoch();
+        bool same = !bind_pipeline && last_pushed_epoch == epoch &&
+                    last_pushed_hash == payload_hash &&
+                    last_pushed_payload.size() == payload_bytes.size();
+        if (same) {
+            const bool equal = std::memcmp(last_pushed_payload.data(), payload_bytes.data(),
+                                           payload_bytes.size()) == 0;
+            if (desc_verify) {
+                auto& data = V2::P3Stats::Get();
+                ++data.desc_verify;
+                data.desc_mismatches += equal ? 0 : 1;
+            }
+            same = equal;
+        }
+        if (same) {
+            push_descriptors = false;
+            if (desc_stats) {
+                ++V2::P3Stats::Get().desc_push_skipped;
+            }
+        } else {
+            last_pushed_payload.assign(payload_bytes.begin(), payload_bytes.end());
+            last_pushed_epoch = epoch;
+            last_pushed_hash = payload_hash;
+        }
+    }
+    const bool use_set_cache = desc_cache && !uses_push_descriptor && !uses_descriptor_buffer;
+    scheduler.Record([this, descriptor_data, bind_pipeline, update_descriptors, push_descriptors,
+                      use_set_cache, payload_hash, cache_tick = scheduler.CurrentTick(),
+                      payload_size = payload_bytes.size(),
                       descriptor_buffer_offset, descriptor_buffer_chunk, bind_descriptor_buffer,
                       rescaling_data = rescaling.Data(), is_rescaling, update_rescaling,
                       uses_render_area = render_area.uses_render_area,
@@ -1377,12 +1459,33 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
             cmdbuf.SetDescriptorBufferOffsetsEXT(VK_PIPELINE_BIND_POINT_GRAPHICS, *pipeline_layout,
                                                  0, buffer_index, descriptor_buffer_offset);
         } else if (uses_push_descriptor) {
-            cmdbuf.PushDescriptorSetWithTemplateKHR(*descriptor_update_template, *pipeline_layout,
-                                                    0, descriptor_data);
+            if (push_descriptors) {
+                cmdbuf.PushDescriptorSetWithTemplateKHR(*descriptor_update_template,
+                                                        *pipeline_layout, 0, descriptor_data);
+            }
         } else if (update_descriptors) {
-            const VkDescriptorSet descriptor_set{descriptor_allocator.Commit()};
-            const vk::Device& dev{device.GetLogical()};
-            dev.UpdateDescriptorSet(descriptor_set, *descriptor_update_template, descriptor_data);
+            // EDEN_NX2_V2_DESCCACHE: a set written with this payload in this command buffer
+            // (tick) is bound again; sets are recycled only once their tick is done.
+            const std::span<const u8> bytes{static_cast<const u8*>(descriptor_data),
+                                            payload_size};
+            VkDescriptorSet descriptor_set{};
+            if (use_set_cache) {
+                if (const VkDescriptorSet* const cached =
+                        worker_set_cache.Find(bytes, payload_hash, cache_tick)) {
+                    descriptor_set = *cached;
+                    VideoCommon::V2::P3Stats::g_worker_set_hits.fetch_add(
+                        1, std::memory_order_relaxed);
+                }
+            }
+            if (descriptor_set == VK_NULL_HANDLE) {
+                descriptor_set = descriptor_allocator.Commit();
+                const vk::Device& dev{device.GetLogical()};
+                dev.UpdateDescriptorSet(descriptor_set, *descriptor_update_template,
+                                        descriptor_data);
+                if (use_set_cache) {
+                    worker_set_cache.Insert(bytes, payload_hash, cache_tick) = descriptor_set;
+                }
+            }
             cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS, *pipeline_layout, 0,
                                       descriptor_set, nullptr);
         }

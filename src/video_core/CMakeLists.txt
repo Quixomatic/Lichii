@@ -128,6 +128,7 @@ add_library(video_core STATIC
     v2/hazard.h
     v2/ir.h
     v2/continued_draw.h
+    v2/desc_cache.h
     v2/draw_model.cpp
     v2/draw_model.h
     v2/ir_arena.h

@@ -39,6 +39,7 @@ void Report(const char* thread_name, u64 window_ns) {
         return;
     }
     Data& d = *t_data;
+    d.desc_set_hits += g_worker_set_hits.exchange(0, std::memory_order_relaxed);
     if (d.key_lookups != 0) {
         LOG_INFO(HW_GPU,
                  "V2 stats {} P3 pipeline key: {:.0f} lookups/s, unchanged {:.1f}%, {:.2f} blocks "

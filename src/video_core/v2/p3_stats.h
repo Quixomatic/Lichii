@@ -4,6 +4,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 
 #include "common/common_types.h"
 #include "video_core/v2/regsem.h"
@@ -70,7 +71,11 @@ struct Data {
     u64 lean_cold{};
 };
 
-/// Counting is on with the stats or any P3 verify mode.
+/// Descriptor set reuse happens on the VulkanWorker, which reports no stats of its own: it
+/// counts here and the next report of a drawing thread takes the count.
+inline std::atomic<u64> g_worker_set_hits{};
+
+/// Counting is on with the stats (verify modes count their checks and mismatches anyway).
 [[nodiscard]] inline bool Enabled() {
     return Stats::Enabled();
 }

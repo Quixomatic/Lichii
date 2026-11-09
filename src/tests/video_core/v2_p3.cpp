@@ -20,6 +20,7 @@
 #include "video_core/renderer_vulkan/fixed_pipeline_state.h"
 #include "video_core/renderer_vulkan/vk_state_tracker.h"
 #include "video_core/v2/continued_draw.h"
+#include "video_core/v2/desc_cache.h"
 #include "video_core/v2/pipeline_lookup.h"
 #include "video_core/v2/regsem.h"
 #include "video_core/v2/v2_switches.h"
@@ -296,4 +297,52 @@ TEST_CASE("V2 P3 continued draws classify changed groups as light or heavy",
                            bit == GroupBit(RegGroup::TexPools);
         REQUIRE(known);
     }
+}
+
+TEST_CASE("V2 P3 descriptor content keys", "[video_core][v2_p3]") {
+    using Cache = VideoCommon::V2::DescriptorContentCache<int, 4>;
+    using VideoCommon::V2::HashDescriptorBytes;
+    Cache cache;
+    std::vector<std::vector<u8>> payloads;
+    std::mt19937 rng{11};
+    for (int i = 0; i < 6; ++i) {
+        std::vector<u8> bytes(24 * (1 + i % 3));
+        for (auto& byte : bytes) {
+            byte = static_cast<u8>(rng());
+        }
+        payloads.push_back(std::move(bytes));
+    }
+    const auto hash = [&](int i) { return HashDescriptorBytes(payloads[i]); };
+    REQUIRE(hash(0) != hash(1));
+    REQUIRE(HashDescriptorBytes(payloads[0]) == hash(0));
+    for (int i = 0; i < 4; ++i) {
+        REQUIRE(cache.Find(payloads[i], hash(i), 1) == nullptr);
+        cache.Insert(payloads[i], hash(i), 1) = i;
+    }
+    for (int i = 0; i < 4; ++i) {
+        const int* const value = cache.Find(payloads[i], hash(i), 1);
+        REQUIRE(value != nullptr);
+        REQUIRE(*value == i);
+        // Another epoch: not valid.
+        REQUIRE(cache.Find(payloads[i], hash(i), 2) == nullptr);
+    }
+    // Touch 1..3 so 0 is the least recent, then a fifth payload replaces it.
+    for (int i = 1; i < 4; ++i) {
+        REQUIRE(cache.Find(payloads[i], hash(i), 1) != nullptr);
+    }
+    cache.Insert(payloads[4], hash(4), 1) = 4;
+    REQUIRE(cache.Find(payloads[0], hash(0), 1) == nullptr);
+    REQUIRE(*cache.Find(payloads[4], hash(4), 1) == 4);
+    // A new epoch takes the entries of old epochs first.
+    cache.Insert(payloads[5], hash(5), 2) = 5;
+    REQUIRE(*cache.Find(payloads[5], hash(5), 2) == 5);
+    // Equal hash, other bytes: no hit unless the hash is trusted; Collides tells.
+    auto forged = payloads[1];
+    forged[3] ^= 0x40;
+    REQUIRE(cache.Find(forged, hash(1), 1) == nullptr);
+    REQUIRE(cache.Find(forged, hash(1), 1, true) != nullptr);
+    REQUIRE(cache.Collides(forged, hash(1), 1));
+    REQUIRE_FALSE(cache.Collides(payloads[1], hash(1), 1));
+    cache.Clear();
+    REQUIRE(cache.Find(payloads[1], hash(1), 1) == nullptr);
 }

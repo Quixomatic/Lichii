@@ -27,6 +27,7 @@
 #include "video_core/renderer_vulkan/vk_descriptor_pool.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
+#include "video_core/v2/desc_cache.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
 namespace VideoCore {
@@ -427,6 +428,19 @@ private:
     vk::PipelineLayout pipeline_layout;
     vk::DescriptorUpdateTemplate descriptor_update_template;
     vk::Pipeline pipeline;
+
+    // EDEN_NX2_V2_DESCCACHE (v2/desc_cache.h): descriptor buffer ranges by payload and ring
+    // generation; the payload last pushed and the recording epoch it was pushed in; descriptor
+    // sets by payload and tick, touched only by the VulkanWorker closures.
+    struct DescriptorBufferRange {
+        VkDeviceSize offset{};
+        u32 chunk{};
+    };
+    VideoCommon::V2::DescriptorContentCache<DescriptorBufferRange> descriptor_buffer_cache;
+    std::vector<u8> last_pushed_payload;
+    u64 last_pushed_epoch{~u64{}};
+    u64 last_pushed_hash{};
+    VideoCommon::V2::DescriptorContentCache<VkDescriptorSet> worker_set_cache;
 
     DescriptorBufferLayout descriptor_buffer_layout;
     std::vector<DescriptorUpdateEntry> last_descriptor_payload;
