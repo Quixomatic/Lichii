@@ -193,6 +193,8 @@ void GpuSplit::Stop() {
     acquire_mode = V2::Mode::Off;
     hazard_mode = V2::Mode::Off;
     hazards.Clear();
+    SetCpuLaneHook(nullptr, nullptr);
+    cpu_lane_requested.store(false, std::memory_order_relaxed);
     back_idle_at.store(~u64{0}, std::memory_order_relaxed);
     back_sequence = 0;
     consumed_sequence.store(0, std::memory_order_relaxed);

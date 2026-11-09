@@ -864,10 +864,9 @@ bool DmaPusher::FlushGpuWrittenCommands(GPUVAddr address, size_t size) {
     }
     const GPUVAddr first_page = address & ~GPUVAddr{0xfff};
     const GPUVAddr end_page = (address + size + 0xfff) & ~GPUVAddr{0xfff};
-    if (auto& split = VideoCommon::GpuSplit::Get(); split.Active() && rasterizer != nullptr &&
-                                                    !diag &&
-                                                    split.HazardMode() != VideoCommon::V2::Mode::Off)
-        [[unlikely]] {
+    auto& split = VideoCommon::GpuSplit::Get();
+    if (split.HazardMode() == VideoCommon::V2::Mode::On && split.Active() &&
+        rasterizer != nullptr && !diag) [[unlikely]] {
         // EDEN_NX2_V2_HAZARD: one wait instead of two; the flush runs on the back after
         // everything queued (the writers among it), then the front reads.
         std::vector<DAddr> pages;
