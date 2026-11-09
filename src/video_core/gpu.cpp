@@ -306,6 +306,30 @@ struct GPU::Impl {
                      raster_area.start_address, raster_area.end_address,
                      reads.load(std::memory_order_relaxed));
         }
+        if (VideoCommon::V2::On(VideoCommon::V2::Switch::Readback) && is_async) [[unlikely]] {
+            // EDEN_NX2_V2_READBACK: the caches' owner records and submits the download; this
+            // thread waits for the GPU and writes guest memory itself (Ryujinx's readback on the
+            // reading thread), so the owner never blocks on the GPU for it.
+            std::function<void()> land;
+            const auto record = [this, raster_area, &land] {
+                InvalidateGPUCache();
+                renderer->ReadRasterizer()->FlushRegionForRead(
+                    raster_area.start_address,
+                    raster_area.end_address - raster_area.start_address, land);
+            };
+            if (UseCpuLane()) {
+                lane_used = true;
+                RunOnCpuLane(record);
+            } else {
+                const u64 fence = RequestSyncOperation(record);
+                gpu_thread.TickGPU(is_async);
+                WaitForSyncOperation(fence);
+            }
+            if (land) {
+                land();
+            }
+            return raster_area;
+        }
         const auto flush = [this, raster_area]() {
             // Apply collected guest writes before downloading GPU data over guest memory.
             InvalidateGPUCache();

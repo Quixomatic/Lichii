@@ -30,6 +30,7 @@ enum class Switch : u32 {
     Hazard,  ///< EDEN_NX2_V2_HAZARD: range hazards and targeted waits for front reads (P2)
     Spin,    ///< EDEN_NX2_V2_SPIN: hand-off spin window before front/back kernel waits (P2)
     CpuLane, ///< EDEN_NX2_V2_CPULANE: guest CPU flush requests served by the back early (P2)
+    Readback, ///< EDEN_NX2_V2_READBACK: requester-side readbacks and learned early downloads
     Count,
 };
 
@@ -41,6 +42,7 @@ inline constexpr std::array<const char*, static_cast<size_t>(Switch::Count)> swi
     "HAZARD",
     "SPIN",
     "CPULANE",
+    "READBACK",
 };
 
 namespace Detail {

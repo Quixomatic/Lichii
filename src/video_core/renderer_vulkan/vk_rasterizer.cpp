@@ -2351,6 +2351,33 @@ void RasterizerVulkan::FlushRegion(DAddr addr, u64 size, VideoCommon::CacheType 
     }
 }
 
+bool RasterizerVulkan::FlushRegionForRead(DAddr addr, u64 size, std::function<void()>& land) {
+    // EDEN_NX2_V2_READBACK: as FlushRegion(All), with the buffer cache's download submitted for
+    // the reading thread to wait for instead of waited for here. Textures, and ranges with query
+    // results still to land (which the download must not land over), keep the old path.
+    if (addr == 0 || size == 0) {
+        return false;
+    }
+    gpu.InvalidateGPUCache();
+    {
+        std::scoped_lock lock{texture_cache.mutex};
+        texture_cache.DownloadMemory(addr, size);
+    }
+    bool submitted = false;
+    {
+        std::scoped_lock lock{buffer_cache.mutex};
+        if (!HasPendingQueries(addr, size)) {
+            submitted = buffer_cache.DownloadMemoryAsync(
+                addr, size, land, VideoCommon::V2::Verify(VideoCommon::V2::Switch::Readback));
+        }
+        if (!submitted) {
+            buffer_cache.DownloadMemory(addr, size);
+        }
+    }
+    query_cache.FlushRegion(addr, size);
+    return submitted;
+}
+
 bool RasterizerVulkan::MustFlushRegion(DAddr addr, u64 size, VideoCommon::CacheType which) {
     // The split's front asks this before each macro DMA read, and the back holds the buffer
     // cache's lock through each draw: pages the GPU never wrote need no look under it.

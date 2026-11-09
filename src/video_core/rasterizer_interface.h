@@ -114,6 +114,15 @@ public:
     virtual void FlushRegion(DAddr addr, u64 size,
                              VideoCommon::CacheType which = VideoCommon::CacheType::All) = 0;
 
+    /// Pipeline v2 (EDEN_NX2_V2_READBACK): FlushRegion for a guest CPU read, where the caches'
+    /// owner may only record and submit the download. When it does, it returns true and sets
+    /// `land`, which the reading thread calls: it waits for the download and writes guest memory.
+    virtual bool FlushRegionForRead(DAddr addr, u64 size, std::function<void()>& land) {
+        (void)land;
+        FlushRegion(addr, size);
+        return false;
+    }
+
     /// Switch 2, from the GPU thread's front: where a GPU-written command list's words are.
     enum class GpuWrittenList {
         Unknown, ///< Neither: the caller drains, flushes the page and notes it synced

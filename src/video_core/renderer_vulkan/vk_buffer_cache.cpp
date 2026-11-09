@@ -514,6 +514,18 @@ void BufferCacheRuntime::FinishForHostRead() {
     scheduler.Finish();
 }
 
+u64 BufferCacheRuntime::SubmitForHostRead() {
+    scheduler.RequestOutsideRenderPassOperationContext();
+    scheduler.Record(HostReadBarrier);
+    const u64 tick = scheduler.CurrentTick();
+    scheduler.Flush();
+    return tick;
+}
+
+void BufferCacheRuntime::WaitForHostRead(u64 tick) {
+    scheduler.GetMasterSemaphore().Wait(tick);
+}
+
 bool BufferCacheRuntime::CanReorderUpload(const Buffer& buffer,
                                           std::span<const VideoCommon::BufferCopy> copies) {
     if (Settings::values.disable_buffer_reorder) {

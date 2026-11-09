@@ -184,6 +184,17 @@ public:
         uniform_buffer_binding_sizes{};
 };
 
+/// The staging buffer type a runtime's deferred downloads use (EDEN_NX2_V2_READBACK).
+template <typename R>
+struct ReadbackStaging {
+    using type = int;
+};
+template <typename R>
+    requires requires(R& runtime) { runtime.DownloadStagingBuffer(size_t{}, true); }
+struct ReadbackStaging<R> {
+    using type = decltype(std::declval<R&>().DownloadStagingBuffer(size_t{}, true));
+};
+
 template <class P>
 class BufferCache : public VideoCommon::ChannelSetupCaches<BufferCacheChannelInfo> {
     friend struct BufferCacheTestAccess;
@@ -271,6 +282,15 @@ public:
     bool OnCPUWrite(DAddr device_addr, u64 size);
 
     void DownloadMemory(DAddr device_addr, u64 size);
+
+    /// Pipeline v2 (EDEN_NX2_V2_READBACK): records the download of the GPU-modified parts of
+    /// the range into a staging buffer and submits it without waiting for the GPU. `land`
+    /// (called on the reading thread) waits for that submission and writes guest memory. Returns
+    /// false, recording nothing, where the old path must run (buffers read in place, nothing
+    /// GPU-modified, no async runtime). `verify`: also download synchronously as before, write
+    /// that, and have `land` compare the asynchronous copy with it.
+    bool DownloadMemoryAsync(DAddr device_addr, u64 size, std::function<void()>& land,
+                             bool verify);
 
     std::optional<VideoCore::RasterizerDownloadArea> GetFlushArea(DAddr device_addr, u64 size);
 
@@ -576,6 +596,26 @@ private:
     void UpdateComputeTextureBuffers();
 
     void MarkWrittenBuffer(BufferId buffer_id, DAddr device_addr, u32 size, bool needs_sync = false);
+
+    /// EDEN_NX2_V2_READBACK: frees the staging of readbacks their readers landed.
+    void FreeLandedReadbacks();
+    /// EDEN_NX2_V2_READBACK early downloads (Switch 2): a guest read of [begin, end); pages read
+    /// back twice become Preflushable, so the fences download their later GPU writes.
+    void LearnReadback(DAddr begin, DAddr end);
+    /// ...and GPU writes to them: four writes nobody read in between drop a page again.
+    void NoteLearnedWrite(DAddr device_addr, u64 size);
+
+    struct ReadbackState;
+    std::vector<std::shared_ptr<ReadbackState>> readbacks_in_flight;
+    struct LearnedPage {
+        u8 reads{};
+        u8 unread_writes{};
+        bool marked{};
+    };
+    std::unordered_map<u64, LearnedPage> learned_pages;
+    size_t learned_marked{};
+    DAddr learned_lowest{~DAddr{0}};
+    DAddr learned_highest{};
 
     /// Counts a GPU write to the command list pages in the range (invalidating their copies) and,
     /// while collecting, asks for new copies.

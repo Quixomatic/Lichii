@@ -137,6 +137,10 @@ public:
     void Finish();
 
     void FinishForHostRead();
+    /// As FinishForHostRead without waiting: submits and returns the tick to wait for.
+    [[nodiscard]] u64 SubmitForHostRead();
+    /// Any thread: waits until the GPU passed `tick` (SubmitForHostRead).
+    void WaitForHostRead(u64 tick);
 
     u64 GetDeviceLocalMemory() const;
 
