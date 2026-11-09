@@ -384,7 +384,9 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
     for (const auto& desc : info.storage_buffers_descriptors) {
         ASSERT(desc.count == 1);
         buffer_cache.BindComputeStorageBuffer(ssbo_index, desc.cbuf_index, desc.cbuf_offset,
-                                              desc.is_written, desc.indirect_offset);
+                                              desc.is_written, desc.indirect_offset,
+
+                                              desc.write_extent);
         ++ssbo_index;
     }
 
@@ -447,7 +449,9 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
     }
     for (const auto& desc : info.texture_descriptors) {
         for (u32 index = 0; index < desc.count; ++index) {
-            const auto handle{read_handle(desc, index)};
+            const auto handle{VideoCommon::HandleIsStoragePointer(info, desc, index)
+                                  ? VideoCommon::NULL_TEXTURE_HANDLE
+                                  : read_handle(desc, index)};
             views.push_back({handle.first});
 
             VideoCommon::SamplerId sampler = texture_cache.GetSamplerId(handle.second, true);

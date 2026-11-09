@@ -255,6 +255,15 @@ public:
         transitions.clear();
     }
 
+    [[nodiscard]] bool WritesStorage() const noexcept {
+        return writes_storage;
+    }
+
+    /// Writes storage images or image buffers (their images are marked modified when resolved).
+    [[nodiscard]] bool WritesImages() const noexcept {
+        return writes_images;
+    }
+
     [[nodiscard]] bool IsBuilt() const noexcept {
         return build->IsBuilt();
     }
@@ -267,6 +276,52 @@ public:
     [[nodiscard]] bool Failed() const noexcept {
         return build->Failed();
     }
+
+    /// Fast draw (nx2_fast_draw.h): whether draws can keep the image views and samplers the last
+    /// captured Configure resolved. Handles computed at draw time are resolved on every draw.
+    [[nodiscard]] bool TakesDeltaDraws() const noexcept {
+        return delta_blocker == DeltaBlocker::None && delta_views_valid;
+    }
+
+    /// Why TakesDeltaDraws is false (diagnostics).
+    enum class DeltaBlocker : u8 {
+        None,
+        WritesImages,
+        Mesh,
+        ComputedHandles,
+        NotConfigured,
+        Count,
+    };
+    [[nodiscard]] DeltaBlocker DeltaDrawBlocker() const noexcept {
+        return delta_blocker != DeltaBlocker::None ? delta_blocker
+               : delta_views_valid                 ? DeltaBlocker::None
+                                                   : DeltaBlocker::NotConfigured;
+    }
+
+    /// Constant buffer slots per stage the pipeline reads texture and image handles from.
+    [[nodiscard]] const std::array<u32, NUM_STAGES>& HandleConstantBuffers() const noexcept {
+        return handle_constant_buffers;
+    }
+
+    /// Resolves and binds every buffer as Configure does (storage buffer addresses are read from
+    /// the constant buffers again) and records the draw's descriptors with the image views,
+    /// samplers and texture buffers the last captured Configure resolved. False when the draw
+    /// can't be recorded, as for Configure.
+    bool ConfigureDelta(bool is_indexed);
+
+    /// The next Configure keeps the views and samplers it resolves for delta draws. With
+    /// `verify`, it first compares them with the ones kept before; DeltaMismatch reports it.
+    void CaptureNextDelta(bool verify) noexcept {
+        capture_delta = true;
+        verify_delta = verify;
+    }
+    [[nodiscard]] bool DeltaMismatch() const noexcept {
+        return delta_mismatch;
+    }
+
+    /// Whether an image the kept views sample has an upload pending or a newer alias to copy in:
+    /// ConfigureDelta prepares none, Configure does.
+    [[nodiscard]] bool DeltaImagesChange() const noexcept;
 
     template <typename Spec>
     static auto MakeConfigureSpecFunc() {
@@ -319,6 +374,21 @@ private:
     bool fragment_has_color0_output{};
     u32 color_output_mask{};
     bool writes_storage{};
+    /// Every texture is sampled with a handle read from a constant buffer: ConfigureImpl can
+    /// resolve them from texture_memo.
+    bool texture_memo_eligible{};
+    VideoCommon::SampledTextureMemo texture_memo;
+    bool writes_images{};
+
+    DeltaBlocker delta_blocker{};
+    bool delta_views_valid{};
+    bool capture_delta{};
+    bool verify_delta{};
+    bool delta_mismatch{};
+    std::array<bool, NUM_STAGES> configured_stages{};
+    std::array<u32, NUM_STAGES> handle_constant_buffers{};
+    std::vector<VideoCommon::ImageViewInOut> delta_views;
+    std::vector<VideoCommon::SamplerId> delta_samplers;
 
     vk::DescriptorSetLayout descriptor_set_layout;
     DescriptorAllocator descriptor_allocator;

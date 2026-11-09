@@ -105,8 +105,9 @@ public:
     void FlushAll() override;
     void FlushRegion(DAddr addr, u64 size,
                      VideoCommon::CacheType which = VideoCommon::CacheType::All) override;
-    GpuWrittenList ReadGpuWrittenCommandList(DAddr addr, std::span<u8> out,
-                                             bool past_sync) override;
+    GpuWrittenList ReadGpuWrittenCommandList(DAddr addr, std::span<u8> out, bool past_sync,
+                                             u64* pending_tick = nullptr) override;
+    bool IsGpuTickDone(u64 tick) override;
     void NoteGpuWrittenCommandListSynced(DAddr page) override;
     void FlushGpuWrittenCommandListPages(std::span<const DAddr> pages) override;
     bool MustFlushRegion(DAddr addr, u64 size,
@@ -366,6 +367,84 @@ private:
     u64 mesh_arena_size{64ULL << 20};
     /// The current submission's arena, after its counter is reset.
     const MeshArena& AcquireMeshArena();
+
+    /// Fast draw (nx2_fast_draw.h): what the last recorded draw left bound.
+    struct ReusableDraw {
+        GraphicsPipeline* pipeline{};
+        const Tegra::Engines::Maxwell3D* maxwell3d{};
+        u64 serial{};
+        u64 map_serial{};
+        u64 tick{};
+        u64 render_pass{};
+        Maxwell::PrimitiveTopology topology{};
+        bool is_indexed{};
+    };
+    enum class FullDraw : u8 {
+        NoCandidate,
+        Kind,
+        StateChanged,
+        Submitted,
+        RenderPass,
+        DeltaPipeline,
+        HandleBind,
+        HandleData,
+        SampledImages,
+        Count,
+    };
+    /// Why a recorded draw can't be followed by a delta draw.
+    enum class Ineligible : u8 {
+        Indirect,
+        Mesh,
+        NotBuilt,
+        WritesImages,
+        TransformFeedback,
+        InlineIndex,
+        Quads,
+        Repacked,
+        NoRenderPass,
+        PipelineNotBound,
+        OffBackThread,
+        Count,
+    };
+    enum class DrawPath : u8 { Full, Delta, Count };
+    struct FastDrawStats {
+        u64 delta{};
+        std::array<u64, static_cast<size_t>(FullDraw::Count)> full{};
+        std::array<u64, static_cast<size_t>(Ineligible::Count)> ineligible{};
+        /// PrepareDraw time and draws per path.
+        std::array<u64, static_cast<size_t>(DrawPath::Count)> prepare_ns{};
+        std::array<u64, static_cast<size_t>(DrawPath::Count)> prepare_draws{};
+        /// EDEN_NX2_FAST_DRAW_VERIFY
+        u64 verified{};
+        u64 pipeline_mismatches{};
+        u64 view_mismatches{};
+        u64 binding_mismatches{};
+        /// DeltaPipeline draws by GraphicsPipeline::DeltaDrawBlocker.
+        std::array<u64, static_cast<size_t>(GraphicsPipeline::DeltaBlocker::Count)> delta_blockers{};
+        /// StateChanged draws by the reason of the last break, and by its 3D method.
+        std::array<u64, static_cast<size_t>(VideoCommon::Nx2FastDraw::Reason::Count)> breaks{};
+        std::array<u32, Maxwell::NUM_REGS> break_methods{};
+        u64 window_start{};
+    };
+    /// The pipeline the draw can take the delta path with, or null for a full resolve. Clears
+    /// the remembered draw either way: only a recorded draw remembers one again.
+    GraphicsPipeline* TakeReusableDraw(bool is_indexed, bool is_indirect);
+    /// Whether the draw TakeReusableDraw took still holds once the caches are locked (serial and
+    /// map_serial as read then), and the images it samples need no preparing.
+    bool DeltaStillHolds(u64 serial, u64 map_serial);
+    void NoteResolvedDraw(GraphicsPipeline* pipeline, bool is_indexed, bool is_indirect, u64 serial,
+                          u64 map_serial);
+    void ReportFastDraws();
+    ReusableDraw reusable_draw;
+    ReusableDraw taken_draw; ///< The draw TakeReusableDraw last returned the pipeline of
+    /// Device memory of the constant buffers TakeReusableDraw checks for texture handle writes.
+    std::array<std::array<VideoCommon::Nx2FastDraw::DeviceSpans, Maxwell::MaxConstBuffers>,
+               Maxwell::MaxShaderStage>
+        handle_spans;
+    FastDrawStats fast_draw_stats;
+    /// Nx2FastDraw::Enabled and VerifyEnabled as the drawing thread last read them.
+    bool fast_draw_on{};
+    bool fast_draw_verify{};
 
     struct IndirectTrace {
         vk::Buffer readback;
