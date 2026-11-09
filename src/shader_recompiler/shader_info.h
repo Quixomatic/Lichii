@@ -401,6 +401,9 @@ struct Info {
     u64 heap_texel_mask{};
     u64 heap_image_buffer_mask{};
     u32 heap_word_base{};
+    /// The pipeline's heap words (all stages) fit the push constants (HEAP_PUSH_WORDS): the
+    /// shader reads them there instead of from the word table.
+    bool heap_words_pushed{};
     /// Why descriptors of this stage were left out of the heap (host bits, for the stats).
     u32 heap_block_reasons{};
     /// Texture handles the shader reads from storage buffers, as programs over constant buffer

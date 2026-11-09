@@ -6,7 +6,11 @@
 
 #pragma once
 
+#include <algorithm>
+#include <array>
 #include <cstddef>
+#include <cstring>
+#include <vector>
 #include <optional>
 
 #include <boost/container/small_vector.hpp>
@@ -183,6 +187,55 @@ struct HeapPushConstant {
     bool verify{};
 };
 
+/// EDEN_NX2_V2_BINDLESS: what a draw pushes at HEAP_PUSH_OFFSET: its heap words, or (word table
+/// pipelines) its first word in the table.
+struct HeapPushData {
+    std::array<u32, Shader::Backend::SPIRV::HEAP_PUSH_WORDS> words{};
+    u32 count{};
+};
+
+/// EDEN_NX2_V2_BINDLESS: the heap word table of a pipeline whose words don't fit the push
+/// constants. Chunks of the stream buffer, one bound per tick until full, so the descriptor (the
+/// chunk) stays the same across draws and only the pushed base moves; equal words are written
+/// once.
+struct HeapWordTable {
+    static constexpr size_t ChunkBytes = 2048;
+
+    VkBuffer buffer{};
+    VkDeviceSize offset{};
+    VkDeviceSize size{};
+    u8* host{};
+    u64 tick{~u64{}};
+    u32 used{};  ///< words written into the chunk
+    u32 base{};  ///< first word of `last`
+    std::vector<u32> last;
+
+    /// Puts `words` in the table (`allocate(bytes)` returns a StagingBufferRef-like allocation
+    /// living for the tick) and returns their first word.
+    template <typename Allocate>
+    u32 Append(const std::vector<u32>& words, u64 current_tick, Allocate&& allocate) {
+        const size_t bytes = words.size() * sizeof(u32);
+        if (tick == current_tick && words == last) {
+            return base;
+        }
+        if (tick != current_tick || (size_t{used} * sizeof(u32)) + bytes > size) {
+            const size_t chunk = (std::max)(ChunkBytes, bytes);
+            const auto ref = allocate(chunk);
+            buffer = ref.buffer;
+            offset = ref.offset;
+            size = chunk;
+            host = ref.mapped_span.data();
+            tick = current_tick;
+            used = 0;
+        }
+        std::memcpy(host + size_t{used} * sizeof(u32), words.data(), bytes);
+        base = used;
+        used += static_cast<u32>(words.size());
+        last = words;
+        return base;
+    }
+};
+
 /// P5a (EDEN_NX2_V2_HEAP_TEXEL): a stage's texel buffer bindings, in the buffer cache's binding
 /// index order (texture buffers' elements, then image buffers'), that read the heap; which are
 /// storage texel buffers, and which of those are integer.
@@ -328,6 +381,7 @@ public:
             const std::array set_layouts{descriptor_set_layout ? descriptor_set_layout
                                                                : heap->EmptyLayout(),
                                          heap->Layout()};
+            // The heap words (or the word table base) follow at HEAP_PUSH_OFFSET.
             const VkPushConstantRange heap_range{
                 .stageFlags = static_cast<VkShaderStageFlags>(
                     is_compute ? VK_SHADER_STAGE_COMPUTE_BIT
@@ -336,8 +390,9 @@ public:
                                                   VK_SHADER_STAGE_MESH_BIT_EXT
                                             : VK_SHADER_STAGE_ALL_GRAPHICS)),
                 .offset = 0,
-                .size = static_cast<u32>(sizeof(RescalingLayout)) - size_offset +
-                        static_cast<u32>(sizeof(RenderAreaLayout)),
+                .size = (std::max)(static_cast<u32>(sizeof(RescalingLayout)) - size_offset +
+                                       static_cast<u32>(sizeof(RenderAreaLayout)),
+                                   Shader::Backend::SPIRV::HEAP_PUSH_RANGE_END),
             };
             return device->GetLogical().CreatePipelineLayout({
                 .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,

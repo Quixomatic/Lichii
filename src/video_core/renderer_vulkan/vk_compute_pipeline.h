@@ -173,10 +173,9 @@ private:
     HeapPushConstant heap_push{};
     HeapTexelMasks heap_texels{}; ///< P5a: texel buffer bindings that read the heap
     u32 heap_reasons{};
-    std::vector<u32> last_heap_words;
-    VkBuffer last_heap_buffer{};
-    VkDeviceSize last_heap_offset{};
-    u64 last_heap_tick{~u64{}};
+    /// The heap words are push constants (they fit HEAP_PUSH_WORDS); else the word table.
+    bool heap_words_pushed{false};
+    HeapWordTable heap_table;
 
     std::function<void()> build_task;
     std::atomic_bool build_claimed{false};

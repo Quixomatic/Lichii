@@ -448,12 +448,13 @@ struct HeapModule {
     bool words_binding{};
     bool sampled_image{};
     bool non_uniform{};
+    u32 push_variables{}; ///< OpVariable ... PushConstant
 };
 
 /// A fragment program sampling texture 0 (with `texture_count` elements, read with a dynamic
 /// element index when above 1) and, with `image`, reading storage image 0.
 HeapModule EmitHeapProgram(u64 texture_mask, u64 image_mask, u32 texture_count, bool image,
-                           const char* name) {
+                           const char* name, bool pushed = false) {
     using namespace Shader;
     ObjectPool<IR::Inst> pool;
     IR::Block block{pool};
@@ -518,6 +519,7 @@ HeapModule EmitHeapProgram(u64 texture_mask, u64 image_mask, u32 texture_count, 
     program.info.heap_texture_mask = texture_mask;
     program.info.heap_image_mask = image_mask;
     program.info.heap_word_base = 3;
+    program.info.heap_words_pushed = pushed;
     Profile profile;
     profile.supported_spirv = 0x00010500;
     profile.unified_descriptor_binding = true;
@@ -546,6 +548,9 @@ HeapModule EmitHeapProgram(u64 texture_mask, u64 image_mask, u32 texture_count, 
         }
         if (opcode == 86) { // OpSampledImage
             module.sampled_image = true;
+        }
+        if (opcode == 59 && words >= 4 && code[i + 3] == 9) { // OpVariable PushConstant
+            ++module.push_variables;
         }
         i += words;
     }
@@ -623,11 +628,25 @@ TEST_CASE("V2 P3 heap descriptors index the bindless heap through the word table
     REQUIRE(heap.words_binding);
     REQUIRE(heap.sampled_image);
     REQUIRE_FALSE(heap.non_uniform);
+    REQUIRE(heap.push_variables == 1); // the table base
     // An array read with a dynamic element index: its heap accesses are NonUniform.
     const HeapModule array = EmitHeapProgram(1, 0, 4, false, "heap_array.spv");
     REQUIRE(array.words_binding);
     REQUIRE(array.non_uniform);
     REQUIRE(array.set1_decorations == 2);
+    // Words that fit the push constants: no word table, one push constant block (perf fix B).
+    const HeapModule pushed = EmitHeapProgram(1, 1, 1, true, "heap_pushed.spv", true);
+    REQUIRE_FALSE(pushed.words_binding);
+    REQUIRE(pushed.set0_decorations == 0);
+    REQUIRE(pushed.set1_decorations == 3);
+    REQUIRE(pushed.push_variables == 1);
+    REQUIRE(pushed.sampled_image);
+    const HeapModule pushed_array =
+        EmitHeapProgram(1, 0, 4, false, "heap_pushed_array.spv", true);
+    REQUIRE_FALSE(pushed_array.words_binding);
+    REQUIRE(pushed_array.non_uniform);
+    REQUIRE(pushed_array.push_variables == 1);
+    REQUIRE(plain.push_variables == 0);
 }
 
 namespace {

@@ -502,6 +502,11 @@ GraphicsPipeline::GraphicsPipeline(
     }
     DescriptorLayoutBuilder builder{MakeBuilder(device, stage_infos, mesh_emulation)};
     if (heap_pipeline) {
+        heap_words_pushed = std::ranges::any_of(stage_infos, [](const Shader::Info& info) {
+            return info.heap_words_pushed;
+        });
+    }
+    if (heap_pipeline && !heap_words_pushed) {
         // The heap word table, last in the payload (the cache kept set 0 below its binding).
         const bool added = builder.AddHeapWords();
         ASSERT(added);
@@ -1789,7 +1794,9 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
                       descriptor_buffer_offset, descriptor_buffer_chunk, bind_descriptor_buffer,
                       rescaling_data = rescaling.Data(), is_rescaling, update_rescaling,
                       uses_render_area = render_area.uses_render_area,
-                      render_area_data = render_area.words](vk::CommandBuffer cmdbuf) {
+                      render_area_data = render_area.words,
+                      heap_data = heap_pipeline ? heap_push_data : HeapPushData{}](
+                         vk::CommandBuffer cmdbuf) {
         if (bind_descriptor_buffer) {
             const VkDescriptorBufferBindingInfoEXT binding_info{
                 descriptor_buffer_ring.BindingInfo(descriptor_buffer_chunk)};
@@ -1820,6 +1827,13 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
         if (uses_render_area) {
             cmdbuf.PushConstants(*pipeline_layout, push_stages, RENDERAREA_LAYOUT_OFFSET,
                                  sizeof(render_area_data), &render_area_data);
+        }
+        if (heap_data.count != 0) {
+            // EDEN_NX2_V2_BINDLESS: the heap words (or the word table base).
+            cmdbuf.PushConstants(*pipeline_layout, push_stages,
+                                 Shader::Backend::SPIRV::HEAP_PUSH_OFFSET,
+                                 static_cast<u32>(heap_data.count * sizeof(u32)),
+                                 heap_data.words.data());
         }
         if (!descriptor_set_layout) {
             return;
@@ -1884,23 +1898,27 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
 }
 
 void GraphicsPipeline::AddHeapWords() {
-    // EDEN_NX2_V2_BINDLESS: the heap words of this draw, in a stream buffer allocation reused
-    // while the words and the command buffer stay the same (so the payload does too).
+    // EDEN_NX2_V2_BINDLESS: the heap words of this draw go to the push constants, so the
+    // descriptor payload does not change with the textures a draw samples.
     std::vector<u32>& words = heap_push.words;
     if (words.empty()) {
         words.push_back(0);
     }
-    const u64 tick = scheduler.CurrentTick();
-    const size_t bytes = words.size() * sizeof(u32);
-    if (last_heap_tick != tick || last_heap_words != words) {
-        const StagingBufferRef ref = buffer_cache.runtime.UploadStagingBuffer(bytes);
-        std::memcpy(ref.mapped_span.data(), words.data(), bytes);
-        last_heap_buffer = ref.buffer;
-        last_heap_offset = ref.offset;
-        last_heap_tick = tick;
-        last_heap_words = words;
+    heap_push_data = {};
+    if (heap_words_pushed) {
+        const size_t count = (std::min)(words.size(), heap_push_data.words.size());
+        std::copy_n(words.begin(), count, heap_push_data.words.begin());
+        heap_push_data.count = static_cast<u32>(count);
+        return;
     }
-    guest_descriptor_queue.AddBuffer(last_heap_buffer, last_heap_offset, bytes);
+    // More words than the push constants hold: the word table. Its chunk is the descriptor (the
+    // same for every draw until it fills or the tick ends); the draw's first word is pushed.
+    heap_push_data.words[0] =
+        heap_table.Append(words, scheduler.CurrentTick(), [this](size_t bytes) {
+            return buffer_cache.runtime.UploadStagingBuffer(bytes);
+        });
+    heap_push_data.count = 1;
+    guest_descriptor_queue.AddBuffer(heap_table.buffer, heap_table.offset, heap_table.size);
 }
 
 void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {

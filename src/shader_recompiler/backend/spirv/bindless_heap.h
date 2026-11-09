@@ -12,9 +12,12 @@
 // dimension and component type), then (P5a, EDEN_NX2_V2_HEAP_TEXEL) an array of uniform texel
 // buffers and two of storage texel buffers (float, integer). A descriptor marked in
 // Info::heap_texture_mask, heap_image_mask, heap_texel_mask or heap_image_buffer_mask declares no
-// binding of its own: each of its elements reads a word from the draw's heap word table, a
-// storage buffer at set 0, binding HEAP_WORDS_BINDING, and takes its image or texel buffer (low
-// 16 bits) and, for textures, its sampler (high 16 bits) from the heap. Per stage the words are
+// binding of its own: each of its elements reads a word, and takes its image or texel buffer (low
+// 16 bits) and, for textures, its sampler (high 16 bits) from the heap. The words are push
+// constants at HEAP_PUSH_OFFSET when the pipeline's words fit (Info::heap_words_pushed: no load
+// before the descriptor fetch, a stable descriptor payload); otherwise they live in the heap word
+// table, a storage buffer at set 0, binding HEAP_WORDS_BINDING, bound once per table chunk, and
+// the push constant at HEAP_PUSH_OFFSET is the draw's first word in it. Per stage the words are
 // the heap texture buffers' elements, the heap image buffers', the heap textures', then the heap
 // storage images' (the order the host binds them in). The host and the shader take every index
 // below from these functions, so they agree.
@@ -39,6 +42,13 @@ inline constexpr u32 MAX_HEAP_ARRAY_LENGTH = 4096;
 /// The draw's heap word table: a storage buffer of set 0 at a binding above any a pipeline's
 /// descriptors take (pipelines whose own bindings would reach it don't use the heap).
 inline constexpr u32 HEAP_WORDS_BINDING = 1023;
+/// The heap push constants: after the rescaling and render area layouts (48 bytes), up to
+/// HEAP_PUSH_WORDS words (or one, the table base), within Vulkan's guaranteed 128 bytes.
+inline constexpr u32 HEAP_PUSH_OFFSET = 48;
+inline constexpr u32 HEAP_PUSH_WORDS = 16;
+/// The push constant range a heap pipeline layout needs.
+inline constexpr u32 HEAP_PUSH_RANGE_END = HEAP_PUSH_OFFSET + HEAP_PUSH_WORDS * 4;
+static_assert(HEAP_PUSH_RANGE_END <= 128);
 
 /// The image class of a sampled texture descriptor's type.
 [[nodiscard]] constexpr u32 HeapImageClass(TextureType type, bool is_multisample) {
@@ -109,6 +119,12 @@ inline constexpr u32 HEAP_WORDS_BINDING = 1023;
 /// The heap binding of a storage texel buffer (image buffer) descriptor's elements.
 [[nodiscard]] constexpr u32 HeapStorageTexelBinding(bool is_integer) {
     return HEAP_FIRST_STORAGE_TEXEL_BINDING + (is_integer ? 1 : 0);
+}
+
+/// Whether any descriptor of `info` reads the heap.
+[[nodiscard]] constexpr bool UsesAnyHeap(const Info& info) {
+    return info.heap_texture_mask != 0 || info.heap_image_mask != 0 ||
+           info.heap_texel_mask != 0 || info.heap_image_buffer_mask != 0;
 }
 
 /// Whether texture descriptor `index` of `info` reads the heap.

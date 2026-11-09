@@ -484,6 +484,8 @@ EmitContext::EmitContext(const Profile& profile_, const RuntimeInfo& runtime_inf
     u32& texture_binding{is_unified ? bindings.unified : bindings.texture};
     u32& image_binding{is_unified ? bindings.unified : bindings.image};
     AddCapability(spv::Capability::Shader);
+    heap_push_needed = UsesAnyHeap(program.info);
+    heap_words_pushed = program.info.heap_words_pushed;
     DefineCommonTypes(program.info);
     DefineCommonConstants();
     DefineInterfaces(program);
@@ -504,6 +506,7 @@ EmitContext::EmitContext(const Profile& profile_, const RuntimeInfo& runtime_inf
     DefineMeshEmulationOutput();
     DefineRescalingInput(program.info);
     DefineRenderArea(program.info);
+    DefineHeapPush();
 }
 
 EmitContext::~EmitContext() = default;
@@ -1270,7 +1273,7 @@ void EmitContext::DefineRescalingInput(const Info& info) {
 }
 
 void EmitContext::DefineRescalingInputPushConstant() {
-    boost::container::static_vector<Id, 3> members{};
+    boost::container::static_vector<Id, 4> members{};
     u32 member_index{0};
 
     rescaling_textures_type = TypeArray(U32[1], Const(4u));
@@ -1287,6 +1290,7 @@ void EmitContext::DefineRescalingInputPushConstant() {
         members.push_back(F32[1]);
         rescaling_downfactor_member_index = member_index++;
     }
+    AddHeapPushMember(members, member_index);
     const Id push_constant_struct{TypeStruct(std::span(members.data(), members.size()))};
     Decorate(push_constant_struct, spv::Decoration::Block);
     Name(push_constant_struct, "ResolutionInfo");
@@ -1308,6 +1312,7 @@ void EmitContext::DefineRescalingInputPushConstant() {
     const Id pointer_type{TypePointer(spv::StorageClass::PushConstant, push_constant_struct)};
     rescaling_push_constants = AddGlobalVariable(pointer_type, spv::StorageClass::PushConstant);
     Name(rescaling_push_constants, "rescaling_push_constants");
+    DecorateHeapPushMember(push_constant_struct, rescaling_push_constants);
 
     if (profile.supported_spirv >= 0x00010400) {
         interfaces.push_back(rescaling_push_constants);
@@ -1331,11 +1336,12 @@ void EmitContext::DefineRenderArea(const Info& info) {
     }
 
     if (profile.unified_descriptor_binding) {
-        boost::container::static_vector<Id, 1> members{};
+        boost::container::static_vector<Id, 4> members{};
         u32 member_index{0};
 
         members.push_back(F32[4]);
         render_are_member_index = member_index++;
+        AddHeapPushMember(members, member_index);
 
         const Id push_constant_struct{TypeStruct(std::span(members.data(), members.size()))};
         Decorate(push_constant_struct, spv::Decoration::Block);
@@ -1348,6 +1354,7 @@ void EmitContext::DefineRenderArea(const Info& info) {
         render_area_push_constant =
             AddGlobalVariable(pointer_type, spv::StorageClass::PushConstant);
         Name(render_area_push_constant, "render_area_push_constants");
+        DecorateHeapPushMember(push_constant_struct, render_area_push_constant);
 
         if (profile.supported_spirv >= 0x00010400) {
             interfaces.push_back(render_area_push_constant);
@@ -1685,8 +1692,52 @@ void EmitContext::DefineTextures(const Info& info, u32& binding, u32& scaling_in
     }
 }
 
+void EmitContext::AddHeapPushMember(boost::container::static_vector<Id, 4>& members,
+                                    u32& member_index) {
+    if (!heap_push_needed || Sirit::ValidId(heap_push_block) || heap_push_member != 0) {
+        return;
+    }
+    const Id array_type{TypeArray(U32[1], Const(heap_words_pushed ? HEAP_PUSH_WORDS : 1U))};
+    Decorate(array_type, spv::Decoration::ArrayStride, 4U);
+    members.push_back(array_type);
+    heap_push_member = member_index++;
+}
+
+void EmitContext::DecorateHeapPushMember(Id struct_type, Id block) {
+    if (!heap_push_needed || Sirit::ValidId(heap_push_block) || heap_push_member == 0) {
+        return;
+    }
+    MemberDecorate(struct_type, heap_push_member, spv::Decoration::Offset, HEAP_PUSH_OFFSET);
+    MemberName(struct_type, heap_push_member, "heap_words");
+    heap_push_block = block;
+    heap_push_pointer = TypePointer(spv::StorageClass::PushConstant, U32[1]);
+}
+
+void EmitContext::DefineHeapPush() {
+    if (!heap_push_needed || Sirit::ValidId(heap_push_block)) {
+        return;
+    }
+    // No rescaling or render area block in this stage: a block holding only the heap member.
+    const Id array_type{TypeArray(U32[1], Const(heap_words_pushed ? HEAP_PUSH_WORDS : 1U))};
+    Decorate(array_type, spv::Decoration::ArrayStride, 4U);
+    const Id struct_type{TypeStruct(array_type)};
+    Decorate(struct_type, spv::Decoration::Block);
+    Name(struct_type, "HeapPush");
+    MemberDecorate(struct_type, 0, spv::Decoration::Offset, HEAP_PUSH_OFFSET);
+    MemberName(struct_type, 0, "heap_words");
+    heap_push_block = AddGlobalVariable(TypePointer(spv::StorageClass::PushConstant, struct_type),
+                                        spv::StorageClass::PushConstant);
+    Name(heap_push_block, "heap_push_constants");
+    heap_push_member = 0;
+    heap_push_pointer = TypePointer(spv::StorageClass::PushConstant, U32[1]);
+    if (profile.supported_spirv >= 0x00010400) {
+        interfaces.push_back(heap_push_block);
+    }
+}
+
 void EmitContext::DefineHeapWords() {
-    if (Sirit::ValidId(heap_words)) {
+    if (Sirit::ValidId(heap_words) || heap_words_pushed) {
+        // Pushed words need no table.
         return;
     }
     AddExtension("SPV_KHR_storage_buffer_storage_class");
@@ -1702,6 +1753,8 @@ void EmitContext::DefineHeapWords() {
                                    spv::StorageClass::StorageBuffer);
     Decorate(heap_words, spv::Decoration::Binding, HEAP_WORDS_BINDING);
     Decorate(heap_words, spv::Decoration::DescriptorSet, 0U);
+    Decorate(heap_words, spv::Decoration::NonWritable);
+    Decorate(heap_words, spv::Decoration::Restrict);
     Name(heap_words, "heap_words");
     if (profile.supported_spirv >= 0x00010400) {
         interfaces.push_back(heap_words);
@@ -1733,8 +1786,24 @@ Id EmitContext::HeapArray(Id image_type, u32 heap_binding, bool coherent) {
 }
 
 Id EmitContext::HeapWord(u32 word, const IR::Value& index, bool arrayed) {
-    Id element{Const(word)};
-    if (arrayed && !(index.IsImmediate() && index.U32() == 0)) {
+    const bool dynamic{arrayed && !(index.IsImmediate() && index.U32() == 0)};
+    const Id member{Const(heap_push_member)};
+    if (heap_words_pushed) {
+        // A push constant: no memory load before the descriptor fetch (a constant offset for
+        // non-arrayed descriptors, resolved when the pipeline is compiled).
+        Id element{Const(word)};
+        if (dynamic) {
+            element = index.IsImmediate() ? Const(word + index.U32())
+                                          : OpIAdd(U32[1], element, Def(index));
+        }
+        const Id pointer{OpAccessChain(heap_push_pointer, heap_push_block, member, element)};
+        return OpLoad(U32[1], pointer);
+    }
+    // The table: the draw's first word comes from the push constants.
+    const Id base_pointer{OpAccessChain(heap_push_pointer, heap_push_block, member,
+                                        u32_zero_value)};
+    Id element{OpIAdd(U32[1], OpLoad(U32[1], base_pointer), Const(word))};
+    if (dynamic) {
         element = OpIAdd(U32[1], element, index.IsImmediate() ? Const(index.U32()) : Def(index));
     }
     const Id pointer{OpAccessChain(heap_word_pointer, heap_words, u32_zero_value, element)};

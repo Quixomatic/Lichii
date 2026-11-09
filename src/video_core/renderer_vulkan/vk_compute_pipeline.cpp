@@ -261,9 +261,12 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
     if (heap_pipeline) {
         heap_push.heap = heap;
         heap_push.verify = VideoCommon::V2::Verify(VideoCommon::V2::Switch::Bindless);
-        const bool added = builder.AddHeapWords();
-        ASSERT(added);
-        ++num_descriptor_entries;
+        heap_words_pushed = info.heap_words_pushed;
+        if (!heap_words_pushed) {
+            const bool added = builder.AddHeapWords();
+            ASSERT(added);
+            ++num_descriptor_entries;
+        }
     }
 
     uses_push_descriptor = builder.CanUsePushDescriptor();
@@ -700,6 +703,7 @@ bool ComputePipeline::ConfigureImpl(Tegra::Engines::KeplerCompute& kepler_comput
 
     // The heap words start with the texel buffers' (EDEN_NX2_V2_HEAP_TEXEL), bound next.
     heap_push.words.clear();
+    HeapPushData heap_data{}; ///< pushed at HEAP_PUSH_OFFSET
     buffer_cache.UpdateComputeBuffers();
     if (heap_texels.heap != 0) [[unlikely]] {
         buffer_cache.runtime.BeginHeapTexels(heap_push.words, heap_texels.heap,
@@ -755,22 +759,25 @@ bool ComputePipeline::ConfigureImpl(Tegra::Engines::KeplerCompute& kepler_comput
     if (heap_pipeline) {
         // The heap slots this configure reserved get their descriptors (P5a).
         heap_push.heap->Commit();
-        // EDEN_NX2_V2_BINDLESS: the dispatch's heap words, reused while unchanged in a tick.
+        // EDEN_NX2_V2_BINDLESS: the dispatch's heap words as push constants, or (more than
+        // they hold) in the word table with the dispatch's first word pushed.
         std::vector<u32>& words = heap_push.words;
         if (words.empty()) {
             words.push_back(0);
         }
-        const u64 tick = scheduler.CurrentTick();
-        const size_t bytes = words.size() * sizeof(u32);
-        if (last_heap_tick != tick || last_heap_words != words) {
-            const StagingBufferRef ref = buffer_cache.runtime.UploadStagingBuffer(bytes);
-            std::memcpy(ref.mapped_span.data(), words.data(), bytes);
-            last_heap_buffer = ref.buffer;
-            last_heap_offset = ref.offset;
-            last_heap_tick = tick;
-            last_heap_words = words;
+        if (heap_words_pushed) {
+            const size_t count = (std::min)(words.size(), heap_data.words.size());
+            std::copy_n(words.begin(), count, heap_data.words.begin());
+            heap_data.count = static_cast<u32>(count);
+        } else {
+            heap_data.words[0] =
+                heap_table.Append(words, scheduler.CurrentTick(), [&buffer_cache](size_t bytes) {
+                    return buffer_cache.runtime.UploadStagingBuffer(bytes);
+                });
+            heap_data.count = 1;
+            guest_descriptor_queue.AddBuffer(heap_table.buffer, heap_table.offset,
+                                             heap_table.size);
         }
-        guest_descriptor_queue.AddBuffer(last_heap_buffer, last_heap_offset, bytes);
     }
     if (VideoCommon::V2::P3Stats::Enabled() && !views.empty() &&
         BindlessHeap::Active() != nullptr) {
@@ -834,7 +841,7 @@ bool ComputePipeline::ConfigureImpl(Tegra::Engines::KeplerCompute& kepler_comput
 
     const bool is_rescaling = !info.texture_descriptors.empty() || !info.image_descriptors.empty();
     auto bind = [this, descriptor_data, is_rescaling, descriptor_buffer_offset,
-                      descriptor_buffer_chunk, bind_descriptor_buffer,
+                      descriptor_buffer_chunk, bind_descriptor_buffer, heap_data,
                       rescaling_data = rescaling.Data()](vk::CommandBuffer cmdbuf) {
         if (heap_pipeline && pipeline) {
             // EDEN_NX2_V2_BINDLESS: the heap set, with every dispatch (its pipeline is bound
@@ -852,6 +859,13 @@ bool ComputePipeline::ConfigureImpl(Tegra::Engines::KeplerCompute& kepler_comput
             return;
         }
         cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, *pipeline);
+        if (heap_data.count != 0) {
+            // EDEN_NX2_V2_BINDLESS: the heap words (or the word table base).
+            cmdbuf.PushConstants(*pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
+                                 Shader::Backend::SPIRV::HEAP_PUSH_OFFSET,
+                                 static_cast<u32>(heap_data.count * sizeof(u32)),
+                                 heap_data.words.data());
+        }
         if (!descriptor_set_layout) {
             return;
         }

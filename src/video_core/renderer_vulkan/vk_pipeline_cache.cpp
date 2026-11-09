@@ -1768,6 +1768,7 @@ u32 MarkHeapStage(Shader::Info& info, u32 word_base, bool storage_images, bool t
     info.heap_texel_mask = 0;
     info.heap_image_buffer_mask = 0;
     info.heap_word_base = word_base;
+    info.heap_words_pushed = false;
     info.heap_block_reasons = 0;
     for (size_t desc = 0; desc < info.texture_descriptors.size(); ++desc) {
         if (desc >= 64) {
@@ -1824,6 +1825,7 @@ void UnmarkHeapStage(Shader::Info& info, u32 reason) {
     info.heap_texel_mask = 0;
     info.heap_image_buffer_mask = 0;
     info.heap_word_base = 0;
+    info.heap_words_pushed = false;
     info.heap_block_reasons = reason;
 }
 
@@ -1862,6 +1864,16 @@ void MarkHeapTextures(std::span<Shader::IR::Program> programs, const GraphicsPip
         for (size_t index = first; index < programs.size(); ++index) {
             if (active(index)) {
                 UnmarkHeapStage(programs[index].info, HeapReasonBindings);
+            }
+        }
+        return;
+    }
+    // Words that fit the push constants are pushed (no load before the descriptor fetch, and the
+    // descriptor payload no longer changes with them); more go to the word table.
+    if (words <= SPIRV::HEAP_PUSH_WORDS) {
+        for (size_t index = first; index < programs.size(); ++index) {
+            if (active(index)) {
+                programs[index].info.heap_words_pushed = true;
             }
         }
     }
@@ -2807,6 +2819,10 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
                 info.texture_descriptors.size() + info.image_descriptors.size() >=
             Shader::Backend::SPIRV::HEAP_WORDS_BINDING) {
             UnmarkHeapStage(program.info, HeapReasonBindings);
+        } else {
+            program.info.heap_words_pushed =
+                Shader::Backend::SPIRV::HeapWordCount(program.info) <=
+                Shader::Backend::SPIRV::HEAP_PUSH_WORDS;
         }
     }
     std::vector<u32> code{EmitSPIRV(profile, program)};

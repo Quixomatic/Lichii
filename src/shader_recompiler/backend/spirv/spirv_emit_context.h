@@ -11,6 +11,8 @@
 #include <utility>
 #include <vector>
 
+#include <boost/container/static_vector.hpp>
+
 #include <sirit/sirit.h>
 #include "common/container/unordered_set.h"
 
@@ -347,6 +349,13 @@ public:
     std::vector<std::pair<u32, Id>> heap_image_variables; ///< (image type id, array variable)
     Id heap_words{};
     Id heap_word_pointer{};
+    /// The push constant block holding the heap words (or the table base), its member and a
+    /// pointer type to one of its words.
+    Id heap_push_block{};
+    u32 heap_push_member{};
+    Id heap_push_pointer{};
+    bool heap_push_needed{}; ///< the stage reads the heap (a heap push member is declared)
+    bool heap_words_pushed{}; ///< Info::heap_words_pushed
     bool uses_heap{};
     /// P5a: a heap texel buffer array was declared (needs the dynamic indexing capabilities).
     bool uses_heap_uniform_texel{};
@@ -492,6 +501,13 @@ private:
     void DefineHeapTexture(const Info& info, const TextureDescriptor& desc, size_t index);
     void DefineHeapImage(const Info& info, const ImageDescriptor& desc, size_t index);
     void DefineHeapWords();
+    /// Appends the heap push member to a push constant block being built (`members`), when the
+    /// stage needs it and no block holds it yet; DecorateHeapPushMember decorates it once the
+    /// block's struct exists.
+    void AddHeapPushMember(boost::container::static_vector<Id, 4>& members, u32& member_index);
+    void DecorateHeapPushMember(Id struct_type, Id block);
+    /// A push constant block of its own for the heap member (no other block in the stage).
+    void DefineHeapPush();
     Id HeapArray(Id image_type, u32 heap_binding, bool coherent);
     void DefineImages(const Info& info, u32& binding, u32& scaling_index);
     void DefineAttributeMemAccess(const Info& info);
