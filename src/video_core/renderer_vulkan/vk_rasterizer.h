@@ -190,6 +190,7 @@ private:
     bool commit_lock_free{};
     /// GPU::CollectedCpuWrites as the owner last applied them.
     u64 commit_collected{};
+    u64 commit_batch{~0ULL}; ///< F2-17: the back batch whose start applied the CPU writes
     /// Whether the calling thread owns the caches: the split's back while it runs, else the GPU
     /// thread.
     [[nodiscard]] bool IsCacheOwner() const;

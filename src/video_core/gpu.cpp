@@ -14,6 +14,7 @@
 #include <utility>
 
 #include "common/assert.h"
+#include "common/scope_exit.h"
 #include "common/settings.h"
 #include "common/settings_enums.h"
 #include "core/core.h"
@@ -150,9 +151,28 @@ struct GPU::Impl {
 
     /// Synchronizes CPU writes with Host GPU memory.
     void InvalidateGPUCache() {
-        std::vector<std::pair<DAddr, u64>> writes;
-        std::function<void(PAddr, size_t)> callback_writes(
-            [&writes](PAddr address, size_t size) { writes.emplace_back(address, size); });
+        // F2-18: no allocation per gather. The gather (one gatherer at a time per manager) may
+        // run on threads other than the caches' owner, so the list is per thread.
+        thread_local std::vector<std::pair<DAddr, u64>> writes;
+        thread_local std::function<void(PAddr, size_t)> callback_writes(
+            [](PAddr address, size_t size) { writes.emplace_back(address, size); });
+        thread_local bool gathering = false;
+        if (gathering) [[unlikely]] {
+            // Re-entered from applying a gather: a list of its own.
+            std::vector<std::pair<DAddr, u64>> nested;
+            std::function<void(PAddr, size_t)> callback(
+                [&nested](PAddr address, size_t size) { nested.emplace_back(address, size); });
+            system.GatherGPUDirtyMemory(callback);
+            if (!nested.empty()) {
+                renderer->ReadRasterizer()->OnCacheInvalidations(nested);
+            }
+            return;
+        }
+        gathering = true;
+        SCOPE_EXIT {
+            gathering = false;
+        };
+        writes.clear();
         system.GatherGPUDirtyMemory(callback_writes);
         if (!writes.empty()) {
             renderer->ReadRasterizer()->OnCacheInvalidations(writes);

@@ -362,6 +362,11 @@ public:
     [[nodiscard]] bool BackBehind() const {
         return published.load(std::memory_order_relaxed) != back_batch_end;
     }
+    /// Back thread: counts the published batches it took (F2-17: guest CPU writes collected
+    /// before a batch was published are applied when the back starts it).
+    [[nodiscard]] u64 BackBatches() const {
+        return back_batches;
+    }
     /// Called on the back before it sleeps waiting for work (the rasterizer submits deferred work).
     void SetIdleHook(void (*hook)(void*), void* argument) {
         idle_hook = hook;
@@ -884,6 +889,7 @@ private:
     std::atomic<bool> idle_hook_requested{};
     std::atomic<bool> back_running{};
     u64 back_batch_end{}; ///< Back thread: the published position of the batch it runs
+    u64 back_batches{};   ///< Back thread: batches taken
 
     // 128 bytes: x86 spatial prefetchers pull 64-byte lines in pairs. back_waiting and wake are
     // always touched together by both threads, so they share a block.

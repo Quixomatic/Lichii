@@ -1208,6 +1208,7 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
         }
         u64 last_store = read_position;
         back_batch_end = available;
+        ++back_batches;
         while (read_position != available) {
             const size_t index = read_position & RingMask;
             if (tracks_writes) [[unlikely]] {

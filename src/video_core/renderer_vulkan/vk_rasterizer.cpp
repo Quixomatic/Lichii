@@ -3166,7 +3166,7 @@ void RasterizerVulkan::InnerInvalidation(std::span<const std::pair<DAddr, std::s
 
 bool RasterizerVulkan::OnCPUWrite(DAddr addr, u64 size) {
     DEBUG_ASSERT(addr != 0 || size != 0);
-    VideoCommon::V2::Versions::HookWrite(addr, size, VideoCommon::V2::Versions::Source::Host);
+    // F2-16: the trap (Core::Memory) moved the page version of this write already.
     if (VideoCommon::V2::On(VideoCommon::V2::Switch::CbufVer)) [[unlikely]] {
         VideoCommon::V2::CbufVer::Log().NoteHost(addr, size);
     }
@@ -3212,6 +3212,9 @@ bool RasterizerVulkan::OnCPUWrite(DAddr addr, u64 size) {
 }
 
 void RasterizerVulkan::OnCacheInvalidations(std::span<const std::pair<DAddr, u64>> ranges) {
+    // The guest CPU writes the write trap collected. The trap moved their page versions, but
+    // the caches apply them only now: a stamp taken in between would vouch for a write they have
+    // not seen, so the versions move again here (until the writer marks the trackers itself).
     if (commit_lock_free) [[unlikely]] {
         for (const auto& [addr, size] : ranges) {
             if (addr == 0 || size == 0) {
@@ -5593,7 +5596,20 @@ void RasterizerVulkan::CommitPoint() {
     context.owner.Claim();
     context.submission = scheduler.CurrentTick();
     // Guest CPU writes collected since the last commit point (exact bytes, per core), applied
-    // before any lookup: a few relaxed loads when there are none.
+    // before any lookup. F2-17 (§8 epochs at ordering points): on the split's back that is the
+    // start of each batch it takes (a write the guest ordered before work was collected before
+    // that work was published), not every draw.
+    const bool split_back = VideoCommon::GpuSplit::OnBackThread();
+    if (split_back) {
+        const u64 batch = VideoCommon::GpuSplit::Get().BackBatches();
+        if (batch == commit_batch) [[likely]] {
+            if (!context.external.Empty() || fence_manager.BacklogPending()) [[unlikely]] {
+                ServeExternal();
+            }
+            return;
+        }
+        commit_batch = batch;
+    }
     if (const u64 collected = gpu.CollectedCpuWrites(); collected != commit_collected)
         [[unlikely]] {
         commit_collected = collected;
