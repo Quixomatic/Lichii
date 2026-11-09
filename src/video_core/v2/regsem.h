@@ -320,8 +320,14 @@ struct BackMirror3D {
 
 /// Builds the Maxwell3D table once (the first Maxwell3D constructor), from its execution mask.
 void InitTable3D(const std::bitset<(std::numeric_limits<u16>::max)()>& execution_mask);
-/// The Maxwell3D table; InitTable3D must have run.
-[[nodiscard]] const Table3D& GetTable3D();
+namespace Detail {
+extern const Table3D* g_table3d; ///< Set once by InitTable3D
+}
+/// The Maxwell3D table; InitTable3D must have run. Inline: the executing engine reads it on
+/// every register write (NoteWrite3D).
+[[nodiscard]] inline const Table3D& GetTable3D() {
+    return *Detail::g_table3d;
+}
 
 /// Recomputes the hashed groups of `tracker` from `regs` (Maxwell3D registers) and returns the
 /// groups whose incremental hash had drifted from it.

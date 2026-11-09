@@ -249,8 +249,6 @@ Table3D BuildTable3D(const std::bitset<(std::numeric_limits<u16>::max)()>& execu
     return table;
 }
 
-const Table3D* g_table3d{};
-
 struct DriftData {
     u64 checks{};
     u64 drifted{};
@@ -259,13 +257,11 @@ thread_local DriftData t_drift{};
 
 } // Anonymous namespace
 
+const Table3D* Detail::g_table3d{};
+
 void InitTable3D(const std::bitset<(std::numeric_limits<u16>::max)()>& execution_mask) {
     static const Table3D table = BuildTable3D(execution_mask);
-    g_table3d = &table;
-}
-
-const Table3D& GetTable3D() {
-    return *g_table3d;
+    Detail::g_table3d = &table;
 }
 
 u32 Rehash3D(GroupTracker& tracker, const u32* regs) {
