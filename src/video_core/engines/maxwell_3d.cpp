@@ -1441,6 +1441,13 @@ struct Maxwell3D::FrontState {
     // EDEN_NX2_V2_MACRO_DUMP / MACROHLE: macro identities by start, for one code generation,
     // and what the macro being dumped does.
     std::unordered_map<u32, VideoCommon::V2::MacroHle::Identity> v2_macros;
+    struct MacroSlot {
+        u32 start{~0U};
+        VideoCommon::V2::MacroHle::Identity identity{};
+        const VideoCommon::V2::MacroHle::Entry* entry{};
+        bool dump_checked{};
+    };
+    std::array<MacroSlot, 64> v2_macro_slots{};
     u64 v2_macro_generation{~u64{0}};
     std::unique_ptr<VideoCommon::V2::MacroHle::Observation> v2_observation;
     bool v2_targets_dirty{true};
@@ -2117,14 +2124,27 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
         if (fs.v2_macro_generation != engine.native_code_generation) {
             fs.v2_macro_generation = engine.native_code_generation;
             fs.v2_macros.clear();
+            fs.v2_macro_slots.fill({});
         }
-        auto [it, inserted] = fs.v2_macros.try_emplace(start);
-        if (inserted) {
-            it->second = MacroHle::Identify(engine.native_code, start);
+        // ~1M macro calls/s: a direct-mapped slot per start holds the identity, its HLE entry
+        // (the table is fixed after loading) and whether the dump already saw it; the map
+        // behind it identifies each start once per code generation.
+        FrontState::MacroSlot& slot = fs.v2_macro_slots[start % fs.v2_macro_slots.size()];
+        if (slot.start != start) [[unlikely]] {
+            auto [it, inserted] = fs.v2_macros.try_emplace(start);
+            if (inserted) {
+                it->second = MacroHle::Identify(engine.native_code, start);
+            }
+            slot = FrontState::MacroSlot{
+                .start = start,
+                .identity = it->second,
+                .entry = MacroHle::Find(it->second.hash),
+                .dump_checked = false,
+            };
         }
-        identity = it->second;
+        identity = slot.identity;
         if (const MacroHle::Entry* entry =
-                hle != VideoCommon::V2::Mode::Off ? MacroHle::Find(identity.hash) : nullptr) {
+                hle != VideoCommon::V2::Mode::Off ? slot.entry : nullptr) {
             const MacroHle::Draw draw = MacroHle::Resolve(*entry, fs.parameters);
             if (hle == VideoCommon::V2::Mode::On) {
                 // The back draws from the GPU buffer; the front reads nothing.
@@ -2141,9 +2161,13 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
                          draw.count_address, draw.max_draws, draw.stride);
             }
         }
-        if (dump && MacroHle::ShouldDump("3d", identity.hash)) {
-            fs.v2_observation = std::make_unique<MacroHle::Observation>();
-            dump_parameters = fs.parameters;
+        // ShouldDump answers true once per macro, so a slot asks it once.
+        if (dump && !slot.dump_checked) {
+            slot.dump_checked = true;
+            if (MacroHle::ShouldDump("3d", identity.hash)) {
+                fs.v2_observation = std::make_unique<MacroHle::Observation>();
+                dump_parameters = fs.parameters;
+            }
         }
     }
     {
