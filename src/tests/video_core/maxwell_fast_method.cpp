@@ -98,6 +98,7 @@ struct GpuSplitTestAccess {
     /// The back records every IR record it executes (EDEN_NX2_V2_IR_TRACE without files).
     static void StartTrace(GpuSplit& split) {
         split.ir_trace = std::make_unique<V2::IrTrace::Recorder>();
+        split.ir_checks = true; // as MaybeStart: the trace is one of the per-record checks
     }
     static const V2::IrTrace::Recorder& Trace(const GpuSplit& split) {
         return *split.ir_trace;

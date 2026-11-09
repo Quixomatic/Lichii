@@ -902,7 +902,8 @@ TEST_CASE("V2 P6: a shard replays its segment from the IR ring onto the snapshot
     REQUIRE(records.size() == 12);
     for (u32 draw = 0; draw < 12; ++draw) {
         INFO("draw " << draw);
-        CHECK(records[draw].ordinal == draw);
+        // Ordinals count the other engine's draw after each one too (F1-35).
+        CHECK(records[draw].ordinal == draw * 2);
         CHECK(records[draw].indexed);
         CHECK(records[draw].engine == 0x1000);
         if (draw == 7) {
