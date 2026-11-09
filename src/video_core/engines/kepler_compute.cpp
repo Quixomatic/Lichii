@@ -39,6 +39,7 @@
 #include "video_core/rasterizer_interface.h"
 #include "video_core/textures/decoders.h"
 #include "video_core/v2/front_writes.h"
+#include "common/scope_exit.h"
 #include "video_core/v2/shader_writes.h"
 #include "video_core/v2/regsem_3d.h"
 
@@ -1741,9 +1742,28 @@ void KeplerCompute::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuS
 void KeplerCompute::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split,
                                   FrontState& fs) {
     const auto positions = FrontMacroPositions(fs);
+    const u32 macro_method = *fs.executing_macro;
     const u32 start = positions[((*fs.executing_macro - 0xe00) / 2) % positions.size()];
     fs.executing_macro.reset();
     auto& macro = FrontMacroEngine(fs);
+    // EDEN_NX2_V2_MACRO_DUMP: each distinct compute macro once, with what it wrote.
+    namespace MacroHle = VideoCommon::V2::MacroHle;
+    std::optional<MacroHle::Identity> dump_identity;
+    std::vector<u32> dump_parameters;
+    MacroHle::Observation observation;
+    if (VideoCommon::V2::On(VideoCommon::V2::Switch::MacroDump)) [[unlikely]] {
+        const MacroHle::Identity identity = MacroHle::Identify(macro.native_code, start);
+        if (MacroHle::ShouldDump("compute", identity.hash)) {
+            dump_identity = identity;
+            dump_parameters = fs.parameters;
+        }
+    }
+    SCOPE_EXIT {
+        if (dump_identity) {
+            MacroHle::Dump("compute", macro_method, start, *dump_identity, macro.native_code,
+                           dump_parameters, observation);
+        }
+    };
     if (native_data_ram) {
         macro.native_interpreter.active_dram = native_data_ram;
     }
@@ -1757,6 +1777,9 @@ void KeplerCompute::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& s
         }
         FrontApply(fs, address, value);
         split.MacroWrite(this, address, value);
+        if (dump_identity && observation.writes.size() < 64) [[unlikely]] {
+            observation.writes.emplace_back(address, value);
+        }
         if (split.TracksWrites()) [[unlikely]] {
             FrontNoteWrites(split, fs, address, value);
         }

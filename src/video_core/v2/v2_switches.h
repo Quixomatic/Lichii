@@ -31,6 +31,8 @@ enum class Switch : u32 {
     Spin,    ///< EDEN_NX2_V2_SPIN: hand-off spin window before front/back kernel waits (P2)
     CpuLane, ///< EDEN_NX2_V2_CPULANE: guest CPU flush requests served by the back early (P2)
     Readback, ///< EDEN_NX2_V2_READBACK: requester-side readbacks and learned early downloads
+    MacroDump, ///< EDEN_NX2_V2_MACRO_DUMP: log NVN2 macros' hash and code (v2/macro_hle.h)
+    MacroHle,  ///< EDEN_NX2_V2_MACROHLE: NVN2 macro HLE from nx2_macro_hle.txt entries
     Count,
 };
 
@@ -43,6 +45,8 @@ inline constexpr std::array<const char*, static_cast<size_t>(Switch::Count)> swi
     "SPIN",
     "CPULANE",
     "READBACK",
+    "MACRO_DUMP",
+    "MACROHLE",
 };
 
 namespace Detail {

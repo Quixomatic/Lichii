@@ -29,6 +29,7 @@
 #include "video_core/nx2_fast_draw.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/textures/texture.h"
+#include "video_core/v2/macro_hle.h"
 #include "video_core/v2/regsem.h"
 #include "video_core/v2/v2_stats.h"
 #include "video_core/engines/maxwell_3d.h"
@@ -3458,6 +3459,8 @@ private:
     bool FrontDmaReadHazard(VideoCommon::GpuSplit& split, GPUVAddr source, size_t bytes,
                             std::span<u32> out);
     void FinishFrontMacro(Core::System& system);
+    /// EDEN_NX2_V2_MACROHLE (back): a host indirect draw replacing an identified NVN2 macro.
+    void RunMacroHleDraw(Core::System& system, const VideoCommon::V2::MacroHle::Draw& draw);
     std::unique_ptr<FrontState> front;
     bool front_macros{};
     // EDEN_NX2_SPLIT_VERIFY: the last SET_SHADOW_RAM_CONTROL writes each side saw (argument,

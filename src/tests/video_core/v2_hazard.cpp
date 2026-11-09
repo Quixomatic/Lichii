@@ -11,6 +11,7 @@
 #include "shader_recompiler/shader_info.h"
 #include "video_core/v2/front_writes.h"
 #include "video_core/v2/hazard.h"
+#include "video_core/v2/macro_hle.h"
 #include "video_core/v2/shader_writes.h"
 
 namespace {
@@ -463,4 +464,37 @@ TEST_CASE("V2 write ranges: uploads and shader write summaries", "[video_core][v
         ShaderWrites::Invalidate(address, address + 0x100);
         CHECK(!ShaderWrites::Lookup(address));
     }
+}
+
+TEST_CASE("V2 NVN2 macro identification and HLE entries", "[video_core][v2_hazard]") {
+    using namespace VideoCommon::V2::MacroHle;
+    // Three instructions; the second has the end bit (bit 0 of its third word): the macro is it
+    // and the one after (its delay slot).
+    std::vector<u32> code(3 * 8, 0x22222222);
+    code[3 * 3 + 2] |= 1; // instruction 3 ends after instruction 4
+    const Identity identity = Identify(code, 2);
+    CHECK(identity.instructions == 3);
+    // The same code elsewhere has the same hash; other code doesn't.
+    std::vector<u32> moved(3 * 8, 0);
+    std::copy(code.begin() + 6, code.begin() + 15, moved.begin() + 12);
+    CHECK(Identify(moved, 4).hash == identity.hash);
+    code[3 * 2] ^= 1;
+    CHECK(Identify(code, 2).hash != identity.hash);
+
+    const auto entry = ParseLine("0123456789abcdef draw_indexed_indirect topology=p0 "
+                                 "address=p2,p3 count=p1 stride=20 base_vertex_attribute");
+    REQUIRE(entry);
+    CHECK(entry->hash == 0x0123456789abcdefULL);
+    CHECK(entry->kind == VideoCommon::V2::MacroHle::Kind::DrawIndexedIndirect);
+    const std::array<u32, 4> parameters{4, 3, 0x12, 0x3400};
+    const Draw draw = Resolve(*entry, parameters);
+    CHECK(draw.topology == 4);
+    CHECK(draw.address == 0x12'0000'3400ULL);
+    CHECK(draw.max_draws == 3);
+    CHECK(draw.stride == 20);
+    CHECK(draw.base_vertex_attribute);
+    CHECK(!ParseLine("# a comment"));
+    CHECK(!ParseLine("1234 draw_arrays_indirect address=p1,p2")); // no topology
+    CHECK(!ParseLine("1234 multi_draw_indexed_indirect_count topology=1 address=p1,p2"));
+    CHECK(ParseLine("1234 draw_arrays_indirect topology=5 address=p1,p2"));
 }

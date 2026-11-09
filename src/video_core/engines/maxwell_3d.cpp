@@ -11,6 +11,7 @@
 #include <limits>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include "common/assert.h"
 #include "common/bit_util.h"
 #include "common/scope_exit.h"
@@ -1168,6 +1169,11 @@ struct Maxwell3D::FrontState {
     // Pipeline v2 P2 write ranges (FrontNoteWrites): the upload being sent, and the device
     // ranges of the render targets, recomputed when their registers change.
     std::optional<std::pair<GPUVAddr, u64>> v2_upload;
+    // EDEN_NX2_V2_MACRO_DUMP / MACROHLE: macro identities by start, for one code generation,
+    // and what the macro being dumped does.
+    std::unordered_map<u32, VideoCommon::V2::MacroHle::Identity> v2_macros;
+    u64 v2_macro_generation{~u64{0}};
+    std::unique_ptr<VideoCommon::V2::MacroHle::Observation> v2_observation;
     bool v2_targets_dirty{true};
     u32 v2_target_count{};
     std::array<std::pair<u64, u64>, 9> v2_targets{};
@@ -1705,6 +1711,46 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
     const auto positions = GetNativeMacroPositions();
     const u32 start = positions[((method - MacroRegistersStart) >> 1) % positions.size()];
     VideoCommon::Nx2Profile::CountMethod(method, false);
+    namespace MacroHle = VideoCommon::V2::MacroHle;
+    const bool dump = VideoCommon::V2::On(VideoCommon::V2::Switch::MacroDump);
+    const VideoCommon::V2::Mode hle = VideoCommon::V2::Get(VideoCommon::V2::Switch::MacroHle);
+    std::vector<u32> dump_parameters;
+    MacroHle::Identity identity{};
+    if ((dump || hle != VideoCommon::V2::Mode::Off) && engine.native_turing) [[unlikely]] {
+        if (fs.v2_macro_generation != engine.native_code_generation) {
+            fs.v2_macro_generation = engine.native_code_generation;
+            fs.v2_macros.clear();
+        }
+        auto [it, inserted] = fs.v2_macros.try_emplace(start);
+        if (inserted) {
+            it->second = MacroHle::Identify(engine.native_code, start);
+        }
+        identity = it->second;
+        if (const MacroHle::Entry* entry =
+                hle != VideoCommon::V2::Mode::Off ? MacroHle::Find(identity.hash) : nullptr) {
+            const MacroHle::Draw draw = MacroHle::Resolve(*entry, fs.parameters);
+            if (hle == VideoCommon::V2::Mode::On) {
+                // The back draws from the GPU buffer; the front reads nothing.
+                fs.parameters.clear();
+                split.Defer([this, system_ptr = &system, draw] {
+                    RunMacroHleDraw(*system_ptr, draw);
+                });
+                return;
+            }
+            static std::atomic<u32> logged{};
+            if (logged.fetch_add(1) < 32) {
+                LOG_INFO(HW_GPU,
+                         "V2 macro HLE verify: macro {:016x} would draw kind {} topology {} from "
+                         "{:#x} (count {:#x}, {} draws, stride {})",
+                         identity.hash, static_cast<u32>(draw.kind), draw.topology, draw.address,
+                         draw.count_address, draw.max_draws, draw.stride);
+            }
+        }
+        if (dump && MacroHle::ShouldDump("3d", identity.hash)) {
+            fs.v2_observation = std::make_unique<MacroHle::Observation>();
+            dump_parameters = fs.parameters;
+        }
+    }
     {
         VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Macro};
         engine.native_interpreter.active_dram = &native_data_ram;
@@ -1715,6 +1761,9 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
         const auto emit = [&](u32 address, u32 value) {
             if (address >= MacroRegistersStart) {
                 return false;
+            }
+            if (fs.v2_observation && fs.v2_observation->writes.size() < 64) [[unlikely]] {
+                fs.v2_observation->writes.emplace_back(address, value);
             }
             FrontWrite(split, fs, address, value, true, true);
             // MME_DMA_READ (into data RAM) and MME_DMA_READ_FIFOED (into the load FIFO).
@@ -1741,6 +1790,11 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
         }
     }
     fs.parameters.clear();
+    if (fs.v2_observation) [[unlikely]] {
+        MacroHle::Dump("3d", method, start, identity, engine.native_code, dump_parameters,
+                       *fs.v2_observation);
+        fs.v2_observation.reset();
+    }
     if (fs.v2 != nullptr && fs.v2->mirror) [[unlikely]] {
         fs.v2->mirror->draw_pending = false;
     }
@@ -1751,6 +1805,45 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
     }
     if (FrontVerifyEnabled() && (++fs.calls & 4095) == 0) [[unlikely]] {
         FrontVerify(split, fs);
+    }
+}
+
+void Maxwell3D::RunMacroHleDraw(Core::System& system, const VideoCommon::V2::MacroHle::Draw& draw) {
+    // As Switch 1's HLE_DrawArraysIndirect / HLE_DrawIndexedIndirect /
+    // HLE_MultiDrawIndexedIndirectCount: the draw manager reads the arguments from the GPU
+    // buffer at `draw.address` (host indirect draw), the count from `draw.count_address`.
+    using Kind = VideoCommon::V2::MacroHle::Kind;
+    ConsumeSink(system);
+    const auto topology = static_cast<Regs::PrimitiveTopology>(draw.topology);
+    const bool indexed = draw.kind != Kind::DrawArraysIndirect;
+    const u32 words = indexed ? 5 : 4;
+    auto& params = draw_manager.indirect_state;
+    params.is_byte_count = false;
+    params.is_indexed = indexed;
+    params.include_count = draw.kind == Kind::MultiDrawIndexedIndirectCount;
+    params.count_start_address = draw.count_address;
+    params.indirect_start_address = draw.address;
+    params.max_draw_counts = draw.max_draws;
+    params.stride = draw.stride;
+    params.buffer_size = (draw.stride != 0 ? draw.stride : words * sizeof(u32)) * draw.max_draws;
+    if (draw.base_vertex_attribute) {
+        engine_state = EngineHint::OnHLEMacro;
+        SetHLEReplacementAttributeType(0, 0x640, indexed ? HLEReplacementAttributeType::BaseVertex
+                                                         : HLEReplacementAttributeType::BaseInstance);
+        if (indexed) {
+            SetHLEReplacementAttributeType(0, 0x644, HLEReplacementAttributeType::BaseInstance);
+        }
+    }
+    if (indexed) {
+        dirty.flags[VideoCommon::Dirty::IndexBuffer] = true;
+        draw_manager.DrawIndexedIndirect(*this, topology, 0,
+                                         static_cast<u32>(EstimateIndexBufferSize()));
+    } else {
+        draw_manager.DrawArrayIndirect(*this, topology);
+    }
+    if (draw.base_vertex_attribute) {
+        engine_state = EngineHint::None;
+        replace_table.clear();
     }
 }
 
@@ -1810,6 +1903,13 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
         memory_manager.ReadBlockUnsafe(source, diag_before.data(), read_bytes);
     }
     VideoCommon::Nx2Profile::CountDmaRead(macro);
+    if (fs.v2_observation) [[unlikely]] {
+        fs.v2_observation->dma_reads.emplace_back(source, words);
+        for (u32 i = 0; i < words && fs.v2_observation->dma_words.size() < 64; ++i) {
+            fs.v2_observation->dma_words.push_back(
+                memory_manager.Read<u32>(source + u64{i} * sizeof(u32)));
+        }
+    }
     const VideoCommon::V2::Mode hazard_mode = split.HazardMode();
     std::vector<u32> hazard_words;
     bool hazard_read = false;
