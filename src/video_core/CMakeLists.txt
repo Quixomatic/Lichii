@@ -127,6 +127,8 @@ add_library(video_core STATIC
     v2/hazard.cpp
     v2/hazard.h
     v2/ir.h
+    v2/cbuf_version.cpp
+    v2/cbuf_version.h
     v2/continued_draw.h
     v2/desc_cache.h
     v2/draw_model.cpp

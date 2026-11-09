@@ -28,6 +28,8 @@
 #include "video_core/nx2_perf.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/texture_cache/util.h"
+#include "video_core/v2/cbuf_version.h"
+#include "video_core/v2/p3_stats.h"
 #include "video_core/v2/v2_stats.h"
 
 namespace VideoCommon {
@@ -40,6 +42,9 @@ BufferCache<P>::BufferCache(Tegra::MaxwellDeviceMemoryManager& device_memory_, R
     // A new runtime has a new scheduler (its ticks restart) and a new stream buffer: whatever the
     // stream uniform reuse remembers refers to the old ones. Before the early return below.
     VideoCommon::ResetUniformStreamReuse<Runtime>();
+    if constexpr (VideoCommon::StreamUniformReusable<Runtime>) {
+        VideoCommon::V2::CbufVer::Table<typename Runtime::StreamUniformRef>().Clear();
+    }
     // Ensure the first slot is used for the null buffer
     void(slot_buffers.insert(runtime, NullBufferParams{}));
     gpu_modified_ranges.Clear();
@@ -1732,10 +1737,19 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
         // Stream buffer path to avoid stalling on non-Nvidia drivers or Vulkan
         bool streamed = false;
         if constexpr (!IS_OPENGL && VideoCommon::StreamUniformReusable<Runtime>) {
+            // EDEN_NX2_V2_CBUFVER: a version of this range copied earlier in this command buffer
+            // (by any stage or slot) that nothing wrote since is referenced again, without
+            // reading guest memory (v2/cbuf_version.h).
+            if (VideoCommon::V2::On(VideoCommon::V2::Switch::CbufVer)) [[unlikely]] {
+                if (BindUniformVersion(stage, index, binding_index, device_addr, size)) {
+                    return;
+                }
+                streamed = true;
+            }
             // The same bytes as this slot's previous bind, in the same command buffer: bind that
             // stream allocation again instead of allocating and copying (uniform_stream_reuse.h).
             // EDEN_NX2_UBOREUSE=0 turns it off.
-            if (VideoCommon::UniformStreamReuseEnabled()) {
+            if (!streamed && VideoCommon::UniformStreamReuseEnabled()) {
                 streamed = VideoCommon::BindSmallUniformReusing(
                     runtime, device_memory, stage, index, binding_index, device_addr, size);
             }
@@ -1774,6 +1788,79 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
         runtime.BindUniformBuffer(buffer, offset, size);
     }
     channel_state->fast_bound_uniform_buffers[stage] &= ~(1u << binding_index);
+}
+
+template <class P>
+bool BufferCache<P>::BindUniformVersion(size_t stage, u32 index, u32 binding_index,
+                                        DAddr device_addr, u32 size) {
+    if constexpr (!IS_OPENGL && VideoCommon::StreamUniformReusable<Runtime>) {
+        namespace V2 = VideoCommon::V2;
+        using Ref = typename Runtime::StreamUniformRef;
+        auto& table = V2::CbufVer::Table<Ref>();
+        const u64 tick = runtime.CurrentTick();
+        const bool verify = V2::Verify(V2::Switch::CbufVer);
+        const bool stats = V2::P3Stats::Enabled();
+        if (stats) {
+            ++V2::P3Stats::Get().cbuf_binds;
+        }
+        if (const Ref* const version = table.Find(device_addr, size, tick)) {
+            bool same = true;
+            if (verify) {
+                // The bytes the shader would read now against the version referenced.
+                auto& data = V2::P3Stats::Get();
+                ++data.cbuf_verify;
+                const std::vector<u8>& kept = table.Bytes(device_addr, size);
+                verify_scratch.resize(size);
+                device_memory.ReadBlockUnsafe(device_addr, verify_scratch.data(), size);
+                same = kept.size() == size &&
+                       std::memcmp(kept.data(), verify_scratch.data(), size) == 0;
+                if (!same) {
+                    ++data.cbuf_mismatches;
+                    static std::atomic<u32> logged{};
+                    if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+                        LOG_WARNING(HW_GPU,
+                                    "V2 cbuf version verify: stage {} cbuf {} at {:#x}+{:#x} "
+                                    "changed behind its version",
+                                    stage, index, device_addr, size);
+                    }
+                }
+            }
+            if (same) {
+                runtime.RebindStreamUniform(*version, size);
+                if (stats) {
+                    auto& data = V2::P3Stats::Get();
+                    ++data.cbuf_hits;
+                    data.cbuf_bytes_saved += size;
+                }
+                return true;
+            }
+        }
+        // A new version: copied (or found byte-equal by the stream reuse) and remembered.
+        Ref used{};
+        bool reused = false;
+        if (VideoCommon::UniformStreamReuseEnabled()) {
+            reused = VideoCommon::BindSmallUniformReusing(runtime, device_memory, stage, index,
+                                                          binding_index, device_addr, size,
+                                                          &used);
+        }
+        const u8* bytes = nullptr;
+        if (!reused) {
+            const std::span<u8> span = runtime.BindMappedUniformBuffer(stage, binding_index, size);
+            device_memory.ReadBlockUnsafe(device_addr, span.data(), size);
+            used = runtime.LastStreamUniformRef();
+            bytes = span.data();
+        }
+        if (verify && bytes == nullptr) {
+            verify_scratch.resize(size);
+            device_memory.ReadBlockUnsafe(device_addr, verify_scratch.data(), size);
+            bytes = verify_scratch.data();
+        }
+        table.Insert(device_addr, size, tick, used, verify ? bytes : nullptr);
+        if (stats) {
+            ++V2::P3Stats::Get().cbuf_copies;
+        }
+    }
+    return false;
 }
 
 template <class P>

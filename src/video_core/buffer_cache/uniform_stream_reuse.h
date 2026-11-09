@@ -89,7 +89,8 @@ inline void ResetUniformStreamReuse() noexcept {
 template <class Runtime, class DeviceMemory>
 [[nodiscard]] bool BindSmallUniformReusing(Runtime& runtime, DeviceMemory& device_memory,
                                            size_t stage, u32 index, u32 binding_index,
-                                           u64 device_addr, u32 size) {
+                                           u64 device_addr, u32 size,
+                                           typename Runtime::StreamUniformRef* used = nullptr) {
     using Reuse = UniformStreamReuse<typename Runtime::StreamUniformRef>;
     if (size == 0 || size > Reuse::MaxBytes || stage >= Reuse::NumStages ||
         index >= Reuse::NumSlots) {
@@ -104,11 +105,17 @@ template <class Runtime, class DeviceMemory>
         slot.size == size && std::memcmp(slot.bytes.data(), scratch, size) == 0;
     if (same_bytes && slot.tick == runtime.CurrentTick()) {
         runtime.RebindStreamUniform(slot.ref, size);
+        if (used != nullptr) {
+            *used = slot.ref;
+        }
         return true;
     }
     const std::span<u8> span = runtime.BindMappedUniformBuffer(stage, binding_index, size);
     std::memcpy(span.data(), scratch, size);
     slot.ref = runtime.LastStreamUniformRef();
+    if (used != nullptr) {
+        *used = slot.ref;
+    }
     // After the allocation: the tick the stream region is tagged with is the one current now.
     slot.tick = runtime.CurrentTick();
     if (!same_bytes) {

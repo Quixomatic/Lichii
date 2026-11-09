@@ -553,6 +553,11 @@ private:
 
     void BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 binding_index, bool needs_bind);
 
+    /// EDEN_NX2_V2_CBUFVER: binds a small constant buffer through its version (v2/cbuf_version.h).
+    /// True when an unchanged version was referenced; false when it bound a new copy.
+    bool BindUniformVersion(size_t stage, u32 index, u32 binding_index, DAddr device_addr,
+                            u32 size);
+
     void BindHostGraphicsStorageBuffers(size_t stage);
 
     void BindHostGraphicsTextureBuffers(size_t stage);
@@ -862,6 +867,7 @@ private:
     // Covers the device address space (MaxwellDeviceTraits::device_virtual_bits).
     std::array<BufferId, ((1ULL << 36) >> CACHING_PAGEBITS)> page_table;
     Common::ScratchBuffer<u8> tmp_buffer;
+    std::vector<u8> verify_scratch; ///< EDEN_NX2_V2_CBUFVER=verify
 
     /// A command list page (Nx2CopyListPages): the GPU writes noted to it and the last copy.
     using Nx2Staging = decltype(std::declval<Runtime&>().DownloadStagingBuffer(size_t{}, true));

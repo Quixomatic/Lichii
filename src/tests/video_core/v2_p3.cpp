@@ -19,6 +19,7 @@
 #include "video_core/renderer_null/null_rasterizer.h"
 #include "video_core/renderer_vulkan/fixed_pipeline_state.h"
 #include "video_core/renderer_vulkan/vk_state_tracker.h"
+#include "video_core/v2/cbuf_version.h"
 #include "video_core/v2/continued_draw.h"
 #include "video_core/v2/desc_cache.h"
 #include "video_core/v2/pipeline_lookup.h"
@@ -345,4 +346,55 @@ TEST_CASE("V2 P3 descriptor content keys", "[video_core][v2_p3]") {
     REQUIRE_FALSE(cache.Collides(payloads[1], hash(1), 1));
     cache.Clear();
     REQUIRE(cache.Find(payloads[1], hash(1), 1) == nullptr);
+}
+
+TEST_CASE("V2 P3 constant buffer versions", "[video_core][v2_p3]") {
+    using namespace VideoCommon::V2::CbufVer;
+    auto log = std::make_unique<WriteLog>();
+    auto table = std::make_unique<VersionTable<int>>(*log);
+    constexpr DAddr A = 0x10'0000;
+    constexpr DAddr B = 0x10'0400;
+    constexpr DAddr Far = 0x80'0000;
+    table->Insert(A, 0x100, 7, 1);
+    table->Insert(B, 0x200, 7, 2);
+    REQUIRE(*table->Find(A, 0x100, 7) == 1);
+    REQUIRE(*table->Find(B, 0x200, 7) == 2);
+    // Another tick (the stream allocation may be gone) or size: no version.
+    REQUIRE(table->Find(A, 0x100, 8) == nullptr);
+    REQUIRE(table->Find(A, 0x80, 7) == nullptr);
+    // An inline write next to A but inside B ends B's version only.
+    log->NoteInline(A + 0x100, A + 0x500);
+    REQUIRE(*table->Find(A, 0x100, 7) == 1);
+    REQUIRE(table->Find(B, 0x200, 7) == nullptr);
+    // Writes elsewhere keep A, even many of them, as long as the log still holds them.
+    for (int i = 0; i < 100; ++i) {
+        log->NoteInline(Far + i * 16, Far + i * 16 + 16);
+        REQUIRE(table->Find(A, 0x100, 7) != nullptr);
+    }
+    // Past the log's size without a lookup: unknown, so the version ends.
+    table->Insert(B, 0x200, 7, 3);
+    for (size_t i = 0; i < WriteLog::LogSize + 1; ++i) {
+        log->NoteInline(Far, Far + 4);
+    }
+    REQUIRE(table->Find(B, 0x200, 7) == nullptr);
+    // A host write to A's page ends it; one to another page doesn't.
+    table->Insert(A, 0x100, 7, 4);
+    log->NoteHost(Far, 4);
+    REQUIRE(*table->Find(A, 0x100, 7) == 4);
+    log->NoteHost(A + 0x800, 4);
+    REQUIRE(table->Find(A, 0x100, 7) == nullptr);
+    // A command list boundary ends every version; a long host write too.
+    table->Insert(A, 0x100, 7, 5);
+    REQUIRE(table->Find(A, 0x100, 7) != nullptr);
+    log->NoteBoundary();
+    REQUIRE(table->Find(A, 0x100, 7) == nullptr);
+    table->Insert(A, 0x100, 7, 6);
+    log->NoteHost(Far, (WriteLog::MaxHostPages + 1) << WriteLog::PageBits);
+    REQUIRE(table->Find(A, 0x100, 7) == nullptr);
+    // Verify keeps the bytes of a version.
+    const std::array<u8, 4> bytes{1, 2, 3, 4};
+    table->Insert(A, 4, 9, 7, bytes.data());
+    REQUIRE(table->Bytes(A, 4) == std::vector<u8>{1, 2, 3, 4});
+    table->Clear();
+    REQUIRE(table->Find(A, 4, 9) == nullptr);
 }
