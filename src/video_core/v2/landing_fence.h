@@ -38,6 +38,8 @@ inline std::atomic<bool> diag_recorded{false};
 /// §9.3: at the back's last idle hook, operations with no fence / uncommitted query flushes.
 inline std::atomic<bool> diag_unfenced{false};
 inline std::atomic<bool> diag_query_flushes{false};
+/// §11.2 step 1: at the back's last sleep, the caches' uncommitted downloads (owed writebacks).
+inline std::atomic<bool> diag_owed_writebacks{false};
 
 /// The renderer's urgent request for a host tick (Scheduler::RequestLazyFlush) and the wake that
 /// runs the back's idle hook (GpuSplit::RequestIdleHook). Set once before the back starts.

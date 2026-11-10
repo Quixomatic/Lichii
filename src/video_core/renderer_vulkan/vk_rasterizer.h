@@ -337,6 +337,12 @@ private:
     VideoCommon::V2::FlushState ReadFlushState();
     /// F4-X2: the split's idle hook (Scheduler::ServeSplitIdleHook with DXVK's sync rule).
     void ServeSplitIdleHook();
+    /// SYNC_SUBMIT_SPEC §11.2 invariant S, the split's idle-sleep hook (GpuSplit::SetIdleSleepHook):
+    /// `prepare` fences the unfenced and submits a due open tick; otherwise only says if one is due.
+    bool ServeIdleSleep(bool prepare);
+    /// §11.2 step 1: puts operations with no fence, uncommitted query flushes and (with
+    /// `owed_writebacks`) the caches' uncommitted downloads on an observable fence. True if it made one.
+    bool FenceUnfenced(bool owed_writebacks);
 
     void TraceRenderState(bool is_indexed, const char* outcome, const Framebuffer* framebuffer);
 

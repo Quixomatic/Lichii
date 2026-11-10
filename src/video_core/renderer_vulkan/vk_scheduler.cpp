@@ -339,10 +339,17 @@ void Scheduler::OnGpuProgress() {
     // re-evaluates rule I (it submits open work only if DXVK's rule holds; nothing open, nothing
     // happens). Not a wait for full idle.
     auto& split = VideoCommon::GpuSplit::Get();
-    // SYNC §10: only with a non-empty open tick (nothing to weigh otherwise).
-    if (lazy_fences && split.BackIdle() &&
-        open_tick_nonempty.load(std::memory_order_acquire) &&
-        master_semaphore->CurrentTick() < master_semaphore->KnownGpuTick() + 3) {
+    if (!lazy_fences) {
+        return;
+    }
+    // SYNC_SUBMIT_SPEC §11.2 step 3 (invariant S), the finish side of the Dekker handshake: the
+    // completion is published (PublishFromFinish), then back_waiting is read; the back stores
+    // back_waiting, then re-reads the in-flight count. The fence keeps the published tick ahead
+    // of the load, so one side always sees the other (3fd8: a completion between the back's
+    // check and its sleep woke nobody). Any completion wakes a back asleep on a non-empty open
+    // tick; the back itself decides whether fewer than two are in flight.
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    if (split.BackIdle() && open_tick_nonempty.load(std::memory_order_seq_cst)) {
         split.RequestIdleHook();
     }
 }

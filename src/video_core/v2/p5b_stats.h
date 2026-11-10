@@ -132,6 +132,9 @@ enum class Counter : u32 {
     ResumePendingPasses,  ///< SYNC §8.2: suspended-channel passes (one per ResumePending call)
     ResumeWithoutProgress,///< ... a poll passed but the channel didn't resume (expected 0)
     IdleUnfencedFences,   ///< SYNC §9.3: idle fences made for operations with no fence after them
+    SubmitsSleep,         ///< SYNC §11.2 rule S: the back submits the open tick before it sleeps
+    BackSleeps,           ///< ... the back's sleeps (S's trigger frequency, §11.6 gate)
+    SleepWakeSubmits,     ///< ... S submits after a completion came between the check and the sleep
     Count,
 };
 

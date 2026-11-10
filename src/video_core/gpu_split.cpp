@@ -1511,17 +1511,40 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
                 available = published.load(std::memory_order_acquire);
             }
             if (available == read_position) {
+                // SYNC_SUBMIT_SPEC §11.2 invariant S: the back may sleep only with the open tick
+                // empty or two submissions in flight. First the hook fences every unfenced
+                // operation and owed writeback and submits a non-empty open tick (fewer than two
+                // in flight).
+                if (idle_sleep_hook != nullptr) [[unlikely]] {
+                    idle_sleep_hook(idle_sleep_argument, true);
+                    if (published.load(std::memory_order_acquire) != read_position) {
+                        continue;
+                    }
+                }
                 // Publish bumps `wake` when it sees back_waiting: read it before the last look
-                // at `published`, so a publish in between ends the wait at once.
+                // at `published`, so a publish in between ends the wait at once. Dekker with the
+                // finish thread (Scheduler::OnGpuProgress): it publishes its completion, then
+                // reads back_waiting; we store back_waiting, then re-check in-flight (the hook
+                // with `prepare` false). One side sees the other's store, so no completion's wake
+                // is lost (3fd8 freeze).
                 back_waiting.store(true, std::memory_order_seq_cst);
+                if (idle_sleep_hook != nullptr) [[unlikely]] {
+                    std::atomic_thread_fence(std::memory_order_seq_cst);
+                }
                 const u32 seen = wake.load(std::memory_order_seq_cst);
                 available = published.load(std::memory_order_seq_cst);
+                const bool must_submit =
+                    idle_sleep_hook != nullptr && idle_sleep_hook(idle_sleep_argument, false);
                 // A request made after the hook ran (RequestIdleHook) runs it before sleeping.
                 if (available == read_position && !stop_token.stop_requested() &&
-                    !hook_requested.load(std::memory_order_seq_cst)) {
+                    !hook_requested.load(std::memory_order_seq_cst) && !must_submit) {
                     wake.wait(seen, std::memory_order_seq_cst);
                 }
                 back_waiting.store(false, std::memory_order_relaxed);
+                if (must_submit && available == read_position) [[unlikely]] {
+                    // A completion came between the hook and back_waiting: submit now.
+                    idle_sleep_hook(idle_sleep_argument, true);
+                }
                 continue;
             }
         }

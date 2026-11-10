@@ -1240,6 +1240,210 @@ TEST_CASE("SYNC §10: an idle back submits any non-empty open tick with fewer th
     }
 }
 
+namespace {
+// SYNC_SUBMIT_SPEC §11.2 invariant S. Model of GpuSplit::BackLoop's sleep block with
+// RasterizerVulkan::ServeIdleSleep (the back) and Scheduler::OnGpuProgress (the finish thread),
+// with the same stores, fences and loads; ticks as MasterSemaphore counts them.
+struct SleepModel {
+    FlushHeuristic heuristic{};
+    std::atomic<u64> current{4}; // the open tick: 1-3 submitted
+    std::atomic<u64> known{1};   // two in flight
+    std::atomic<bool> nonempty{true};
+    std::atomic<bool> back_waiting{false};
+    std::atomic<u32> wake{0};
+    std::atomic<bool> hook_requested{false};
+    std::atomic<u32> submits{0};
+    bool wake_guaranteed = true; // a finish thread publishes the tick
+
+    u32 Pending() const {
+        const u64 cur = current.load(std::memory_order_acquire);
+        const u64 done = known.load(std::memory_order_acquire);
+        return static_cast<u32>(cur > done + 1 ? cur - done - 1 : 0);
+    }
+    bool Hook(bool prepare) {
+        const bool due = heuristic.SleepSubmitDue(
+            Pending(), nonempty.load(std::memory_order_relaxed), wake_guaranteed);
+        if (prepare && due) {
+            current.fetch_add(1);
+            nonempty.store(false, std::memory_order_seq_cst);
+            submits.fetch_add(1);
+            return false;
+        }
+        return !prepare && due;
+    }
+    u32 Announce() {
+        back_waiting.store(true, std::memory_order_seq_cst);
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        return wake.load(std::memory_order_seq_cst);
+    }
+    void Publish() {
+        known.fetch_add(1, std::memory_order_release); // MasterSemaphore::Refresh's CAS
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        if (back_waiting.load(std::memory_order_seq_cst) &&
+            nonempty.load(std::memory_order_seq_cst)) {
+            hook_requested.store(true, std::memory_order_seq_cst); // RequestIdleHook
+            wake.fetch_add(1, std::memory_order_seq_cst);
+        }
+    }
+};
+} // namespace
+
+TEST_CASE("SYNC §11.2 invariant S: no completion wake is lost and no open tick sleeps unsubmitted",
+          "[video_core][v2_p5b]") {
+    SECTION("3fd8: a completion between the back's check and its sleep: the back submits") {
+        SleepModel m;
+        m.Hook(true); // two in flight: no submit
+        REQUIRE(m.submits.load() == 0);
+        m.Publish(); // the back is not waiting yet: no wake (the 3fd8 race)
+        REQUIRE_FALSE(m.hook_requested.load());
+        const u32 seen = m.Announce();
+        // The old protocol slept here on `seen` and nothing changed `wake`: the freeze.
+        REQUIRE(m.wake.load() == seen);
+        const bool must_submit = m.Hook(false); // the Dekker re-check sees one in flight
+        REQUIRE(must_submit);
+        m.back_waiting.store(false);
+        m.Hook(true);
+        REQUIRE(m.submits.load() == 1);
+        REQUIRE(m.Pending() == 2); // the open tick went out with one still in flight
+    }
+    SECTION("the completion after the back's sleep announcement wakes it, then it submits") {
+        SleepModel m;
+        m.Hook(true);
+        const u32 seen = m.Announce();
+        REQUIRE_FALSE(m.Hook(false)); // still two in flight: sleep
+        m.Publish();
+        REQUIRE(m.wake.load() != seen); // wake.wait(seen) returns
+        REQUIRE(m.hook_requested.load());
+        m.back_waiting.store(false);
+        m.Hook(true);
+        REQUIRE(m.submits.load() == 1);
+    }
+    SECTION("threads: the finish thread publishes at any moment of the back's sleep block") {
+        u32 lost = 0;
+        for (u32 iteration = 0; iteration < 1000 && lost == 0; ++iteration) {
+            SleepModel m;
+            std::jthread finish([&] {
+                for (u32 spin = 0; spin < (iteration * 7) % 97; ++spin) {
+                    std::atomic_signal_fence(std::memory_order_seq_cst);
+                }
+                m.Publish();
+            });
+            while (m.submits.load() == 0) {
+                m.Hook(true);
+                if (m.submits.load() != 0) {
+                    break;
+                }
+                const u32 seen = m.Announce();
+                const bool must_submit = m.Hook(false);
+                if (!must_submit && !m.hook_requested.exchange(false)) {
+                    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{1};
+                    while (m.wake.load() == seen && std::chrono::steady_clock::now() < deadline) {
+                        std::this_thread::yield();
+                    }
+                    if (m.wake.load() == seen) {
+                        ++lost; // asleep on a non-empty open tick with one in flight
+                        break;
+                    }
+                }
+                m.back_waiting.store(false);
+                m.hook_requested.store(false);
+            }
+            finish.join();
+        }
+        REQUIRE(lost == 0);
+    }
+    SECTION("9c4a b2 / d5ed / 49e1: idle back, open tick non-empty, nothing in flight: submitted "
+            "before the sleep") {
+        SleepModel m;
+        m.known.store(3); // nothing in flight
+        m.Hook(true);
+        REQUIRE(m.submits.load() == 1);
+        REQUIRE_FALSE(m.nonempty.load());
+        // The new open tick is empty: the back sleeps, and no number of sleeps submits it.
+        for (int sleep = 0; sleep < 1000; ++sleep) {
+            m.Hook(true);
+            REQUIRE_FALSE(m.Hook(false));
+        }
+        REQUIRE(m.submits.load() == 1);
+    }
+    SECTION("no finish thread (no completion wake): a non-empty open tick never sleeps") {
+        SleepModel m;
+        m.wake_guaranteed = false;
+        m.known.store(0); // three in flight
+        m.Hook(true);
+        REQUIRE(m.submits.load() == 1);
+    }
+}
+
+TEST_CASE("SYNC §11.2 step 1: the unfenced and owed writebacks are fenced before the back sleeps",
+          "[video_core][v2_p5b]") {
+    // Model of RasterizerVulkan::FenceUnfenced + the fence manager's SignalFence with
+    // EDEN_NX2_V2_WRITEBACK (defer_writebacks): a non-observable fence leaves the caches'
+    // uncommitted downloads owed; an observable one commits them, and they land at its pop.
+    struct Fences {
+        bool uncommitted_operation = false; // SyncOperation / a deferred reduction's op
+        bool owed_download = false;         // a cache download nobody committed
+        bool defer_writebacks = true;
+        bool fence_queued = false;
+        bool fence_carries_download = false;
+        bool open_work = false;
+        u32 fences = 0;
+        void SignalFence(bool observable) {
+            fence_carries_download = owed_download && (observable || !defer_writebacks);
+            owed_download = owed_download && !fence_carries_download;
+            uncommitted_operation = false; // moved into the fence's pending operations
+            fence_queued = true;
+            open_work = true; // a lazy fence in the open tick (NoteLazyFence)
+            ++fences;
+        }
+        bool FenceUnfenced(bool owed_writebacks) {
+            if (!uncommitted_operation && !(owed_writebacks && owed_download)) {
+                return false;
+            }
+            SignalFence(true);
+            return true;
+        }
+    };
+    FlushHeuristic heuristic{};
+    SECTION("8d31 / 019d / 5b06: a reduction deferred behind a landing plus an unfenced op, back "
+            "idle: fenced, submitted, landed, the acquire resumes") {
+        Fences f;
+        f.uncommitted_operation = true;
+        u32 word = 0x1000;
+        const u32 target = 0x1013; // the acquire waits for the 0x13 reduction
+        REQUIRE(f.FenceUnfenced(true));
+        REQUIRE(heuristic.SleepSubmitDue(0, f.open_work, true)); // step 2 submits it
+        // The finish thread completes the tick, the fencing thread pops the fence: the operation
+        // writes the word and Landing::Note rings the front.
+        word += 0x13;
+        REQUIRE(word == target);
+        REQUIRE_FALSE(f.FenceUnfenced(true)); // nothing left: no second fence
+        REQUIRE(f.fences == 1);
+    }
+    SECTION("WRITEBACK: an owed download, the observable fence at the sleep puts it in memory") {
+        Fences f;
+        f.owed_download = true;
+        // §9.3's old check (operations and query flushes only) saw nothing to fence: W7.
+        REQUIRE_FALSE(f.FenceUnfenced(false));
+        REQUIRE(f.owed_download);
+        REQUIRE(f.FenceUnfenced(true));
+        REQUIRE(f.fence_carries_download);
+        REQUIRE_FALSE(f.owed_download);
+        // A non-observable fence would have left it owed.
+        Fences g;
+        g.owed_download = true;
+        g.SignalFence(false);
+        REQUIRE(g.owed_download);
+    }
+    SECTION("nothing unfenced, nothing owed: no fence") {
+        Fences f;
+        for (int sleep = 0; sleep < 100; ++sleep) {
+            REQUIRE_FALSE(f.FenceUnfenced(true));
+        }
+        REQUIRE(f.fences == 0);
+    }
+}
+
 TEST_CASE("SYNC step 9: the post-pass list runs in order after the pass, before the submit",
           "[video_core][v2_p5b]") {
     // Model of the recording stream: the scheduler runs the list at the pass end (EndRenderPass)

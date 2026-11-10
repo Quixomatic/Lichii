@@ -147,7 +147,8 @@ void Report(const char* thread_name, u64 window_ns) {
     {
         const u64 by_rule = at(Counter::SubmitsPassBoundary) + at(Counter::SubmitsChunk) +
                             at(Counter::SubmitsIdle) + at(Counter::SubmitsWaiter) +
-                            at(Counter::SubmitsDeferred) + at(Counter::SubmitsPresent);
+                            at(Counter::SubmitsDeferred) + at(Counter::SubmitsPresent) +
+                            at(Counter::SubmitsSleep);
         const auto finishes = FinishSites().Take();
         std::string finish_list;
         for (size_t i = 0; i < finishes.size() && i < 16; ++i) {
@@ -165,7 +166,8 @@ void Report(const char* thread_name, u64 window_ns) {
                  "tick age at submit max {:.1f} ms | resume passes {:.0f}/s, resumed without "
                  "progress {:.0f}/s | idle fences for unfenced operations {:.0f}/s | macro DMA "
                  "reads by the semaphore view (per s): forwarded {:.0f}, waited "
-                 "{:.0f}, clear {:.0f} | finishes by site: {}",
+                 "{:.0f}, clear {:.0f} | S sleep point {:.2f}/frame (after a racing completion "
+                 "{:.2f}), back sleeps {:.1f}/frame | finishes by site: {}",
                  thread_name, per_frame(at(Counter::SubmitsPassBoundary)),
                  per_frame(at(Counter::SubmitsChunk)), per_frame(at(Counter::SubmitsIdle)),
                  per_frame(at(Counter::SubmitsWaiter)), per_frame(at(Counter::SubmitsDeferred)),
@@ -185,6 +187,8 @@ void Report(const char* thread_name, u64 window_ns) {
                  PerSecond(at(Counter::DmaReadsSemForwarded), seconds),
                  PerSecond(at(Counter::DmaReadsSemWaited), seconds),
                  PerSecond(at(Counter::DmaReadsSemClear), seconds),
+                 per_frame(at(Counter::SubmitsSleep)), per_frame(at(Counter::SleepWakeSubmits)),
+                 per_frame(at(Counter::BackSleeps)),
                  finish_list.empty() ? std::string{"none"} : finish_list);
     }
     // F4-06: which untracked operations still flush every pending write.

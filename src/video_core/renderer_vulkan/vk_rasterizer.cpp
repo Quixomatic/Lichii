@@ -865,6 +865,11 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
         VideoCommon::V2::FlushParams params{};
         params.pass_boundaries = true;
         flush_heuristic = VideoCommon::V2::FlushHeuristic{params};
+        VideoCommon::GpuSplit::Get().SetIdleSleepHook(
+            [](void* argument, bool prepare) {
+                return static_cast<RasterizerVulkan*>(argument)->ServeIdleSleep(prepare);
+            },
+            this);
     }
     if (VideoCommon::V2::On(VideoCommon::V2::Switch::Bindless)) [[unlikely]] {
         bindless_heap = BindlessHeap::Create(device, scheduler);
@@ -919,6 +924,7 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
 
 RasterizerVulkan::~RasterizerVulkan() {
     VideoCommon::GpuSplit::Get().SetIdleHook(nullptr, nullptr);
+    VideoCommon::GpuSplit::Get().SetIdleSleepHook(nullptr, nullptr);
     VideoCommon::GpuSplit::SetTransferJoinHook(nullptr, nullptr);
     scheduler.WaitWorker();
     scheduler.Finish();
@@ -4924,29 +4930,93 @@ void RasterizerVulkan::FlushHint(VideoCommon::V2::FlushHint hint) {
     }
 }
 
-void RasterizerVulkan::ServeSplitIdleHook() {
-    // SYNC_SUBMIT_SPEC §9.3 fix 1 (MP §6 class D "land on a host fence", which presupposes the
-    // fence exists; SESSION_HANDOFF §5 lesson 1): at every back-idle point, operations queued
-    // with no fence after them (SyncOperation: query-cache writes, UnregisterPending, query DMA
-    // reads) and the query cache's uncommitted flushes get one, as IrExec::LandCaptured makes it:
-    // a delayed fence, then FlushCommands. Rule I below submits it (a lazy fence with
-    // operations in the open tick). Nothing blocks: no forced ReleaseFences. The d5ed quiet
+bool RasterizerVulkan::FenceUnfenced(bool owed_writebacks) {
+    // SYNC_SUBMIT_SPEC §9.3 fix 1 / §11.2 step 1 (MP §6 class D "land on a host fence", which
+    // presupposes the fence exists; SESSION_HANDOFF §5 lesson 1): operations queued with no fence
+    // after them (SyncOperation: query-cache writes, UnregisterPending, query DMA reads) and the
+    // query cache's uncommitted flushes get one, a delayed fence as IrExec::LandCaptured makes it.
+    // §11.1 W7: with `owed_writebacks` also the buffer and texture caches' uncommitted downloads
+    // (EDEN_NX2_V2_WRITEBACK commits them only at an observable fence or a frame end, and in a
+    // hang no frame ends; a waiting guest is the sync that observes them, MP §5.4). The fence is
+    // observable, so it commits them. Nothing blocks: no forced ReleaseFences. The d5ed quiet
     // deadlock: those operations waited for a SignalFence that an idle back never made.
-    if (adapt_submit && scheduler.LazyFencesHere() &&
-        (fence_manager.HasUncommittedOperations() || query_cache.HasUncommittedFlushes()))
-        [[unlikely]] {
-        VideoCore::g_signaling_query_report_fence = true;
-        SignalFence([] {});
-        VideoCore::g_signaling_query_report_fence = false;
-        FlushCommands();
-        VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::IdleUnfencedFences);
-        VideoCommon::V2::LandingFence::diag_unfenced.store(false, std::memory_order_relaxed);
+    bool unfenced = fence_manager.HasUncommittedOperations() || query_cache.HasUncommittedFlushes();
+    bool owed = false;
+    if (owed_writebacks) {
+        const auto look = [&] {
+            owed = texture_cache.HasAsyncFlushWork() || buffer_cache.HasUncommittedFlushes();
+        };
+        if (commit_lock_free) {
+            WithCaches(look);
+        } else {
+            std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
+            look();
+        }
     }
-    if (scheduler.LazyFencesHere()) [[unlikely]] {
-        VideoCommon::V2::LandingFence::diag_unfenced.store(fence_manager.HasUncommittedOperations(),
-                                                           std::memory_order_relaxed);
-        VideoCommon::V2::LandingFence::diag_query_flushes.store(
-            query_cache.HasUncommittedFlushes(), std::memory_order_relaxed);
+    VideoCommon::V2::LandingFence::diag_owed_writebacks.store(owed, std::memory_order_relaxed);
+    if (!unfenced && !owed) {
+        VideoCommon::V2::LandingFence::diag_unfenced.store(false, std::memory_order_relaxed);
+        VideoCommon::V2::LandingFence::diag_query_flushes.store(false, std::memory_order_relaxed);
+        return false;
+    }
+    VideoCore::g_signaling_query_report_fence = true;
+    fence_manager.SignalFence([] {}, /*observable=*/true);
+    VideoCore::g_signaling_query_report_fence = false;
+    NoteNonDrawWork(1); // SYNC §7.3 fix 3: a fence counts toward rule C
+    FlushCommands();
+    VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::IdleUnfencedFences);
+    VideoCommon::V2::LandingFence::diag_unfenced.store(fence_manager.HasUncommittedOperations(),
+                                                       std::memory_order_relaxed);
+    VideoCommon::V2::LandingFence::diag_query_flushes.store(query_cache.HasUncommittedFlushes(),
+                                                            std::memory_order_relaxed);
+    return true;
+}
+
+bool RasterizerVulkan::ServeIdleSleep(bool prepare) {
+    // SYNC_SUBMIT_SPEC §11.2 invariant S (MP §5.5 "pending GPU work"; DXVK ImplicitSynchronization
+    // at the recording thread's idle point): the back may sleep only with the open tick empty, or
+    // with busy_pending submissions in flight and the finish thread's completion wake to come.
+    // GpuSplit::BackLoop calls this only where it is about to sleep (the ring empty after the
+    // spin window): `prepare` before back_waiting is set (fence the unfenced, then submit), then
+    // with `prepare` false after it is set (the Dekker re-check: is a submit due now?).
+    if (!adapt_submit || !scheduler.LazyFencesHere()) {
+        return false;
+    }
+    namespace P5b = VideoCommon::V2::P5bStats;
+    if (prepare) {
+        P5b::Add(P5b::Counter::BackSleeps);
+        FenceUnfenced(true);
+    }
+    // Back side of the handshake: back_waiting was stored before (GpuSplit's fence), so this
+    // read of the GPU's tick sees any completion whose publish missed the back's sleep.
+    const auto state = ReadFlushState();
+    const bool due = flush_heuristic.SleepSubmitDue(state.pending, scheduler.RecordedSinceSubmit(),
+                                                    scheduler.FinishThreadPublishesTick());
+    if (!prepare) {
+        if (due) {
+            P5b::Add(P5b::Counter::SleepWakeSubmits); // a completion raced the check (3fd8)
+        }
+        return due;
+    }
+    if (!due) {
+        return false;
+    }
+    SyncAdaptiveTick();
+    P5b::Add(P5b::Counter::SubmitsSleep);
+    P5b::Add(P5b::Counter::FlushLazy);
+    scheduler.Flush();
+    pending_native_work = false;
+    adapt_tick = scheduler.GetMasterSemaphore().CurrentTick();
+    flush_heuristic.NoteSubmit(AdaptNowUs());
+    return false;
+}
+
+void RasterizerVulkan::ServeSplitIdleHook() {
+    // §9.3 between entries (a RequestIdleHook while the back is busy: rule W time). At the back's
+    // sleep point ServeIdleSleep fences the unfenced, owed writebacks included (§11.2 step 1).
+    if (adapt_submit && scheduler.LazyFencesHere() &&
+        VideoCommon::GpuSplit::Get().HookBetweenEntries()) [[unlikely]] {
+        FenceUnfenced(false);
     }
     // F4-X2: the split's idle hook, with DXVK's synchronization rule for open work nobody blocks
     // on.

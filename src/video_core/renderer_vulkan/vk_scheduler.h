@@ -130,6 +130,9 @@ public:
     /// Recording thread: a lazy fence waits for `tick`.
     void NoteLazyFence(u64 tick) {
         lazy_outstanding_tick = tick;
+        if (lazy_fences && tick == CurrentTick()) {
+            NoteOpenTickWork(); // §11.2: a lazy fence alone makes the open tick worth a submit
+        }
         VideoCommon::V2::LandingFence::diag_lazy_tick.store(tick, std::memory_order_relaxed);
         if (open_since_us == 0) {
             open_since_us = NowUs(); // SYNC §7.3: the open tick's age at its submit
@@ -430,9 +433,7 @@ public:
         if (lazy_fences && !recorded_since_submit) [[unlikely]] {
             // SYNC_SUBMIT_SPEC §11 invariant S: the open tick holds work (the back may not sleep
             // on it with fewer than two submissions in flight).
-            recorded_since_submit = true;
-            open_tick_nonempty.store(true, std::memory_order_seq_cst);
-            VideoCommon::V2::LandingFence::diag_recorded.store(true, std::memory_order_relaxed);
+            NoteOpenTickWork();
         }
         if (chunk->Record(command)) {
             return;
@@ -694,6 +695,12 @@ private:
             open_since_us = 0;
         }
         VideoCommon::V2::LandingFence::diag_submit_wanted.store(false, std::memory_order_relaxed);
+    }
+    /// SYNC §11.2: the open tick holds work (a command or a lazy fence).
+    void NoteOpenTickWork() {
+        recorded_since_submit = true;
+        open_tick_nonempty.store(true, std::memory_order_seq_cst);
+        VideoCommon::V2::LandingFence::diag_recorded.store(true, std::memory_order_relaxed);
     }
     /// SYNC §10: after SubmitExecution (whatever it recorded to close the command buffer went
     /// with it), the new open tick is empty.

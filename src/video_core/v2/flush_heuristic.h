@@ -199,6 +199,15 @@ public:
                (draws >= params.pass_min_draws && since >= params.pass_interval_us);
     }
 
+    /// SYNC_SUBMIT_SPEC §11.2 invariant S (rule I only at the back's sleep point): the back may
+    /// sleep on a non-empty open tick (`open_work`: a command or a lazy fence since the last
+    /// submission) only with busy_pending submissions in flight and a completion wake guaranteed
+    /// (`wake_guaranteed`: the finish thread publishes the GPU tick and wakes the back). Otherwise
+    /// the open tick is due now.
+    [[nodiscard]] bool SleepSubmitDue(u32 pending, bool open_work,
+                                      bool wake_guaranteed) const noexcept {
+        return open_work && (!wake_guaranteed || pending < params.busy_pending);
+    }
     /// SYNC_SUBMIT_SPEC §10: rule I at an idle point: a non-empty open tick (`recorded`: any
     /// command since the last submission) is due once fewer than busy_pending are in flight.
     [[nodiscard]] bool IdleDue(u32 pending, bool recorded) const noexcept {

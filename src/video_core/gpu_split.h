@@ -564,9 +564,18 @@ public:
     [[nodiscard]] bool BackRunning() const {
         return back_running.load(std::memory_order_acquire);
     }
-    /// Any thread: whether the back sleeps waiting for work (SYNC rule I's GPU progress wake).
+    /// Any thread: whether the back sleeps waiting for work (seq_cst: the §11.2 Dekker handshake
+    /// with the finish thread).
     [[nodiscard]] bool BackIdle() const {
-        return back_waiting.load(std::memory_order_relaxed);
+        return back_waiting.load(std::memory_order_seq_cst);
+    }
+    /// SYNC_SUBMIT_SPEC §11.2 invariant S, set by the renderer before the back starts. `prepare`
+    /// true: before sleeping, fence what is unfenced and submit a non-empty open tick with fewer
+    /// than two in flight. `prepare` false (after back_waiting is set): whether sleeping now would
+    /// leave a non-empty open tick with fewer than two in flight (then the back loops instead).
+    void SetIdleSleepHook(bool (*hook)(void*, bool), void* argument) {
+        idle_sleep_hook = hook;
+        idle_sleep_argument = argument;
     }
     /// Any thread: has the back call the idle hook soon, between entries or at once if it sleeps.
     void RequestIdleHook() {
@@ -1142,6 +1151,8 @@ private:
     void* idle_argument{};
     bool hook_between_entries{}; ///< Back: HookBetweenEntries
     bool hook_at_batch_end{};    ///< Back: HookAtBatchEnd
+    bool (*idle_sleep_hook)(void*, bool){}; ///< SetIdleSleepHook
+    void* idle_sleep_argument{};
     void (*cpu_lane_hook)(void*){};
     void* cpu_lane_argument{};
     std::atomic<bool> cpu_lane_requested{};
