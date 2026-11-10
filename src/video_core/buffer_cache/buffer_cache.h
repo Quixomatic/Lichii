@@ -3083,13 +3083,15 @@ void BufferCache<P>::V2TickCbufWatch() {
         if (!v2_cbuf_arming) {
             v2_cbuf_arming = std::make_unique<W::Arming>(W::Get());
         }
-        // Reactive flushing takes read permission from every cached page: with it on, only
-        // pages others already hold are armed, so the watch changes no protection (Phase 1).
+        // Reactive flushing takes read permission from every cached page. A page the watch
+        // alone holds traps only writes (DeviceMemoryManager::UpdateWatchCount, Phase 2);
+        // EDEN_NX2_CBUFWATCH=held arms only pages others already hold instead (Phase 1).
         static const bool no_reactive = [] {
             const char* const value = std::getenv("EDEN_NX2_NO_REACTIVE");
             return value != nullptr && value[0] == '1';
         }();
-        const bool only_held = Settings::values.use_reactive_flushing.GetValue() &&
+        const bool only_held = W::OnlyHeldPages() &&
+                               Settings::values.use_reactive_flushing.GetValue() &&
                                !(no_reactive && Settings::CurrentProgramIsSwitch2());
         W::DeviceOps<Tegra::MaxwellDeviceMemoryManager> ops{device_memory};
         v2_cbuf_arming->Tick(frame_tick, only_held, ops);

@@ -50,6 +50,20 @@ inline constexpr u32 SeqOne = 8;
     return word & ~(QueuedBit | OwedBit);
 }
 
+/// A page's protection by its cached count and whether the watch's +1 is part of it
+/// (DeviceMemoryManager): the watch alone traps only writes, so reactive flushing's read
+/// protection applies only to pages other caches hold.
+enum class Protection : u8 {
+    None = 0,    ///< not cached
+    Cached = 1,  ///< the reactive flushing setting decides reads; writes trap
+    Watched = 2, ///< only writes trap
+};
+[[nodiscard]] constexpr Protection ProtectionOf(u32 count, bool watch_held) noexcept {
+    return count == 0 ? Protection::None
+           : count == 1 && watch_held ? Protection::Watched
+                                      : Protection::Cached;
+}
+
 /// The words of a window's pages (second page 0 for one-page windows) and whether all were armed.
 struct Snap {
     u64 words{};
@@ -214,6 +228,9 @@ private:
 
 /// EDEN_NX2_CBUFWATCH (default 1): 0 keeps the per-bind byte compare (A/B).
 [[nodiscard]] bool Enabled();
+/// EDEN_NX2_CBUFWATCH=held: with reactive flushing on, arm only pages others already hold
+/// (design Phase 1). Default: any page, write-protected only while the watch alone holds it.
+[[nodiscard]] bool OnlyHeldPages();
 
 /// The foreign write hook: one cached-mode branch when the ring is off.
 inline void HookForeign(u64 addr, u64 size) {
@@ -499,7 +516,7 @@ struct DeviceOps {
         for (const auto& [addr, size] : ranges) {
             copy.emplace_back(addr, static_cast<size_t>(size));
         }
-        memory.UpdatePagesCachedBatch(copy, delta);
+        memory.UpdateWatchCount(copy, delta);
     }
     bool TryHold(u64 page_address) {
         return memory.HoldPageIfCached(page_address);

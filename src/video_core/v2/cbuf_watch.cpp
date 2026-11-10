@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <cstdlib>
+#include <string_view>
 
 #include "video_core/v2/cbuf_watch.h"
 
@@ -132,6 +133,14 @@ bool Enabled() {
         return value == nullptr || value[0] != '0';
     }();
     return enabled && On(Switch::CbufRing);
+}
+
+bool OnlyHeldPages() {
+    static const bool held = [] {
+        const char* const value = std::getenv("EDEN_NX2_CBUFWATCH");
+        return value != nullptr && std::string_view{value} == "held";
+    }();
+    return held;
 }
 
 } // namespace VideoCommon::V2::CbufWatch

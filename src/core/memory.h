@@ -485,6 +485,10 @@ public:
      */
     void RasterizerMarkRegionCached(Common::ProcessAddress vaddr, u64 size, bool cached);
 
+    /// Marks the pages cached with only writes trapped (F2-03's write watch is their only
+    /// holder): reads stay free even with reactive flushing.
+    void RasterizerMarkRegionWatched(Common::ProcessAddress vaddr, u64 size);
+
     /**
      * Makes the next guest read of each rasterizer cached page in the range take the slow path
      * (fastmem only), so that the read reaches the GPU's reactive flush once.

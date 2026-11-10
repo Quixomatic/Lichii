@@ -148,6 +148,9 @@ public:
     /// Adds 1 to the page's cached count only if it is already held (no protection change);
     /// true if it did (F2-03's write watch with reactive flushing on).
     bool HoldPageIfCached(DAddr addr);
+    /// F2-03: the write watch's own +1/-1 on its pages. A page the watch alone holds traps only
+    /// writes (MarkRegionWatched), whatever reactive flushing does to the other cached pages.
+    void UpdateWatchCount(std::span<const std::pair<DAddr, size_t>> ranges, s32 delta);
     /// Gives back the write watch's counts on device pages about to be (re)mapped.
     void ReleaseWatchedPages(DAddr addr, size_t size);
 
@@ -182,7 +185,8 @@ private:
     }
 
     // Internal helper that performs the update assuming the caller already holds the necessary lock.
-    void UpdatePagesCachedCountNoLock(DAddr addr, size_t size, s32 delta);
+    // `watch_op`: the write watch's own count (UpdateWatchCount).
+    void UpdatePagesCachedCountNoLock(DAddr addr, size_t size, s32 delta, bool watch_op = false);
 
 private:
     static constexpr size_t device_virtual_bits = Traits::device_virtual_bits;
@@ -288,6 +292,25 @@ private:
     std::unique_ptr<CachedPages> cached_pages;
     Common::RangeMutex counter_guard;
     std::mutex mapping_guard;
+
+    // F2-03: which pages' counts include the write watch's (one bit per device page, under
+    // counter_guard), allocated when the watch first holds a page.
+    static constexpr size_t num_watch_words = (1ULL << (device_virtual_bits - page_bits)) / 64;
+    std::unique_ptr<std::atomic<u64>[]> watch_bits;
+    std::once_flag watch_once;
+    std::atomic<bool> watch_active{};
+    void EnableWatch();
+    [[nodiscard]] bool WatchHeld(size_t page) const {
+        return (watch_bits[page >> 6].load(std::memory_order_relaxed) >> (page & 63)) & 1;
+    }
+    void SetWatchHeld(size_t page, bool held) {
+        const u64 bit = u64{1} << (page & 63);
+        if (held) {
+            watch_bits[page >> 6].fetch_or(bit, std::memory_order_relaxed);
+        } else {
+            watch_bits[page >> 6].fetch_and(~bit, std::memory_order_relaxed);
+        }
+    }
 
 
 };

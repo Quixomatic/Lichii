@@ -591,3 +591,20 @@ TEST_CASE("V2 F2-03: the collect epoch moves with the ring on and the draw cache
     REQUIRE(Versions::Epochs().Current() == before + 2);
     modes = saved;
 }
+
+TEST_CASE("V2 F2-03: a page the watch alone holds traps only writes", "[video_core][v2_cbufwatch]") {
+    using W::Protection;
+    using W::ProtectionOf;
+    // The watch arms an uncached page: write-protected only (reads stay free with reactive
+    // flushing on).
+    REQUIRE(ProtectionOf(0, false) == Protection::None);
+    REQUIRE(ProtectionOf(1, true) == Protection::Watched);
+    // The buffer cache tracks it too: reactive flushing's protection; and back when it lets go.
+    REQUIRE(ProtectionOf(2, true) == Protection::Cached);
+    REQUIRE(ProtectionOf(1, true) == Protection::Watched);
+    // A trap gives the watch's count back: uncached.
+    REQUIRE(ProtectionOf(0, false) == Protection::None);
+    // Another holder alone, with or without the watch's +1 on top: cached.
+    REQUIRE(ProtectionOf(1, false) == Protection::Cached);
+    REQUIRE(ProtectionOf(2, true) == Protection::Cached);
+}
