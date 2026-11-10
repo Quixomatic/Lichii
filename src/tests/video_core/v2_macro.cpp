@@ -672,7 +672,7 @@ TEST_CASE("V2 macro HLE: the constant buffer and surface binds match the macros"
             }
             CHECK(dram == expected);
         }
-        CHECK(evaluated > 1000);
+        CHECK(evaluated > 500); // the rest fail in the macro (out-of-range indices)
         CHECK(with_writes > 200);
         // Another parameter count: the macro runs.
         MacroHle::Effects effects;

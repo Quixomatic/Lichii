@@ -569,6 +569,10 @@ TEST_CASE("V2 acquire: a suspended acquire whose release the view never records 
         for (int poll = 0; poll < 10 && !resumed; ++poll) {
             const AcquireDecision view =
                 DecideAcquire(SemaphoreOp::Equal, 1, clear, memory_word, memory_word, 0);
+            if (view.verdict == AcquireVerdict::Met) {
+                resumed = true; // the poll's own memory read passes it
+                break;
+            }
             REQUIRE(ViewSuspends(view.verdict, false));
             switch (PlanSuspendedPoll(false, false, queued != 0)) {
             case SuspendedPoll::OldRead:

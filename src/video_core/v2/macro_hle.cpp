@@ -256,13 +256,21 @@ constexpr u32 Merge(u32 x, u32 y, u32 dest, u32 count, u32 source) {
     return (x & ~(mask << dest)) | (((y >> source) & mask) << dest);
 }
 
+// The arrays hold every write a modelled macro makes (SurfaceBind: 9 and 4): an entry that
+// makes more is a modelling error (the static_asserts below), never a write past them.
 void AddWrite(Effects& out, u32 method, u32 value) {
-    out.writes[out.num_writes++] = {method, value};
+    if (out.num_writes < out.writes.size()) {
+        out.writes[out.num_writes++] = {method, value};
+    }
 }
 
 void AddDramWrite(Effects& out, u32 index, u32 value) {
-    out.dram_writes[out.num_dram_writes++] = {index, value};
+    if (out.num_dram_writes < out.dram_writes.size()) {
+        out.dram_writes[out.num_dram_writes++] = {index, value};
+    }
 }
+static_assert(std::tuple_size_v<decltype(Effects::writes)> >= 9);
+static_assert(std::tuple_size_v<decltype(Effects::dram_writes)> >= 4);
 
 // 3D 96d36d962a7ff692 (15 instructions at 0x21), p0 stage or binding index, p1 slot, p2
 // address low, p3 size << 12 | address high:

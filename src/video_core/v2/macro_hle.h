@@ -134,7 +134,7 @@ struct Draw {
 /// What a ConstantBufferBind or SurfaceBind call does: its method writes and data RAM writes,
 /// each in order.
 struct Effects {
-    std::array<std::pair<u32, u32>, 8> writes{};
+    std::array<std::pair<u32, u32>, 12> writes{}; ///< SurfaceBind makes 9
     u32 num_writes = 0;
     std::array<std::pair<u32, u32>, 4> dram_writes{};
     u32 num_dram_writes = 0;

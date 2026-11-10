@@ -3553,7 +3553,10 @@ void Maxwell3D::FrontHlePure(Core::System& system, VideoCommon::GpuSplit& split,
     // The macro's data RAM writes, then its method writes in order through the front's write
     // path, as its run would make them (FrontRunMacro's `write`).
     for (u32 i = 0; i < effects.num_dram_writes; ++i) {
-        native_data_ram[effects.dram_writes[i].first] = effects.dram_writes[i].second;
+        const auto [index, value] = effects.dram_writes[i];
+        if (index < native_data_ram.size()) { // Evaluate checked the macro's bounds
+            native_data_ram[index] = value;
+        }
     }
     for (u32 i = 0; i < effects.num_writes; ++i) {
         const auto [method, value] = effects.writes[i];
