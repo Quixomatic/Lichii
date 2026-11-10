@@ -293,6 +293,12 @@ public:
             });
     }
 
+    /// P6 Step 0 (DRAWREC=verify purity): moves with every recorded command.
+    [[nodiscard]] u64 RecordMark() const noexcept {
+        return (reinterpret_cast<std::uintptr_t>(chunk.get()) * 0x9E3779B97F4A7C15ULL) ^
+               reinterpret_cast<std::uintptr_t>(chunk->LastCommand());
+    }
+
     /// P5b (EDEN_NX2_V2_XFERQ): whether the device's dedicated transfer queue is in use.
     [[nodiscard]] bool HasTransferQueue() const noexcept {
         return transfer_queue != nullptr;
@@ -535,6 +541,11 @@ private:
 
         bool Empty() const {
             return command_offset == 0;
+        }
+
+        /// The last recorded command (DRAWREC=verify: moves with every record).
+        const void* LastCommand() const {
+            return last;
         }
 
         bool HasSubmit() const {

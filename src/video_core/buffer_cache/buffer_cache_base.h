@@ -640,6 +640,21 @@ public:
     [[nodiscard]] u64 BufferDeletions() const noexcept {
         return buffer_deletions;
     }
+    /// DRAWREC=verify (step 10): a hash of what a cache mutation moves; a pure resolve leaves
+    /// it unchanged.
+    [[nodiscard]] u64 DrawRecPurity() const noexcept {
+        u64 hash = 0xcbf29ce484222325ULL;
+        const auto mix = [&](u64 value) { hash = (hash ^ value) * 0x100000001b3ULL; };
+        mix(slot_buffers.size());
+        mix(vertex_buffers_serial);
+        mix(buffer_deletions);
+        mix(enabled_vertex_buffers_mask);
+        mix(v2_binds.Requests().size());
+        mix(v2_creates.Requests().size());
+        mix(v2_defer ? 1 : 0);
+        mix(channel_state->has_deleted_buffers ? 1 : 0);
+        return hash;
+    }
 
     Runtime& runtime;
     // EDEN_NX2_V2_DRAWCACHE buffer replay (ReplayGraphicsBuffers): bindings bound from the recipe

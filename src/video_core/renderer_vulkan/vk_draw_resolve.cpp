@@ -25,7 +25,9 @@
 #include "video_core/textures/texture.h"
 #include "video_core/v2/commit.h"
 #include "video_core/v2/resolve/draw_record.h"
+#include "video_core/v2/resolve/dynamic_state.h"
 #include "video_core/v2/resolve/state_view.h"
+#include "video_core/v2/versions.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 
 namespace Vulkan {
@@ -372,6 +374,96 @@ template R::ResolveStatus GraphicsPipeline::ResolveBuffers<R::LiveView>(
     const R::LiveView&, const R::ResolveContext&, R::ResolvedDraw&, C::RequestList&) const;
 template R::ResolveStatus GraphicsPipeline::ResolveBuffers<R::SnapshotView>(
     const R::SnapshotView&, const R::ResolveContext&, R::ResolvedDraw&, C::RequestList&) const;
+
+template <class View>
+R::ResolveStatus GraphicsPipeline::ResolveDraw(const View& view, const R::ResolveContext& ctx,
+                                               R::ResolvedDraw& out, C::RequestList& textures,
+                                               C::RequestList& buffers) const {
+    namespace Versions = VideoCommon::V2::Versions;
+    out.Clear();
+    R::DrawHeader& h = out.h;
+    // 1. Header and stamps.
+    h.ordinal = ctx.ordinal;
+    h.fingerprint = view.Groups().Fingerprint(VideoCommon::V2::AllGroups);
+    h.draw = view.Draw();
+    h.topology = view.Topology();
+    h.indexed = ctx.is_indexed;
+    h.indirect = ctx.is_indirect;
+    h.pipeline = ctx.pipeline;
+    h.pipeline_epoch = ctx.pipeline_epoch;
+    h.map_serial = gpu_memory->MapSerial();
+    h.image_table_changes = texture_cache.GraphicsImageTableChanges();
+    h.sampler_table_changes = texture_cache.GraphicsSamplerTableChanges();
+    h.texture_bindings_serial = texture_cache.TextureBindingsSerial();
+    h.buffer_deletions = buffer_cache.BufferDeletions();
+    h.rescale_epoch = Versions::Gens().GetEpoch(Versions::Epoch::Rescale);
+    h.residency = texture_cache.CurrentResidency();
+    h.stages = recipe_stages;
+    // 2. What the record path does not take yet (D3).
+    if (IsMeshPipeline()) {
+        return CommitOnly(out, IsEmulatedMesh() ? R::CommitOnlyReason::EmulatedMesh
+                                                : R::CommitOnlyReason::Mesh);
+    }
+    if (ctx.frame_dump) {
+        return CommitOnly(out, R::CommitOnlyReason::FrameDump);
+    }
+    if (ctx.sampled_recording) {
+        return CommitOnly(out, R::CommitOnlyReason::SampledRecording);
+    }
+    if (view.Regs().transform_feedback_enabled != 0) {
+        return CommitOnly(out, R::CommitOnlyReason::TransformFeedback);
+    }
+    if (ctx.is_indexed && view.InlineIndexDraw()) {
+        return CommitOnly(out, R::CommitOnlyReason::InlineIndex);
+    }
+    if (ctx.is_indirect) {
+        return CommitOnly(out, R::CommitOnlyReason::Indirect);
+    }
+    // 3. The descriptor tables this draw reads (SynchronizeDescriptors' inputs).
+    h.tables = R::TablesOf(view);
+    if (!texture_cache.DescriptorTablesMatch(h.tables)) {
+        h.status = R::ResolveStatus::Stale;
+        h.stale = R::StaleReason::DescriptorTables;
+        return R::ResolveStatus::Stale;
+    }
+    // 4-5. Textures, then buffers (texture buffers come from the views).
+    ResolveTextures(view, out, textures);
+    if (const R::ResolveStatus status = ResolveBuffers(view, ctx, out, buffers);
+        status != R::ResolveStatus::Ready) {
+        return status;
+    }
+    // 6. Render targets.
+    h.rt = R::RtKeyOf(view);
+    const auto prediction = texture_cache.PredictRenderTargets(h.rt);
+    h.rt_ids = prediction.ids;
+    h.rt_known = prediction.known;
+    h.rt_inputs_hold = prediction.inputs_hold;
+    // 7. Dynamic state (scale-independent).
+    h.dynamic = R::ComputeDynamic(view, *ctx.features);
+    // 8. Render area, as ConfigureImpl pushes it (Switch 2 titles may never program the
+    // surface clip; colour target 0 then).
+    const auto& regs = view.Regs();
+    for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
+        if (recipe_stages[stage] && stage_infos[stage].uses_render_area) {
+            const u32 clip_width = regs.surface_clip.width, clip_height = regs.surface_clip.height;
+            const bool clip_set = clip_width != 0 && clip_height != 0;
+            h.render_area.uses = true;
+            h.render_area.w = static_cast<f32>(clip_set ? clip_width : u32{regs.rt[0].width});
+            h.render_area.h = static_cast<f32>(clip_set ? clip_height : u32{regs.rt[0].height});
+        }
+    }
+    h.texture_requests = {0, static_cast<u32>(textures.Requests().size())};
+    h.buffer_requests = {0, static_cast<u32>(buffers.Requests().size())};
+    h.status = R::ResolveStatus::Ready;
+    return R::ResolveStatus::Ready;
+}
+
+template R::ResolveStatus GraphicsPipeline::ResolveDraw<R::LiveView>(
+    const R::LiveView&, const R::ResolveContext&, R::ResolvedDraw&, C::RequestList&,
+    C::RequestList&) const;
+template R::ResolveStatus GraphicsPipeline::ResolveDraw<R::SnapshotView>(
+    const R::SnapshotView&, const R::ResolveContext&, R::ResolvedDraw&, C::RequestList&,
+    C::RequestList&) const;
 
 template void GraphicsPipeline::ResolveTextures<R::LiveView>(const R::LiveView&,
                                                              R::ResolvedDraw&,

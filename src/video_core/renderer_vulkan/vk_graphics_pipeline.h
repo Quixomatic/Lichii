@@ -422,6 +422,17 @@ public:
         return stage_infos[stage];
     }
 
+    /// Pipeline v2 P6 Step 0 (EDEN_NX2_V2_DRAWREC, vk_draw_resolve.cpp): the draw's record from
+    /// the view alone (pure). Its cache mutations go to `textures` (applied first) and `buffers`
+    /// as requests. Stale: the descriptor tables must be synchronized first (once).
+    /// CommitOnly(reason): the draw takes the old Configure.
+    template <class View>
+    [[nodiscard]] VideoCommon::V2::Resolve::ResolveStatus ResolveDraw(
+        const View& view, const VideoCommon::V2::Resolve::ResolveContext& ctx,
+        VideoCommon::V2::Resolve::ResolvedDraw& out,
+        VideoCommon::V2::Commit::RequestList& textures,
+        VideoCommon::V2::Commit::RequestList& buffers) const;
+
 private:
     // Pipeline v2 P6 Step 0 (EDEN_NX2_V2_DRAWREC, vk_draw_resolve.cpp): the pure resolve of a
     // draw record. Reads only the view, guest memory and const cache lookups.

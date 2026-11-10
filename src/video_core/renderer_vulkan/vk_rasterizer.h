@@ -195,6 +195,28 @@ private:
     VideoCommon::V2::Mode drawrec{VideoCommon::V2::Mode::Off};
     VideoCommon::V2::Resolve::DynamicFeatures drawrec_features{};
     u64 drawrec_features_program{~0ULL}; ///< the program id the features were built for
+    /// The draw's record and its request lists (reset per draw with a new commit segment).
+    VideoCommon::V2::Resolve::ResolvedDraw drawrec_record;
+    VideoCommon::V2::Commit::RequestList drawrec_textures;
+    VideoCommon::V2::Commit::RequestList drawrec_buffers;
+    u64 drawrec_ordinal{};
+    /// DRAWREC=verify (step 10): what a cache mutation moves, around a pure resolve.
+    struct DrawRecPurity {
+        u64 flags{};
+        u64 textures{};
+        u64 buffers{};
+        u64 heap_releases{};
+        u64 heap_generation{};
+        u64 commit_list{};
+        u64 record_mark{};
+        bool operator==(const DrawRecPurity&) const = default;
+    };
+    [[nodiscard]] DrawRecPurity TakeDrawRecPurity() const;
+    /// Resolves the draw into drawrec_record (Stale: tables synchronized and resolved again
+    /// once; a second Stale is CommitOnly(Retry)); with `check`, around the purity snapshot.
+    VideoCommon::V2::Resolve::ResolveStatus ResolveDrawRecord(GraphicsPipeline& pipeline,
+                                                              bool is_indexed, bool is_indirect,
+                                                              bool check);
     /// GPU::CollectedCpuWrites as the owner last applied them.
     u64 commit_collected{};
     u64 commit_batch{~0ULL}; ///< F2-17: the back batch whose start applied the CPU writes

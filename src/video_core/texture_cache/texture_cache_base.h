@@ -552,6 +552,24 @@ public:
     [[nodiscard]] u64 TextureBindingsSerial() const noexcept {
         return texture_bindings_serial;
     }
+    /// DRAWREC=verify (step 10): a hash of what a cache mutation moves (slot vectors, serials,
+    /// table changes, deferred requests); a pure resolve leaves it unchanged.
+    [[nodiscard]] u64 DrawRecPurity() const noexcept {
+        u64 hash = 0xcbf29ce484222325ULL;
+        const auto mix = [&](u64 value) { hash = (hash ^ value) * 0x100000001b3ULL; };
+        mix(slot_images.size());
+        mix(slot_image_views.size());
+        mix(slot_samplers.size());
+        mix(texture_bindings_serial);
+        mix(render_targets_serial);
+        mix(prepare_epoch);
+        mix(modification_tick);
+        mix(channel_state->graphics_image_table.changes);
+        mix(channel_state->graphics_sampler_table.changes);
+        mix(v2_sampler_list.Requests().size());
+        mix(has_deleted_images ? 1 : 0);
+        return hash;
+    }
 
 private:
     /// FillImageViews with COMMIT=1: pure lookups into requests, then one commit.

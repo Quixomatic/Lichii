@@ -1777,6 +1777,14 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
             }
         }
     }
+    if (drawrec == VideoCommon::V2::Mode::Verify) [[unlikely]] {
+        // P6 Step 0 (step 10): the record resolve next to the old configure, which still runs;
+        // the resolve must change nothing (purity snapshot around it).
+        Profile::Scope scope{Profile::Zone::Configure};
+        static_cast<void>(ResolveDrawRecord(*pipeline, is_indexed, is_indirect, true));
+        VideoCommon::V2::Resolve::CountRecordStat(
+            VideoCommon::V2::Resolve::GetRecordStats().verify_draws);
+    }
     const bool delta_holds =
         delta_pipeline != nullptr && DeltaStillHolds(draw_serial, draw_map_serial);
     const DrawPath path = delta_holds && !verify_pipeline ? DrawPath::Delta : DrawPath::Full;
@@ -5323,6 +5331,72 @@ void RasterizerVulkan::EncodeDynamic(const VideoCommon::V2::Resolve::DynamicStat
             EmitVertexInput(scheduler, device, buffer_cache_runtime, v);
         }
     }
+}
+
+RasterizerVulkan::DrawRecPurity RasterizerVulkan::TakeDrawRecPurity() const {
+    DrawRecPurity purity{};
+    purity.flags = std::hash<Tegra::Engines::Maxwell3D::DirtyState::Flags>{}(maxwell3d->dirty.flags);
+    purity.textures = texture_cache.DrawRecPurity();
+    purity.buffers = buffer_cache.DrawRecPurity();
+    if (bindless_heap) {
+        purity.heap_releases = bindless_heap->Releases();
+        purity.heap_generation = bindless_heap->Generation();
+    }
+    purity.commit_list = commit ? commit->list.Requests().size() : 0;
+    purity.record_mark = scheduler.RecordMark();
+    return purity;
+}
+
+VideoCommon::V2::Resolve::ResolveStatus RasterizerVulkan::ResolveDrawRecord(
+    GraphicsPipeline& pipeline, bool is_indexed, bool is_indirect, bool check) {
+    namespace R = VideoCommon::V2::Resolve;
+    namespace Versions = VideoCommon::V2::Versions;
+    R::RecordStats& stats = R::GetRecordStats();
+    const R::ResolveContext ctx{
+        .pipeline = &pipeline,
+        .pipeline_epoch = Versions::Gens().GetEpoch(Versions::Epoch::Pipelines),
+        .is_indexed = is_indexed,
+        .is_indirect = is_indirect,
+        .frame_dump = frame_dump.Capturing(),
+        .sampled_recording = RecordingSampledTextures(),
+        .ordinal = drawrec_ordinal++,
+        .previous = nullptr,
+        .features = &DrawRecFeatures(),
+    };
+    const auto resolve = [&] {
+        drawrec_textures.Reset(commit->next_segment++);
+        drawrec_buffers.Reset(commit->next_segment++);
+        const DrawRecPurity before = check ? TakeDrawRecPurity() : DrawRecPurity{};
+        const R::ResolveStatus status =
+            pipeline.ResolveDraw(R::LiveView{*maxwell3d}, ctx, drawrec_record, drawrec_textures,
+                                 drawrec_buffers);
+        if (check && TakeDrawRecPurity() != before) [[unlikely]] {
+            R::CountRecordStat(stats.purity_violations);
+            static std::atomic<u32> logged{};
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+                LOG_WARNING(Render_Vulkan,
+                            "V2 draw record verify: the resolve of draw {} changed cache or "
+                            "engine state",
+                            ctx.ordinal);
+            }
+        }
+        return status;
+    };
+    R::ResolveStatus status = resolve();
+    if (status == R::ResolveStatus::Stale) {
+        R::CountRecordStat(stats.stale);
+        texture_cache.SyncDescriptorTables(drawrec_record.h.tables);
+        status = resolve();
+        if (status == R::ResolveStatus::Stale) {
+            drawrec_record.h.status = R::ResolveStatus::CommitOnly;
+            drawrec_record.h.reason = R::CommitOnlyReason::Retry;
+            status = R::ResolveStatus::CommitOnly;
+        }
+    }
+    if (status == R::ResolveStatus::CommitOnly) {
+        R::CountRecordStat(stats.commit_only[static_cast<size_t>(drawrec_record.h.reason)]);
+    }
+    return status;
 }
 
 void RasterizerVulkan::HandleTransformFeedback() {

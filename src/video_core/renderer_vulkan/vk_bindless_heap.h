@@ -125,6 +125,10 @@ public:
     [[nodiscard]] u64 Releases() const noexcept {
         return releases.load(std::memory_order_acquire);
     }
+    /// Moves at each Commit (DRAWREC=verify purity).
+    [[nodiscard]] u64 Generation() const noexcept {
+        return generation.load(std::memory_order_acquire);
+    }
     /// F2-04: marks `slot` of `binding` used by the current tick (what Slot does on a lookup).
     void Touch(u32 binding, u32 slot);
 
