@@ -122,6 +122,30 @@ void KeplerCompute::ConsumeSinkImpl(Core::System& system) {
     method_sink.clear();
 }
 
+namespace {
+/// F3-X1: what running QMD reductions and max releases at their fence costs (any thread: the
+/// operation runs where its fence lands). Logged every 65536 landings: mean and max wait from
+/// the back's capture to the landing.
+void NoteReductionLatency(u64 captured_ns) {
+    static std::atomic<u64> count{};
+    static std::atomic<u64> total_ns{};
+    static std::atomic<u64> max_ns{};
+    const u64 waited = VideoCommon::Nx2Profile::Now() - captured_ns;
+    total_ns.fetch_add(waited, std::memory_order_relaxed);
+    u64 seen = max_ns.load(std::memory_order_relaxed);
+    while (seen < waited && !max_ns.compare_exchange_weak(seen, waited)) {
+    }
+    if (const u64 landed = count.fetch_add(1, std::memory_order_relaxed) + 1;
+        (landed & 0xffff) == 1 || (landed & 0xffff) == 0) {
+        LOG_INFO(HW_GPU,
+                 "V2 QMD reductions at their fence: {} landed, mean {} us, max {} us since the "
+                 "back ran them",
+                 landed, total_ns.load(std::memory_order_relaxed) / landed / 1000,
+                 max_ns.load(std::memory_order_relaxed) / 1000);
+    }
+}
+} // Anonymous namespace
+
 // SET_REPORT_SEMAPHORE_A-D (0x6c0-0x6c3): address high/low, payload, then operation in bits 1:0
 // (release / acquire / report only / trap), reduction enable bit 3 with the op in bits 11:9, and
 // a one-word (no timestamp) structure in bit 28. NVN2 releases queue syncs from compute this way.
@@ -424,21 +448,32 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
                 // at its fence, behind it, and reports its landing like the delayed ones.
                 const bool deferred =
                     reduction_or_max && !delayed && VideoCommon::V2::Landing::MustDeferUntracked();
-                const bool at_fence = reduction_or_max && (delayed || deferred);
+                // F3-X1 (8d31 / 019d hangs: acquires waited on words 19 ADD reductions short,
+                // with no producer the front could see): while the split's front records writes,
+                // every reduction and max release runs at its fence with an untracked ticket and
+                // its range, so a waiting acquire sees it (QmdReleaseMayWrite: submit request,
+                // landing, latch: §6 class C). Without it SignalFence ran it "at once" except when
+                // committed flushes made it a real fence, and then it landed unannounced.
+                const bool tracked = VideoCommon::V2::Landing::untracked_tag != 0;
+                const bool at_fence = reduction_or_max && (delayed || deferred || tracked);
                 const auto untracked_device =
                     at_fence ? memory_manager.GpuToCpuAddress(address) : std::nullopt;
                 const u64 untracked =
                     untracked_device ? VideoCommon::V2::Landing::CaptureUntracked(
                                            *untracked_device, sizeof(u32))
                                      : 0;
+                const u64 captured_ns =
+                    untracked != 0 ? VideoCommon::Nx2Profile::Now() : 0;
                 if (flags & (1U << 26)) {
-                    VideoCore::g_signaling_query_report_fence = deferred;
-                    rasterizer->SignalFence([this, address, payload, flags, untracked] {
+                    VideoCore::g_signaling_query_report_fence = deferred || tracked;
+                    rasterizer->SignalFence([this, address, payload, flags, untracked,
+                                             captured_ns] {
                         const u32 value = ReduceSemaphore((flags >> 20) & 7, (flags >> 24) & 1,
                                                           memory_manager.Read<u32>(address), payload);
                         memory_manager.Write<u32>(address, value);
                         if (untracked != 0) {
                             VideoCommon::V2::Landing::NoteUntracked(untracked);
+                            NoteReductionLatency(captured_ns);
                         }
                         if (const auto device = memory_manager.GpuToCpuAddress(address)) {
                             Tegra::Nx2SemaphoreWaiters::Get().OnWrite(*device, value);
@@ -462,12 +497,13 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
                     // NVN2 tracks QMD completion with a max release (bit 19) into a word other
                     // releases also advance: a plain write would move it backwards and leave
                     // GEQ acquires waiting forever.
-                    VideoCore::g_signaling_query_report_fence = deferred;
-                    rasterizer->SignalFence([this, address, payload, untracked] {
+                    VideoCore::g_signaling_query_report_fence = deferred || tracked;
+                    rasterizer->SignalFence([this, address, payload, untracked, captured_ns] {
                         const u32 value = (std::max)(memory_manager.Read<u32>(address), payload);
                         memory_manager.Write<u32>(address, value);
                         if (untracked != 0) {
                             VideoCommon::V2::Landing::NoteUntracked(untracked);
+                            NoteReductionLatency(captured_ns);
                         }
                         if (const auto device = memory_manager.GpuToCpuAddress(address)) {
                             Tegra::Nx2SemaphoreWaiters::Get().OnWrite(*device, value);
