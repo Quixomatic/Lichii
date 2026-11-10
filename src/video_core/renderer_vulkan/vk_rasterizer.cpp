@@ -3257,9 +3257,8 @@ void RasterizerVulkan::DispatchCompute() {
         // The deferred native binding may follow DLSS's command buffer bindings.
         scheduler.InvalidateState();
     }
-    if (buffer_cache.v2_writer_downloads) [[unlikely]] {
-        buffer_cache.RecordWriterDownloads(); // EDEN_NX2_V2_XREADBACK
-    }
+    // U-01: the learned pages' downloads are recorded once per fence (CommitAsyncFlushesHigh),
+    // not behind every dispatch.
     SubmitNx2ListCopies();
     publish_collision_map();
 

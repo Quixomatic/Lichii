@@ -305,14 +305,27 @@ std::optional<VideoCore::RasterizerDownloadArea> BufferCache<P>::GetFlushArea(DA
     DAddr device_addr_end_aligned = Common::AlignUp(device_addr + size, Core::DEVICE_PAGESIZE);
     area->start_address = device_addr_start_aligned;
     area->end_address = device_addr_end_aligned;
+    bool stale_learned = false;
     if (memory_tracker.IsRegionPreflushable(device_addr, size)) {
         if (learned_marked != 0) [[unlikely]] {
             LearnReadback(device_addr_start_aligned, device_addr_end_aligned); // A read: not unread
         }
-        area->preemtive = true;
-        return area;
+        // U-01: a learned page's early download lands at its fence; until then guest memory is
+        // older than the GPU's write (gpu_modified_ranges loses the range at the landing).
+        // Answering "preemptive" then served a stale read: read it back now instead.
+        if (learned_marked != 0 && Tegra::g_nx2_ampere.load(std::memory_order_relaxed) &&
+            VideoCommon::V2::On(VideoCommon::V2::Switch::Readback)) [[unlikely]] {
+            gpu_modified_ranges.ForEachInRange(
+                device_addr_start_aligned, device_addr_end_aligned - device_addr_start_aligned,
+                [&stale_learned](DAddr, DAddr) { stale_learned = true; });
+        }
+        if (!stale_learned) {
+            area->preemtive = true;
+            return area;
+        }
     };
-    area->preemtive = !IsRegionGpuModified(device_addr_start_aligned,
+    area->preemtive = !stale_learned &&
+                      !IsRegionGpuModified(device_addr_start_aligned,
                                            device_addr_end_aligned - device_addr_start_aligned);
     // A preflushable mark persists and downloads later GPU writes at every fence. Native titles
     // instead keep read traps and flush on demand.
@@ -327,7 +340,7 @@ std::optional<VideoCore::RasterizerDownloadArea> BufferCache<P>::GetFlushArea(DA
                 device_addr_start_aligned, device_addr_end_aligned - device_addr_start_aligned);
         } else {
             if (VideoCommon::V2::On(VideoCommon::V2::Switch::Readback) &&
-                !Settings::IsGPULevelHigh()) [[unlikely]] {
+                !Settings::IsGPULevelHigh() && !stale_learned) [[unlikely]] {
                 // Early downloads: pages the guest keeps reading back become Preflushable.
                 LearnReadback(device_addr_start_aligned, device_addr_end_aligned);
             }
@@ -2334,7 +2347,10 @@ void BufferCache<P>::RecordWriterDownloads() {
 template <class P>
 void BufferCache<P>::CommitAsyncFlushesHigh() {
     if (v2_writer_downloads) [[unlikely]] {
-        // The downloads prepared behind their writers land with this fence.
+        // U-01 (MASTER_PLAN §6 class C, P5b-F3): every learned page written since the last fence
+        // is downloaded in one batch (one staging allocation, one barrier pair) and lands with
+        // this fence; the fence-commit path below then has none of those ranges (one path).
+        RecordWriterDownloads();
         writer_downloads_fenced.push_back(std::move(writer_downloads_open));
         writer_downloads_open.clear();
     }

@@ -287,6 +287,20 @@ struct BufferCacheTestAccess {
     static u32 CpuMarks(Cache& cache) {
         return cache.memory_tracker.cpu_marks;
     }
+    /// U-01: a page learned for early downloads (Preflushable by learning).
+    static void Learn(Cache& cache, DAddr address, u64 size) {
+        cache.memory_tracker.MarkRegionAsPreflushable(address, size);
+        cache.learned_marked = 1;
+    }
+    static void GpuWrite(Cache& cache, DAddr address, u64 size) {
+        cache.gpu_modified_ranges.Add(address, size);
+    }
+    static void Landed(Cache& cache, DAddr address, u64 size) {
+        cache.gpu_modified_ranges.Subtract(address, size);
+    }
+    static bool Preemptive(Cache& cache, DAddr address, u64 size) {
+        return cache.GetFlushArea(address, size)->preemtive;
+    }
 };
 
 } // namespace VideoCommon
@@ -1061,4 +1075,28 @@ TEST_CASE("Commit: bind uploads are ordered requests applied before the draw",
     Access::BindStage(*f.cache);
     REQUIRE(f.runtime.uploads == 2);
     f.cache->SetCommit(nullptr);
+}
+
+TEST_CASE("U-01: a learned page read before its early download landed is read back",
+          "[buffer_ports][v2_p5b]") {
+    namespace V2 = VideoCommon::V2;
+    const auto saved = V2::g_modes;
+    const bool saved_ampere = Tegra::g_nx2_ampere.load();
+    V2::g_modes[static_cast<size_t>(V2::Switch::Readback)] = V2::Mode::On;
+    Tegra::g_nx2_ampere.store(true);
+    SCOPE_EXIT {
+        V2::g_modes = saved;
+        Tegra::g_nx2_ampere.store(saved_ampere);
+    };
+    Fixture f;
+    Access::Add(*f.cache, 0x20000, 0x10000);
+    Access::Learn(*f.cache, 0x21000, 0x1000);
+    // Learned and nothing owed: memory is current, no readback.
+    REQUIRE(Access::Preemptive(*f.cache, 0x21000, 0x100));
+    // A GPU write whose download has not landed: the old answer ("preemptive") was a stale read.
+    Access::GpuWrite(*f.cache, 0x21000, 0x1000);
+    REQUIRE_FALSE(Access::Preemptive(*f.cache, 0x21000, 0x100));
+    // Landed: preemptive again.
+    Access::Landed(*f.cache, 0x21000, 0x1000);
+    REQUIRE(Access::Preemptive(*f.cache, 0x21000, 0x100));
 }
