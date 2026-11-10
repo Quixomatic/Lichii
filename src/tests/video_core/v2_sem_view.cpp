@@ -393,10 +393,10 @@ TEST_CASE("SYNC step 4: no submit when nobody waits and the GPU is busy",
           "[video_core][v2_sem_view]") {
     // A suspended acquire with no producer at a fence asks for nothing.
     REQUIRE(PlanSuspendedPoll(false, false, 9, 0) == SuspendedPoll::Wait);
-    // An idle hook with only a lazy fence's open tick, no request and DXVK's rule not due:
-    // the work is left for the next boundary (no urgent-at-queue request exists any more).
+    // An idle hook with only a lazy fence's open tick and no request: the work is left for the
+    // next boundary or the sleep point (no urgent-at-queue request exists any more).
     SubmitRequests requests;
-    REQUIRE(requests.AtIdleHook(false, true, false, 9, 9, false) ==
+    REQUIRE(requests.AtIdleHook(false, true, false, 9, 9) ==
             SubmitRequests::IdleAction::Leave);
 }
 

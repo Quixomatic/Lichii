@@ -164,11 +164,10 @@ public:
     /// The idle hook (the back goes idle, or another thread asked with RequestIdleHook): what
     /// FlushDeferred submits, plus with lazy fences any work they or WantSubmit wait for.
     void ServeIdleHook();
-    /// The split's idle hook (RasterizerVulkan registers it): ServeIdleHook, except that open work
-    /// no thread blocks on (no urgent request, nothing deferred) is submitted only when
-    /// `sync_due(argument)` says DXVK's synchronization rule holds (F4-X2,
-    /// SubmitRequests::AtIdleHook, FlushHeuristic::SyncPointDue); it is asked only then.
-    void ServeSplitIdleHook(bool (*sync_due)(void*), void* argument);
+    /// The split's idle hook (RasterizerVulkan registers it): submits DeferFlush's work and an
+    /// urgent request (rule W); open work no thread blocks on is left for rules B/C and the
+    /// back's sleep point (SYNC_SUBMIT_SPEC §11, SubmitRequests::AtIdleHook).
+    void ServeSplitIdleHook();
     /// Any thread, F4-02/F4-04: `tick` is submitted when this returns. On the split's back it
     /// submits; other threads ask the back (RequestLazyFlush + WaitSubmitted), or submit
     /// themselves once the back stopped.

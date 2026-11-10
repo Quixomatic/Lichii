@@ -1007,11 +1007,6 @@ public:
     [[nodiscard]] bool HookBetweenEntries() const noexcept {
         return hook_between_entries;
     }
-    /// Back, inside the idle hook (SYNC §7.3 fix 1): it runs because a batch ended with the ring
-    /// empty (counted apart in the submits by rule).
-    [[nodiscard]] bool HookAtBatchEnd() const noexcept {
-        return hook_at_batch_end;
-    }
 
 private:
     /// Back: runs a front job (RequestBackJob) and the CPU lane hook if one was asked for
@@ -1150,7 +1145,6 @@ private:
     void (*idle_hook)(void*){};
     void* idle_argument{};
     bool hook_between_entries{}; ///< Back: HookBetweenEntries
-    bool hook_at_batch_end{};    ///< Back: HookAtBatchEnd
     bool (*idle_sleep_hook)(void*, bool){}; ///< SetIdleSleepHook
     void* idle_sleep_argument{};
     void (*cpu_lane_hook)(void*){};

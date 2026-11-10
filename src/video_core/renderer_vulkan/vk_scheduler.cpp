@@ -275,7 +275,7 @@ void Scheduler::ServeIdleHook() {
     }
 }
 
-void Scheduler::ServeSplitIdleHook(bool (*sync_due)(void*), void* argument) {
+void Scheduler::ServeSplitIdleHook() {
     if (!lazy_fences) {
         FlushDeferred();
         return;
@@ -285,23 +285,13 @@ void Scheduler::ServeSplitIdleHook(bool (*sync_due)(void*), void* argument) {
     // F4-X2 (MASTER_PLAN §5.5, DXVK): DeferFlush's work and an urgent request (a thread blocks on
     // the open tick: a landing wait, a front list read, a readback, a fence wait past its
     // escalation) submit now, whether the GPU is busy or not. Everything else (lazy fences and
-    // their bounded-time requests, list ends, list copies) goes out here only by DXVK's
-    // synchronization rule: the GPU is about to go idle (fewer than two submissions in flight)
-    // and the work is worth a submission, or the pending threshold. A wake alone (RequestIdleHook)
-    // is not a reason. Work left here rides the next pass boundary or chunk; no thread waits on
-    // it, and one that starts to files its own urgent request.
+    // their bounded-time requests, list ends, list copies, recorded work) is left: a pass
+    // boundary or chunk takes it while the back records, and invariant S at the back's sleep
+    // point (SYNC_SUBMIT_SPEC §11.2, RasterizerVulkan::ServeIdleSleep) when it stops. A wake
+    // alone (RequestIdleHook) is not a reason.
     const u64 open = CurrentTick();
-    // SYNC_SUBMIT_SPEC §10: any recorded command makes the open tick work rule I weighs (the
-    // sync_due callback submits it with fewer than two submissions in flight).
-    const bool wanted = submit_wanted || recorded_since_submit;
-    if (!submit_requests.IdleSubmits(flush_pending, lazy_fences, wanted, lazy_outstanding_tick,
-                                     open)) {
-        return;
-    }
-    // The heuristic is read only when nothing else decides.
-    const bool due = !flush_pending && !submit_requests.Urgent(open) && sync_due(argument);
-    switch (submit_requests.AtIdleHook(flush_pending, lazy_fences, wanted,
-                                       lazy_outstanding_tick, open, due)) {
+    switch (submit_requests.AtIdleHook(flush_pending, lazy_fences, submit_wanted,
+                                       lazy_outstanding_tick, open)) {
     case IdleAction::None:
         return;
     case IdleAction::Leave:
@@ -317,13 +307,6 @@ void Scheduler::ServeSplitIdleHook(bool (*sync_due)(void*), void* argument) {
         // flight → postpone" exception (d1435e18fd's coalescing branch removed).
         P5b::Add(P5b::Counter::IdleUrgent);
         P5b::Add(P5b::Counter::SubmitsWaiter);
-        break;
-    case IdleAction::Sync:
-        P5b::Add(P5b::Counter::IdleSync);
-        P5b::Add(P5b::Counter::SubmitsIdle);
-        if (VideoCommon::GpuSplit::Get().HookAtBatchEnd()) {
-            P5b::Add(P5b::Counter::SubmitsIdleBatchEnd);
-        }
         break;
     }
     P5b::Add(P5b::Counter::FlushLazy);

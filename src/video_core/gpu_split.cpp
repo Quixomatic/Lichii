@@ -1581,19 +1581,9 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
         consumed_sequence.store(back_sequence, std::memory_order_release);
         consumed.store(read_position, std::memory_order_seq_cst);
         NotifyFront();
-        // SYNC_SUBMIT_SPEC §7.3 fix 1 (DXVK's synchronization point: the recording thread ran out
-        // of work): the ring running empty at a batch end runs the idle hook at once, not only
-        // after idle_hook_ns of uninterrupted emptiness, which a front publishing a record every
-        // few µs never left (0c86/e412 boot hang). The hook returns at once with nothing open.
-        if (feed_idle_back && idle_hook != nullptr &&
-            published.load(std::memory_order_acquire) == read_position) [[unlikely]] {
-            hook_requested.store(false, std::memory_order_seq_cst);
-            idle_hook_requested.store(false, std::memory_order_relaxed);
-            ServeCpuLane();
-            hook_at_batch_end = true;
-            idle_hook(idle_argument);
-            hook_at_batch_end = false;
-        }
+        // SYNC_SUBMIT_SPEC §11.6 item 3: no idle hook at a batch end (§7.3 fix 1 submitted a tiny
+        // tick at almost every publish, 3fd8's 55 submits/f). A front feeding a zero-draw stream
+        // is bounded by rule C (every item counts); a front stall reaches the sleep point (S).
     }
     back_running.store(false, std::memory_order_seq_cst);
 

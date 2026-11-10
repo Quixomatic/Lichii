@@ -180,25 +180,6 @@ public:
         return hint >= FlushHint::Strong && draws >= params.strong_chunks * params.chunk_draws;
     }
 
-    /// F4-X2 (MASTER_PLAN §5.5; DXVK ImplicitSynchronization, util_flush.cpp): the recording
-    /// thread's idle hook with open work no thread blocks on. While fewer than busy_pending
-    /// submissions are in flight the GPU is about to go idle: submit once the work is worth one
-    /// (Ryujinx's pass rule, pass_min_draws and pass_interval_us since the last submission, or
-    /// min_draws). While it is busy: DXVK's threshold, min(20, pending * 3) chunks. Otherwise the
-    /// work waits for the next pass boundary or chunk.
-    [[nodiscard]] bool SyncPointDue(const FlushState& state, u64 now_us) const noexcept {
-        if (draws == 0) {
-            return false;
-        }
-        if (state.pending >= params.busy_pending) {
-            return draws / params.chunk_draws >=
-                   (std::min)(params.max_chunk_threshold, state.pending * 3);
-        }
-        const u64 since = last_submit_us == 0 ? 0 : now_us - last_submit_us;
-        return draws >= params.min_draws ||
-               (draws >= params.pass_min_draws && since >= params.pass_interval_us);
-    }
-
     /// SYNC_SUBMIT_SPEC §11.2 invariant S (rule I only at the back's sleep point): the back may
     /// sleep on a non-empty open tick (`open_work`: a command or a lazy fence since the last
     /// submission) only with busy_pending submissions in flight and a completion wake guaranteed
@@ -207,16 +188,6 @@ public:
     [[nodiscard]] bool SleepSubmitDue(u32 pending, bool open_work,
                                       bool wake_guaranteed) const noexcept {
         return open_work && (!wake_guaranteed || pending < params.busy_pending);
-    }
-    /// SYNC_SUBMIT_SPEC §10: rule I at an idle point: a non-empty open tick (`recorded`: any
-    /// command since the last submission) is due once fewer than busy_pending are in flight.
-    [[nodiscard]] bool IdleDue(u32 pending, bool recorded) const noexcept {
-        return pending < params.busy_pending && recorded;
-    }
-    /// §7.3 fix 2 (kept for its tests; §10's IdleDue covers it): a lazy fence or a list end.
-    [[nodiscard]] bool OpenWorkDue(u32 pending, bool lazy_fence_open,
-                                   bool list_end_open) const noexcept {
-        return pending < params.busy_pending && (lazy_fence_open || list_end_open);
     }
 
     /// Any submission (heuristic or not) resets the counters.

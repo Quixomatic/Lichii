@@ -5018,39 +5018,9 @@ void RasterizerVulkan::ServeSplitIdleHook() {
         VideoCommon::GpuSplit::Get().HookBetweenEntries()) [[unlikely]] {
         FenceUnfenced(false);
     }
-    // F4-X2: the split's idle hook, with DXVK's synchronization rule for open work nobody blocks
-    // on.
-    scheduler.ServeSplitIdleHook(
-        [](void* argument) {
-            auto& self = *static_cast<RasterizerVulkan*>(argument);
-            if (!self.adapt_submit) {
-                return false;
-            }
-            self.SyncAdaptiveTick();
-            const auto state = self.ReadFlushState();
-            // SYNC_SUBMIT_SPEC §2.5 rule I: a lazy fence in the open tick that carries operations
-            // still to land (a deferred QMD reduction, a counter report) is a synchronization
-            // point (DXVK): with the GPU about to go idle it is worth a submission, so it lands
-            // although no draw follows it and nobody blocks on it yet.
-            // SYNC_SUBMIT_SPEC §10 (MP §5.5 "pending GPU work"; DXVK ImplicitSynchronization): an
-            // idle back submits any non-empty open tick with fewer than two submissions in
-            // flight, whatever it holds (draws, dispatches, copies, fences) and whether anyone
-            // waits or not: some producers are visible to no waiter (49e1 hang). An empty tick
-            // never submits; two in flight wait for the finish thread's publish.
-            if (self.flush_heuristic.IdleDue(state.pending,
-                                             self.scheduler.RecordedSinceSubmit())) {
-                VideoCommon::V2::P5bStats::Add(
-                    VideoCommon::V2::P5bStats::Counter::SubmitsIdleNonDraw);
-                return true;
-            }
-            if (!self.adaptive_flush_fed) {
-                // Titles without native tiling keep the draw cadence of FlushWork: only the
-                // pending rule applies.
-                return state.pending < self.flush_heuristic.Params().busy_pending;
-            }
-            return self.flush_heuristic.SyncPointDue(state, AdaptNowUs());
-        },
-        this);
+    // F4-X2: deferred work and rule W. SYNC_SUBMIT_SPEC §11.6 item 3: rule I (§2.5 sync point,
+    // §10 any non-empty tick) is no longer weighed here; it lives only at the sleep point.
+    scheduler.ServeSplitIdleHook();
 }
 
 u64 RasterizerVulkan::AdaptNowUs() {
@@ -5095,7 +5065,6 @@ void RasterizerVulkan::AdaptiveFlushWork(u32 cost) {
     namespace P5b = VideoCommon::V2::P5bStats;
     using H = VideoCommon::V2::FlushHeuristic;
     const auto& params = flush_heuristic.Params();
-    adaptive_flush_fed = true;
     SyncAdaptiveTick();
     const auto read_state = [this] { return ReadFlushState(); };
     const auto count_reason = [](u8 reason) {

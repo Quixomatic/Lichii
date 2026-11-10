@@ -42,17 +42,15 @@ public:
         None,     ///< nothing to submit
         Deferred, ///< DeferFlush's work: submit
         Urgent,   ///< a thread blocks on the open tick: submit
-        Sync,     ///< DXVK's synchronization rule holds (FlushHeuristic::SyncPointDue): submit
-        Leave,    ///< open work nobody blocks on: the next pass boundary or chunk takes it
+        Leave,    ///< open work nobody blocks on: a pass boundary, a chunk or the sleep point
     };
-    /// F4-X2 (MASTER_PLAN §5.5; DXVK GpuFlushTracker, ImplicitSynchronization): the split's idle
-    /// hook (Scheduler::ServeSplitIdleHook) is a synchronization point. DeferFlush's work and an
-    /// urgent request submit; other open work only when `sync_due` (fewer than two submissions in
-    /// flight and enough work, or DXVK's pending threshold). Waking the hook (RequestIdleHook)
-    /// says nothing by itself (f1d05e9625: 54 idle-hook submits a frame).
+    /// F4-X2 / SYNC_SUBMIT_SPEC §11 (MASTER_PLAN §5.5): the split's idle hook
+    /// (Scheduler::ServeSplitIdleHook) serves DeferFlush's work and an urgent request (rule W).
+    /// Other open work is left: rule I exists only as invariant S at the back's sleep point
+    /// (FlushHeuristic::SleepSubmitDue), never at a wake or between entries. Waking the hook
+    /// (RequestIdleHook) says nothing by itself (f1d05e9625: 54 idle-hook submits a frame).
     [[nodiscard]] IdleAction AtIdleHook(bool flush_pending, bool lazy_fences, bool wanted,
-                                        u64 lazy_fence_tick, u64 open_tick,
-                                        bool sync_due) const noexcept {
+                                        u64 lazy_fence_tick, u64 open_tick) const noexcept {
         if (!IdleSubmits(flush_pending, lazy_fences, wanted, lazy_fence_tick, open_tick)) {
             return IdleAction::None;
         }
@@ -62,7 +60,7 @@ public:
         if (Urgent(open_tick)) {
             return IdleAction::Urgent;
         }
-        return sync_due ? IdleAction::Sync : IdleAction::Leave;
+        return IdleAction::Leave;
     }
 
     /// The idle hook's decision (the recording thread goes idle, or a waiter woke it). Submits

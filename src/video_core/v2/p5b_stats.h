@@ -125,9 +125,7 @@ enum class Counter : u32 {
     DmaReadsSemClear,     ///< ... nothing pending: memory
     HoistedCopies,        ///< SYNC Step 9: hazard-free buffer copies in the upload command buffer
     QueryWfiAfterPass,    ///< SYNC Step 9: query result copies deferred to the pass end
-    SubmitsIdleBatchEnd,  ///< SYNC §7.3: rule I submits from the idle hook at a batch end
-    SubmitsIdleNonDraw,   ///< ... rule I for guest-visible work without draws
-    FencingRequests,      ///< ... rule W requests from the blocked fencing thread
+    FencingRequests,      ///< SYNC §7.3: rule W requests from the blocked fencing thread
     OpenTickAgeMaxUs,     ///< ... the oldest open tick (with a lazy fence) at its submit (max)
     ResumePendingPasses,  ///< SYNC §8.2: suspended-channel passes (one per ResumePending call)
     ResumeWithoutProgress,///< ... a poll passed but the channel didn't resume (expected 0)

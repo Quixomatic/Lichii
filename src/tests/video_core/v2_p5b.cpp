@@ -920,38 +920,13 @@ TEST_CASE("V2 P5b flush decisions at pass boundaries", "[video_core][v2_p5b]") {
         REQUIRE(boundary.action == FlushAction::Flush);
         REQUIRE(boundary.reason == FlushHeuristic::ReasonStrong);
     }
-    SECTION("F4-X2: the idle hook's synchronization rule (DXVK pending < 2, minimum work)") {
-        const FlushState idle{.pending = 0, .back_behind = false};
-        const FlushState one{.pending = 1, .back_behind = false};
-        const FlushState two{.pending = 2, .back_behind = false};
+    SECTION("SYNC §11.2: the sleep point's rule S (any open work; two in flight with a wake)") {
         FlushHeuristic heuristic{params};
-        heuristic.NoteSubmit(1000);
-        // Nothing recorded: never.
-        REQUIRE_FALSE(heuristic.SyncPointDue(idle, 1'000'000));
-        for (u32 i = 0; i < params.pass_min_draws - 1; ++i) {
-            heuristic.Advance(1, one, 1000);
-        }
-        // Too few draws, however long ago and however idle.
-        REQUIRE_FALSE(heuristic.SyncPointDue(idle, 1000 + 10 * params.pass_interval_us));
-        heuristic.Advance(1, one, 1000);
-        // Enough draws but too soon after the last submission.
-        REQUIRE_FALSE(heuristic.SyncPointDue(one, 1000 + params.pass_interval_us / 2));
-        // The GPU about to go idle (fewer than two in flight), enough work: due.
-        REQUIRE(heuristic.SyncPointDue(one, 1000 + params.pass_interval_us));
-        REQUIRE(heuristic.SyncPointDue(idle, 1000 + params.pass_interval_us));
-        // Busy (two in flight): DXVK's threshold, min(20, pending * 3) = 6 chunks.
-        REQUIRE_FALSE(heuristic.SyncPointDue(two, 1000 + params.pass_interval_us));
-        for (u32 i = heuristic.Draws(); i < 6 * params.chunk_draws; ++i) {
-            heuristic.Advance(1, one, 1000);
-        }
-        REQUIRE(heuristic.SyncPointDue(two, 1001));
-        // min_draws alone is enough while the GPU is about to go idle.
-        FlushHeuristic many{params};
-        many.NoteSubmit(1000);
-        for (u32 i = 0; i < params.min_draws; ++i) {
-            many.Advance(1, one, 1000);
-        }
-        REQUIRE(many.SyncPointDue(one, 1001));
+        REQUIRE_FALSE(heuristic.SleepSubmitDue(0, false, true)); // an empty tick never
+        REQUIRE(heuristic.SleepSubmitDue(0, true, true));
+        REQUIRE(heuristic.SleepSubmitDue(1, true, true));
+        REQUIRE_FALSE(heuristic.SleepSubmitDue(2, true, true)); // the finish thread wakes it
+        REQUIRE(heuristic.SleepSubmitDue(2, true, false));      // no wake would come
     }
 }
 
@@ -966,47 +941,38 @@ TEST_CASE("V2 P5b the idle hook submits nothing while the GPU is busy and nobody
     constexpr u64 open = 10;
     SubmitRequests requests;
     u32 submits = 0;
-    const auto idle_hook = [&](bool flush_pending, bool wanted, u64 lazy_tick, bool sync_due) {
-        const auto action =
-            requests.AtIdleHook(flush_pending, true, wanted, lazy_tick, open, sync_due);
+    const auto idle_hook = [&](bool flush_pending, bool wanted, u64 lazy_tick) {
+        const auto action = requests.AtIdleHook(flush_pending, true, wanted, lazy_tick, open);
         if (action != Action::None && action != Action::Leave) {
             ++submits;
         }
         return action;
     };
     // Nothing open: nothing to do.
-    REQUIRE(idle_hook(false, false, 0, true) == Action::None);
-    // The heuristic with two submissions in flight and a few draws: the rule says no.
+    REQUIRE(idle_hook(false, false, 0) == Action::None);
     FlushParams params;
     params.pass_boundaries = true;
     FlushHeuristic heuristic{params};
-    const FlushState busy{.pending = 2, .back_behind = false};
-    heuristic.NoteSubmit(1000);
-    for (u32 i = 0; i < 40; ++i) {
-        heuristic.Advance(1, busy, 1000);
-    }
-    REQUIRE_FALSE(heuristic.SyncPointDue(busy, 1'000'000));
     // Wanted work (list copies, list ends) and an open lazy fence, woken many times.
     for (u32 i = 0; i < 100; ++i) {
-        REQUIRE(idle_hook(false, true, open, heuristic.SyncPointDue(busy, 1'000'000)) ==
-                Action::Leave);
+        REQUIRE(idle_hook(false, true, open) == Action::Leave);
     }
     // The lazy fence's window ran out (not urgent): still left for the next boundary.
     requests.Request(open, false);
     REQUIRE(requests.Open(open));
     REQUIRE_FALSE(requests.Urgent(open));
-    REQUIRE(idle_hook(false, true, open, false) == Action::Leave);
+    REQUIRE(idle_hook(false, true, open) == Action::Leave);
     REQUIRE(submits == 0);
-    // One in flight (the GPU is about to go idle) and enough work: DXVK's rule submits.
-    const FlushState one{.pending = 1, .back_behind = false};
-    REQUIRE(heuristic.SyncPointDue(one, 1000 + params.pass_interval_us));
-    REQUIRE(idle_hook(false, true, open, true) == Action::Sync);
+    // SYNC §11: the open work goes out at the back's sleep point once fewer than two are in
+    // flight (rule S), never from a wake of the hook.
+    REQUIRE_FALSE(heuristic.SleepSubmitDue(2, true, true));
+    REQUIRE(heuristic.SleepSubmitDue(1, true, true));
     // A thread blocking on the open tick, or DeferFlush's work: at once, GPU busy or not.
     SubmitRequests blocked;
     blocked.Request(open);
     REQUIRE(blocked.Urgent(open));
-    REQUIRE(blocked.AtIdleHook(false, true, false, 0, open, false) == Action::Urgent);
-    REQUIRE(requests.AtIdleHook(true, true, false, 0, open, false) == Action::Deferred);
+    REQUIRE(blocked.AtIdleHook(false, true, false, 0, open) == Action::Urgent);
+    REQUIRE(requests.AtIdleHook(true, true, false, 0, open) == Action::Deferred);
     // Submitted ticks are no longer urgent.
     REQUIRE_FALSE(blocked.Urgent(open + 1));
 }
@@ -1032,14 +998,12 @@ TEST_CASE("SYNC 5b06 boot hang: every channel suspended, the back idle, a lazy f
     bool submitted = false;
     const bool back_idle = true;
     const auto idle_hook = [&](u32 pending) {
-        // RasterizerVulkan's rule I: an open lazy fence is worth a submission with the GPU about
-        // to go idle; the heuristic alone says no (draws == 0).
-        const FlushState state{.pending = pending, .back_behind = false};
-        const bool lazy_fence_open = true;
-        const bool due = (pending < params.busy_pending && lazy_fence_open) ||
-                         heuristic.SyncPointDue(state, 1'000'000);
-        const auto action = requests.AtIdleHook(false, true, false, open, open, due);
+        // The idle hook serves rule W; then the back's sleep point (rule S): an open lazy fence
+        // makes the open tick non-empty, submitted with fewer than two in flight.
+        const auto action = requests.AtIdleHook(false, true, false, open, open);
         submitted |= action != Action::None && action != Action::Leave;
+        const bool lazy_fence_open = true;
+        submitted |= heuristic.SleepSubmitDue(pending, lazy_fence_open, true);
     };
     // Two submissions in flight when the back went idle: left for now.
     idle_hook(2);
@@ -1053,13 +1017,11 @@ TEST_CASE("SYNC 5b06 boot hang: every channel suspended, the back idle, a lazy f
     // The lazy fence pops, then the fences behind it: the reductions land.
     word += 0x13;
     REQUIRE(word == 0x61a);
-    // Rule I alone (no request) also submits once fewer than two are in flight.
+    // Rule S alone (no request) also submits once fewer than two are in flight.
     SubmitRequests fresh;
     submitted = false;
-    const FlushState one{.pending = 1, .back_behind = false};
-    REQUIRE_FALSE(heuristic.SyncPointDue(one, 1'000'000));
-    const auto action = fresh.AtIdleHook(false, true, false, open, open, true);
-    REQUIRE(action == Action::Sync);
+    REQUIRE(fresh.AtIdleHook(false, true, false, open, open) == Action::Leave);
+    REQUIRE(heuristic.SleepSubmitDue(1, true, true));
 }
 
 TEST_CASE("SYNC §7.3: open work without draws is submitted however the back is fed",
@@ -1069,25 +1031,25 @@ TEST_CASE("SYNC §7.3: open work without draws is submitted however the back is 
     FlushParams params;
     params.pass_boundaries = true;
     constexpr u64 open = 50;
-    SECTION("(a) a lazy fence with an operation, 0 draws, a record every 5 us: the batch end "
-            "runs rule I and the tick is submitted") {
-        // GpuSplit::BackLoop (fix 1) runs the idle hook at every batch end with the ring empty;
-        // with records every 5 us the timed hook (idle_hook_ns of emptiness) never would.
+    SECTION("(a) a lazy fence with an operation, 0 draws, a record every 5 us: each record counts "
+            "toward rule C, and a front stall reaches the sleep point (S)") {
+        // §11.6 item 3: no idle hook at batch ends any more. While the front keeps publishing,
+        // the fences and list ends it carries advance the chunk count; once it stops, the back
+        // sleeps only after submitting the non-empty open tick.
         FlushHeuristic heuristic{params};
         heuristic.NoteSubmit(1000);
         SubmitRequests requests;
+        const FlushState state{.pending = 0, .back_behind = false};
         bool landed = false;
-        for (int batch = 0; batch < 100 && !landed; ++batch) {
-            const bool ring_empty_at_batch_end = true; // the back caught up before the next one
-            if (ring_empty_at_batch_end) {
-                const FlushState state{.pending = 0, .back_behind = false};
-                const bool due = heuristic.OpenWorkDue(state.pending, true, false) ||
-                                 heuristic.SyncPointDue(state, 2000);
-                const auto action = requests.AtIdleHook(false, true, false, open, open, due);
-                landed = action == Action::Sync; // submitted: the fence pops, the op lands
-            }
+        u32 records = 0;
+        for (; records < 10'000 && !landed; ++records) {
+            REQUIRE(requests.AtIdleHook(false, true, false, open, open) == Action::Leave);
+            landed = heuristic.Advance(1, state, 1000 + 5 * records).action == FlushAction::Flush;
         }
         REQUIRE(landed);
+        REQUIRE(records <= params.max_draws);
+        // The front stalls after a single fence: the sleep point submits it.
+        REQUIRE(heuristic.SleepSubmitDue(state.pending, true, true));
     }
     SECTION("(b) a pure compute stream that never empties the ring: rule C submits within the "
             "chunk bound") {
@@ -1126,7 +1088,7 @@ TEST_CASE("SYNC §7.3: open work without draws is submitted however the back is 
             }
         }
         REQUIRE(requested);
-        REQUIRE(requests.AtIdleHook(false, true, false, open, open, false) == Action::Urgent);
+        REQUIRE(requests.AtIdleHook(false, true, false, open, open) == Action::Urgent);
     }
     SECTION("(d) nobody waits, two in flight, draws only: no extra submit") {
         FlushHeuristic heuristic{params};
@@ -1136,21 +1098,17 @@ TEST_CASE("SYNC §7.3: open work without draws is submitted however the back is 
             REQUIRE(heuristic.Advance(1, two, 1000).action != FlushAction::Flush);
         }
         SubmitRequests requests;
-        const bool due = heuristic.OpenWorkDue(two.pending, true, true) ||
-                         heuristic.SyncPointDue(two, 1'000'000);
-        REQUIRE_FALSE(due);
-        REQUIRE(requests.AtIdleHook(false, true, false, open, open, due) == Action::Leave);
+        REQUIRE_FALSE(heuristic.SleepSubmitDue(two.pending, true, true));
+        REQUIRE(requests.AtIdleHook(false, true, false, open, open) == Action::Leave);
     }
 }
 
-TEST_CASE("SYNC §9 idle back: operations with no fence get one, rule I submits it",
+TEST_CASE("SYNC §9 idle back: operations with no fence get one, rule S submits it",
           "[video_core][v2_p5b]") {
-    // Model of RasterizerVulkan::ServeSplitIdleHook's §9.3 step and the fence manager: a
+    // Model of RasterizerVulkan::ServeIdleSleep's step 1 (FenceUnfenced) and the fence manager: a
     // SyncOperation (or a query-cache uncommitted flush) waits for the next SignalFence; on an
-    // idle back none comes unless the idle hook makes it. The fence lands once its tick is
-    // submitted; rule I submits a lazy fence in the open tick with the GPU about to idle.
-    using VideoCommon::V2::SubmitRequests;
-    using Action = SubmitRequests::IdleAction;
+    // idle back none comes unless the sleep point makes it. The fence lands once its tick is
+    // submitted; rule S submits the lazy fence's open tick with the GPU about to idle.
     FlushParams params;
     params.pass_boundaries = true;
     FlushHeuristic heuristic{params};
@@ -1170,11 +1128,8 @@ TEST_CASE("SYNC §9 idle back: operations with no fence get one, rule I submits 
             f.lazy_tick = open;
             ++f.fences;
         }
-        SubmitRequests requests;
         const bool lazy_open = f.lazy_tick >= open;
-        const bool due = heuristic.OpenWorkDue(pending, lazy_open, false);
-        const auto action = requests.AtIdleHook(false, true, false, f.lazy_tick, open, due);
-        if (action == Action::Sync) {
+        if (heuristic.SleepSubmitDue(pending, lazy_open, true)) {
             ++submits;
         }
     };
@@ -1209,34 +1164,30 @@ TEST_CASE("SYNC §9 idle back: operations with no fence get one, rule I submits 
 }
 
 
-TEST_CASE("SYNC §10: an idle back submits any non-empty open tick with fewer than two in flight",
+TEST_CASE("SYNC §10/§11: a sleeping back submits any non-empty open tick with fewer than two in "
+          "flight",
           "[video_core][v2_p5b]") {
-    using VideoCommon::V2::SubmitRequests;
-    using Action = SubmitRequests::IdleAction;
     FlushParams params;
     params.pass_boundaries = true;
     FlushHeuristic heuristic{params};
-    constexpr u64 open = 11026; // 6 ticks past the newest lazy fence (11020)
-    // ServeSplitIdleHook: `wanted` includes RecordedSinceSubmit; sync_due is IdleDue.
-    const auto idle_hook = [&](bool recorded, u32 pending) {
-        SubmitRequests requests;
-        return requests.AtIdleHook(false, true, recorded, 11020, open,
-                                   heuristic.IdleDue(pending, recorded));
+    // The back's sleep point (ServeIdleSleep): RecordedSinceSubmit is the open tick's work.
+    const auto sleep_point = [&](bool recorded, u32 pending) {
+        return heuristic.SleepSubmitDue(pending, recorded, true);
     };
     SECTION("(a) a dispatch only, no draws, no fence, no waiter, back idle: submitted") {
-        REQUIRE(idle_hook(true, 0) == Action::Sync);
-        REQUIRE(idle_hook(true, 1) == Action::Sync);
+        REQUIRE(sleep_point(true, 0));
+        REQUIRE(sleep_point(true, 1));
     }
     SECTION("(b) an empty open tick on an idle back: never submitted (storm guard)") {
-        for (int hook = 0; hook < 1000; ++hook) {
-            REQUIRE(idle_hook(false, 0) == Action::None);
+        for (int sleep = 0; sleep < 1000; ++sleep) {
+            REQUIRE_FALSE(sleep_point(false, 0));
         }
     }
     SECTION("(c) two in flight with recorded work: waits for a finish publish, then submits") {
-        REQUIRE(idle_hook(true, 2) == Action::Leave);
-        // The finish thread publishes a completion (one in flight): RequestIdleHook (the back is
-        // idle, the open tick non-empty), and the hook submits.
-        REQUIRE(idle_hook(true, 1) == Action::Sync);
+        REQUIRE_FALSE(sleep_point(true, 2));
+        // The finish thread publishes a completion (one in flight) and wakes the sleeping back
+        // (open tick non-empty); its next sleep point submits.
+        REQUIRE(sleep_point(true, 1));
     }
 }
 
@@ -1365,6 +1316,38 @@ TEST_CASE("SYNC §11.2 invariant S: no completion wake is lost and no open tick 
             REQUIRE_FALSE(m.Hook(false));
         }
         REQUIRE(m.submits.load() == 1);
+    }
+    SECTION("§11.6 item 3, steady state: the front publishes every 5 us with draws: no submit "
+            "but B/C (3fd8's 55/f guard)") {
+        // Model of BackLoop: a batch end runs no hook; the sleep point is reached only when the
+        // ring stays empty past the spin window. One 16.6 ms frame, a draw per publish, a pass
+        // boundary every 150 draws, one submission in flight.
+        FlushParams params;
+        params.pass_boundaries = true;
+        FlushHeuristic heuristic{params};
+        heuristic.NoteSubmit(1);
+        constexpr u64 spin_window_us = 20;
+        constexpr u64 gap_us = 5;
+        const FlushState one{.pending = 1, .back_behind = false};
+        u32 rule_bc = 0;
+        u32 rule_s = 0;
+        u32 draws = 0;
+        for (u64 now = 1; now < 16'600; now += gap_us) {
+            ++draws;
+            if (draws % 150 == 0 && heuristic.AtPassBoundary(FlushHint::Weak, one, now).action ==
+                                         FlushAction::Flush) {
+                ++rule_bc;
+            }
+            if (heuristic.Advance(1, one, now).action == FlushAction::Flush) {
+                ++rule_bc;
+            }
+            if (gap_us > spin_window_us && heuristic.SleepSubmitDue(one.pending, true, true)) {
+                ++rule_s; // never: the next publish comes inside the spin window
+            }
+        }
+        REQUIRE(rule_s == 0);
+        REQUIRE(rule_bc >= 1);
+        REQUIRE(rule_bc <= 40);
     }
     SECTION("no finish thread (no completion wake): a non-empty open tick never sleeps") {
         SleepModel m;
@@ -1507,36 +1490,30 @@ TEST_CASE("SYNC step 9: a buffer copy goes to the upload stream only when hazard
     REQUIRE_FALSE(hazard_free(false, false, false)); // v1: in order as before
 }
 
-TEST_CASE("SYNC step 7: the back submits for rules B, C, I and W only", "[video_core][v2_p5b]") {
+TEST_CASE("SYNC step 7 / §11: the back submits for rules B, C, W and S only",
+          "[video_core][v2_p5b]") {
     using VideoCommon::V2::SubmitRequests;
     using Action = SubmitRequests::IdleAction;
     FlushParams params;
     params.pass_boundaries = true;
     constexpr u64 open = 20;
-    // The idle hook's rule I input (RasterizerVulkan::ServeSplitIdleHook): DXVK's sync point, or
-    // a lazy fence in the open tick carrying captures with the GPU about to go idle.
-    const auto rule_i = [&](const FlushHeuristic& heuristic, u32 pending, bool captures_open) {
-        const FlushState state{.pending = pending, .back_behind = false};
-        return (pending < params.busy_pending && captures_open) ||
-               heuristic.SyncPointDue(state, 1'000'000);
-    };
-    SECTION("idle back (a): a lazy fence nobody waits on is submitted by rule I") {
+    SECTION("idle back (a): a lazy fence nobody waits on is submitted at the sleep point (S)") {
         FlushHeuristic heuristic{params};
         heuristic.NoteSubmit(1000);
         SubmitRequests requests;
-        // No draw after it (draws == 0), one submission in flight, captures in the open tick.
-        REQUIRE(requests.AtIdleHook(false, true, false, open, open, rule_i(heuristic, 1, true)) ==
-                Action::Sync);
-        // Without captures and without work worth a submission: left (nothing waits on it).
-        REQUIRE(requests.AtIdleHook(false, true, false, open, open, rule_i(heuristic, 1, false)) ==
-                Action::Leave);
+        // No draw after it (draws == 0), one submission in flight: the idle hook leaves it, the
+        // sleep point submits it (the lazy fence makes the open tick non-empty).
+        REQUIRE(requests.AtIdleHook(false, true, false, open, open) == Action::Leave);
+        REQUIRE(heuristic.SleepSubmitDue(1, true, true));
+        // Nothing in the open tick: the back sleeps without a submit.
+        REQUIRE_FALSE(heuristic.SleepSubmitDue(1, false, true));
     }
     SECTION("idle back (b): a host waiter's request is served at the next entry boundary, "
             "however many submissions are in flight") {
         SubmitRequests requests;
         requests.Request(open, true);
         // No "two in flight → postpone" exception: the hook between entries submits it.
-        REQUIRE(requests.AtIdleHook(false, true, false, open, open, false) == Action::Urgent);
+        REQUIRE(requests.AtIdleHook(false, true, false, open, open) == Action::Urgent);
         // Mid-pass a chunk doesn't take it (rule C has no request branch).
         FlushHeuristic heuristic{params};
         heuristic.NoteSubmit(1000);
@@ -1557,13 +1534,12 @@ TEST_CASE("SYNC step 7: the back submits for rules B, C, I and W only", "[video_
             heuristic.Advance(1, one, 1000);
         }
         SubmitRequests requests;
-        // Two in flight: DXVK's threshold (6 chunks) is not reached: left.
-        REQUIRE(requests.AtIdleHook(false, true, false, open, open, rule_i(heuristic, 2, false)) ==
-                Action::Leave);
-        // The finish thread published a completion (one in flight): the GPU progress wake runs
-        // the idle hook again, and rule I submits the work while one is still in flight.
-        REQUIRE(requests.AtIdleHook(false, true, false, open, open, rule_i(heuristic, 1, false)) ==
-                Action::Sync);
+        // Two in flight: the idle hook leaves it and the back may sleep (a wake will come).
+        REQUIRE(requests.AtIdleHook(false, true, false, open, open) == Action::Leave);
+        REQUIRE_FALSE(heuristic.SleepSubmitDue(2, true, true));
+        // The finish thread published a completion (one in flight) and woke the back: its sleep
+        // point submits the work while one is still in flight.
+        REQUIRE(heuristic.SleepSubmitDue(1, true, true));
     }
     SECTION("rule B at pass boundaries, rule C at chunks, nothing else") {
         FlushHeuristic heuristic{params};
@@ -1623,7 +1599,7 @@ TEST_CASE("V2 P5b a landing wait asks for its fence's tick and an idle back subm
             }
             // The idle hook: the lazy fence and wanted work are open, the GPU busy.
             const u64 open = current_tick.load();
-            switch (requests.AtIdleHook(false, true, true, 7, open, false)) {
+            switch (requests.AtIdleHook(false, true, true, 7, open)) {
             case Action::Urgent:
                 current_tick.fetch_add(1);
                 submits.fetch_add(1);
@@ -1687,7 +1663,7 @@ TEST_CASE("V2 P5b a landing wait asks for its fence's tick and an idle back subm
     SubmitRequests stubbed;
     REQUIRE_FALSE(stubbed.Urgent(11));
     stubbed.Request(11, true);
-    REQUIRE(stubbed.AtIdleHook(false, true, false, 11, 11, false) == Action::Urgent);
+    REQUIRE(stubbed.AtIdleHook(false, true, false, 11, 11) == Action::Urgent);
 
     LandingFence::request_hook = nullptr;
     LandingFence::request_argument = nullptr;
