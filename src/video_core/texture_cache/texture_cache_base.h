@@ -921,6 +921,9 @@ private:
         Image image;
     };
     std::deque<GpuSentencedImage> gpu_sentenced_images;
+    /// F4-09: {tick, bytes} of deleted images the finish thread destroys (Runtime::RetireImage);
+    /// only their memory is counted here.
+    std::deque<std::pair<u64, u64>> gpu_retired_images;
     u64 gpu_sentenced_bytes{};
 
     /// Bytes of images per device memory block, for the collector (refreshed every 60 frames).

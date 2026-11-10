@@ -1374,6 +1374,16 @@ void TextureCacheRuntime::NoteImageUse(const Image& image) {
     scheduler.NoteImageRead(image.Handle(), image.gpu_addr, image.gpu_addr + image.guest_size_bytes);
 }
 
+bool TextureCacheRuntime::RetireImage(u64 tick, Image& image) {
+    if (!scheduler.FinishThreadPublishesTick()) {
+        return false;
+    }
+    image.DetachOwnerState();
+    auto retired = std::make_shared<Image>(std::move(image));
+    scheduler.RetireAfter(tick, [retired = std::move(retired)]() mutable { retired.reset(); });
+    return true;
+}
+
 u64 TextureCacheRuntime::ReadHazardSerial() const noexcept {
     return scheduler.ReadHazardSerial();
 }
@@ -3273,6 +3283,22 @@ Image::~Image() {
             runtime->EraseResolveShadow(*scaled_image);
         }
     }
+}
+
+void Image::DetachOwnerState() {
+    if (ENABLE_MSAA_RESOLVE_CONSUME && runtime != nullptr) {
+        if (original_image) {
+            runtime->EraseResolveShadow(*original_image);
+        }
+        if (scaled_image) {
+            runtime->EraseResolveShadow(*scaled_image);
+        }
+    }
+    runtime = nullptr;
+    scale_framebuffer.reset();
+    normal_framebuffer.reset();
+    scale_view.reset();
+    normal_view.reset();
 }
 
 void Image::AllocateComputeUnswizzleBuffer(u32 max_slices) {

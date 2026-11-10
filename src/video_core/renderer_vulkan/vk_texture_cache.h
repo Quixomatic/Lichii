@@ -319,6 +319,10 @@ public:
     /// EDEN_NX2_V2_DYNRENDER: a draw/dispatch uses `image` (pending attachment writes it overlaps
     /// need a barrier first).
     void NoteImageUse(const Image& image);
+    /// F4-09 (MASTER_PLAN §5.5 S6 retires lifetimes): with the finish thread, a deleted image is
+    /// destroyed there once the GPU passed `tick` (moved out of `image`). False: the caller keeps
+    /// it as before.
+    bool RetireImage(u64 tick, Image& image);
     /// F2-09: what NoteImageUse could still find (0: nothing).
     [[nodiscard]] u64 ReadHazardSerial() const noexcept;
 
@@ -552,6 +556,11 @@ public:
 
     /// P5b: the open submission used this image (track id for hoisting decisions).
     void NoteV2Use() noexcept;
+
+    /// F4-09, recording thread: drops what only the caches' owner may touch (resolve shadows,
+    /// the scale/normal views and their heap slots, framebuffers), so the rest (device memory,
+    /// images, storage views) can be destroyed on the finish thread.
+    void DetachOwnerState();
 
     /// Marks the image initialized; returns whether it already was (first upload discards).
     bool TakeInitialized() noexcept {

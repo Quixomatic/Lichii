@@ -452,6 +452,10 @@ void TextureCache<P>::TickFrame() {
             gpu_sentenced_bytes -= gpu_sentenced_images.front().bytes;
             gpu_sentenced_images.pop_front();
         }
+        while (!gpu_retired_images.empty() && runtime.IsFree(gpu_retired_images.front().first)) {
+            gpu_sentenced_bytes -= gpu_retired_images.front().second;
+            gpu_retired_images.pop_front();
+        }
     }
     // If we can obtain the memory info, use it instead of the estimate.
     if (runtime.CanReportMemoryUsage()) {
@@ -4422,8 +4426,18 @@ void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
         LOG_INFO(Render_Vulkan, "Retained image for queued download: id={}", image_id.Value());
     } else if (!immediate_delete) {
         if constexpr (requires { runtime.CurrentTick(); }) {
-            gpu_sentenced_images.push_back(
-                {runtime.CurrentTick(), freed_bytes, std::move(slot_images[image_id])});
+            const u64 tick = runtime.CurrentTick();
+            bool retired = false;
+            if constexpr (requires { runtime.RetireImage(tick, slot_images[image_id]); }) {
+                // F4-09 (§5.5 S6): destroyed by the finish thread once the GPU is past it.
+                retired = runtime.RetireImage(tick, slot_images[image_id]);
+            }
+            if (retired) {
+                gpu_retired_images.emplace_back(tick, freed_bytes);
+            } else {
+                gpu_sentenced_images.push_back(
+                    {tick, freed_bytes, std::move(slot_images[image_id])});
+            }
             gpu_sentenced_bytes += freed_bytes;
         } else {
             sentenced_images.Push(std::move(slot_images[image_id]));
