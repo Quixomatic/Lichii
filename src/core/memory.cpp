@@ -38,6 +38,7 @@
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/host1x/host1x.h"
 #include "video_core/rasterizer_download_area.h"
+#include "video_core/v2/cbuf_watch.h"
 #include "video_core/v2/v2_switches.h"
 #include "video_core/v2/versions.h"
 
@@ -948,6 +949,13 @@ struct Memory::Impl {
         gpu_device_memory->ApplyOpOnPointer(p, scratch_buffers[core], [&](DAddr address) {
             // EDEN_NX2_V2_DRAWCACHE: every trapped write moves its page's version.
             VideoCommon::V2::Versions::HookCpuWrite(address, size);
+            if (VideoCommon::V2::On(VideoCommon::V2::Switch::CbufRing)) [[unlikely]] {
+                // F2-03: the store disarms its watched pages before it lands; the disarming
+                // thread gives the watch's count back.
+                VideoCommon::V2::CbufWatch::Get().OnCpuWrite(address, size, [this](DAddr page) {
+                    gpu_device_memory->UpdatePagesCachedCount(page, YUZU_PAGESIZE, -1);
+                });
+            }
             auto& current_area = rasterizer_write_areas[core];
             PAddr subaddress = address >> YUZU_PAGEBITS;
             // Performance note:
