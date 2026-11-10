@@ -63,8 +63,8 @@ public:
     /// must take the graphics path (nothing queued). F4-04: `producer` is the newest graphics
     /// tick that used the buffers read (UINT64_MAX: unknown, treated as the open one). Already on
     /// the graphics queue: the job goes to the transfer queue now, waiting on it, without
-    /// flushing. Still open: it rides the open submission (F4-02 lazy mode; `ride_tick` gets that
-    /// tick, which a waiter must ask for), else the open submission is flushed as before.
+    /// flushing. Still open: the job rides the open submission, which is flushed at once.
+    /// `ride_tick` (if given) is set to 0: no job is left riding an unsubmitted tick.
     Job Submit(u64 producer = (std::numeric_limits<u64>::max)(), u64* ride_tick = nullptr);
 
     /// Any thread: waits for the job (and counts its latency). `ride_tick`: the open submission
@@ -87,6 +87,7 @@ private:
         vk::CommandPool pool;
         vk::Semaphore timeline;
         VideoCommon::V2::JobTimeline values;
+        u64 last_post_tick = 0; ///< tick the newest post job rides (queued behind it)
         struct InFlight {
             u64 value;
             VkCommandBuffer cmdbuf;

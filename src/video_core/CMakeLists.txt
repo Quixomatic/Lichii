@@ -158,6 +158,7 @@ add_library(video_core STATIC
     v2/frame_pacer.h
     v2/gpu_unswizzle.h
     v2/qmd_front.h
+    v2/submit_requests.h
     v2/tick_ring.h
     v2/timeline_join.h
     v2/pipeline_lookup.h

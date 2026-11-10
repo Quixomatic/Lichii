@@ -230,13 +230,14 @@ bool Scheduler::LazyFencesHere() const {
 }
 
 void Scheduler::ServeIdleHook() {
-    FlushDeferred();
     if (!lazy_fences) {
+        FlushDeferred();
         return;
     }
     // F4-02: the back is going idle (nothing else will submit) or a waiter asked. Replaces
     // DeferFlush's own submit for lazy fences and command list ends.
-    if (submit_wanted || (lazy_outstanding_tick != 0 && !IsSubmitted(lazy_outstanding_tick))) {
+    if (submit_requests.IdleSubmits(flush_pending, lazy_fences, submit_wanted,
+                                    lazy_outstanding_tick, CurrentTick())) {
         VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::FlushLazy);
         Flush();
     }
@@ -269,8 +270,7 @@ void Scheduler::FlushDeferred() {
         Flush();
         return;
     }
-    const u64 lazy = lazy_flush_tick.load(std::memory_order_relaxed);
-    if (lazy != 0 && !IsSubmitted(lazy)) [[unlikely]] {
+    if (submit_requests.Open(CurrentTick())) [[unlikely]] {
         VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::FlushLazy);
         Flush();
     }

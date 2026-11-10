@@ -30,6 +30,7 @@
 #include "video_core/renderer_vulkan/fragment_barrier_state.h"
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
 #include "video_core/v2/barrier_tracker.h"
+#include "video_core/v2/submit_requests.h"
 #include "video_core/v2/timeline_join.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
@@ -78,10 +79,7 @@ public:
     /// Any thread: a lazy fence (early downloads) waited long enough for `tick` to be submitted;
     /// the back submits it at its next idle hook. Follow with WaitSubmitted.
     void RequestLazyFlush(u64 tick) {
-        u64 current = lazy_flush_tick.load(std::memory_order_relaxed);
-        while (current < tick &&
-               !lazy_flush_tick.compare_exchange_weak(current, tick, std::memory_order_relaxed)) {
-        }
+        submit_requests.Request(tick);
     }
 
     /// F4-02 (EDEN_NX2_V2_ADAPTSUBMIT, MASTER_PLAN §6 classes A/B, Ryujinx SyncManager non-strict
@@ -112,8 +110,7 @@ public:
     void EnsureSubmitted(u64 tick);
     /// Recording thread, F4-02: a thread asked for a tick that is still open.
     [[nodiscard]] bool SubmitRequested() const noexcept {
-        const u64 lazy = lazy_flush_tick.load(std::memory_order_relaxed);
-        return lazy != 0 && !IsSubmitted(lazy);
+        return submit_requests.Open(master_semaphore->CurrentTick());
     }
     /// Threads other than the split's back: waits until tick is submitted, asking the back to
     /// submit deferred work (logged every 2 s while it waits). False only when the back thread
@@ -537,7 +534,7 @@ public:
 private:
     std::chrono::steady_clock::time_point last_flush{};
     bool flush_pending{};
-    std::atomic<u64> lazy_flush_tick{}; ///< RequestLazyFlush
+    VideoCommon::V2::SubmitRequests submit_requests; ///< RequestLazyFlush
     bool lazy_fences{};                 ///< F4-02: SetLazyFences
     bool finish_publishes_tick{};       ///< F4-12: FinishThreadPublishesTick
     bool pass_transform_feedback{};     ///< F4-07: NoteTransformFeedback

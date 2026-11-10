@@ -111,6 +111,18 @@ public:
     /// resource graphics work after it may overwrite). Waits on one semaphore keep the newest.
     /// False when every slot holds another semaphore: the caller takes the in-order path.
     [[nodiscard]] bool AddGraphicsWait(u64 semaphore, u64 value) noexcept {
+        // A post job of the open submission waits for that submission: the open submission
+        // waiting for it would be a cycle on the GPU (it never completes). Its wait goes to the
+        // next submission instead.
+        for (u32 i = 0; i < num_post_jobs; ++i) {
+            if (post_jobs[i].semaphore == semaphore && post_jobs[i].value <= value) {
+                if (num_carried == carried.size()) {
+                    return false;
+                }
+                carried[num_carried++] = {semaphore, value};
+                return true;
+            }
+        }
         for (u32 i = 0; i < num_waits; ++i) {
             if (waits[i].semaphore == semaphore) {
                 waits[i].value = (std::max)(waits[i].value, value);
@@ -148,7 +160,11 @@ public:
         has_transfer = false;
         has_images = false;
         transfer_wait = 0;
-        num_waits = 0;
+        num_waits = num_carried;
+        for (u32 i = 0; i < num_carried; ++i) {
+            waits[i] = carried[i];
+        }
+        num_carried = 0;
         blocked = false;
         return batch;
     }
@@ -163,22 +179,25 @@ private:
     std::array<Wait, MaxExtraWaits> waits{};
     u32 num_post_jobs = 0;
     std::array<PostJob, MaxPostJobs> post_jobs{};
+    u32 num_carried = 0; ///< waits on this batch's post jobs, for the next batch
+    std::array<Wait, MaxPostJobs> carried{};
 };
 
 /// F4-04 (MASTER_PLAN §6: "a submit is forced only if the covering sync is not yet submitted",
 /// Ryujinx): how a readback job reaches the transfer queue.
 enum class ReadbackRoute : u8 {
     Direct,   ///< its producer is already on the graphics queue: submit now, waiting on it
-    Ride,     ///< the producer is still open: a post job of the open submission, no submit
     FlushNow, ///< as before: a post job, and the open submission goes out at once
 };
 
 /// `producer`: newest graphics tick that used the job's sources (0: none). `open_tick`: the
-/// recording tick. `queued_tick`: newest tick on the graphics queue. `lazy`: submissions follow
-/// requests (F4-02), so a reader waiting on a riding job asks for it. Image copies carry a
-/// release recorded in the open submission and are waited for at once: always FlushNow.
-[[nodiscard]] constexpr ReadbackRoute ChooseReadbackRoute(bool images, bool lazy, u64 producer,
-                                                          u64 open_tick, u64 queued_tick,
+/// recording tick. `queued_tick`: newest tick on the graphics queue. Image copies carry a release
+/// recorded in the open submission and are waited for at once: always FlushNow. A producer in
+/// the open tick always flushes it: a job riding the open submission unflushed would run after
+/// all of it, so later writes recorded into the same tick could reach the buffer before the job
+/// reads it, and the next graphics wait would land on the job's own tick (the 3d9126d161 hang).
+[[nodiscard]] constexpr ReadbackRoute ChooseReadbackRoute(bool images, u64 producer, u64 open_tick,
+                                                          u64 queued_tick,
                                                           u64 gpu_tick) noexcept {
     if (images) {
         return ReadbackRoute::FlushNow;
@@ -186,7 +205,7 @@ enum class ReadbackRoute : u8 {
     if (producer < open_tick && (producer <= queued_tick || producer <= gpu_tick)) {
         return ReadbackRoute::Direct;
     }
-    return lazy ? ReadbackRoute::Ride : ReadbackRoute::FlushNow;
+    return ReadbackRoute::FlushNow;
 }
 
 /// A per-thread timeline's values for readback jobs (BackgroundResources): monotonic, and

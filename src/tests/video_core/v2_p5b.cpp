@@ -2,7 +2,13 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <array>
+#include <atomic>
 #include <bit>
+#include <chrono>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
+#include <utility>
 #include <map>
 #include <random>
 #include <string>
@@ -16,6 +22,7 @@
 #include "video_core/v2/flush_heuristic.h"
 #include "video_core/v2/frame_pacer.h"
 #include "video_core/v2/p5b_stats.h"
+#include "video_core/v2/submit_requests.h"
 #include "video_core/v2/gpu_unswizzle.h"
 #include "video_core/textures/decoders.h"
 #include "video_core/v2/qmd_front.h"
@@ -682,19 +689,93 @@ TEST_CASE("V2 P5b readbacks submit only if their producer is still open",
     using VideoCommon::V2::ChooseReadbackRoute;
     using VideoCommon::V2::ReadbackRoute;
     // open tick 10, the graphics queue has up to 8, the GPU finished 5.
-    REQUIRE(ChooseReadbackRoute(false, true, 7, 10, 8, 5) == ReadbackRoute::Direct);
-    REQUIRE(ChooseReadbackRoute(false, false, 8, 10, 8, 5) == ReadbackRoute::Direct);
-    REQUIRE(ChooseReadbackRoute(false, true, 0, 10, 0, 0) == ReadbackRoute::Direct);
+    REQUIRE(ChooseReadbackRoute(false, 7, 10, 8, 5) == ReadbackRoute::Direct);
+    REQUIRE(ChooseReadbackRoute(false, 8, 10, 8, 5) == ReadbackRoute::Direct);
+    REQUIRE(ChooseReadbackRoute(false, 0, 10, 0, 0) == ReadbackRoute::Direct);
     // Handed to the worker but not on the queue yet (B1: the job must not get ahead of it).
-    REQUIRE(ChooseReadbackRoute(false, true, 9, 10, 8, 5) == ReadbackRoute::Ride);
-    REQUIRE(ChooseReadbackRoute(false, false, 9, 10, 8, 5) == ReadbackRoute::FlushNow);
+    REQUIRE(ChooseReadbackRoute(false, 9, 10, 8, 5) == ReadbackRoute::FlushNow);
     // ... unless the GPU already finished it.
-    REQUIRE(ChooseReadbackRoute(false, true, 9, 10, 8, 9) == ReadbackRoute::Direct);
-    // The open tick: ride it, or flush without lazy submissions.
-    REQUIRE(ChooseReadbackRoute(false, true, 10, 10, 9, 9) == ReadbackRoute::Ride);
-    REQUIRE(ChooseReadbackRoute(false, false, 10, 10, 9, 9) == ReadbackRoute::FlushNow);
+    REQUIRE(ChooseReadbackRoute(false, 9, 10, 8, 9) == ReadbackRoute::Direct);
+    // The open tick is flushed at once: no job is left riding an unsubmitted tick (3d9126d161).
+    REQUIRE(ChooseReadbackRoute(false, 10, 10, 9, 9) == ReadbackRoute::FlushNow);
     // Image copies carry a release recorded in the open submission.
-    REQUIRE(ChooseReadbackRoute(true, true, 1, 10, 9, 9) == ReadbackRoute::FlushNow);
+    REQUIRE(ChooseReadbackRoute(true, 1, 10, 9, 9) == ReadbackRoute::FlushNow);
+}
+
+TEST_CASE("V2 P5b a graphics wait on the open submission's own post job goes to the next one",
+          "[video_core][v2_p5b]") {
+    // 3d9126d161 hang: a readback job riding open tick T (waiting for T) was also joined into T's
+    // waits, so T waited for a job that waited for T.
+    TimelineJoin join;
+    REQUIRE(join.AddPostJob(0x100, 0x200, 7));
+    REQUIRE(join.AddGraphicsWait(0x200, 7));
+    REQUIRE(join.AddGraphicsWait(0x300, 2)); // another thread's job: this submission waits
+    auto batch = join.Close(10);
+    REQUIRE(batch.num_post_jobs == 1);
+    REQUIRE(batch.num_extra_waits == 1);
+    REQUIRE(batch.extra_waits[0].semaphore == 0x300);
+    batch = join.Close(11);
+    REQUIRE(batch.num_extra_waits == 1);
+    REQUIRE(batch.extra_waits[0].semaphore == 0x200);
+    REQUIRE(batch.extra_waits[0].value == 7);
+    REQUIRE(join.Close(12).num_extra_waits == 0);
+}
+
+TEST_CASE("V2 P5b a wait on an open tick completes with the recording thread idle",
+          "[video_core][v2_p5b]") {
+    // SESSION_HANDOFF §5g: a landing wait must cause its submit. Model of the protocol: the
+    // recording thread sleeps until woken (GpuSplit's back in WaitOnAddress), then runs its idle
+    // hook (Scheduler::ServeIdleHook -> SubmitRequests::IdleSubmits). A reader waiting on the open
+    // tick asks (Request) and wakes it (RequestIdleHook); no other work ever arrives.
+    using VideoCommon::V2::SubmitRequests;
+    SubmitRequests requests;
+    std::atomic<u64> current_tick{5}; // ticks below are submitted; 5 is open with recorded work
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool woken = false;
+    bool stop = false;
+    u32 submits = 0;
+    std::thread back([&] {
+        std::unique_lock lock{mutex};
+        while (!stop) {
+            cv.wait(lock, [&] { return woken || stop; });
+            if (std::exchange(woken, false)) {
+                // The idle hook: lazy fences on, nothing wanted or fenced, only the request.
+                if (requests.IdleSubmits(false, true, false, 0, current_tick.load())) {
+                    current_tick.fetch_add(1);
+                    ++submits;
+                }
+            }
+        }
+    });
+    const u64 tick = current_tick.load();
+    requests.Request(tick);
+    {
+        std::scoped_lock lock{mutex};
+        woken = true;
+    }
+    cv.notify_one();
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{2};
+    while (current_tick.load() <= tick && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::yield();
+    }
+    const bool submitted = current_tick.load() > tick;
+    {
+        std::scoped_lock lock{mutex};
+        stop = true;
+    }
+    cv.notify_one();
+    back.join();
+    REQUIRE(submitted);
+    REQUIRE(submits == 1);
+    // Served: an idle hook with no request and nothing pending submits nothing.
+    REQUIRE_FALSE(requests.IdleSubmits(false, true, false, 0, current_tick.load()));
+    // Lazy fences: an open fence tick or wanted work is submitted at the idle hook; without lazy
+    // fences only deferred work and requests.
+    REQUIRE(requests.IdleSubmits(false, true, false, current_tick.load(), current_tick.load()));
+    REQUIRE(requests.IdleSubmits(false, true, true, 0, current_tick.load()));
+    REQUIRE_FALSE(requests.IdleSubmits(false, false, true, current_tick.load(), current_tick.load()));
+    REQUIRE(requests.IdleSubmits(true, false, false, 0, current_tick.load()));
 }
 
 TEST_CASE("V2 P5b flush decisions at pass boundaries", "[video_core][v2_p5b]") {

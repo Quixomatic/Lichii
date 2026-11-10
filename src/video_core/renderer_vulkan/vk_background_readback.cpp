@@ -136,14 +136,22 @@ BackgroundReadback::Job BackgroundReadback::Submit(u64 producer, u64* ride_tick)
     }
     const u64 open_tick = scheduler.CurrentTick();
     const SubmitEngine* const engine = scheduler.GetSubmitEngine();
-    const auto route = VideoCommon::V2::ChooseReadbackRoute(
-        !image_copies.empty(), ride_tick != nullptr && scheduler.LazyFencesHere(),
-        (std::min)(producer, open_tick), open_tick, engine != nullptr ? engine->QueuedTick() : 0,
+    const u64 queued_tick = engine != nullptr ? engine->QueuedTick() : 0;
+    Resources& r = ThreadResources();
+    auto route = VideoCommon::V2::ChooseReadbackRoute(
+        !image_copies.empty(), (std::min)(producer, open_tick), open_tick, queued_tick,
         scheduler.GetMasterSemaphore().KnownGpuTick());
+    if (r.last_post_tick > queued_tick) {
+        // An earlier job of this thread still waits to be queued behind its tick: submitting
+        // this one first would signal the thread's timeline out of order.
+        route = VideoCommon::V2::ReadbackRoute::FlushNow;
+    }
+    if (ride_tick != nullptr) {
+        *ride_tick = 0;
+    }
     // The producers (and the releases) go to the GPU; the job waits for that tick.
     const u64 producer_tick =
         route == VideoCommon::V2::ReadbackRoute::Direct ? producer : open_tick;
-    Resources& r = ThreadResources();
     const vk::CommandBuffer cmdbuf{TakeCommandBuffer(r), device.GetDispatchLoader()};
     cmdbuf.Begin({
         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
@@ -181,19 +189,12 @@ BackgroundReadback::Job BackgroundReadback::Submit(u64 producer, u64* ride_tick)
         }
         vk::Check(result);
         P5bStats::Add(Counter::ReadbacksDirect);
-    } else if (route == VideoCommon::V2::ReadbackRoute::Ride &&
-               scheduler.AddTransferJob(*cmdbuf, *r.timeline, value)) {
-        // F4-04: the producer is open: the job rides it with no submit of its own. The open
-        // submission goes out at the next heuristic submit, the idle hook, or when the reader
-        // asks for it (Wait with ride_tick).
-        scheduler.WantSubmit();
-        *ride_tick = open_tick;
-        P5bStats::Add(Counter::ReadbacksRiding);
     } else if (scheduler.AddTransferJob(*cmdbuf, *r.timeline, value)) {
         // Perf fix C (MASTER_PLAN §6 class C): the job rides the producing submission: the submit
         // path queues it on the transfer queue right behind that tick's own transfer batch, so
         // the recorder never waits for the worker. Fix pass 1's B1 order (job after the batch
         // graphics `producer_tick` waits for) holds by construction.
+        r.last_post_tick = open_tick;
         scheduler.Flush();
     } else {
         scheduler.Flush();
