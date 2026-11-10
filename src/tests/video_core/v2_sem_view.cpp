@@ -350,6 +350,38 @@ TEST_CASE("SYNC step 4: no submit when nobody waits and the GPU is busy",
             SubmitRequests::IdleAction::Leave);
 }
 
+TEST_CASE("SYNC step 6: macro DMA reads of semaphore words forward known values, wait only for "
+          "unknown writers",
+          "[video_core][v2_sem_view]") {
+    // Maxwell3D's FrontDmaReadSem takes, per word: no pending writer → memory; a pending known
+    // writer (a QMD reduction over a pending payload) → its value, no wait; an unknown writer
+    // made at execute → its position; an unknown writer at a fence → the targeted landing (one
+    // request for its ticket's tick, CompleteLanding; idle-back test: "V2 landing: the back lands
+    // its captured operations for a waiting front").
+    SemView view;
+    constexpr u64 word = 0xa000;
+    view.Note(word, 0x40, true, 10, Retire::Untracked, 10, Kind::QmdPayload, At(0));
+    view.NoteReduction(word, false, 0, 2, 11, Retire::Untracked, 11, Kind::QmdReduction, At(0),
+                       true, Reduce, [] { return 0U; });
+    const auto known = view.Find(word, At(5));
+    REQUIRE(known.pending);
+    REQUIRE(known.writer.known);
+    REQUIRE(known.writer.value == 0x42); // forwarded: the read needs no wait
+    view.Note(word + 4, 0, false, 20, Retire::Consumed, 0, Kind::Release, At(0));
+    const auto at_execute = view.Find(word + 4, At(5));
+    REQUIRE(at_execute.pending);
+    REQUIRE_FALSE(at_execute.writer.known);
+    REQUIRE(at_execute.writer.retire == Retire::Consumed); // wait for position 20 only
+    REQUIRE(at_execute.writer.position == 20);
+    view.Note(word + 8, 0, false, 30, Retire::Landing, 0x1e01, Kind::Counter, At(0));
+    const auto at_fence = view.Find(word + 8, At(40));
+    REQUIRE(at_fence.pending);
+    REQUIRE(at_fence.writer.retire == Retire::Landing); // targeted landing by its ticket
+    REQUIRE(at_fence.writer.ticket == 0x1e01);
+    // Once landed nothing is pending and memory holds it.
+    REQUIRE_FALSE(view.Find(word + 8, At(40, 0x1e01)).pending);
+}
+
 TEST_CASE("SYNC step 2 idle back: an acquire met by a fence-flagged release whose fence is not "
           "submitted passes at once (class B)",
           "[video_core][v2_sem_view]") {

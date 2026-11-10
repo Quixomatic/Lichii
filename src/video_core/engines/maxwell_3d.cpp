@@ -28,6 +28,7 @@
 #include "video_core/gpu_split.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
+#include "video_core/v2/p5b_stats.h"
 #include "video_core/nx2_cmdpage_diag.h"
 #include "video_core/nx2_fast_draw.h"
 #include "video_core/nx2_perf.h"
@@ -3804,6 +3805,84 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
     }
 }
 
+namespace {
+// SYNC Step 6: a macro DMA read of words only semaphore writers (releases, reports, QMD
+// releases) may have pending, answered from S1's semaphore view. True: `out` holds the words.
+// False: the caller's targeted path decides (nothing waited for here is lost: it re-reads).
+bool FrontDmaReadSem(VideoCommon::GpuSplit& split, const Tegra::MemoryManager& memory,
+                     GPUVAddr source, DAddr device, std::span<u32> out) {
+    namespace V2 = VideoCommon::V2;
+    using V2::Stats::Decision;
+    constexpr auto site = VideoCommon::DrainSite::MacroDmaRead;
+    const u64 bytes = out.size() * sizeof(u32);
+    if (out.size() > 16 || Tegra::Nx2MayBeGpuWritten(device, bytes)) {
+        return false;
+    }
+    // Writers other than semaphores (shader stores, copies, uploads, draws before the last
+    // host-level wait): the hazard table decides those (no landing, no untracked branch here).
+    V2::HazardFilter others;
+    others.ranged = V2::AllProducers & ~(V2::ProducerBit(V2::Producer::Release) |
+                                         V2::ProducerBit(V2::Producer::Report) |
+                                         V2::ProducerBit(V2::Producer::QmdRelease));
+    others.unbounded = V2::ProducerBit(V2::Producer::Dispatch) |
+                       V2::ProducerBit(V2::Producer::Copy) | V2::ProducerBit(V2::Producer::Upload);
+    others.unbounded_synced = V2::ProducerBit(V2::Producer::Draw);
+    bool waited = false;
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        if (split.FindWrites(device, bytes, others).kind != V2::HazardResult::Kind::Clear) {
+            return false;
+        }
+        const V2::SemProgress progress = split.SemNow();
+        // An unknown QMD (one the front's model can't read) may write any word: wait for the
+        // back to run it (its reductions run then; its fence-flagged releases are below).
+        u64 wait = split.Sem().UnboundedUnknown(progress.consumed);
+        // QMD release operations still to land over the range that S1 doesn't know.
+        const bool untracked = V2::Landing::UntrackedTargetFor(device, bytes) != 0;
+        bool all_known = true;
+        std::array<V2::SemView::Answer, 16> answers;
+        for (size_t i = 0; i < out.size(); ++i) {
+            answers[i] = split.Sem().Find(device + i * sizeof(u32), progress);
+            const V2::SemView::Writer& writer = answers[i].writer;
+            if (!answers[i].pending || (writer.known && !writer.bound)) {
+                all_known &= answers[i].pending;
+                continue;
+            }
+            all_known = false;
+            if (writer.retire != V2::SemView::Retire::Consumed) {
+                return false; // Unknown at a fence: the targeted landing below (one request)
+            }
+            wait = std::max(wait, writer.position);
+        }
+        if (untracked && !all_known) {
+            return false;
+        }
+        if (wait != 0) {
+            split.WaitForPosition(wait, site);
+            waited = true;
+            continue;
+        }
+        // Read memory after the lookups: a writer that retired in between is in it.
+        for (size_t i = 0; i < out.size(); ++i) {
+            out[i] = answers[i].pending ? answers[i].writer.value
+                                        : memory.Read<u32>(source + i * sizeof(u32));
+        }
+        bool forwarded = false;
+        for (size_t i = 0; i < out.size(); ++i) {
+            forwarded |= answers[i].pending;
+        }
+        V2::Stats::NoteDecision(site,
+                                waited      ? Decision::Narrowed
+                                : forwarded ? Decision::Forwarded
+                                            : Decision::Avoided);
+        V2::P5bStats::Add(waited      ? V2::P5bStats::Counter::DmaReadsSemWaited
+                          : forwarded ? V2::P5bStats::Counter::DmaReadsSemForwarded
+                                      : V2::P5bStats::Counter::DmaReadsSemClear);
+        return true;
+    }
+    return false;
+}
+} // Anonymous namespace
+
 bool Maxwell3D::FrontDmaReadHazard(VideoCommon::GpuSplit& split, GPUVAddr source, size_t bytes,
                                    std::span<u32> out) {
     namespace V2 = VideoCommon::V2;
@@ -3825,6 +3904,14 @@ bool Maxwell3D::FrontDmaReadHazard(VideoCommon::GpuSplit& split, GPUVAddr source
         if (!page_device || *page_device != *device + (page - source)) {
             return fall_back(Reason::Unmapped);
         }
+    }
+    // SYNC_SUBMIT_SPEC §2.3 / Step 6 (MP §5.1 "if a known store overlaps it forwards the bytes;
+    // if an Unknown store overlaps it does a targeted wait"): semaphore words are forwarded from
+    // S1's semaphore view; only an unknown writer is waited for (its position when it is made
+    // at execute time). An at-fence unknown writer, a GPU-written page or a non-semaphore writer
+    // take the targeted path below. Replaces 7143815ed9's wait for every unbounded QMD note.
+    if (FrontDmaReadSem(split, memory_manager, source, *device, out)) {
+        return true;
     }
     // Fix F3-08 (MASTER_PLAN §6): no drain. Counters and timestamps still to land (class D,
     // strict) are waited for by landing ticket; words the buffer cache may hold newer than

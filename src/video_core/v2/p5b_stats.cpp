@@ -161,7 +161,8 @@ void Report(const char* thread_name, u64 window_ns) {
                  "{:.2f}, I idle {:.2f}, W waiter {:.2f}, deferred {:.2f}, present {:.2f}, other "
                  "{:.2f} | QMD reductions at execute {:.0f}/s, at their fence {:.0f}/s | "
                  "requests by origin (per s): acquires {:.0f} (fence jobs {:.0f}), landing waits "
-                 "{:.0f} | finishes by site: {}",
+                 "{:.0f} | macro DMA reads by the semaphore view (per s): forwarded {:.0f}, waited "
+                 "{:.0f}, clear {:.0f} | finishes by site: {}",
                  thread_name, per_frame(at(Counter::SubmitsPassBoundary)),
                  per_frame(at(Counter::SubmitsChunk)), per_frame(at(Counter::SubmitsIdle)),
                  per_frame(at(Counter::SubmitsWaiter)), per_frame(at(Counter::SubmitsDeferred)),
@@ -172,6 +173,9 @@ void Report(const char* thread_name, u64 window_ns) {
                  PerSecond(at(Counter::RequestsAcquire), seconds),
                  PerSecond(at(Counter::FenceJobsAcquire), seconds),
                  PerSecond(at(Counter::RequestsLanding), seconds),
+                 PerSecond(at(Counter::DmaReadsSemForwarded), seconds),
+                 PerSecond(at(Counter::DmaReadsSemWaited), seconds),
+                 PerSecond(at(Counter::DmaReadsSemClear), seconds),
                  finish_list.empty() ? std::string{"none"} : finish_list);
     }
     // F4-06: which untracked operations still flush every pending write.

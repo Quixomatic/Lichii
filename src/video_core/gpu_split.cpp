@@ -597,23 +597,21 @@ bool GpuSplit::WaitUntrackedLanded(u64 ticket, DrainSite site, u64 timeout_us) {
     const bool v2_stats = V2::Stats::Enabled();
     const u64 start = Nx2Profile::Enabled() || v2_stats ? Nx2Profile::Ticks() : 0;
     const auto begin = std::chrono::steady_clock::now();
-    auto next_request = begin;
     u64 requested_tick = 0;
     for (u32 spins = 0; !landed(); ++spins) {
         const auto now = std::chrono::steady_clock::now();
         if (now - begin >= std::chrono::microseconds{timeout_us} || !BackRunning()) {
             return landed();
         }
-        // Its fence may sit in the open submission (F4-02): never drain. F4-X2 (R2-F4-01): an
-        // urgent request for the fence's tick as soon as it is queued, not the GPU's idle.
+        // Its fence may sit in the open submission (F4-02): never drain. SYNC_SUBMIT_SPEC §2.3
+        // (rule W): one request per change of the fence's tick, served at the back's next entry
+        // boundary or at once if idle; no timed re-ask.
         const u64 fence_tick = V2::LandingFence::TickFor(0, ticket);
-        if (fence_tick > requested_tick || now >= next_request) {
-            if (fence_tick > requested_tick) {
-                V2::LandingFence::Request(fence_tick);
-                requested_tick = fence_tick;
-            }
+        if (fence_tick > requested_tick) {
+            V2::LandingFence::Request(fence_tick);
+            requested_tick = fence_tick;
             RequestIdleHook();
-            next_request = now + std::chrono::milliseconds{1};
+            V2::P5bStats::Add(V2::P5bStats::Counter::RequestsLanding);
         }
         if (spins < 64) {
             Pause();
@@ -638,23 +636,20 @@ bool GpuSplit::WaitLanded(u64 ticket, DrainSite site, u64 timeout_us) {
     const bool v2_stats = V2::Stats::Enabled();
     const u64 start = Nx2Profile::Enabled() || v2_stats ? Nx2Profile::Ticks() : 0;
     const auto begin = std::chrono::steady_clock::now();
-    auto next_request = begin;
     u64 requested_tick = 0;
     for (u32 spins = 0; V2::Landing::landed.load(std::memory_order_acquire) < ticket; ++spins) {
         const auto now = std::chrono::steady_clock::now();
         if (now - begin >= std::chrono::microseconds{timeout_us} || !BackRunning()) {
             return V2::Landing::landed.load(std::memory_order_acquire) >= ticket;
         }
-        // The operation's fence may sit in the open submission: ask for it (no drain). F4-X2
-        // (R2-F4-01): urgently, for the fence's tick, as soon as it is queued.
+        // The operation's fence may sit in the open submission: ask for it (no drain).
+        // SYNC_SUBMIT_SPEC §2.3 (rule W): one request per change of the fence's tick.
         const u64 fence_tick = V2::LandingFence::TickFor(ticket, 0);
-        if (fence_tick > requested_tick || now >= next_request) {
-            if (fence_tick > requested_tick) {
-                V2::LandingFence::Request(fence_tick);
-                requested_tick = fence_tick;
-            }
+        if (fence_tick > requested_tick) {
+            V2::LandingFence::Request(fence_tick);
+            requested_tick = fence_tick;
             RequestIdleHook();
-            next_request = now + std::chrono::milliseconds{1};
+            V2::P5bStats::Add(V2::P5bStats::Counter::RequestsLanding);
         }
         if (spins < 64) {
             Pause();

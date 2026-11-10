@@ -121,6 +121,9 @@ enum class Counter : u32 {
     RequestsAcquire,  ///< SYNC Step 4: submit requests filed by suspended acquires (at-fence row)
     FenceJobsAcquire, ///< ... fences signalled for a capture no fence carried (idle back)
     RequestsLanding,  ///< ... filed by front landing waits (WaitLanded/WaitUntrackedLanded)
+    DmaReadsSemForwarded, ///< SYNC Step 6: macro DMA reads forwarded from the semaphore view
+    DmaReadsSemWaited,    ///< ... after waiting for an unknown at-execute writer's position
+    DmaReadsSemClear,     ///< ... nothing pending: memory
     Count,
 };
 
