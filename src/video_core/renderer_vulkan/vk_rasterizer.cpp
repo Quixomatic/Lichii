@@ -67,6 +67,7 @@
 #include "video_core/v2/p3_stats.h"
 #include "video_core/v2/p5b_stats.h"
 #include "video_core/v2/regsem.h"
+#include "video_core/v2/resolve/dynamic_state.h"
 #include "video_core/v2/resolve/split_resolve.h"
 #include "video_core/v2/shader_writes.h"
 #include "video_core/v2/v2_stats.h"
@@ -139,8 +140,29 @@ struct DrawParams {
     bool is_indexed;
 };
 
-VkViewport GetViewportState(const Device& device, const Maxwell& regs, size_t index, float scale) {
-    const auto& src = regs.viewport_transform[index];
+/// Pipeline v2 Step 0: the inputs of a viewport and a scissor, from the registers or from a draw
+/// record's ViewportInputs (the same fields).
+struct ViewportSource {
+    const Maxwell::ViewportTransform* transform;
+    const Maxwell::ScissorTest* scissor;
+    const Maxwell::SurfaceClip& surface_clip;
+    const Maxwell::WindowOrigin& window_origin;
+    Maxwell::DepthMode depth_mode;
+};
+
+ViewportSource ViewportSourceOf(const Maxwell& regs) {
+    return {regs.viewport_transform.data(), regs.scissor_test.data(), regs.surface_clip,
+            regs.window_origin, regs.depth_mode};
+}
+
+ViewportSource ViewportSourceOf(const VideoCommon::V2::Resolve::ViewportInputs& inputs) {
+    return {inputs.transform.data(), inputs.scissor.data(), inputs.surface_clip,
+            inputs.window_origin, inputs.depth_mode};
+}
+
+VkViewport GetViewportState(const Device& device, const ViewportSource& regs, size_t index,
+                            float scale) {
+    const auto& src = regs.transform[index];
     const auto conv = [scale](float value) {
         float new_value = value * scale;
         if (scale < 1.0f) {
@@ -187,8 +209,13 @@ VkViewport GetViewportState(const Device& device, const Maxwell& regs, size_t in
     return viewport;
 }
 
-VkRect2D GetScissorState(const Maxwell& regs, size_t index, u32 up_scale = 1, u32 down_shift = 0) {
-    const auto& src = regs.scissor_test[index];
+VkViewport GetViewportState(const Device& device, const Maxwell& regs, size_t index, float scale) {
+    return GetViewportState(device, ViewportSourceOf(regs), index, scale);
+}
+
+VkRect2D GetScissorState(const ViewportSource& regs, size_t index, u32 up_scale = 1,
+                         u32 down_shift = 0) {
+    const auto& src = regs.scissor[index];
     VkRect2D scissor{};
     const auto scale_up = [&](s32 value) -> s32 {
         if (value == 0) {
@@ -227,6 +254,10 @@ VkRect2D GetScissorState(const Maxwell& regs, size_t index, u32 up_scale = 1, u3
         scissor.extent.height = (std::numeric_limits<s32>::max)();
     }
     return scissor;
+}
+
+VkRect2D GetScissorState(const Maxwell& regs, size_t index, u32 up_scale = 1, u32 down_shift = 0) {
+    return GetScissorState(ViewportSourceOf(regs), index, up_scale, down_shift);
 }
 
 DrawParams MakeDrawParams(const Tegra::Engines::Maxwell3D::DrawManager::State& draw_state, u32 num_instances, bool is_indexed) {
@@ -272,6 +303,366 @@ bool IsPrimitiveRestartSupported(const Device& device, VkPrimitiveTopology topol
             SupportsPrimitiveRestart(topology) ||
             (topology == VK_PRIMITIVE_TOPOLOGY_PATCH_LIST &&
              device.IsPatchListPrimitiveRestartSupported()));
+}
+
+// Pipeline v2 Step 0 (notes/STEP0_SPEC.md §2 item 19): the recording half of the dynamic state
+// updates, shared by the legacy Update* (values from the registers) and EncodeDynamic (values
+// from a draw record).
+
+void EmitViewports(Scheduler& scheduler, const Device& device, const ViewportSource& src,
+                   bool scale_offset_enabled, float scale) {
+    if (!scale_offset_enabled) {
+        float x = static_cast<float>(src.surface_clip.x);
+        float y = static_cast<float>(src.surface_clip.y);
+        float width = (std::max)(1.0f, static_cast<float>(src.surface_clip.width));
+        float height = (std::max)(1.0f, static_cast<float>(src.surface_clip.height));
+        if (src.window_origin.mode != Maxwell::WindowOrigin::Mode::UpperLeft) {
+            y += height;
+            height = -height;
+        }
+        VkViewport viewport{
+            .x = x,
+            .y = y,
+            .width = width,
+            .height = height,
+            .minDepth = 0.0f,
+            .maxDepth = 1.0f,
+        };
+        scheduler.Record([&device, viewport](vk::CommandBuffer cmdbuf) {
+            const u32 num_viewports = std::min<u32>(device.GetMaxViewports(), Maxwell::NumViewports);
+            std::array<VkViewport, Maxwell::NumViewports> viewport_list{};
+            viewport_list.fill(viewport);
+            const vk::Span<VkViewport> viewports(viewport_list.data(), num_viewports);
+            cmdbuf.SetViewport(0, viewports);
+        });
+        return;
+    }
+    const std::array viewport_list{
+        GetViewportState(device, src, 0, scale),  GetViewportState(device, src, 1, scale),
+        GetViewportState(device, src, 2, scale),  GetViewportState(device, src, 3, scale),
+        GetViewportState(device, src, 4, scale),  GetViewportState(device, src, 5, scale),
+        GetViewportState(device, src, 6, scale),  GetViewportState(device, src, 7, scale),
+        GetViewportState(device, src, 8, scale),  GetViewportState(device, src, 9, scale),
+        GetViewportState(device, src, 10, scale), GetViewportState(device, src, 11, scale),
+        GetViewportState(device, src, 12, scale), GetViewportState(device, src, 13, scale),
+        GetViewportState(device, src, 14, scale), GetViewportState(device, src, 15, scale),
+    };
+    scheduler.Record([&device, viewport_list](vk::CommandBuffer cmdbuf) {
+        const u32 num_viewports = std::min<u32>(device.GetMaxViewports(), Maxwell::NumViewports);
+        const vk::Span<VkViewport> viewports(viewport_list.data(), num_viewports);
+        cmdbuf.SetViewport(0, viewports);
+    });
+}
+
+void EmitScissors(Scheduler& scheduler, const Device& device, const ViewportSource& src,
+                  bool scale_offset_enabled, u32 up_scale, u32 down_shift) {
+    if (!scale_offset_enabled) {
+        u32 x = src.surface_clip.x;
+        u32 y = src.surface_clip.y;
+        u32 width = (std::max)(1u, static_cast<u32>(src.surface_clip.width));
+        u32 height = (std::max)(1u, static_cast<u32>(src.surface_clip.height));
+        if (src.window_origin.mode != Maxwell::WindowOrigin::Mode::UpperLeft) {
+            y = src.surface_clip.height - (y + height);
+        }
+        VkRect2D scissor{};
+        scissor.offset.x = static_cast<int32_t>(x);
+        scissor.offset.y = static_cast<int32_t>(y);
+        scissor.extent.width = width;
+        scissor.extent.height = height;
+        scheduler.Record([&device, scissor](vk::CommandBuffer cmdbuf) {
+            const u32 num_scissors = std::min<u32>(device.GetMaxViewports(), Maxwell::NumViewports);
+            std::array<VkRect2D, Maxwell::NumViewports> scissor_list{};
+            scissor_list.fill(scissor);
+            const vk::Span<VkRect2D> scissors(scissor_list.data(), num_scissors);
+            cmdbuf.SetScissor(0, scissors);
+        });
+        return;
+    }
+    const std::array scissor_list{
+        GetScissorState(src, 0, up_scale, down_shift),
+        GetScissorState(src, 1, up_scale, down_shift),
+        GetScissorState(src, 2, up_scale, down_shift),
+        GetScissorState(src, 3, up_scale, down_shift),
+        GetScissorState(src, 4, up_scale, down_shift),
+        GetScissorState(src, 5, up_scale, down_shift),
+        GetScissorState(src, 6, up_scale, down_shift),
+        GetScissorState(src, 7, up_scale, down_shift),
+        GetScissorState(src, 8, up_scale, down_shift),
+        GetScissorState(src, 9, up_scale, down_shift),
+        GetScissorState(src, 10, up_scale, down_shift),
+        GetScissorState(src, 11, up_scale, down_shift),
+        GetScissorState(src, 12, up_scale, down_shift),
+        GetScissorState(src, 13, up_scale, down_shift),
+        GetScissorState(src, 14, up_scale, down_shift),
+        GetScissorState(src, 15, up_scale, down_shift),
+    };
+    scheduler.Record([&device, scissor_list](vk::CommandBuffer cmdbuf) {
+        const u32 num_scissors = std::min<u32>(device.GetMaxViewports(), Maxwell::NumViewports);
+        const vk::Span<VkRect2D> scissors(scissor_list.data(), num_scissors);
+        cmdbuf.SetScissor(0, scissors);
+    });
+}
+
+void EmitDepthBias(Scheduler& scheduler, const Device& device,
+                   const VideoCommon::V2::Resolve::DepthBiasValues& bias) {
+    scheduler.Record([constant = bias.constant, clamp = bias.clamp, factor = bias.slope,
+                      &device](vk::CommandBuffer cmdbuf) {
+        if (device.IsExtDepthBiasControlSupported()) {
+            static VkDepthBiasRepresentationInfoEXT bias_info{
+                .sType = VK_STRUCTURE_TYPE_DEPTH_BIAS_REPRESENTATION_INFO_EXT,
+                .pNext = nullptr,
+                .depthBiasRepresentation =
+                    VK_DEPTH_BIAS_REPRESENTATION_LEAST_REPRESENTABLE_VALUE_FORCE_UNORM_EXT,
+                .depthBiasExact = VK_FALSE,
+            };
+
+            cmdbuf.SetDepthBias(constant, clamp, factor, &bias_info);
+        } else {
+            cmdbuf.SetDepthBias(constant, clamp, factor);
+        }
+    });
+}
+
+/// The guest stencil face values (UpdateStencilFaces).
+struct StencilFaceValues {
+    u32 two_side;
+    u32 front_ref;
+    u32 back_ref;
+    u32 front_write_mask;
+    u32 back_write_mask;
+    u32 front_compare_mask;
+    u32 back_compare_mask;
+};
+
+/// UpdateStencilFaces after its TouchStencilProperties check.
+void EmitStencilFaces(Scheduler& scheduler, StateTracker& state_tracker,
+                      const StencilFaceValues& stencil) {
+    bool update_references = state_tracker.TouchStencilReference();
+    bool update_write_mask = state_tracker.TouchStencilWriteMask();
+    bool update_compare_masks = state_tracker.TouchStencilCompare();
+    if (state_tracker.TouchStencilSide(stencil.two_side != 0)) {
+        update_references = true;
+        update_write_mask = true;
+        update_compare_masks = true;
+    }
+    if (update_references) {
+        [&]() {
+            bool changed;
+            if (stencil.two_side) {
+                const bool front_changed =
+                    state_tracker.CheckStencilReferenceFront(stencil.front_ref);
+                const bool back_changed = state_tracker.CheckStencilReferenceBack(stencil.back_ref);
+                changed = front_changed || back_changed;
+            } else {
+                const bool front_changed =
+                    state_tracker.CheckStencilReferenceFront(stencil.front_ref);
+                const bool back_changed =
+                    state_tracker.CheckStencilReferenceBack(stencil.front_ref);
+                changed = front_changed || back_changed;
+            }
+            if (!changed) {
+                return;
+            }
+            scheduler.Record([front_ref = stencil.front_ref, back_ref = stencil.back_ref,
+                              two_sided = stencil.two_side](vk::CommandBuffer cmdbuf) {
+                const bool set_back = two_sided && front_ref != back_ref;
+                // Front face
+                cmdbuf.SetStencilReference(set_back ? VK_STENCIL_FACE_FRONT_BIT
+                                                    : VK_STENCIL_FACE_FRONT_AND_BACK,
+                                           front_ref);
+                if (set_back) {
+                    cmdbuf.SetStencilReference(VK_STENCIL_FACE_BACK_BIT, back_ref);
+                }
+            });
+        }();
+    }
+    if (update_write_mask) {
+        [&]() {
+            bool changed;
+            if (stencil.two_side) {
+                const bool front_changed =
+                    state_tracker.CheckStencilWriteMaskFront(stencil.front_write_mask);
+                const bool back_changed =
+                    state_tracker.CheckStencilWriteMaskBack(stencil.back_write_mask);
+                changed = front_changed || back_changed;
+            } else {
+                const bool front_changed =
+                    state_tracker.CheckStencilWriteMaskFront(stencil.front_write_mask);
+                const bool back_changed =
+                    state_tracker.CheckStencilWriteMaskBack(stencil.front_write_mask);
+                changed = front_changed || back_changed;
+            }
+            if (!changed) {
+                return;
+            }
+            scheduler.Record([front_write_mask = stencil.front_write_mask,
+                              back_write_mask = stencil.back_write_mask,
+                              two_sided = stencil.two_side](vk::CommandBuffer cmdbuf) {
+                const bool set_back = two_sided && front_write_mask != back_write_mask;
+                // Front face
+                cmdbuf.SetStencilWriteMask(set_back ? VK_STENCIL_FACE_FRONT_BIT
+                                                    : VK_STENCIL_FACE_FRONT_AND_BACK,
+                                           front_write_mask);
+                if (set_back) {
+                    cmdbuf.SetStencilWriteMask(VK_STENCIL_FACE_BACK_BIT, back_write_mask);
+                }
+            });
+        }();
+    }
+    if (update_compare_masks) {
+        [&]() {
+            bool changed;
+            if (stencil.two_side) {
+                const bool front_changed =
+                    state_tracker.CheckStencilCompareMaskFront(stencil.front_compare_mask);
+                const bool back_changed =
+                    state_tracker.CheckStencilCompareMaskBack(stencil.back_compare_mask);
+                changed = front_changed || back_changed;
+            } else {
+                const bool front_changed =
+                    state_tracker.CheckStencilCompareMaskFront(stencil.front_compare_mask);
+                const bool back_changed =
+                    state_tracker.CheckStencilCompareMaskBack(stencil.front_compare_mask);
+                changed = front_changed || back_changed;
+            }
+            if (!changed) {
+                return;
+            }
+            scheduler.Record([front_test_mask = stencil.front_compare_mask,
+                              back_test_mask = stencil.back_compare_mask,
+                              two_sided = stencil.two_side](vk::CommandBuffer cmdbuf) {
+                const bool set_back = two_sided && front_test_mask != back_test_mask;
+                // Front face
+                cmdbuf.SetStencilCompareMask(set_back ? VK_STENCIL_FACE_FRONT_BIT
+                                                      : VK_STENCIL_FACE_FRONT_AND_BACK,
+                                             front_test_mask);
+                if (set_back) {
+                    cmdbuf.SetStencilCompareMask(VK_STENCIL_FACE_BACK_BIT, back_test_mask);
+                }
+            });
+        }();
+    }
+    state_tracker.ClearStencilReset();
+}
+
+void EmitFrontFace(Scheduler& scheduler, Maxwell::FrontFace guest, bool flip_y) {
+    VkFrontFace front_face = MaxwellToVK::FrontFace(guest);
+    if (flip_y) {
+        front_face = front_face == VK_FRONT_FACE_CLOCKWISE ? VK_FRONT_FACE_COUNTER_CLOCKWISE
+                                                           : VK_FRONT_FACE_CLOCKWISE;
+    }
+    scheduler.Record(
+        [front_face](vk::CommandBuffer cmdbuf) { cmdbuf.SetFrontFaceEXT(front_face); });
+}
+
+void EmitStencilOp(Scheduler& scheduler, bool two_side,
+                   const VideoCommon::V2::Resolve::StencilFaceOp& front_op,
+                   const VideoCommon::V2::Resolve::StencilFaceOp& back_op) {
+    const Maxwell::StencilOp::Op fail = front_op.fail;
+    const Maxwell::StencilOp::Op zfail = front_op.zfail;
+    const Maxwell::StencilOp::Op zpass = front_op.zpass;
+    const Maxwell::ComparisonOp compare = front_op.func;
+    if (two_side) {
+        // Separate stencil op per face
+        const Maxwell::StencilOp::Op back_fail = back_op.fail;
+        const Maxwell::StencilOp::Op back_zfail = back_op.zfail;
+        const Maxwell::StencilOp::Op back_zpass = back_op.zpass;
+        const Maxwell::ComparisonOp back_compare = back_op.func;
+        scheduler.Record([fail, zfail, zpass, compare, back_fail, back_zfail, back_zpass,
+                          back_compare](vk::CommandBuffer cmdbuf) {
+            cmdbuf.SetStencilOpEXT(VK_STENCIL_FACE_FRONT_BIT, MaxwellToVK::StencilOp(fail),
+                                   MaxwellToVK::StencilOp(zpass), MaxwellToVK::StencilOp(zfail),
+                                   MaxwellToVK::ComparisonOp(compare));
+            cmdbuf.SetStencilOpEXT(VK_STENCIL_FACE_BACK_BIT, MaxwellToVK::StencilOp(back_fail),
+                                   MaxwellToVK::StencilOp(back_zpass),
+                                   MaxwellToVK::StencilOp(back_zfail),
+                                   MaxwellToVK::ComparisonOp(back_compare));
+        });
+    } else {
+        // Front face defines the stencil op of both faces
+        scheduler.Record([fail, zfail, zpass, compare](vk::CommandBuffer cmdbuf) {
+            cmdbuf.SetStencilOpEXT(VK_STENCIL_FACE_FRONT_AND_BACK, MaxwellToVK::StencilOp(fail),
+                                   MaxwellToVK::StencilOp(zpass), MaxwellToVK::StencilOp(zfail),
+                                   MaxwellToVK::ComparisonOp(compare));
+        });
+    }
+}
+
+void EmitLogicOp(Scheduler& scheduler, u32 op_value) {
+    auto op = op_value >= 0x1500 && op_value < 0x1510 ? static_cast<VkLogicOp>(op_value - 0x1500)
+                                                      : VK_LOGIC_OP_NO_OP;
+    scheduler.Record([op](vk::CommandBuffer cmdbuf) { cmdbuf.SetLogicOpEXT(op); });
+}
+
+void EmitBlendEquations(
+    Scheduler& scheduler, bool squashed,
+    const std::array<VideoCommon::V2::Resolve::BlendEquation, Maxwell::NumRenderTargets>& guest) {
+    std::array<VkColorBlendEquationEXT, Maxwell::NumRenderTargets> setup_blends{};
+    if (squashed) {
+        // Temporary workaround for games that use iterated blending
+        setup_blends[0].srcColorBlendFactor = VK_BLEND_FACTOR_ONE;
+        setup_blends[0].dstColorBlendFactor = VK_BLEND_FACTOR_ONE;
+        setup_blends[0].colorBlendOp = VK_BLEND_OP_ADD;
+        setup_blends[0].srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_COLOR;
+        setup_blends[0].dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
+        setup_blends[0].alphaBlendOp = VK_BLEND_OP_ADD;
+        for (size_t index = 1; index < Maxwell::NumRenderTargets; index++) {
+            setup_blends[index] = setup_blends[0];
+        }
+    } else {
+        for (size_t index = 0; index < Maxwell::NumRenderTargets; index++) {
+            auto& host_blend = setup_blends[index];
+            const auto& guest_blend = guest[index];
+            host_blend.srcColorBlendFactor = MaxwellToVK::BlendFactor(guest_blend.color_source);
+            host_blend.dstColorBlendFactor = MaxwellToVK::BlendFactor(guest_blend.color_dest);
+            host_blend.colorBlendOp = MaxwellToVK::BlendEquation(guest_blend.color_op);
+            host_blend.srcAlphaBlendFactor = MaxwellToVK::BlendFactor(guest_blend.alpha_source);
+            host_blend.dstAlphaBlendFactor = MaxwellToVK::BlendFactor(guest_blend.alpha_dest);
+            host_blend.alphaBlendOp = MaxwellToVK::BlendEquation(guest_blend.alpha_op);
+        }
+    }
+    scheduler.Record([setup_blends](vk::CommandBuffer cmdbuf) {
+        cmdbuf.SetColorBlendEquationEXT(0, setup_blends);
+    });
+}
+
+/// UpdateVertexInput's recording from the guest attributes and bindings (VertexInputOf).
+template <class Runtime>
+void EmitVertexInput(Scheduler& scheduler, const Device& device, const Runtime& runtime,
+                     const VideoCommon::V2::Resolve::DynamicValues& values) {
+    boost::container::static_vector<VkVertexInputBindingDescription2EXT, 32> bindings;
+    boost::container::static_vector<VkVertexInputAttributeDescription2EXT, 32> attributes;
+    for (u32 index = 0; index < values.num_attributes; ++index) {
+        const auto& attribute = values.attributes[index];
+        if (!attribute.enabled) {
+            continue;
+        }
+        const u32 binding = attribute.binding;
+        attributes.push_back({
+            .sType = VK_STRUCTURE_TYPE_VERTEX_INPUT_ATTRIBUTE_DESCRIPTION_2_EXT,
+            .pNext = nullptr,
+            .location = index,
+            .binding = binding,
+            .format = MaxwellToVK::VertexFormat(device, attribute.type, attribute.size),
+            .offset = attribute.offset +
+                      (runtime.IsVertexRepacked(binding) && attribute.offset >= 65 ? 3 : 0),
+        });
+    }
+    for (u32 binding = 0; binding < values.num_bindings; ++binding) {
+        const auto& input = values.bindings[binding];
+        bindings.push_back({
+            .sType = VK_STRUCTURE_TYPE_VERTEX_INPUT_BINDING_DESCRIPTION_2_EXT,
+            .pNext = nullptr,
+            .binding = binding,
+            .stride = runtime.IsVertexRepacked(binding) ? 72U : input.stride,
+            .inputRate = input.instanced ? VK_VERTEX_INPUT_RATE_INSTANCE
+                                         : VK_VERTEX_INPUT_RATE_VERTEX,
+            .divisor = input.divisor,
+        });
+    }
+    scheduler.Record([bindings, attributes](vk::CommandBuffer cmdbuf) {
+        cmdbuf.SetVertexInputEXT(bindings, attributes);
+    });
 }
 } // Anonymous namespace
 
@@ -4632,6 +5023,312 @@ void RasterizerVulkan::UpdateDynamicStates(const GraphicsPipeline* pipeline) {
     }
 }
 
+const VideoCommon::V2::Resolve::DynamicFeatures& RasterizerVulkan::DrawRecFeatures() {
+    auto& features = drawrec_features;
+    features.squashed_iterated_blend = Settings::values.use_squashed_iterated_blend;
+    if (drawrec_features_program == program_id) [[likely]] {
+        return features;
+    }
+    drawrec_features_program = program_id;
+    const VkDriverIdKHR driver = device.GetDriverID();
+    features.eds1 = device.IsExtExtendedDynamicStateSupported();
+    features.eds2 = device.IsExtExtendedDynamicState2Supported();
+    features.eds2_extras = device.IsExtExtendedDynamicState2ExtrasSupported();
+    features.eds3_enables = device.IsExtExtendedDynamicState3EnablesSupported();
+    features.eds3_blending = device.IsExtExtendedDynamicState3BlendingSupported();
+    features.color_write_enable = device.IsExtColorWriteEnableSupported();
+    features.vertex_input_dynamic = device.IsExtVertexInputDynamicStateSupported();
+    features.amd_logic_op = driver == VkDriverIdKHR::VK_DRIVER_ID_AMD_OPEN_SOURCE ||
+                            driver == VkDriverIdKHR::VK_DRIVER_ID_AMD_PROPRIETARY;
+    features.nv_viewport_swizzle = device.IsNvViewportSwizzleSupported();
+    features.depth_range_unrestricted = device.IsExtDepthRangeUnrestrictedSupported();
+    features.depth_bounds = device.IsDepthBoundsSupported();
+    features.smooth_lines = device.SupportsSmoothLines();
+    features.molten_vk = device.IsMoltenVK();
+    features.d24_bias_rescale = D24BiasRescale();
+    features.restart_topologies = 0;
+    for (u32 index = 0; index <= static_cast<u32>(Maxwell::PrimitiveTopology::Patches); ++index) {
+        const auto topology = static_cast<Maxwell::PrimitiveTopology>(index);
+        // MaxwellToVK::PrimitiveTopology's mapping, without its per-call Polygon warning.
+        const VkPrimitiveTopology host = topology == Maxwell::PrimitiveTopology::Polygon
+                                             ? VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN
+                                             : MaxwellToVK::PrimitiveTopology(device, topology);
+        if (IsPrimitiveRestartSupported(device, host)) {
+            features.restart_topologies |= 1U << index;
+        }
+    }
+    features.max_viewports = std::min<u32>(device.GetMaxViewports(), Maxwell::NumViewports);
+    features.max_vertex_attributes = MaxVertexInputAttributes();
+    features.max_vertex_bindings = MaxVertexInputBindings();
+    return features;
+}
+
+void RasterizerVulkan::EncodeDynamic(const VideoCommon::V2::Resolve::DynamicState& state,
+                                     const GraphicsPipeline* pipeline) {
+    namespace R = VideoCommon::V2::Resolve;
+    const R::DynamicValues& v = state.values;
+    auto& flags = maxwell3d->dirty.flags;
+    const bool emulated_mesh{pipeline != nullptr && pipeline->IsEmulatedMesh()};
+    if (emulated_mesh) {
+        state_tracker.InvalidateInputState();
+    }
+    const auto topology = maxwell3d->draw_manager.draw_state.topology;
+    const bool topology_changed = !emulated_mesh && state_tracker.ChangePrimitiveTopology(topology);
+    if (topology_changed) {
+        flags[Dirty::DepthBiasEnable] = true;
+        flags[Dirty::PrimitiveRestartEnable] = true;
+    }
+    // F2-08's one mask test, as UpdateDynamicStates does it.
+    if (VideoCommon::V2::On(VideoCommon::V2::Switch::DrawCache) && !emulated_mesh &&
+        !topology_changed) [[unlikely]] {
+        static const auto dynamic_flags = [] {
+            Tegra::Engines::Maxwell3D::DirtyState::Flags mask;
+            for (u32 flag = Dirty::VertexInput; flag < Dirty::VertexInputKey; ++flag) {
+                mask.set(flag);
+            }
+            mask.set(VideoCommon::Dirty::RescaleViewports);
+            mask.set(VideoCommon::Dirty::RescaleScissors);
+            mask.set(VideoCommon::Dirty::DepthBiasGlobal);
+            mask.set(VideoCommon::Dirty::VertexBuffers);
+            return mask;
+        }();
+        const u32 color_output_mask = pipeline ? pipeline->ColorOutputMask() : ~0U;
+        if ((flags & dynamic_flags).none() && color_output_mask == last_color_output_mask) {
+            return;
+        }
+    }
+
+    const ViewportSource viewport = ViewportSourceOf(state.viewport);
+    const bool scale_offset = state.viewport.viewport_scale_offset_enabled != 0;
+    if (state_tracker.TouchViewports()) {
+        flags[Dirty::Scissors] = true;
+        const float scale = scale_offset && texture_cache.IsRescaling()
+                                ? Settings::values.resolution_info.up_factor
+                                : 1.0f;
+        EmitViewports(scheduler, device, viewport, scale_offset, scale);
+    }
+    if (state_tracker.TouchScissors()) {
+        u32 up_scale = 1;
+        u32 down_shift = 0;
+        if (scale_offset && texture_cache.IsRescaling()) {
+            up_scale = Settings::values.resolution_info.up_scale;
+            down_shift = Settings::values.resolution_info.down_shift;
+        }
+        EmitScissors(scheduler, device, viewport, scale_offset, up_scale, down_shift);
+    }
+    if (state_tracker.TouchDepthBias()) {
+        EmitDepthBias(scheduler, device,
+                      R::DepthBiasValues{.constant = v.depth_bias_constant,
+                                         .clamp = v.depth_bias_clamp,
+                                         .slope = v.depth_bias_slope});
+    }
+    if (state_tracker.TouchBlendConstants()) {
+        scheduler.Record([blend_color = v.blend_constants](vk::CommandBuffer cmdbuf) {
+            cmdbuf.SetBlendConstants(blend_color.data());
+        });
+    }
+    if (state_tracker.TouchDepthBounds()) {
+        scheduler.Record([min = v.depth_bounds_min, max = v.depth_bounds_max](
+                             vk::CommandBuffer cmdbuf) { cmdbuf.SetDepthBounds(min, max); });
+    }
+    if (state_tracker.TouchStencilProperties()) {
+        EmitStencilFaces(scheduler, state_tracker,
+                         StencilFaceValues{
+                             .two_side = v.stencil_two_side,
+                             .front_ref = v.stencil_front_ref,
+                             .back_ref = v.stencil_back_ref,
+                             .front_write_mask = v.stencil_front_write_mask,
+                             .back_write_mask = v.stencil_back_write_mask,
+                             .front_compare_mask = v.stencil_front_compare_mask,
+                             .back_compare_mask = v.stencil_back_compare_mask,
+                         });
+    }
+    if (state_tracker.TouchLineWidth()) {
+        scheduler.Record(
+            [width = v.line_width](vk::CommandBuffer cmdbuf) { cmdbuf.SetLineWidth(width); });
+    }
+
+    if (device.IsExtExtendedDynamicStateSupported()) {
+        if (state_tracker.TouchCullMode()) {
+            scheduler.Record([enabled = v.cull_enable, cull_face = v.cull_face](
+                                 vk::CommandBuffer cmdbuf) {
+                cmdbuf.SetCullModeEXT(enabled ? MaxwellToVK::CullFace(cull_face)
+                                              : VK_CULL_MODE_NONE);
+            });
+        }
+        if (state_tracker.TouchDepthCompareOp()) {
+            scheduler.Record([func = v.depth_compare](vk::CommandBuffer cmdbuf) {
+                cmdbuf.SetDepthCompareOpEXT(MaxwellToVK::ComparisonOp(func));
+            });
+        }
+        if (state_tracker.TouchFrontFace()) {
+            EmitFrontFace(scheduler, v.front_face, v.front_face_flip != 0);
+        }
+        if (state_tracker.TouchStencilOp()) {
+            EmitStencilOp(scheduler, v.stencil_two_side != 0, v.stencil_front, v.stencil_back);
+        }
+        if (state_tracker.TouchStateEnable()) {
+            if (state_tracker.TouchDepthBoundsTestEnable()) {
+                scheduler.Record([enable = v.depth_bounds_test != 0](vk::CommandBuffer cmdbuf) {
+                    cmdbuf.SetDepthBoundsTestEnableEXT(enable);
+                });
+            }
+            if (state_tracker.TouchDepthTestEnable()) {
+                scheduler.Record([enable = v.depth_test != 0](vk::CommandBuffer cmdbuf) {
+                    cmdbuf.SetDepthTestEnableEXT(enable);
+                });
+            }
+            if (state_tracker.TouchDepthWriteEnable()) {
+                scheduler.Record([enable = v.depth_write != 0](vk::CommandBuffer cmdbuf) {
+                    cmdbuf.SetDepthWriteEnableEXT(enable);
+                });
+            }
+            if (state_tracker.TouchStencilTestEnable()) {
+                scheduler.Record([enable = v.stencil_test != 0](vk::CommandBuffer cmdbuf) {
+                    cmdbuf.SetStencilTestEnableEXT(enable);
+                });
+            }
+        }
+        if (topology_changed) {
+            scheduler.Record([topology_vk = MaxwellToVK::PrimitiveTopology(device, topology)](
+                                 vk::CommandBuffer cmdbuf) {
+                cmdbuf.SetPrimitiveTopologyEXT(topology_vk);
+            });
+        }
+    }
+
+    if (device.IsExtExtendedDynamicState2Supported()) {
+        if (!emulated_mesh && state_tracker.TouchPrimitiveRestartEnable()) {
+            scheduler.Record([enable = v.primitive_restart != 0](vk::CommandBuffer cmdbuf) {
+                cmdbuf.SetPrimitiveRestartEnableEXT(enable);
+            });
+        }
+        if (state_tracker.TouchRasterizerDiscardEnable()) {
+            scheduler.Record([discard = v.rasterizer_discard != 0](vk::CommandBuffer cmdbuf) {
+                cmdbuf.SetRasterizerDiscardEnableEXT(discard);
+            });
+        }
+        if (state_tracker.TouchDepthBiasEnable()) {
+            scheduler.Record([enable = v.depth_bias_enable != 0](vk::CommandBuffer cmdbuf) {
+                cmdbuf.SetDepthBiasEnableEXT(enable);
+            });
+        }
+    }
+
+    if (device.IsExtExtendedDynamicState2ExtrasSupported() && state_tracker.TouchLogicOp()) {
+        EmitLogicOp(scheduler, v.logic_op);
+    }
+
+    if (device.IsExtExtendedDynamicState3EnablesSupported()) {
+        UpdateLogicOpEnable(v.logic_op_enable != 0);
+        if (state_tracker.TouchDepthClampEnable() &&
+            device.SupportsDynamicState3DepthClampEnable()) {
+            scheduler.Record([enable = v.depth_clamp != 0](vk::CommandBuffer cmdbuf) {
+                cmdbuf.SetDepthClampEnableEXT(enable);
+            });
+        }
+        if (device.IsExtLineRasterizationSupported() &&
+            state_tracker.TouchLineRasterizationMode() &&
+            device.SupportsDynamicState3LineRasterizationMode()) {
+            const VkLineRasterizationModeEXT mode =
+                v.line_smooth ? VK_LINE_RASTERIZATION_MODE_RECTANGULAR_SMOOTH_EXT
+                              : VK_LINE_RASTERIZATION_MODE_RECTANGULAR_EXT;
+            scheduler.Record(
+                [mode](vk::CommandBuffer cmdbuf) { cmdbuf.SetLineRasterizationModeEXT(mode); });
+        }
+        if (state_tracker.TouchLineStippleEnable() &&
+            device.SupportsDynamicState3LineStippleEnable()) {
+            scheduler.Record([enable = v.line_stipple != 0](vk::CommandBuffer cmdbuf) {
+                cmdbuf.SetLineStippleEnableEXT(enable);
+            });
+        }
+        if (state_tracker.TouchConservativeRasterizationMode() &&
+            device.SupportsDynamicState3ConservativeRasterizationMode()) {
+            scheduler.Record([enable = v.conservative != 0](vk::CommandBuffer cmdbuf) {
+                cmdbuf.SetConservativeRasterizationModeEXT(
+                    enable ? VK_CONSERVATIVE_RASTERIZATION_MODE_OVERESTIMATE_EXT
+                           : VK_CONSERVATIVE_RASTERIZATION_MODE_DISABLED_EXT);
+            });
+        }
+        if (state_tracker.TouchAlphaToCoverageEnable() &&
+            device.SupportsDynamicState3AlphaToCoverageEnable()) {
+            GraphicsPipeline* const current = pipeline_cache.CurrentGraphicsPipeline();
+            const bool enable = current != nullptr && current->SupportsAlphaToCoverage() &&
+                                v.alpha_to_coverage != 0;
+            scheduler.Record([enable](vk::CommandBuffer cmdbuf) {
+                cmdbuf.SetAlphaToCoverageEnableEXT(enable ? VK_TRUE : VK_FALSE);
+            });
+        }
+        if (state_tracker.TouchAlphaToOneEnable() &&
+            device.SupportsDynamicState3AlphaToOneEnable()) {
+            GraphicsPipeline* const current = pipeline_cache.CurrentGraphicsPipeline();
+            const bool enable =
+                current != nullptr && current->SupportsAlphaToOne() && v.alpha_to_one != 0;
+            scheduler.Record([enable](vk::CommandBuffer cmdbuf) {
+                cmdbuf.SetAlphaToOneEnableEXT(enable ? VK_TRUE : VK_FALSE);
+            });
+        }
+    }
+
+    if (device.IsExtExtendedDynamicState3BlendingSupported()) {
+        const u32 color_output_mask = pipeline ? pipeline->ColorOutputMask() : ~0U;
+        const bool color_output_changed = color_output_mask != last_color_output_mask;
+        if (state_tracker.TouchBlending() || color_output_changed) {
+            if (state_tracker.TouchColorMask() || color_output_changed) {
+                last_color_output_mask = color_output_mask;
+                std::array<VkColorComponentFlags, Maxwell::NumRenderTargets> setup_masks{};
+                for (size_t index = 0; index < Maxwell::NumRenderTargets; index++) {
+                    setup_masks[index] =
+                        v.color_masks[index] & ((color_output_mask >> (index * 4)) & 0xF);
+                }
+                scheduler.Record([setup_masks](vk::CommandBuffer cmdbuf) {
+                    cmdbuf.SetColorWriteMaskEXT(0, setup_masks);
+                });
+            }
+            if (state_tracker.TouchBlendEnable()) {
+                std::array<VkBool32, Maxwell::NumRenderTargets> setup_enables{};
+                for (size_t index = 0; index < Maxwell::NumRenderTargets; index++) {
+                    setup_enables[index] = v.blend_enables[index] != 0 ? VK_TRUE : VK_FALSE;
+                }
+                scheduler.Record([setup_enables](vk::CommandBuffer cmdbuf) {
+                    cmdbuf.SetColorBlendEnableEXT(0, setup_enables);
+                });
+            }
+            if (state_tracker.TouchBlendEquations()) {
+                EmitBlendEquations(scheduler, v.iterated_blend_squash != 0, v.blend_equations);
+            }
+        }
+    } else if (device.IsExtColorWriteEnableSupported() && state_tracker.TouchColorMask()) {
+        std::array<VkBool32, Maxwell::NumRenderTargets> setup_enables{};
+        for (size_t index = 0; index < Maxwell::NumRenderTargets; index++) {
+            setup_enables[index] = v.color_write_enables[index] != 0 ? VK_TRUE : VK_FALSE;
+        }
+        scheduler.Record([setup_enables](vk::CommandBuffer cmdbuf) {
+            cmdbuf.SetColorWriteEnableEXT(setup_enables);
+        });
+    }
+
+    if (device.IsExtVertexInputDynamicStateSupported() && !emulated_mesh) {
+        const GraphicsPipeline* const gp =
+            pipeline != nullptr ? pipeline : pipeline_cache.CurrentGraphicsPipeline();
+        const bool vertex_input_dirty = flags[Dirty::VertexInput];
+        if (gp && gp->HasDynamicVertexInput() &&
+            (vertex_input_dirty || flags[VideoCommon::Dirty::VertexBuffers])) {
+            if (vertex_input_dirty) {
+                flags[Dirty::VertexInputKey] = true;
+            }
+            flags[Dirty::VertexInput] = false;
+            for (size_t index = 0; index < Maxwell::NumVertexAttributes; ++index) {
+                flags[Dirty::VertexAttribute0 + index] = false;
+            }
+            for (size_t index = 0; index < Maxwell::NumVertexArrays; ++index) {
+                flags[Dirty::VertexBinding0 + index] = false;
+            }
+            EmitVertexInput(scheduler, device, buffer_cache_runtime, v);
+        }
+    }
+}
+
 void RasterizerVulkan::HandleTransformFeedback() {
     static std::once_flag warn_unsupported;
 
@@ -4668,159 +5365,54 @@ void RasterizerVulkan::UpdateViewportsState(Tegra::Engines::Maxwell3D::Regs& reg
 
     maxwell3d->dirty.flags[Dirty::Scissors] = true;
 
-    if (!regs.viewport_scale_offset_enabled) {
-        float x = static_cast<float>(regs.surface_clip.x);
-        float y = static_cast<float>(regs.surface_clip.y);
-        float width = (std::max)(1.0f, static_cast<float>(regs.surface_clip.width));
-        float height = (std::max)(1.0f, static_cast<float>(regs.surface_clip.height));
-        if (regs.window_origin.mode != Maxwell::WindowOrigin::Mode::UpperLeft) {
-            y += height;
-            height = -height;
-        }
-        VkViewport viewport{
-            .x = x,
-            .y = y,
-            .width = width,
-            .height = height,
-            .minDepth = 0.0f,
-            .maxDepth = 1.0f,
-        };
-        scheduler.Record([this, viewport](vk::CommandBuffer cmdbuf) {
-            const u32 num_viewports = std::min<u32>(device.GetMaxViewports(), Maxwell::NumViewports);
-            std::array<VkViewport, Maxwell::NumViewports> viewport_list{};
-            viewport_list.fill(viewport);
-            const vk::Span<VkViewport> viewports(viewport_list.data(), num_viewports);
-            cmdbuf.SetViewport(0, viewports);
-        });
-        return;
+    float scale = 1.0f;
+    if (regs.viewport_scale_offset_enabled) {
+        const bool is_rescaling{texture_cache.IsRescaling()};
+        scale = is_rescaling ? Settings::values.resolution_info.up_factor : 1.0f;
     }
-    const bool is_rescaling{texture_cache.IsRescaling()};
-    const float scale = is_rescaling ? Settings::values.resolution_info.up_factor : 1.0f;
-    const std::array viewport_list{
-        GetViewportState(device, regs, 0, scale),  GetViewportState(device, regs, 1, scale),
-        GetViewportState(device, regs, 2, scale),  GetViewportState(device, regs, 3, scale),
-        GetViewportState(device, regs, 4, scale),  GetViewportState(device, regs, 5, scale),
-        GetViewportState(device, regs, 6, scale),  GetViewportState(device, regs, 7, scale),
-        GetViewportState(device, regs, 8, scale),  GetViewportState(device, regs, 9, scale),
-        GetViewportState(device, regs, 10, scale), GetViewportState(device, regs, 11, scale),
-        GetViewportState(device, regs, 12, scale), GetViewportState(device, regs, 13, scale),
-        GetViewportState(device, regs, 14, scale), GetViewportState(device, regs, 15, scale),
-    };
-    scheduler.Record([this, viewport_list](vk::CommandBuffer cmdbuf) {
-        const u32 num_viewports = std::min<u32>(device.GetMaxViewports(), Maxwell::NumViewports);
-        const vk::Span<VkViewport> viewports(viewport_list.data(), num_viewports);
-        cmdbuf.SetViewport(0, viewports);
-    });
+    EmitViewports(scheduler, device, ViewportSourceOf(regs), regs.viewport_scale_offset_enabled != 0,
+                  scale);
 }
 
 void RasterizerVulkan::UpdateScissorsState(Tegra::Engines::Maxwell3D::Regs& regs) {
     if (!state_tracker.TouchScissors()) {
         return;
     }
-    if (!regs.viewport_scale_offset_enabled) {
-        u32 x = regs.surface_clip.x;
-        u32 y = regs.surface_clip.y;
-        u32 width = (std::max)(1u, static_cast<u32>(regs.surface_clip.width));
-        u32 height = (std::max)(1u, static_cast<u32>(regs.surface_clip.height));
-        if (regs.window_origin.mode != Maxwell::WindowOrigin::Mode::UpperLeft) {
-            y = regs.surface_clip.height - (y + height);
-        }
-        VkRect2D scissor{};
-        scissor.offset.x = static_cast<int32_t>(x);
-        scissor.offset.y = static_cast<int32_t>(y);
-        scissor.extent.width  = width;
-        scissor.extent.height = height;
-        scheduler.Record([this, scissor](vk::CommandBuffer cmdbuf) {
-            const u32 num_scissors = std::min<u32>(device.GetMaxViewports(), Maxwell::NumViewports);
-            std::array<VkRect2D, Maxwell::NumViewports> scissor_list{};
-            scissor_list.fill(scissor);
-            const vk::Span<VkRect2D> scissors(scissor_list.data(), num_scissors);
-            cmdbuf.SetScissor(0, scissors);
-        });
-        return;
-    }
     u32 up_scale = 1;
     u32 down_shift = 0;
-    if (texture_cache.IsRescaling()) {
+    if (regs.viewport_scale_offset_enabled && texture_cache.IsRescaling()) {
         up_scale = Settings::values.resolution_info.up_scale;
         down_shift = Settings::values.resolution_info.down_shift;
     }
-    const std::array scissor_list{
-        GetScissorState(regs, 0, up_scale, down_shift),
-        GetScissorState(regs, 1, up_scale, down_shift),
-        GetScissorState(regs, 2, up_scale, down_shift),
-        GetScissorState(regs, 3, up_scale, down_shift),
-        GetScissorState(regs, 4, up_scale, down_shift),
-        GetScissorState(regs, 5, up_scale, down_shift),
-        GetScissorState(regs, 6, up_scale, down_shift),
-        GetScissorState(regs, 7, up_scale, down_shift),
-        GetScissorState(regs, 8, up_scale, down_shift),
-        GetScissorState(regs, 9, up_scale, down_shift),
-        GetScissorState(regs, 10, up_scale, down_shift),
-        GetScissorState(regs, 11, up_scale, down_shift),
-        GetScissorState(regs, 12, up_scale, down_shift),
-        GetScissorState(regs, 13, up_scale, down_shift),
-        GetScissorState(regs, 14, up_scale, down_shift),
-        GetScissorState(regs, 15, up_scale, down_shift),
-    };
-    scheduler.Record([this, scissor_list](vk::CommandBuffer cmdbuf) {
-        const u32 num_scissors = std::min<u32>(device.GetMaxViewports(), Maxwell::NumViewports);
-        const vk::Span<VkRect2D> scissors(scissor_list.data(), num_scissors);
-        cmdbuf.SetScissor(0, scissors);
-    });
+    EmitScissors(scheduler, device, ViewportSourceOf(regs), regs.viewport_scale_offset_enabled != 0,
+                 up_scale, down_shift);
 }
 
 void RasterizerVulkan::UpdateDepthBias(Tegra::Engines::Maxwell3D::Regs& regs) {
     if (!state_tracker.TouchDepthBias()) {
         return;
     }
-    float units = regs.depth_bias / 2.0f;
-    const bool is_d24 = regs.zeta.format == Tegra::DepthFormat::Z24_UNORM_S8_UINT ||
-                        regs.zeta.format == Tegra::DepthFormat::X8Z24_UNORM ||
-                        regs.zeta.format == Tegra::DepthFormat::S8Z24_UNORM ||
-                        regs.zeta.format == Tegra::DepthFormat::V8Z24_UNORM;
+    EmitDepthBias(scheduler, device,
+                  VideoCommon::V2::Resolve::DepthBiasOf(
+                      regs, VideoCommon::V2::Resolve::IsD24DepthFormat(regs.zeta.format) &&
+                                D24BiasRescale()));
+}
 
-    if (is_d24 && !device.SupportsD24DepthBuffer()) {
-        static constexpr const size_t length = sizeof(NEEDS_D24) / sizeof(NEEDS_D24[0]);
-
-        static constexpr const u64* start = NEEDS_D24;
-        static constexpr const u64* end = NEEDS_D24 + length;
-
-        const u64* it = std::find(start, end, program_id);
-
-        if (it != end) {
-            // the base formulas can be obtained from here:
-            //   https://docs.microsoft.com/en-us/windows/win32/direct3d11/d3d10-graphics-programming-guide-output-merger-stage-depth-bias
-            const double rescale_factor =
-                static_cast<double>(1ULL << (32 - 24)) / (static_cast<double>(0x1.ep+127));
-            units = static_cast<float>(static_cast<double>(units) * rescale_factor);
-        }
+bool RasterizerVulkan::D24BiasRescale() const {
+    if (device.SupportsD24DepthBuffer()) {
+        return false;
     }
-
-    scheduler.Record([constant = units, clamp = regs.depth_bias_clamp,
-                      factor = regs.slope_scale_depth_bias, this](vk::CommandBuffer cmdbuf) {
-        if (device.IsExtDepthBiasControlSupported()) {
-            static VkDepthBiasRepresentationInfoEXT bias_info{
-                .sType = VK_STRUCTURE_TYPE_DEPTH_BIAS_REPRESENTATION_INFO_EXT,
-                .pNext = nullptr,
-                .depthBiasRepresentation =
-                    VK_DEPTH_BIAS_REPRESENTATION_LEAST_REPRESENTABLE_VALUE_FORCE_UNORM_EXT,
-                .depthBiasExact = VK_FALSE,
-            };
-
-            cmdbuf.SetDepthBias(constant, clamp, factor, &bias_info);
-        } else {
-            cmdbuf.SetDepthBias(constant, clamp, factor);
-        }
-    });
+    static constexpr const size_t length = sizeof(NEEDS_D24) / sizeof(NEEDS_D24[0]);
+    static constexpr const u64* start = NEEDS_D24;
+    static constexpr const u64* end = NEEDS_D24 + length;
+    return std::find(start, end, program_id) != end;
 }
 
 void RasterizerVulkan::UpdateBlendConstants(Tegra::Engines::Maxwell3D::Regs& regs) {
     if (!state_tracker.TouchBlendConstants()) {
         return;
     }
-    const std::array blend_color = {regs.blend_color.r, regs.blend_color.g, regs.blend_color.b,
-                                    regs.blend_color.a};
+    const std::array blend_color = VideoCommon::V2::Resolve::BlendConstantsOf(regs);
     scheduler.Record(
         [blend_color](vk::CommandBuffer cmdbuf) { cmdbuf.SetBlendConstants(blend_color.data()); });
 }
@@ -4837,121 +5429,23 @@ void RasterizerVulkan::UpdateStencilFaces(Tegra::Engines::Maxwell3D::Regs& regs)
     if (!state_tracker.TouchStencilProperties()) {
         return;
     }
-    bool update_references = state_tracker.TouchStencilReference();
-    bool update_write_mask = state_tracker.TouchStencilWriteMask();
-    bool update_compare_masks = state_tracker.TouchStencilCompare();
-    if (state_tracker.TouchStencilSide(regs.stencil_two_side_enable != 0)) {
-        update_references = true;
-        update_write_mask = true;
-        update_compare_masks = true;
-    }
-    if (update_references) {
-        [&]() {
-            bool changed;
-            if (regs.stencil_two_side_enable) {
-                const bool front_changed =
-                    state_tracker.CheckStencilReferenceFront(regs.stencil_front_ref);
-                const bool back_changed =
-                    state_tracker.CheckStencilReferenceBack(regs.stencil_back_ref);
-                changed = front_changed || back_changed;
-            } else {
-                const bool front_changed =
-                    state_tracker.CheckStencilReferenceFront(regs.stencil_front_ref);
-                const bool back_changed =
-                    state_tracker.CheckStencilReferenceBack(regs.stencil_front_ref);
-                changed = front_changed || back_changed;
-            }
-            if (!changed) {
-                return;
-            }
-            scheduler.Record([front_ref = regs.stencil_front_ref, back_ref = regs.stencil_back_ref,
-                              two_sided = regs.stencil_two_side_enable](vk::CommandBuffer cmdbuf) {
-                const bool set_back = two_sided && front_ref != back_ref;
-                // Front face
-                cmdbuf.SetStencilReference(set_back ? VK_STENCIL_FACE_FRONT_BIT
-                                                    : VK_STENCIL_FACE_FRONT_AND_BACK,
-                                           front_ref);
-                if (set_back) {
-                    cmdbuf.SetStencilReference(VK_STENCIL_FACE_BACK_BIT, back_ref);
-                }
-            });
-        }();
-    }
-    if (update_write_mask) {
-        [&]() {
-            bool changed;
-            if (regs.stencil_two_side_enable) {
-                const bool front_changed =
-                    state_tracker.CheckStencilWriteMaskFront(regs.stencil_front_mask);
-                const bool back_changed =
-                    state_tracker.CheckStencilWriteMaskBack(regs.stencil_back_mask);
-                changed = front_changed || back_changed;
-            } else {
-                const bool front_changed =
-                    state_tracker.CheckStencilWriteMaskFront(regs.stencil_front_mask);
-                const bool back_changed =
-                    state_tracker.CheckStencilWriteMaskBack(regs.stencil_front_mask);
-                changed = front_changed || back_changed;
-            }
-            if (!changed) {
-                return;
-            }
-            scheduler.Record([front_write_mask = regs.stencil_front_mask,
-                              back_write_mask = regs.stencil_back_mask,
-                              two_sided = regs.stencil_two_side_enable](vk::CommandBuffer cmdbuf) {
-                const bool set_back = two_sided && front_write_mask != back_write_mask;
-                // Front face
-                cmdbuf.SetStencilWriteMask(set_back ? VK_STENCIL_FACE_FRONT_BIT
-                                                    : VK_STENCIL_FACE_FRONT_AND_BACK,
-                                           front_write_mask);
-                if (set_back) {
-                    cmdbuf.SetStencilWriteMask(VK_STENCIL_FACE_BACK_BIT, back_write_mask);
-                }
-            });
-        }();
-    }
-    if (update_compare_masks) {
-        [&]() {
-            bool changed;
-            if (regs.stencil_two_side_enable) {
-                const bool front_changed =
-                    state_tracker.CheckStencilCompareMaskFront(regs.stencil_front_func_mask);
-                const bool back_changed =
-                    state_tracker.CheckStencilCompareMaskBack(regs.stencil_back_func_mask);
-                changed = front_changed || back_changed;
-            } else {
-                const bool front_changed =
-                    state_tracker.CheckStencilCompareMaskFront(regs.stencil_front_func_mask);
-                const bool back_changed =
-                    state_tracker.CheckStencilCompareMaskBack(regs.stencil_front_func_mask);
-                changed = front_changed || back_changed;
-            }
-            if (!changed) {
-                return;
-            }
-            scheduler.Record([front_test_mask = regs.stencil_front_func_mask,
-                              back_test_mask = regs.stencil_back_func_mask,
-                              two_sided = regs.stencil_two_side_enable](vk::CommandBuffer cmdbuf) {
-                const bool set_back = two_sided && front_test_mask != back_test_mask;
-                // Front face
-                cmdbuf.SetStencilCompareMask(set_back ? VK_STENCIL_FACE_FRONT_BIT
-                                                      : VK_STENCIL_FACE_FRONT_AND_BACK,
-                                             front_test_mask);
-                if (set_back) {
-                    cmdbuf.SetStencilCompareMask(VK_STENCIL_FACE_BACK_BIT, back_test_mask);
-                }
-            });
-        }();
-    }
-    state_tracker.ClearStencilReset();
+    EmitStencilFaces(scheduler, state_tracker,
+                     StencilFaceValues{
+                         .two_side = regs.stencil_two_side_enable,
+                         .front_ref = regs.stencil_front_ref,
+                         .back_ref = regs.stencil_back_ref,
+                         .front_write_mask = regs.stencil_front_mask,
+                         .back_write_mask = regs.stencil_back_mask,
+                         .front_compare_mask = regs.stencil_front_func_mask,
+                         .back_compare_mask = regs.stencil_back_func_mask,
+                     });
 }
 
 void RasterizerVulkan::UpdateLineWidth(Tegra::Engines::Maxwell3D::Regs& regs) {
     if (!state_tracker.TouchLineWidth()) {
         return;
     }
-    const float width =
-        regs.line_anti_alias_enable ? regs.line_width_smooth : regs.line_width_aliased;
+    const float width = VideoCommon::V2::Resolve::LineWidthOf(regs);
     scheduler.Record([width](vk::CommandBuffer cmdbuf) { cmdbuf.SetLineWidth(width); });
 }
 
@@ -5002,13 +5496,16 @@ void RasterizerVulkan::UpdatePrimitiveRestartEnable(Tegra::Engines::Maxwell3D::R
         return;
     }
 
-    bool enable = regs.primitive_restart.enabled != 0;
-    if (device.IsMoltenVK()) {
-        enable = true;
-    } else if (enable) {
-        const auto topology = MaxwellToVK::PrimitiveTopology(device, maxwell3d->draw_manager.draw_state.topology);
-        enable = IsPrimitiveRestartSupported(device, topology);
+    const auto guest_topology = maxwell3d->draw_manager.draw_state.topology;
+    u32 restart_topologies = 0;
+    if (!device.IsMoltenVK() && regs.primitive_restart.enabled != 0) {
+        const auto topology = MaxwellToVK::PrimitiveTopology(device, guest_topology);
+        restart_topologies = IsPrimitiveRestartSupported(device, topology)
+                                 ? 1U << static_cast<u32>(guest_topology)
+                                 : 0U;
     }
+    const bool enable = VideoCommon::V2::Resolve::PrimitiveRestartOf(
+        regs, guest_topology, device.IsMoltenVK(), restart_topologies);
 
     scheduler.Record([enable](vk::CommandBuffer cmdbuf) {
         cmdbuf.SetPrimitiveRestartEnableEXT(enable);
@@ -5095,34 +5592,9 @@ void RasterizerVulkan::UpdateDepthBiasEnable(Tegra::Engines::Maxwell3D::Regs& re
     if (!state_tracker.TouchDepthBiasEnable()) {
         return;
     }
-    constexpr size_t POINT = 0;
-    constexpr size_t LINE = 1;
-    constexpr size_t POLYGON = 2;
-    static constexpr std::array POLYGON_OFFSET_ENABLE_LUT = {
-        POINT,   // Points
-        LINE,    // Lines
-        LINE,    // LineLoop
-        LINE,    // LineStrip
-        POLYGON, // Triangles
-        POLYGON, // TriangleStrip
-        POLYGON, // TriangleFan
-        POLYGON, // Quads
-        POLYGON, // QuadStrip
-        POLYGON, // Polygon
-        LINE,    // LinesAdjacency
-        LINE,    // LineStripAdjacency
-        POLYGON, // TrianglesAdjacency
-        POLYGON, // TriangleStripAdjacency
-        POLYGON, // Patches
-    };
-    const std::array enabled_lut{
-        regs.polygon_offset_point_enable,
-        regs.polygon_offset_line_enable,
-        regs.polygon_offset_fill_enable,
-    };
-    const u32 topology_index = u32(maxwell3d->draw_manager.draw_state.topology);
-    const u32 enable = enabled_lut[POLYGON_OFFSET_ENABLE_LUT[topology_index]];
-    scheduler.Record([enable](vk::CommandBuffer cmdbuf) { cmdbuf.SetDepthBiasEnableEXT(enable != 0); });
+    const bool enable = VideoCommon::V2::Resolve::DepthBiasEnableOf(
+        regs, maxwell3d->draw_manager.draw_state.topology);
+    scheduler.Record([enable](vk::CommandBuffer cmdbuf) { cmdbuf.SetDepthBiasEnableEXT(enable); });
 }
 
 void RasterizerVulkan::UpdateLogicOpEnable(bool enable) {
@@ -5147,12 +5619,7 @@ void RasterizerVulkan::UpdateDepthClampEnable(Tegra::Engines::Maxwell3D::Regs& r
     if (!device.SupportsDynamicState3DepthClampEnable()) {
         return;
     }
-    bool is_enabled = !(regs.viewport_clip_control.geometry_clip ==
-                            Maxwell::ViewportClipControl::GeometryClip::Passthrough ||
-                        regs.viewport_clip_control.geometry_clip ==
-                            Maxwell::ViewportClipControl::GeometryClip::FrustumXYZ ||
-                        regs.viewport_clip_control.geometry_clip ==
-                            Maxwell::ViewportClipControl::GeometryClip::FrustumZ);
+    const bool is_enabled = VideoCommon::V2::Resolve::DepthClampOf(regs);
     scheduler.Record(
         [is_enabled](vk::CommandBuffer cmdbuf) { cmdbuf.SetDepthClampEnableEXT(is_enabled); });
 }
@@ -5205,58 +5672,23 @@ void RasterizerVulkan::UpdateFrontFace(Tegra::Engines::Maxwell3D::Regs& regs) {
     if (!state_tracker.TouchFrontFace()) {
         return;
     }
-
-    VkFrontFace front_face = MaxwellToVK::FrontFace(regs.gl_front_face);
-    if (regs.window_origin.flip_y != 0) {
-        front_face = front_face == VK_FRONT_FACE_CLOCKWISE ? VK_FRONT_FACE_COUNTER_CLOCKWISE
-                                                           : VK_FRONT_FACE_CLOCKWISE;
-    }
-    scheduler.Record(
-        [front_face](vk::CommandBuffer cmdbuf) { cmdbuf.SetFrontFaceEXT(front_face); });
+    EmitFrontFace(scheduler, regs.gl_front_face, regs.window_origin.flip_y != 0);
 }
 
 void RasterizerVulkan::UpdateStencilOp(Tegra::Engines::Maxwell3D::Regs& regs) {
     if (!state_tracker.TouchStencilOp()) {
         return;
     }
-    const Maxwell::StencilOp::Op fail = regs.stencil_front_op.fail;
-    const Maxwell::StencilOp::Op zfail = regs.stencil_front_op.zfail;
-    const Maxwell::StencilOp::Op zpass = regs.stencil_front_op.zpass;
-    const Maxwell::ComparisonOp compare = regs.stencil_front_op.func;
-    if (regs.stencil_two_side_enable) {
-        // Separate stencil op per face
-        const Maxwell::StencilOp::Op back_fail = regs.stencil_back_op.fail;
-        const Maxwell::StencilOp::Op back_zfail = regs.stencil_back_op.zfail;
-        const Maxwell::StencilOp::Op back_zpass = regs.stencil_back_op.zpass;
-        const Maxwell::ComparisonOp back_compare = regs.stencil_back_op.func;
-        scheduler.Record([fail, zfail, zpass, compare, back_fail, back_zfail, back_zpass,
-                          back_compare](vk::CommandBuffer cmdbuf) {
-            cmdbuf.SetStencilOpEXT(VK_STENCIL_FACE_FRONT_BIT, MaxwellToVK::StencilOp(fail),
-                                   MaxwellToVK::StencilOp(zpass), MaxwellToVK::StencilOp(zfail),
-                                   MaxwellToVK::ComparisonOp(compare));
-            cmdbuf.SetStencilOpEXT(VK_STENCIL_FACE_BACK_BIT, MaxwellToVK::StencilOp(back_fail),
-                                   MaxwellToVK::StencilOp(back_zpass),
-                                   MaxwellToVK::StencilOp(back_zfail),
-                                   MaxwellToVK::ComparisonOp(back_compare));
-        });
-    } else {
-        // Front face defines the stencil op of both faces
-        scheduler.Record([fail, zfail, zpass, compare](vk::CommandBuffer cmdbuf) {
-            cmdbuf.SetStencilOpEXT(VK_STENCIL_FACE_FRONT_AND_BACK, MaxwellToVK::StencilOp(fail),
-                                   MaxwellToVK::StencilOp(zpass), MaxwellToVK::StencilOp(zfail),
-                                   MaxwellToVK::ComparisonOp(compare));
-        });
-    }
+    EmitStencilOp(scheduler, regs.stencil_two_side_enable != 0,
+                  VideoCommon::V2::Resolve::StencilFaceOpOf(regs.stencil_front_op),
+                  VideoCommon::V2::Resolve::StencilFaceOpOf(regs.stencil_back_op));
 }
 
 void RasterizerVulkan::UpdateLogicOp(Tegra::Engines::Maxwell3D::Regs& regs) {
     if (!state_tracker.TouchLogicOp()) {
         return;
     }
-    const auto op_value = static_cast<u32>(regs.logic_op.op);
-    auto op = op_value >= 0x1500 && op_value < 0x1510 ? static_cast<VkLogicOp>(op_value - 0x1500)
-                                                      : VK_LOGIC_OP_NO_OP;
-    scheduler.Record([op](vk::CommandBuffer cmdbuf) { cmdbuf.SetLogicOpEXT(op); });
+    EmitLogicOp(scheduler, static_cast<u32>(regs.logic_op.op));
 }
 
 void RasterizerVulkan::UpdateBlending(Tegra::Engines::Maxwell3D::Regs& regs,
@@ -5273,21 +5705,8 @@ void RasterizerVulkan::UpdateBlending(Tegra::Engines::Maxwell3D::Regs& regs,
         last_color_output_mask = color_output_mask;
         std::array<VkColorComponentFlags, Maxwell::NumRenderTargets> setup_masks{};
         for (size_t index = 0; index < Maxwell::NumRenderTargets; index++) {
-            const auto& mask = regs.color_mask[regs.color_mask_common ? 0 : index];
-            auto& current = setup_masks[index];
-            if (mask.R) {
-                current |= VK_COLOR_COMPONENT_R_BIT;
-            }
-            if (mask.G) {
-                current |= VK_COLOR_COMPONENT_G_BIT;
-            }
-            if (mask.B) {
-                current |= VK_COLOR_COMPONENT_B_BIT;
-            }
-            if (mask.A) {
-                current |= VK_COLOR_COMPONENT_A_BIT;
-            }
-            current &= (color_output_mask >> (index * 4)) & 0xF;
+            setup_masks[index] = VideoCommon::V2::Resolve::ColorMaskOf(regs, index) &
+                                 ((color_output_mask >> (index * 4)) & 0xF);
         }
         scheduler.Record([setup_masks](vk::CommandBuffer cmdbuf) {
             cmdbuf.SetColorWriteMaskEXT(0, setup_masks);
@@ -5297,14 +5716,8 @@ void RasterizerVulkan::UpdateBlending(Tegra::Engines::Maxwell3D::Regs& regs,
     if (state_tracker.TouchBlendEnable()) {
         std::array<VkBool32, Maxwell::NumRenderTargets> setup_enables{};
         for (size_t index = 0; index < Maxwell::NumRenderTargets; index++) {
-            bool is_integer = false;
-            if (regs.rt[index].format != Tegra::RenderTargetFormat::NONE) {
-                const auto format =
-                    VideoCore::Surface::PixelFormatFromRenderTargetFormat(regs.rt[index].format);
-                is_integer = IsPixelFormatInteger(format);
-            }
             setup_enables[index] =
-                (!is_integer && regs.blend.enable[index] != 0) ? VK_TRUE : VK_FALSE;
+                VideoCommon::V2::Resolve::BlendEnableOf(regs, index) ? VK_TRUE : VK_FALSE;
         }
         scheduler.Record([setup_enables](vk::CommandBuffer cmdbuf) {
             cmdbuf.SetColorBlendEnableEXT(0, setup_enables);
@@ -5312,45 +5725,10 @@ void RasterizerVulkan::UpdateBlending(Tegra::Engines::Maxwell3D::Regs& regs,
     }
 
     if (state_tracker.TouchBlendEquations()) {
-        std::array<VkColorBlendEquationEXT, Maxwell::NumRenderTargets> setup_blends{};
-
-        const auto blend_setup = [&](auto& host_blend, const auto& guest_blend) {
-            host_blend.srcColorBlendFactor = MaxwellToVK::BlendFactor(guest_blend.color_source);
-            host_blend.dstColorBlendFactor = MaxwellToVK::BlendFactor(guest_blend.color_dest);
-            host_blend.colorBlendOp = MaxwellToVK::BlendEquation(guest_blend.color_op);
-            host_blend.srcAlphaBlendFactor = MaxwellToVK::BlendFactor(guest_blend.alpha_source);
-            host_blend.dstAlphaBlendFactor = MaxwellToVK::BlendFactor(guest_blend.alpha_dest);
-            host_blend.alphaBlendOp = MaxwellToVK::BlendEquation(guest_blend.alpha_op);
-        };
-
-        // Single blend equation for all targets
-        if (!regs.blend_per_target_enabled) {
-            // Temporary workaround for games that use iterated blending
-            if (regs.iterated_blend.enable && Settings::values.use_squashed_iterated_blend) {
-                setup_blends[0].srcColorBlendFactor = VK_BLEND_FACTOR_ONE;
-                setup_blends[0].dstColorBlendFactor = VK_BLEND_FACTOR_ONE;
-                setup_blends[0].colorBlendOp = VK_BLEND_OP_ADD;
-                setup_blends[0].srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_COLOR;
-                setup_blends[0].dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
-                setup_blends[0].alphaBlendOp = VK_BLEND_OP_ADD;
-            } else {
-                blend_setup(setup_blends[0], regs.blend);
-            }
-
-            // Copy first blend state to all other targets
-            for (size_t index = 1; index < Maxwell::NumRenderTargets; index++) {
-                setup_blends[index] = setup_blends[0];
-            }
-        } else {
-            // Per-target blending
-            for (size_t index = 0; index < Maxwell::NumRenderTargets; index++) {
-                blend_setup(setup_blends[index], regs.blend_per_target[index]);
-            }
-        }
-
-        scheduler.Record([setup_blends](vk::CommandBuffer cmdbuf) {
-            cmdbuf.SetColorBlendEquationEXT(0, setup_blends);
-        });
+        std::array<VideoCommon::V2::Resolve::BlendEquation, Maxwell::NumRenderTargets> equations{};
+        const bool squashed = VideoCommon::V2::Resolve::BlendEquationsOf(
+            regs, Settings::values.use_squashed_iterated_blend, equations);
+        EmitBlendEquations(scheduler, squashed, equations);
     }
 }
 
@@ -5360,8 +5738,8 @@ void RasterizerVulkan::UpdateColorWriteEnable(Tegra::Engines::Maxwell3D::Regs& r
     }
     std::array<VkBool32, Maxwell::NumRenderTargets> setup_enables{};
     for (size_t index = 0; index < Maxwell::NumRenderTargets; index++) {
-        const auto& mask = regs.color_mask[regs.color_mask_common ? 0 : index];
-        setup_enables[index] = (mask.R || mask.G || mask.B || mask.A) ? VK_TRUE : VK_FALSE;
+        setup_enables[index] =
+            VideoCommon::V2::Resolve::ColorMaskOf(regs, index) != 0 ? VK_TRUE : VK_FALSE;
     }
     scheduler.Record([setup_enables](vk::CommandBuffer cmdbuf) {
         cmdbuf.SetColorWriteEnableEXT(setup_enables);
@@ -5389,46 +5767,9 @@ void RasterizerVulkan::UpdateVertexInput(Tegra::Engines::Maxwell3D::Regs& regs) 
     }
     dirty[Dirty::VertexInput] = false;
 
-    boost::container::static_vector<VkVertexInputBindingDescription2EXT, 32> bindings;
-    boost::container::static_vector<VkVertexInputAttributeDescription2EXT, 32> attributes;
-
-    const u32 max_attributes =
-        static_cast<u32>(std::min<size_t>(Maxwell::NumVertexAttributes,
-                                          device.GetMaxVertexInputAttributes()));
-    const u32 max_bindings =
-        static_cast<u32>(std::min<size_t>(Maxwell::NumVertexArrays,
-                                          device.GetMaxVertexInputBindings()));
-
-
-    for (u32 index = 0; index < max_attributes; ++index) {
-        const Maxwell::VertexAttribute attribute{regs.vertex_attrib_format[index]};
-        const u32 binding{attribute.buffer};
-        if (attribute.constant || binding >= max_bindings) {
-            continue;
-        }
-        attributes.push_back({
-            .sType = VK_STRUCTURE_TYPE_VERTEX_INPUT_ATTRIBUTE_DESCRIPTION_2_EXT,
-            .pNext = nullptr,
-            .location = index,
-            .binding = binding,
-            .format = MaxwellToVK::VertexFormat(device, attribute.type, attribute.size),
-            .offset = attribute.offset +
-                      (buffer_cache_runtime.IsVertexRepacked(binding) && attribute.offset >= 65 ? 3 : 0),
-        });
-    }
-
-    for (u32 binding = 0; binding < max_bindings; ++binding) {
-        const auto& input_binding{regs.vertex_streams[binding]};
-        const bool is_instanced{regs.vertex_stream_instances.IsInstancingEnabled(binding)};
-        bindings.push_back({
-            .sType = VK_STRUCTURE_TYPE_VERTEX_INPUT_BINDING_DESCRIPTION_2_EXT,
-            .pNext = nullptr,
-            .binding = binding,
-            .stride = buffer_cache_runtime.IsVertexRepacked(binding) ? 72U : input_binding.stride.Value(),
-            .inputRate = is_instanced ? VK_VERTEX_INPUT_RATE_INSTANCE : VK_VERTEX_INPUT_RATE_VERTEX,
-            .divisor = is_instanced ? input_binding.frequency : 1,
-        });
-    }
+    VideoCommon::V2::Resolve::DynamicValues values;
+    VideoCommon::V2::Resolve::VertexInputOf(regs, MaxVertexInputAttributes(),
+                                            MaxVertexInputBindings(), values);
 
     for (size_t index = 0; index < Maxwell::NumVertexAttributes; ++index) {
         dirty[Dirty::VertexAttribute0 + index] = false;
@@ -5437,9 +5778,17 @@ void RasterizerVulkan::UpdateVertexInput(Tegra::Engines::Maxwell3D::Regs& regs) 
         dirty[Dirty::VertexBinding0 + index] = false;
     }
 
-    scheduler.Record([bindings, attributes](vk::CommandBuffer cmdbuf) {
-        cmdbuf.SetVertexInputEXT(bindings, attributes);
-    });
+    EmitVertexInput(scheduler, device, buffer_cache_runtime, values);
+}
+
+u32 RasterizerVulkan::MaxVertexInputAttributes() const {
+    return static_cast<u32>(
+        std::min<size_t>(Maxwell::NumVertexAttributes, device.GetMaxVertexInputAttributes()));
+}
+
+u32 RasterizerVulkan::MaxVertexInputBindings() const {
+    return static_cast<u32>(
+        std::min<size_t>(Maxwell::NumVertexArrays, device.GetMaxVertexInputBindings()));
 }
 
 void RasterizerVulkan::InitializeChannel(Tegra::Control::ChannelState& channel) {

@@ -29,6 +29,7 @@
 #include "video_core/renderer_vulkan/vk_draw_cache.h"
 #include "video_core/v2/flush_heuristic.h"
 #include "video_core/v2/commit.h"
+#include "video_core/v2/resolve/draw_record.h"
 #include "video_core/v2/v2_switches.h"
 #include "video_core/renderer_vulkan/vk_fence_manager.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
@@ -192,6 +193,8 @@ private:
     /// EDEN_NX2_V2_DRAWREC (P6 Step 0, notes/STEP0_SPEC.md) as the constructor allowed it: off
     /// unless COMMIT=1 lock-free, DRAWCACHE on and no dynamic storage buffer limit.
     VideoCommon::V2::Mode drawrec{VideoCommon::V2::Mode::Off};
+    VideoCommon::V2::Resolve::DynamicFeatures drawrec_features{};
+    u64 drawrec_features_program{~0ULL}; ///< the program id the features were built for
     /// GPU::CollectedCpuWrites as the owner last applied them.
     u64 commit_collected{};
     u64 commit_batch{~0ULL}; ///< F2-17: the back batch whose start applied the CPU writes
@@ -310,6 +313,17 @@ private:
     void UpdateColorWriteEnable(Tegra::Engines::Maxwell3D::Regs& regs);
 
     void UpdateVertexInput(Tegra::Engines::Maxwell3D::Regs& regs);
+
+    /// P6 Step 0 (EDEN_NX2_V2_DRAWREC): UpdateDynamicStates' control flow (state tracker
+    /// touches, the F2-08 mask test, the flags it sets) recording a draw record's values.
+    void EncodeDynamic(const VideoCommon::V2::Resolve::DynamicState& state,
+                       const GraphicsPipeline* pipeline);
+    /// The device features ComputeDynamic reads (refreshed when the title or a setting moves).
+    [[nodiscard]] const VideoCommon::V2::Resolve::DynamicFeatures& DrawRecFeatures();
+    /// The host has no D24 depth and the title rescales its D24 depth bias (NEEDS_D24).
+    [[nodiscard]] bool D24BiasRescale() const;
+    [[nodiscard]] u32 MaxVertexInputAttributes() const;
+    [[nodiscard]] u32 MaxVertexInputBindings() const;
 
     void FrameDumpPass(const Framebuffer* framebuffer);
     /// EDEN_NX2_PENDING_WRITE_TRACE: logs bound buffer ranges with collected, unapplied CPU writes.
