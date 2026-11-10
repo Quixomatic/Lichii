@@ -141,7 +141,10 @@ BdaModule EmitBdaProgram(const BdaSetup& setup, const char* name) {
         }
         i += words;
     }
+    // One variable per element type (u32 and f32 here) aliases each binding.
     std::ranges::sort(module.bindings);
+    module.bindings.erase(std::unique(module.bindings.begin(), module.bindings.end()),
+                          module.bindings.end());
     return module;
 }
 } // Anonymous namespace
@@ -270,7 +273,7 @@ TEST_CASE("V2 F2-02 constant buffers read through buffer device addresses",
     unmarked.pushed = true;
     unmarked.keep_bindings = true;
     REQUIRE(EmitBdaProgram(unmarked, "cbuf_unmarked.spv").code == plain.code);
-    REQUIRE(plain.uniform_variables == 3);
+    REQUIRE(plain.uniform_variables == 6); // 3 buffers x (u32, f32)
     REQUIRE(plain.push_variables == 0);
     REQUIRE(plain.convert_to_pointer == 0);
     REQUIRE(plain.addressing == 0); // Logical
@@ -298,12 +301,12 @@ TEST_CASE("V2 F2-02 constant buffers read through buffer device addresses",
     // with verify's kept bindings 0 and 2 (cbuf 3's binding stays reserved).
     const BdaModule mixed =
         EmitBdaProgram({.mask = 1U << 3, .base = 2, .pushed = true}, "cbuf_mixed.spv");
-    REQUIRE(mixed.uniform_variables == 2);
+    REQUIRE(mixed.uniform_variables == 4);
     REQUIRE(mixed.convert_to_pointer == 1);
     REQUIRE(mixed.bindings == std::vector<u32>{0, 1});
     const BdaModule kept = EmitBdaProgram(
         {.mask = 1U << 3, .pushed = true, .keep_bindings = true}, "cbuf_mixed_kept.spv");
-    REQUIRE(kept.uniform_variables == 2);
+    REQUIRE(kept.uniform_variables == 4);
     REQUIRE(kept.bindings == std::vector<u32>{0, 2});
 
     // The address member shares the stage's push block: the rescaling block, or the heap's.
