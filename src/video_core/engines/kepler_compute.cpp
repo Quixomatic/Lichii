@@ -2345,7 +2345,31 @@ void KeplerCompute::FrontNoteInlineQmd(VideoCommon::GpuSplit& split, FrontState&
         split.NoteUnboundedWrite(Producer::QmdRelease);
         return;
     }
-    split.NoteUnboundedWrite(Producer::QmdRelease);
+    // F3-X1 rest: the launched QMD's own release slots, as NativeQmdScheduler runs them at its
+    // completion (address, 4 or 16 bytes; payload releases' values for the poll's deferral and
+    // its resume line). A dependent chain is launched from memory later: unbounded then.
+    bool releases_bounded = (qmd[16] & 1) == 0;
+    for (const u32 base : Tegra::NativeQmdScheduler::ReleaseSlots) {
+        const u32 flags = qmd[base + 1];
+        if ((flags & (1U << 23)) == 0) {
+            continue;
+        }
+        if (!Tegra::NativeQmdScheduler::IsDecodableRelease(flags)) {
+            releases_bounded = false;
+            continue;
+        }
+        const GPUVAddr address = (GPUVAddr{flags & 0xff} << 32) | qmd[base];
+        V2::NoteRangeWriteGpu(split, memory_manager, address, (flags >> 30) == 0 ? 16U : 4U,
+                              Producer::QmdRelease);
+        if ((flags & ((1U << 26) | (1U << 19))) == 0) {
+            if (const auto device = memory_manager.GpuToCpuAddress(address)) {
+                split.RememberQmdRelease(*device, qmd[base + 2]);
+            }
+        }
+    }
+    if (!releases_bounded) {
+        split.NoteUnboundedWrite(Producer::QmdRelease);
+    }
     const GPUVAddr program = (GPUVAddr{qmd[49] & 0x1ffff} << 32) | qmd[48];
     const auto program_device = memory_manager.GpuToCpuAddress(program);
     const auto summary = program_device ? V2::ShaderWrites::Lookup(*program_device)
