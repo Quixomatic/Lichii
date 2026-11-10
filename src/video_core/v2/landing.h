@@ -80,20 +80,55 @@ inline void Note(u64 ticket) {
     }
 }
 
+/// Back: inside an Untracked scope, the ring position its writes would have been tagged with.
+inline thread_local u64 untracked_tag = 0;
+/// Writes the front never notes (QMD releases) that land at an operation (F3F5b-5): the newest
+/// entry that queued one, and the newest whose operation ran. The front can't tell their words,
+/// but while one is queued a suspended acquire's release may be it: the view asks for the submit
+/// and lets the latch resume it rather than draining for it (GpuSplit::UntrackedReleasePending).
+inline std::atomic<u64> untracked_issued{0};
+inline std::atomic<u64> untracked_landed{0};
+
+inline void RaiseTo(std::atomic<u64>& value, u64 position) {
+    u64 current = value.load(std::memory_order_relaxed);
+    while (current < position &&
+           !value.compare_exchange_weak(current, position, std::memory_order_release,
+                                        std::memory_order_relaxed)) {
+    }
+}
+
+/// Back: an untracked write about to land at an operation: its entry (0 outside an Untracked
+/// scope, or when the front doesn't record).
+inline u64 CaptureUntracked() {
+    if (untracked_tag == 0) {
+        return 0;
+    }
+    RaiseTo(untracked_issued, untracked_tag);
+    return untracked_tag;
+}
+
+/// Its operation ran (operations run in order).
+inline void NoteUntracked(u64 position) {
+    RaiseTo(untracked_landed, position);
+}
+
 /// Back: writes made inside take no ticket (the front never noted them).
 class Untracked {
 public:
-    Untracked() : saved{tag} {
+    Untracked() : saved{tag}, saved_untracked{untracked_tag} {
+        untracked_tag = tag;
         tag = 0;
     }
     ~Untracked() {
         tag = saved;
+        untracked_tag = saved_untracked;
     }
     Untracked(const Untracked&) = delete;
     Untracked& operator=(const Untracked&) = delete;
 
 private:
     u64 saved;
+    u64 saved_untracked;
 };
 
 } // namespace VideoCommon::V2::Landing

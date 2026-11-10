@@ -401,6 +401,7 @@ bool Puller::PollAcquireView(DmaPusher& dma_pusher) {
     bool decided = false;
     bool passes = false;
     bool net = false;
+    bool untracked = false; ///< A QMD release was pending when the net was planned
     if (Passes(check)) {
         decided = true;
         passes = true;
@@ -414,7 +415,9 @@ bool Puller::PollAcquireView(DmaPusher& dma_pusher) {
         const u64 since_old_poll = static_cast<u64>(
             std::chrono::duration_cast<std::chrono::microseconds>(now - acquire.last_old_poll)
                 .count());
-        switch (V2::PlanSuspendedPoll(check.reason == Reason::GpuWritten, since_old_poll)) {
+        untracked = split.UntrackedReleasePending();
+        switch (V2::PlanSuspendedPoll(check.reason == Reason::GpuWritten, since_old_poll,
+                                      untracked)) {
         case V2::SuspendedPoll::OldPath:
             // Progress net for a release the view never records: the old poll drains, flushes
             // the word and reads it.
@@ -431,7 +434,7 @@ bool Puller::PollAcquireView(DmaPusher& dma_pusher) {
             }
             break;
         case V2::SuspendedPoll::Wait:
-            if (split.LandingPending() &&
+            if ((split.LandingPending() || untracked) &&
                 now - acquire.last_request >= std::chrono::milliseconds{1}) {
                 // Releases still to land: their fences may sit in a deferred submission.
                 acquire.last_request = now;
@@ -472,11 +475,13 @@ bool Puller::PollAcquireView(DmaPusher& dma_pusher) {
                 LOG_INFO(HW_GPU,
                          "V2 acquire progress poll resumed channel {} semaphore {:#x} (device "
                          "{:#x}) op {} value {:#x}: view reason {}, word {:#x} before the drain, "
-                         "{:#x} after, gpu-written page {}, sem_execute {}, waited {} us",
+                         "{:#x} after, gpu-written page {}, sem_execute {}, QMD release pending "
+                         "{}, waited {} us",
                          dma_pusher.channel_state.bind_id, address, device.value_or(0),
                          operation, value, static_cast<u32>(check.reason), view_word,
                          dma_pusher.memory_manager.Read<u32>(address),
                          device && Nx2MayBeGpuWritten(*device, sizeof(u32)), acquire.sem_execute,
+                         untracked,
                          std::chrono::duration_cast<std::chrono::microseconds>(
                              std::chrono::steady_clock::now() - acquire.since)
                              .count());

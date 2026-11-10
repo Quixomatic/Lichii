@@ -520,6 +520,42 @@ TEST_CASE("V2 acquire: a suspended acquire whose release the view never records 
         CHECK(PlanSuspendedPoll(false, 0) == SuspendedPoll::Wait);
         CHECK(PlanSuspendedPoll(true, 0) == SuspendedPoll::ReadBack);
     }
+    SECTION("a QMD release still on its way latches the waiter; the net waits for it, bounded") {
+        // F3F5b-5: the 32 net resumes at OoT's boot (word N-1 -> N after the drain). While a
+        // release the view can't see may land, the net doesn't drain for it...
+        CHECK(PlanSuspendedPoll(false, OldPathEveryUs, true) == SuspendedPoll::Wait);
+        CHECK(PlanSuspendedPoll(false, OldPathEveryUs + UntrackedDeferUs - 1, true) ==
+              SuspendedPoll::Wait);
+        CHECK(PlanSuspendedPoll(true, OldPathEveryUs, true) == SuspendedPoll::ReadBack);
+        // ...but a release the view never records still gets the net, later.
+        CHECK(PlanSuspendedPoll(false, OldPathEveryUs + UntrackedDeferUs, true) ==
+              SuspendedPoll::OldPath);
+        CHECK(PlanSuspendedPoll(false, OldPathEveryUs, false) == SuspendedPoll::OldPath);
+    }
+    SECTION("an untracked release reports its entry when it is queued and when it lands") {
+        const u64 saved_tag = Landing::tag;
+        const u64 issued = Landing::untracked_issued.load();
+        const u64 landed = Landing::untracked_landed.load();
+        Landing::untracked_issued.store(0);
+        Landing::untracked_landed.store(0);
+        CHECK(Landing::CaptureUntracked() == 0); // outside an Untracked scope
+        Landing::tag = 700;
+        u64 position = 0;
+        {
+            const Landing::Untracked untracked;
+            CHECK(Landing::Capture() == 0); // no ticket: the front never numbered it
+            position = Landing::CaptureUntracked();
+        }
+        CHECK(Landing::tag == 700);
+        CHECK(Landing::untracked_tag == 0);
+        CHECK(position == 700);
+        CHECK(Landing::untracked_issued.load() > Landing::untracked_landed.load()); // pending
+        Landing::NoteUntracked(position);
+        CHECK(Landing::untracked_issued.load() == Landing::untracked_landed.load());
+        Landing::tag = saved_tag;
+        Landing::untracked_issued.store(issued);
+        Landing::untracked_landed.store(landed);
+    }
 }
 
 // F3F5b-1/-2: a wait that must see what a report's operation writes (its timestamp, or a release

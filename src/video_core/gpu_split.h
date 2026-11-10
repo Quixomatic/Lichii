@@ -242,11 +242,17 @@ public:
     void NoteRangeWrite(u64 device_address, u64 size, V2::Producer producer) {
         if (producer != V2::Producer::CbData) {
             FlushCbWrite();
+            if (producer == V2::Producer::QmdRelease) {
+                last_qmd_release = write_position;
+            }
         }
         PrepareHazardNote();
         hazards.NoteRange(device_address, size, write_position, producer);
     }
     void NoteUnboundedWrite(V2::Producer producer) {
+        if (producer == V2::Producer::QmdRelease) {
+            last_qmd_release = write_position;
+        }
         hazards.NoteUnbounded(producer, write_position);
     }
     /// Front, TracksWrites: constant buffer words just sent to a GPU range. Words that continue
@@ -333,6 +339,14 @@ public:
     /// operation too. Conservative: the back defers only if this held when the write was noted.
     [[nodiscard]] bool LandingPending() const {
         return last_ticket > V2::Landing::landed.load(std::memory_order_acquire);
+    }
+    /// Front (F3F5b-5): a QMD release (which the view can't see) may still be on its way: a
+    /// dispatch that may release is queued, or the back queued a release operation that hasn't
+    /// run (Landing::untracked_issued / untracked_landed).
+    [[nodiscard]] bool UntrackedReleasePending() const {
+        return last_qmd_release > ConsumedNow() ||
+               V2::Landing::untracked_issued.load(std::memory_order_acquire) >
+                   V2::Landing::untracked_landed.load(std::memory_order_acquire);
     }
     /// Front: a release of known bytes just sent that lands at an operation (fence-flagged, at
     /// High accuracy, or deferred behind an earlier one), with its landing ticket. Until it lands
@@ -942,6 +956,7 @@ private:
     u64 ticket_position{};    ///< NextLandingTicket: the entry and index of the last ticket
     u64 ticket_sub{};
     u64 last_ticket{};
+    u64 last_qmd_release{}; ///< Front: write position of the last QmdRelease note
     u64 back_entry_position{}; ///< Back: ring position of the entry it runs (TracksWrites)
 
     // Back side.

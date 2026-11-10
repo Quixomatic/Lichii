@@ -277,6 +277,9 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
     const bool deferred = at_once && VideoCommon::V2::Landing::MustDefer();
     const bool immediate = at_once && !deferred;
     const u64 landing = immediate ? 0 : VideoCommon::V2::Landing::Capture();
+    // QMD releases (Landing::Untracked) take no ticket; their landing is still reported.
+    const u64 untracked =
+        immediate || landing != 0 ? 0 : VideoCommon::V2::Landing::CaptureUntracked();
     const size_t new_query_id = streamer->WriteCounter(cpu_addr, has_timestamp, payload, subreport);
     auto* query = streamer->GetQuery(new_query_id);
     if (is_fence) {
@@ -293,7 +296,18 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
     u8* pointer_timestamp = impl->device_memory.template GetPointer<u8>(cpu_addr + 8);
     std::function<void()> operation([this, streamer, query_base = query, query_location,
                                      pointer, pointer_timestamp, cpu_addr, addr,
-                                     asid = gpu_memory->GetID(), counter_type, landing] {
+                                     asid = gpu_memory->GetID(), counter_type, landing,
+                                     untracked] {
+        // An untracked write's landing is reported on every exit, once its bytes are written.
+        struct NoteOnExit {
+            u64 position;
+            ~NoteOnExit() {
+                if (position != 0) {
+                    VideoCommon::V2::Landing::NoteUntracked(position);
+                }
+            }
+        };
+        [[maybe_unused]] const NoteOnExit untracked_note{untracked};
         if (True(query_base->flags & QueryFlagBits::IsInvalidated)) {
             if (const u64 trace = QueryTrace::Sample(QueryTrace::Event::Discard)) {
                 LOG_INFO(HW_GPU,

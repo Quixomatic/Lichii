@@ -264,8 +264,16 @@ enum class SuspendedPoll : u8 {
 /// every OldPathEvery the old path (drain, flush, read) polls once. Not the old 1 ms valve: class
 /// B passes what the valve used to drain for.
 inline constexpr u64 OldPathEveryUs = 2000;
-[[nodiscard]] constexpr SuspendedPoll PlanSuspendedPoll(bool gpu_written, u64 since_old_poll_us) {
-    if (since_old_poll_us >= OldPathEveryUs) {
+/// F3F5b-5: while a QMD release the view can't see may still land (GpuSplit::
+/// UntrackedReleasePending), the net waits up to this much longer: that release latches the
+/// waiter when it lands, where the net would drain and wait for the fences to see it (OoT's
+/// boot: 32 net resumes, word N-1 → N, never a page the GPU wrote). Bounded, so a release the
+/// view never records still progresses while QMD releases keep coming.
+inline constexpr u64 UntrackedDeferUs = 20000;
+[[nodiscard]] constexpr SuspendedPoll PlanSuspendedPoll(bool gpu_written, u64 since_old_poll_us,
+                                                        bool untracked_pending = false) {
+    if (since_old_poll_us >= OldPathEveryUs &&
+        (!untracked_pending || since_old_poll_us >= OldPathEveryUs + UntrackedDeferUs)) {
         return SuspendedPoll::OldPath;
     }
     return gpu_written ? SuspendedPoll::ReadBack : SuspendedPoll::Wait;
