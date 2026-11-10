@@ -2734,6 +2734,21 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
             if (fs.v2_observation && fs.v2_observation->writes.size() < 64) [[unlikely]] {
                 fs.v2_observation->writes.emplace_back(address, value);
             }
+            // F3c: over half the macros' writes change nothing (a state write of the value the
+            // register and its shadow copy hold). Under S1 those are dropped here, as
+            // FrontWriteS1 would drop them after its bookkeeping: only the executable ones
+            // and the changes go through it.
+            if (fs.s1_exec && fs.skip_same && fs.regs[address] == value &&
+                (fs.v2_table->flags[address] & VideoCommon::V2::RegSem::Exec) == 0 &&
+                (fs.control == Regs::ShadowRamControl::Passthrough ||
+                 ((fs.control == Regs::ShadowRamControl::Track ||
+                   fs.control == Regs::ShadowRamControl::TrackWithFilter) &&
+                  fs.shadow[address] == value)) &&
+                !fs.v2_draw_model.HasDeferredDraw()) [[likely]] {
+                ++fs.s1_writes;
+                ++fs.s1_same_writes;
+                return true;
+            }
             FrontWrite(split, fs, address, value, true, true);
             return true;
         };
