@@ -918,9 +918,13 @@ void GraphicsPipeline::RelookupRecordProxies(R::ResolvedDraw& record) const {
             entry.view = {lookup.id.index, texture_cache.ViewGeneration(lookup.id)};
         }
     }
+    // A buffer the configure's join deleted (its generation moved) is looked up again too: the
+    // configure's loop after a deletion did (UpdateGraphicsBuffers), and the verify encode and
+    // the template must not bind the freed slot (S0-G18).
     ForEachRecordBuffer(record, [&](VideoCommon::V2::Versions::WeakRef& ref, DAddr device_addr,
                                     u32 size) {
-        if (C::IsProxy(ref.id)) {
+        if (C::IsProxy(ref.id) ||
+            buffer_cache.BufferGeneration(VideoCommon::BufferId{ref.id}) != ref.generation) {
             const VideoCommon::BufferId id = buffer_cache.PeekBuffer(device_addr, size, false);
             ref = {id.index, buffer_cache.BufferGeneration(id)};
         }
@@ -1395,6 +1399,14 @@ void GraphicsPipeline::VerifyDrawEncode(const R::ResolvedDraw& record) {
     DrawRecObserver* const observer = drawrec_observer;
     if (observer == nullptr || !observer->done || !observer->derived_ok ||
         !observer->buffers_match || record.h.status != R::ResolveStatus::Ready) {
+        return;
+    }
+    // The encode rewrites the channel state's bindings from the record, and the draws after
+    // this one keep them: it runs only where the record (its proxies and the buffers the
+    // configure's join deleted looked up again by VerifyDrawApply) binds exactly what the
+    // configure bound. A dependent match alone (SameBuffer) left a freed buffer bound (S0-G18).
+    if (!R::SameBufferIds(record, observer->observed)) {
+        R::CountRecordStat(R::GetRecordStats().dependent);
         return;
     }
     // R-8: a second encode of equal bindings: the vertex and index binds repeat (harmless), its

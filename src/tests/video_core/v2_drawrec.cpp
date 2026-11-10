@@ -293,6 +293,31 @@ TEST_CASE("V2 DRAWREC: a buffer the draw's join deleted is dependent", "[video_c
     REQUIRE_FALSE(R::CompareRecords(resolved, observed, 0, reasons, nullptr, nullptr));
 }
 
+TEST_CASE("V2 DRAWREC: the verify encode needs the configure's buffer ids, not a dependent match",
+          "[video_core][v2_drawrec]") {
+    // S0-G18 (971d: device loss under DRAWREC=verify): a dependent match (the buffer the
+    // configure's join deleted) let the second encode write the freed id into the channel
+    // state. The encode runs only when every buffer id equals the configure's.
+    const auto with_buffers = [](u32 vertex_id, u32 ssbo_id) {
+        R::ResolvedDraw record = SampleRecord();
+        record.h.vertex = record.Push(std::span<const R::ResolvedVertex>(std::array{
+            R::ResolvedVertex{.slot = 0, .buffer = {vertex_id, 0}, .daddr = 0x20000,
+                              .size = 0x400, .stride = 16}}));
+        record.h.ssbo = record.Push(std::span<const R::ResolvedSsbo>(std::array{
+            R::ResolvedSsbo{.stage = 4, .index = 0, .written = 1, .daddr = 0x30000,
+                            .size = 0x100, .buffer = {ssbo_id, 0}}}));
+        return record;
+    };
+    REQUIRE(R::SameBufferIds(with_buffers(900, 7), with_buffers(900, 7)));
+    // The configure bound 901 where the record still holds the deleted 900.
+    REQUIRE_FALSE(R::SameBufferIds(with_buffers(900, 7), with_buffers(901, 7)));
+    REQUIRE_FALSE(R::SameBufferIds(with_buffers(900, 7), with_buffers(900, 8)));
+    // Generations are not compared (the relookup refreshes them; the id is what is bound).
+    R::ResolvedDraw regen = with_buffers(900, 7);
+    regen.Span<R::ResolvedVertex>(regen.h.vertex)[0].buffer.generation = 3;
+    REQUIRE(R::SameBufferIds(regen, with_buffers(900, 7)));
+}
+
 TEST_CASE("V2 DRAWREC: a table update to a known view compares as that view",
           "[video_core][v2_drawrec]") {
     // F2e (c236: views differ on 13% of draws): a ViewBind proxy (the TIC entry changed, its

@@ -129,6 +129,29 @@ bool HasProxies(const ResolvedDraw& record) {
     return proxy;
 }
 
+bool SameBufferIds(const ResolvedDraw& lhs, const ResolvedDraw& rhs) {
+    const DrawHeader& l = lhs.h;
+    const DrawHeader& r = rhs.h;
+    const auto same = [&]<class T>(T*, Seg ls, Seg rs) {
+        const auto a = lhs.Span<const T>(ls);
+        const auto b = rhs.Span<const T>(rs);
+        return std::ranges::equal(a, b, [](const T& x, const T& y) {
+            return x.buffer.id == y.buffer.id;
+        });
+    };
+    if (l.indexed != r.indexed || l.vertex_mask != r.vertex_mask) {
+        return false;
+    }
+    if (l.indexed && (l.index.valid != r.index.valid ||
+                      (l.index.valid && l.index.buffer.id != r.index.buffer.id))) {
+        return false;
+    }
+    return same(static_cast<ResolvedVertex*>(nullptr), l.vertex, r.vertex) &&
+           same(static_cast<ResolvedUbo*>(nullptr), l.ubo, r.ubo) &&
+           same(static_cast<ResolvedSsbo*>(nullptr), l.ssbo, r.ssbo) &&
+           same(static_cast<ResolvedTbo*>(nullptr), l.tbo, r.tbo);
+}
+
 std::string DescribeRecordGroup(const ResolvedDraw& resolved, const ResolvedDraw& observed,
                                 RecordGroup group) {
     const DrawHeader& r = resolved.h;

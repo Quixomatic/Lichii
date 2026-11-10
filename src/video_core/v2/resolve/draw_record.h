@@ -428,6 +428,11 @@ struct ResolveContext {
 /// Whether any handle of the record is still a commit proxy (not usable as a template).
 [[nodiscard]] bool HasProxies(const ResolvedDraw& record);
 
+/// DRAWREC=verify: whether two records bind the same buffer ids (index when indexed, vertex,
+/// uniform, storage and texture buffers, in order). The verify's second encode writes the
+/// channel state's bindings from its record, so it runs only on this (S0-G18).
+[[nodiscard]] bool SameBufferIds(const ResolvedDraw& lhs, const ResolvedDraw& rhs);
+
 /// DRAWREC=verify: replaces the view proxies of table updates whose view the lookup already
 /// knows (ViewBind requests: a cached view or the null view) with that view, so the compare
 /// with the old configure is exact for them. Creations keep their proxies (dependent).
