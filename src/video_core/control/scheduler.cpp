@@ -15,6 +15,7 @@
 #include "video_core/control/scheduler.h"
 #include "video_core/gpu.h"
 #include "video_core/gpu_split.h"
+#include "video_core/v2/p5b_stats.h"
 
 namespace Tegra::Control {
 
@@ -77,6 +78,10 @@ bool Scheduler::ResumePending(GPU& gpu) {
         split.Publish();
     }
     // Running one channel can release the semaphore another waits for: retry until none moves.
+    // SYNC_SUBMIT_SPEC §8.2: with the view (ACQUIRE on) one pass per call, counting only channels
+    // that really resumed, so the GPU thread's TryPop runs between passes (new guest command
+    // lists are "other channels" too: MP §5.1; 20c0's loop starved them for good).
+    const bool view = VideoCommon::GpuSplit::Get().AcquireMode() != VideoCommon::V2::Mode::Off;
     for (bool progress = true; progress;) {
         progress = false;
         for (const auto& state : pending_channels) {
@@ -91,18 +96,29 @@ bool Scheduler::ResumePending(GPU& gpu) {
                 continue;
             }
             BindChannel(gpu, state->bind_id);
+            const u64 suspensions = dma_pusher.suspensions.load(std::memory_order_acquire);
             dma_pusher.DispatchCalls();
-            // SYNC (20c0 boot hang): a channel that resumes and suspends again every pass keeps
-            // this loop going without returning to the GPU thread's publish, so the back never
-            // saw the other channels' last records (9 words written, not published) and their
-            // producers never ran. MP §5.1 "the engine runs other channels": what this channel
-            // sent is handed to the back now (nothing happens when nothing new was written).
-            if (auto& split = VideoCommon::GpuSplit::Get();
-                split.Active() && split.AcquireMode() != VideoCommon::V2::Mode::Off) [[unlikely]] {
-                split.Publish();
+            // SYNC (20c0 boot hang): what this channel sent is handed to the back now (nothing
+            // happens when nothing new was written; MP §5.1 "the engine runs other channels").
+            if (view) [[unlikely]] {
+                VideoCommon::GpuSplit::Get().Publish();
+            }
+            // Resumed: the acquire cleared (it may have suspended on a later one since), or a
+            // command-list tick wait ended.
+            const bool resumed =
+                dma_pusher.suspensions.load(std::memory_order_acquire) != suspensions ||
+                !dma_pusher.HasPendingAcquire();
+            if (view && !resumed) [[unlikely]] {
+                VideoCommon::V2::P5bStats::Add(
+                    VideoCommon::V2::P5bStats::Counter::ResumeWithoutProgress);
+                continue;
             }
             progress = true;
             any_progress = true;
+        }
+        if (view) {
+            VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::ResumePendingPasses);
+            break; // §8.2: back to the GPU thread loop after each pass
         }
     }
     std::erase_if(pending_channels, [](const auto& state) {

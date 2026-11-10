@@ -339,6 +339,56 @@ TEST_CASE("SYNC step 4 idle back: every wake row of §2.2 resumes once its event
     }
 }
 
+TEST_CASE("SYNC §8 (20c0 livelock): a passed poll stays passed, and a re-suspending channel "
+          "can't starve the CPU queue",
+          "[video_core][v2_sem_view][gpu_split_dispatch]") {
+    // Model of Puller::CanResumeAcquire + PollAcquireView's wake gate and Control::Scheduler::
+    // ResumePending with the GPU thread loop (TryPop between passes).
+    struct Acquire {
+        u8 wake_bits = SemWake::Consumed;
+        u64 seen_consumed = 0;
+        bool passed = false;
+        bool pending = true;
+    };
+    u64 consumed = 10;
+    const auto poll = [&](Acquire& a, bool view_meets) {
+        if (a.passed) {
+            return true; // §8.2: the second check returns the first one's pass
+        }
+        if ((a.wake_bits & SemWake::Cpu) == 0 && consumed == a.seen_consumed) {
+            return false; // the wake gate: nothing moved since the last check
+        }
+        a.seen_consumed = consumed;
+        a.passed = view_meets;
+        return view_meets;
+    };
+    SECTION("(a) Step's immediate re-check resumes the channel") {
+        Acquire a;
+        REQUIRE(poll(a, true));  // ResumePending's poll passes (epochs taken now)
+        REQUIRE(poll(a, true));  // DmaPusher::Step's re-check: no epoch moved, still passes
+        a.pending = false;       // ResumeAcquire clears it
+        REQUIRE_FALSE(a.pending);
+    }
+    SECTION("(b) a channel that re-suspends every pass can't stop a queued submit") {
+        Acquire stuck;            // waits for a release only the queued guest submit carries
+        stuck.wake_bits = SemWake::ReleaseParsed | SemWake::Cpu;
+        bool submit_queued = true;
+        bool released = false;
+        for (int loop = 0; loop < 10 && !released; ++loop) {
+            // One ResumePending pass: another channel resumes and suspends again (consumed moves).
+            ++consumed;
+            REQUIRE_FALSE(poll(stuck, false));
+            // Back in the GPU thread loop: TryPop parses the queued submit.
+            if (submit_queued) {
+                submit_queued = false;
+                released = true; // its release meets the stuck acquire
+            }
+        }
+        REQUIRE(released);
+        REQUIRE(poll(stuck, true));
+    }
+}
+
 TEST_CASE("SYNC step 4: no submit when nobody waits and the GPU is busy",
           "[video_core][v2_sem_view]") {
     // A suspended acquire with no producer at a fence asks for nothing.

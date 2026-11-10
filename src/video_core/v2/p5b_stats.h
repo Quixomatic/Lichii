@@ -129,6 +129,8 @@ enum class Counter : u32 {
     SubmitsIdleNonDraw,   ///< ... rule I for guest-visible work without draws
     FencingRequests,      ///< ... rule W requests from the blocked fencing thread
     OpenTickAgeMaxUs,     ///< ... the oldest open tick (with a lazy fence) at its submit (max)
+    ResumePendingPasses,  ///< SYNC §8.2: suspended-channel passes (one per ResumePending call)
+    ResumeWithoutProgress,///< ... a poll passed but the channel didn't resume (expected 0)
     Count,
 };
 

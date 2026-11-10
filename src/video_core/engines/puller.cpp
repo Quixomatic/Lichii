@@ -462,7 +462,17 @@ bool Puller::PendingAcquire::Matches(u32 current) const {
 bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
     if (pending_acquire && VideoCommon::GpuSplit::Get().AcquireMode() != V2::Mode::Off)
         [[unlikely]] {
-        return PollAcquireView(dma_pusher);
+        // SYNC_SUBMIT_SPEC §8.2 (MP §6 classes A/B: a pass is decided once): the immediate
+        // second check from DmaPusher::Step returns the first one's pass (20c0 hang: the
+        // wake-epoch gate rejected it, the channel never resumed, ResumePending never ended).
+        if (pending_acquire->passed) {
+            return true;
+        }
+        const bool passes = PollAcquireView(dma_pusher);
+        if (passes && pending_acquire) {
+            pending_acquire->passed = true;
+        }
+        return passes;
     }
     if (!pending_acquire || !V2Stats::Enabled()) [[likely]] {
         return PollAcquire(dma_pusher);

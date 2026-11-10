@@ -99,6 +99,9 @@ public:
         u64 requested_tick{};
         /// Unmet checks of this suspension (the 2 s clock is read every 64).
         u32 polls{};
+        /// SYNC_SUBMIT_SPEC §8.2: a poll passed it; it stays passed until ResumeAcquire clears it
+        /// (DmaPusher::Step's second check must not contradict ResumePending's).
+        bool passed{};
         /// SYNC Step 0: what its last poll waited for (V2::Stats::WakeClass), for the STATS line.
         u8 wake{};
         /// SYNC_SUBMIT_SPEC §2.2: the wake classes that can change its answer (V2::SemWake; 0:

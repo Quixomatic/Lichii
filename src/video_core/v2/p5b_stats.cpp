@@ -162,7 +162,8 @@ void Report(const char* thread_name, u64 window_ns) {
                  "{:.2f} | QMD reductions at execute {:.0f}/s, at their fence {:.0f}/s | "
                  "requests by origin (per s): acquires {:.0f}, landing waits {:.0f}, fencing "
                  "thread {:.0f} | rule I at batch end {:.2f}/frame, non-draw {:.2f}/frame, open "
-                 "tick age at submit max {:.1f} ms | macro DMA reads by the semaphore view (per s): forwarded {:.0f}, waited "
+                 "tick age at submit max {:.1f} ms | resume passes {:.0f}/s, resumed without "
+                 "progress {:.0f}/s | macro DMA reads by the semaphore view (per s): forwarded {:.0f}, waited "
                  "{:.0f}, clear {:.0f} | finishes by site: {}",
                  thread_name, per_frame(at(Counter::SubmitsPassBoundary)),
                  per_frame(at(Counter::SubmitsChunk)), per_frame(at(Counter::SubmitsIdle)),
@@ -177,6 +178,8 @@ void Report(const char* thread_name, u64 window_ns) {
                  per_frame(at(Counter::SubmitsIdleBatchEnd)),
                  per_frame(at(Counter::SubmitsIdleNonDraw)),
                  static_cast<double>(at(Counter::OpenTickAgeMaxUs)) / 1000.0,
+                 PerSecond(at(Counter::ResumePendingPasses), seconds),
+                 PerSecond(at(Counter::ResumeWithoutProgress), seconds),
                  PerSecond(at(Counter::DmaReadsSemForwarded), seconds),
                  PerSecond(at(Counter::DmaReadsSemWaited), seconds),
                  PerSecond(at(Counter::DmaReadsSemClear), seconds),
