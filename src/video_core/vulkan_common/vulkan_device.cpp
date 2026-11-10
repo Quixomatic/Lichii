@@ -764,16 +764,24 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
         RemoveExtensionFeature(extensions.descriptor_buffer, features.descriptor_buffer,
                                VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME);
     }
+    // EDEN_NX2_V2_CBUFBDA reads constant buffers through device addresses: keep them for it.
+    const bool cbuf_bda = VideoCommon::V2::On(VideoCommon::V2::Switch::CbufBda) &&
+                          extensions.buffer_device_address &&
+                          features.buffer_device_address.bufferDeviceAddress;
+    if (VideoCommon::V2::On(VideoCommon::V2::Switch::CbufBda)) {
+        LOG_INFO(Render_Vulkan, "EDEN_NX2_V2_CBUFBDA: buffer device address {}",
+                 cbuf_bda ? "kept" : "not supported by the device");
+    }
 #ifdef EGLANTINE_STREAMLINE
     // NVIDIA's DLSS needs buffer device addresses: keep the feature enabled for
     // it, but leave Eglantine's own buffers as they are without descriptor buffers.
     const bool dlss_wants_device_address =
         streamline_extensions && features.buffer_device_address.bufferDeviceAddress;
     if (!extensions.descriptor_buffer && dlss_wants_device_address) {
-        extensions.buffer_device_address = false;
+        extensions.buffer_device_address = cbuf_bda;
     } else
 #endif
-    if (!extensions.descriptor_buffer) {
+    if (!extensions.descriptor_buffer && !cbuf_bda) {
         RemoveExtensionFeature(extensions.buffer_device_address, features.buffer_device_address,
                                VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME);
     }

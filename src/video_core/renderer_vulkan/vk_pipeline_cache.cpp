@@ -2648,11 +2648,22 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     }
     // EDEN_NX2_V2_CBUFBDA: which constant buffers read through addresses, after the heap marks
     // (the addresses follow the heap words in the push constants).
-    if (VideoCommon::V2::On(VideoCommon::V2::Switch::CbufBda) &&
-        device.IsBufferDeviceAddressSupported() && profile.support_int64) [[unlikely]] {
-        MarkCbufBda(programs, key, uses_vertex_a && uses_vertex_b ? 1 : 0,
-                    layer_source_program != nullptr, mesh_emulation.has_value(),
-                    VideoCommon::V2::Verify(VideoCommon::V2::Switch::CbufBda));
+    if (VideoCommon::V2::On(VideoCommon::V2::Switch::CbufBda)) [[unlikely]] {
+        const bool address = device.IsBufferDeviceAddressSupported();
+        const bool int64 = profile.support_int64;
+        static std::once_flag gate_logged;
+        std::call_once(gate_logged, [&] {
+            LOG_INFO(Render_Vulkan, "EDEN_NX2_V2_CBUFBDA: pipelines {} (buffer device address {}, "
+                                    "shader int64 {})",
+                     address && int64 ? "read constant buffers through addresses"
+                                      : "keep uniform buffers",
+                     address ? "on" : "off", int64 ? "on" : "off");
+        });
+        if (address && int64) {
+            MarkCbufBda(programs, key, uses_vertex_a && uses_vertex_b ? 1 : 0,
+                        layer_source_program != nullptr, mesh_emulation.has_value(),
+                        VideoCommon::V2::Verify(VideoCommon::V2::Switch::CbufBda));
+        }
     }
     std::array<const Shader::Info*, Maxwell::MaxShaderStage> infos{};
     std::array<vk::ShaderModule, Maxwell::MaxShaderStage> modules;
