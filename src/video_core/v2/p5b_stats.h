@@ -131,6 +131,7 @@ enum class Counter : u32 {
     OpenTickAgeMaxUs,     ///< ... the oldest open tick (with a lazy fence) at its submit (max)
     ResumePendingPasses,  ///< SYNC §8.2: suspended-channel passes (one per ResumePending call)
     ResumeWithoutProgress,///< ... a poll passed but the channel didn't resume (expected 0)
+    IdleUnfencedFences,   ///< SYNC §9.3: idle fences made for operations with no fence after them
     Count,
 };
 

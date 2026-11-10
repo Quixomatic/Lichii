@@ -30,10 +30,11 @@ inline std::atomic<u64> untracked{0};
 /// waiter asks for, 9c4a)
 inline std::atomic<u64> diag_open_tick{1};
 inline std::atomic<u64> diag_lazy_tick{0};       ///< The newest lazy fence's tick
-/// The recording thread recorded a command since its last submission (the open tick holds work).
-inline std::atomic<bool> open_work{false};
 inline std::atomic<bool> diag_submit_wanted{false};
 inline std::atomic<u64> diag_fence_wait_tick{0}; ///< The tick the fencing thread blocks on (0: none)
+/// §9.3: at the back's last idle hook, operations with no fence / uncommitted query flushes.
+inline std::atomic<bool> diag_unfenced{false};
+inline std::atomic<bool> diag_query_flushes{false};
 
 /// The renderer's urgent request for a host tick (Scheduler::RequestLazyFlush) and the wake that
 /// runs the back's idle hook (GpuSplit::RequestIdleHook). Set once before the back starts.

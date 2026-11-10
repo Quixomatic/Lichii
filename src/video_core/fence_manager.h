@@ -90,6 +90,12 @@ public:
         // and the fencing thread crashed walking it. Its own lock, held for no callbacks.
         std::scoped_lock lock{uncommitted_guard};
         uncommitted_operations.emplace_back(std::move(func));
+        has_uncommitted.store(true, std::memory_order_release);
+    }
+
+    /// SYNC_SUBMIT_SPEC §9.3: operations queued with no fence after them yet (one load).
+    [[nodiscard]] bool HasUncommittedOperations() const {
+        return has_uncommitted.load(std::memory_order_acquire);
     }
 
     /// `observable`: a guest sync rides on the fence (a syncpoint, a release, a report): GPU data
@@ -147,6 +153,7 @@ public:
             pending_operations.emplace_back(std::move(uncommitted_operations));
             uncommitted_operations.clear(); // moved-from: make it empty explicitly
             uncommitted_operations.reserve(64);
+            has_uncommitted.store(false, std::memory_order_release);
         }
         pending_flushes.push_back(committed_flushes);
         QueueFence(new_fence);
@@ -616,6 +623,7 @@ private:
     std::mutex guard;
     std::mutex ring_guard;
     std::mutex uncommitted_guard; ///< Guards uncommitted_operations
+    std::atomic<bool> has_uncommitted{false}; ///< HasUncommittedOperations
 
     /// P5a: fence work handed to the caches' owner (SetCommitBacklog).
     struct BacklogEntry {

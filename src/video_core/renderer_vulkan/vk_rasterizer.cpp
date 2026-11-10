@@ -4925,6 +4925,29 @@ void RasterizerVulkan::FlushHint(VideoCommon::V2::FlushHint hint) {
 }
 
 void RasterizerVulkan::ServeSplitIdleHook() {
+    // SYNC_SUBMIT_SPEC §9.3 fix 1 (MP §6 class D "land on a host fence", which presupposes the
+    // fence exists; SESSION_HANDOFF §5 lesson 1): at every back-idle point, operations queued
+    // with no fence after them (SyncOperation: query-cache writes, UnregisterPending, query DMA
+    // reads) and the query cache's uncommitted flushes get one, as IrExec::LandCaptured makes it:
+    // a delayed fence, then FlushCommands. Rule I below submits it (a lazy fence with
+    // operations in the open tick). Nothing blocks: no forced ReleaseFences. The d5ed quiet
+    // deadlock: those operations waited for a SignalFence that an idle back never made.
+    if (adapt_submit && scheduler.LazyFencesHere() &&
+        (fence_manager.HasUncommittedOperations() || query_cache.HasUncommittedFlushes()))
+        [[unlikely]] {
+        VideoCore::g_signaling_query_report_fence = true;
+        SignalFence([] {});
+        VideoCore::g_signaling_query_report_fence = false;
+        FlushCommands();
+        VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::IdleUnfencedFences);
+        VideoCommon::V2::LandingFence::diag_unfenced.store(false, std::memory_order_relaxed);
+    }
+    if (scheduler.LazyFencesHere()) [[unlikely]] {
+        VideoCommon::V2::LandingFence::diag_unfenced.store(fence_manager.HasUncommittedOperations(),
+                                                           std::memory_order_relaxed);
+        VideoCommon::V2::LandingFence::diag_query_flushes.store(
+            query_cache.HasUncommittedFlushes(), std::memory_order_relaxed);
+    }
     // F4-X2: the split's idle hook, with DXVK's synchronization rule for open work nobody blocks
     // on.
     scheduler.ServeSplitIdleHook(

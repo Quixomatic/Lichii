@@ -277,7 +277,8 @@ V2::SemDecision DecideSem(DmaPusher& dma_pusher, GPUVAddr address, u32 value, V2
         answer = split.Sem().Find(*device, progress);
     }
     in.memory_word = memory.Read<u32>(address);
-    const V2::SemDecision decision = V2::DecideFromView(op, value, answer, in);
+    V2::SemDecision decision = V2::DecideFromView(op, value, answer, in);
+    decision.memory_word = in.memory_word;
     if (V2Stats::Enabled()) [[unlikely]] {
         V2Stats::NoteSemRow(static_cast<u8>(decision.row));
         V2Stats::NoteSemEvictions(split.Sem().TakeEvictions());
@@ -519,6 +520,8 @@ bool Puller::PollAcquireView(DmaPusher& dma_pusher) {
         return false;
     }
     TakeWakeEpochs(acquire);
+    // §9.1: the latch as the decision saw it (the verify log's "latched before").
+    const bool latched_before_check = verify && Nx2SemaphoreWaiters::Get().Latched(this);
     const ViewCheck check = CheckWithView(dma_pusher, address, value, op, word_landed);
     bool decided = false;
     bool passes = false;
@@ -590,27 +593,6 @@ bool Puller::PollAcquireView(DmaPusher& dma_pusher) {
         case V2::SuspendedPoll::Wait:
             break;
         }
-        // 9c4a quiet deadlock (back idle, open tick 8855 with work recorded after the last lazy
-        // fence, no lazy fence or list end in it, every waiter row 3): rule I has nothing to
-        // weigh and nobody else asks. MP §6 "an interrupt forces a submit if the sync is not yet
-        // submitted", SESSION_HANDOFF §5 "every wait causes its submit": an unmet waiter with
-        // the back idle (it ran everything sent) files rule W for the open tick. 142874f storm:
-        // only when the open tick holds recorded work (an empty tick is never asked for) and the
-        // back consumed new entries since the last ask (once per back position across all
-        // waiters, not per tick: every submit opens a new tick).
-        const u64 consumed_now = split.ConsumedNow();
-        if (!gpu_written && consumed_now == split.WritePosition() &&
-            V2::LandingFence::open_work.load(std::memory_order_acquire)) {
-            static u64 asked_at_consumed = ~u64{0}; // Front thread only
-            const u64 open_tick =
-                V2::LandingFence::diag_open_tick.load(std::memory_order_relaxed);
-            if (open_tick != 0 && consumed_now != asked_at_consumed) {
-                asked_at_consumed = consumed_now;
-                V2::LandingFence::Request(open_tick);
-                split.RequestIdleHook();
-                V2::P5bStats::Add(V2::P5bStats::Counter::RequestsAcquire);
-            }
-        }
         if (decided && V2Stats::Enabled()) [[unlikely]] {
             V2Stats::NoteDecision(VideoCommon::DrainSite::Acquire, Decision::Avoided,
                                   Reason::None);
@@ -621,7 +603,8 @@ bool Puller::PollAcquireView(DmaPusher& dma_pusher) {
                         "Channel {} waits on semaphore {:#x} (op {}, {:#x}, now {:#x}) for 2 s "
                         "(view: {}, row {}; open tick {}, newest lazy fence tick {}, list end "
                         "wanted {}, fencing thread waits for tick {}; back consumed {:#x} of "
-                        "{:#x}, landed {:#x}, untracked landed {:#x} of {:#x})",
+                        "{:#x}, landed {:#x} of issued {:#x}, untracked landed {:#x} of {:#x}; "
+                        "unfenced operations {}, uncommitted query flushes {})",
                         dma_pusher.channel_state.bind_id, address, operation, value,
                         dma_pusher.memory_manager.Read<u32>(address),
                         static_cast<u32>(check.reason), static_cast<u32>(check.decision.row),
@@ -631,8 +614,11 @@ bool Puller::PollAcquireView(DmaPusher& dma_pusher) {
                         V2::LandingFence::diag_fence_wait_tick.load(std::memory_order_relaxed),
                         split.ConsumedNow(), split.WritePosition(),
                         V2::Landing::landed.load(std::memory_order_relaxed),
+                        V2::Landing::issued.load(std::memory_order_relaxed),
                         V2::Landing::untracked_landed.load(std::memory_order_relaxed),
-                        V2::Landing::untracked_issued.load(std::memory_order_relaxed));
+                        V2::Landing::untracked_issued.load(std::memory_order_relaxed),
+                        V2::LandingFence::diag_unfenced.load(std::memory_order_relaxed),
+                        V2::LandingFence::diag_query_flushes.load(std::memory_order_relaxed));
             if (acquire.sem_execute) {
                 return SemExecuteGiveUp(acquire);
             }
@@ -645,9 +631,10 @@ bool Puller::PollAcquireView(DmaPusher& dma_pusher) {
     if (!decided || verify) {
         // The old poll reads memory each pass: keep the front's sleep at one tick.
         V2::FrontWake::NoteTickWaiter();
-        // SYNC (20c0 boot hang): what the drained path sees that the view doesn't, logged.
-        const u32 word_at_view = verify ? dma_pusher.memory_manager.Read<u32>(address) : 0;
-        const bool latched_at_view = verify && Nx2SemaphoreWaiters::Get().Latched(this);
+        // SYNC (20c0 boot hang): what the drained path sees that the view doesn't, logged with
+        // the word the decision read and the latch before the check (§9.1).
+        const u32 word_at_view = check.decision.memory_word;
+        const bool latched_at_view = latched_before_check;
         const auto view_device = verify ? dma_pusher.memory_manager.GpuToCpuAddress(address)
                                         : std::nullopt;
         const bool cache_holds =

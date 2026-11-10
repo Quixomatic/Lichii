@@ -270,6 +270,7 @@ struct SemDecision {
     u64 ticket = 0;   ///< Landing wake: the writer's ticket (Untracked: its position)
     SemView::Retire retire = SemView::Retire::Consumed;
     bool request = false; ///< Class D / at-fence row: one submit request for the ticket's tick
+    u32 memory_word = 0;  ///< The word the decision read (diagnostics)
 };
 
 /// SYNC_SUBMIT_SPEC §2.1 decision table.

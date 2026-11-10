@@ -1143,70 +1143,71 @@ TEST_CASE("SYNC §7.3: open work without draws is submitted however the back is 
     }
 }
 
-TEST_CASE("SYNC 9c4a quiet deadlock: back idle, open tick with work but no lazy fence, every "
-          "waiter 'no writer': the open tick is submitted once",
+TEST_CASE("SYNC §9 idle back: operations with no fence get one, rule I submits it",
           "[video_core][v2_p5b]") {
+    // Model of RasterizerVulkan::ServeSplitIdleHook's §9.3 step and the fence manager: a
+    // SyncOperation (or a query-cache uncommitted flush) waits for the next SignalFence; on an
+    // idle back none comes unless the idle hook makes it. The fence lands once its tick is
+    // submitted; rule I submits a lazy fence in the open tick with the GPU about to idle.
     using VideoCommon::V2::SubmitRequests;
     using Action = SubmitRequests::IdleAction;
-    constexpr u64 open = 8855; // work recorded after lazy fence 8854; no fence, no list end
-    SubmitRequests requests;
-    // Rule I has nothing to weigh: no lazy fence in the open tick, nothing wanted.
-    REQUIRE(requests.AtIdleHook(false, true, false, 8854, open, true) == Action::None);
-    // The suspended polls (the back ran everything sent) ask once for the open tick.
-    u64 asked_open_tick = 0;
-    u32 requests_filed = 0;
-    for (int poll = 0; poll < 1000; ++poll) {
-        const bool back_idle = true;
-        if (back_idle && open != asked_open_tick) {
-            asked_open_tick = open;
-            requests.Request(open, true);
-            ++requests_filed;
+    FlushParams params;
+    params.pass_boundaries = true;
+    FlushHeuristic heuristic{params};
+    heuristic.NoteSubmit(1000);
+    constexpr u64 open = 31;
+    struct Fences {
+        bool uncommitted_operation = false;
+        bool uncommitted_query_flush = false;
+        u64 lazy_tick = 0;
+        u32 fences = 0;
+    };
+    const auto idle_hook = [&](Fences& f, u32 pending, u32& submits) {
+        if (f.uncommitted_operation || f.uncommitted_query_flush) {
+            // g_signaling_query_report_fence + SignalFence + FlushCommands: a lazy fence with them
+            f.uncommitted_operation = false;
+            f.uncommitted_query_flush = false;
+            f.lazy_tick = open;
+            ++f.fences;
         }
-    }
-    REQUIRE(requests_filed == 1);
-    REQUIRE(requests.AtIdleHook(false, true, false, 8854, open, false) == Action::Urgent);
-    // Submitted: the next tick is open and nothing is asked until a poll sees it idle again.
-    REQUIRE_FALSE(requests.Urgent(open + 1));
-}
-
-TEST_CASE("SYNC 142874f storm: an unmet waiter on an idle back never asks for an empty tick; new "
-          "work is submitted exactly once",
-          "[video_core][v2_p5b]") {
-    using VideoCommon::V2::SubmitRequests;
-    using Action = SubmitRequests::IdleAction;
-    // Model of Puller::PollAcquireView's ask (open tick holds work, back consumed new entries
-    // since the last ask) and ServeSplitIdleHook (an empty tick is never submitted).
-    u64 open = 100;
-    bool open_work = false;
-    u64 consumed = 5000;
-    u64 asked_at_consumed = ~u64{0};
-    u32 submits = 0;
-    SubmitRequests requests;
-    const auto poll_and_serve = [&] {
-        if (open_work && consumed != asked_at_consumed) {
-            asked_at_consumed = consumed;
-            requests.Request(open, true);
-        }
-        const auto action = requests.AtIdleHook(false, true, false, 0, open, false);
-        if (action == Action::Urgent && open_work) {
+        SubmitRequests requests;
+        const bool lazy_open = f.lazy_tick >= open;
+        const bool due = heuristic.OpenWorkDue(pending, lazy_open, false);
+        const auto action = requests.AtIdleHook(false, true, false, f.lazy_tick, open, due);
+        if (action == Action::Sync) {
             ++submits;
-            ++open;           // every submit opens a new tick
-            open_work = false; // ... with nothing recorded in it
         }
     };
-    // The waiter stays unmet, the back idle, the open tick empty: nothing is submitted.
-    for (int poll = 0; poll < 1000; ++poll) {
-        poll_and_serve();
+    SECTION("(a) a SyncOperation writing a semaphore word lands; the suspended acquire resumes") {
+        Fences f;
+        f.uncommitted_operation = true;
+        u32 submits = 0;
+        u32 word = 0xea7;
+        idle_hook(f, 0, submits);
+        REQUIRE(f.fences == 1);
+        REQUIRE(submits == 1);
+        word += 0x13; // the fence popped, the operation wrote the word
+        REQUIRE(word == 0xeba);
     }
-    REQUIRE(submits == 0);
-    // The back runs new entries that record work: exactly one submission.
-    consumed += 64;
-    open_work = true;
-    for (int poll = 0; poll < 1000; ++poll) {
-        poll_and_serve();
+    SECTION("(b) the same with a query-cache uncommitted flush") {
+        Fences f;
+        f.uncommitted_query_flush = true;
+        u32 submits = 0;
+        idle_hook(f, 1, submits);
+        REQUIRE(f.fences == 1);
+        REQUIRE(submits == 1);
     }
-    REQUIRE(submits == 1);
+    SECTION("(c) nothing unfenced and nothing open: no fence, no submit") {
+        Fences f;
+        u32 submits = 0;
+        for (int hook = 0; hook < 100; ++hook) {
+            idle_hook(f, 0, submits);
+        }
+        REQUIRE(f.fences == 0);
+        REQUIRE(submits == 0);
+    }
 }
+
 
 TEST_CASE("SYNC step 9: the post-pass list runs in order after the pass, before the submit",
           "[video_core][v2_p5b]") {

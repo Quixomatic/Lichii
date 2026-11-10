@@ -311,11 +311,6 @@ void Scheduler::ServeSplitIdleHook(bool (*sync_due)(void*), void* argument) {
         // SYNC_SUBMIT_SPEC §2.5 rule W: a thread blocks on the open tick; served at this entry
         // boundary (requests filed since the previous one share this submit), with no "two in
         // flight → postpone" exception (d1435e18fd's coalescing branch removed).
-        if (!open_tick_has_work) {
-            // 142874f storm: an empty tick (no command, no fence) is never submitted; the
-            // request stays open for the tick and is served once work is recorded in it.
-            return;
-        }
         P5b::Add(P5b::Counter::IdleUrgent);
         P5b::Add(P5b::Counter::SubmitsWaiter);
         break;
