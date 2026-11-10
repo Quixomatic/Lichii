@@ -743,6 +743,14 @@ bool Scheduler::CanClearInPass(const Framebuffer* framebuffer, std::optional<u32
            u64{rect.baseArrayLayer} + rect.layerCount <= active_layers;
 }
 
+void Scheduler::EndRenderPassForClear(std::source_location location) {
+    if (!state.renderpass) {
+        return;
+    }
+    CountRenderPassEnd(location.file_name(), location.line());
+    EndRenderPass();
+}
+
 void Scheduler::FlushDeferredClear() {
     if (deferred_clear.framebuffer == nullptr) {
         return;
@@ -793,6 +801,12 @@ void Scheduler::RequestRendering(const Framebuffer* framebuffer, u32 color_count
         VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::HazardBreaks);
         EndRenderPass();
     }
+    if (deferred_clear.framebuffer == framebuffer && color_count != 0 &&
+        (deferred_clear.color_clear_mask >> (std::min)(color_count, 8U)) != 0) [[unlikely]] {
+        // Chunk B3: the draw's pipeline attaches fewer colours than a cleared slot: those load
+        // ops would be cut off, so the clear runs as its own pass first.
+        EndRenderPass();
+    }
     if (deferred_clear.framebuffer == framebuffer) {
         // The deferred clear becomes the pass's clear load ops.
         const DeferredClear dc = std::exchange(deferred_clear, DeferredClear{});
@@ -812,6 +826,12 @@ void Scheduler::RequestRendering(const Framebuffer* framebuffer, u32 color_count
     }
     if (state.renderpass) {
         CountRenderPassEnd(location.file_name(), location.line());
+        if (state.dynamic && framebuffer->Handle() == state.framebuffer &&
+            render_area.width == state.render_area.width &&
+            render_area.height == state.render_area.height) [[unlikely]] {
+            // Chunk B3: the same attachments, restarted only for the pipeline's colour count.
+            VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::PassColorRestarts);
+        }
     }
     EndRenderPass();
     BeginRenderingImpl(framebuffer, color_count, 0, {}, false, {});

@@ -107,6 +107,8 @@ enum class Counter : u32 {
     ClearsKeptPass,     ///< chunk B2: clears recorded in the open pass of another framebuffer key
     ClearPassEndsFull,  ///< passes ended by a full clear of attachments the pass does not hold
     ClearPassEndsPartial, ///< passes ended by a partial or blit clear
+    PassColorRestarts,  ///< chunk B3: same attachments, pass restarted for the colour count
+    ClearsDeferredEnded,///< chunk B3: full clears that ended another pass and became load ops
     Count,
 };
 

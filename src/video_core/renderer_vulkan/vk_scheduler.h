@@ -323,6 +323,10 @@ public:
                                       std::optional<u32> color_slot, bool depth_stencil,
                                       const VkClearRect& rect) const;
 
+    /// Chunk B3: a full clear of attachments the open pass doesn't hold ends it (its own pass
+    /// begin would), so that the clear becomes the next draw's load op.
+    void EndRenderPassForClear(std::source_location location = std::source_location::current());
+
     /// Changes whenever a render pass begins or ends.
     u64 RenderPassSerial() const {
         return render_pass_serial;

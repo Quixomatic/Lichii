@@ -2926,11 +2926,10 @@ void RasterizerVulkan::Clear(u32 layer_count) {
                     : 0;
     const bool pass_was_active = scheduler.IsRenderPassActive();
     const u64 pass_serial = scheduler.RenderPassSerial();
-    // R2-F4-06: a clear never ends an open pass to be deferred (77a898f8df did: +53 pass ends/f
-    // at 8d31). Its x4 was the deferred clears' viewport/scissor records outside a pass taking
-    // Record's auto flush (a full barrier) once F4-X3 left tracked writes pending across WFIs;
-    // dynamic state now records without it (Scheduler::RecordState).
-    const bool can_defer_clear = deferrable_shape && !pass_was_active;
+    // R2-F4-06: the 0fe4 clear x4 was the deferred clears' viewport/scissor records outside a
+    // pass taking Record's auto flush (a full barrier); dynamic state now records without it
+    // (Scheduler::RecordState).
+    bool can_defer_clear = deferrable_shape && !pass_was_active;
     // Chunk B2 (d5e4: clears ended 35.1 passes/f): a clear whose attachments are the open pass's
     // own (a framebuffer object of another key over the same views) is a vkCmdClearAttachments
     // in that pass; only the blit clears (partial channels, stencil masks) need their own.
@@ -2944,6 +2943,17 @@ void RasterizerVulkan::Clear(u32 layer_count) {
         scheduler.CanClearInPass(framebuffer,
                                  clears_color ? std::optional<u32>{clear_slot} : std::nullopt,
                                  clears_depth_stencil, clear_rect);
+    if (!clear_in_open_pass && deferrable_shape && pass_was_active &&
+        scheduler.TracksBarriers()) [[unlikely]] {
+        // Chunk B3 (67e9: 50-57 passes/f ended by full clears of attachments the open pass
+        // doesn't hold): that pass ends either way. Begun by the clear itself, the new pass took
+        // every colour slot (count 0), and the next draw's pipeline count ended it again
+        // (RequestRendering's same-pass test needs the count: two passes per clear). Deferred,
+        // the clear becomes the load op of the pass the next draw begins with its own count.
+        scheduler.EndRenderPassForClear();
+        can_defer_clear = true;
+        P5b::Add(P5b::Counter::ClearsDeferredEnded);
+    }
     if (!can_defer_clear && !clear_in_open_pass) {
         scheduler.RequestRendering(framebuffer);
     }
