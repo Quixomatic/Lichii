@@ -637,6 +637,58 @@ TEST_CASE("V2 acquire: a suspended acquire whose release the view never records 
         // A known producer gets its submit request first.
         CHECK(!ForcePendingLandings(false, false, false, true, false, false));
     }
+    SECTION("019d livelock: a producer in the open command buffer lands once; no re-fire") {
+        // The producer was an operation queued without a fence (SyncOperation) in work not yet
+        // submitted: a forced release of the existing fences found nothing, and its ring record
+        // moved `consumed`, so the guard re-armed every poll (~2,500 forces/s). The model: the
+        // operation lands only if the force signals a fence for it AND submits; the force adds
+        // no ring record (a back job), so `consumed` stays.
+        struct Back {
+            bool open_operation = true; ///< queued without a fence, in the open command buffer
+            bool fence_for_it = false;
+            bool submitted = false;
+            u64 consumed = 700;
+            u32 word = 0x3e7eb;
+            void ReleaseFencesForced() { // runs the operations of submitted fences only
+                if (fence_for_it && submitted && open_operation) {
+                    open_operation = false;
+                    ++word;
+                }
+            }
+            void LandEverythingPending() { // what the waiter's job does
+                fence_for_it = true;       // SignalFence: carries the uncommitted operations
+                submitted = true;          // FlushCommands: the open command buffer
+                ReleaseFencesForced();
+            }
+        } back;
+        // The old force (existing fences only) lands nothing.
+        back.ReleaseFencesForced();
+        CHECK(back.word == 0x3e7eb);
+        u64 released_at = 0;
+        u32 forces = 0;
+        bool resumed = false;
+        for (int poll = 0; poll < 100 && !resumed; ++poll) {
+            if (ForcePendingLandings(false, false, true, false, false,
+                                     released_at == back.consumed + 1)) {
+                ++forces;
+                back.LandEverythingPending();
+                released_at = back.consumed + 1; // unchanged: the job added no record
+            }
+            resumed = SemaphoreMet(SemaphoreOp::Gequal, back.word, 0x3e7ec);
+        }
+        CHECK(resumed);
+        CHECK(forces == 1);
+        // Unmet after a force with nothing new at the back: no further force, poll after poll.
+        u64 again_at = 701;
+        u32 refires = 0;
+        for (int poll = 0; poll < 100; ++poll) {
+            refires += ForcePendingLandings(false, false, true, false, false,
+                                            again_at == back.consumed + 1)
+                           ? 1
+                           : 0;
+        }
+        CHECK(refires == 0);
+    }
     SECTION("a producer that lands at a fence makes the poll ask for its submit, never a drain") {
         // F3F5b-5 / F3-X1: a QMD release (or a release still to land) that may write the word
         // latches the waiter when its operation runs; the poll asks for the submit that runs it,

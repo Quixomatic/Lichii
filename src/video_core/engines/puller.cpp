@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <optional>
 #include <string>
+#include <thread>
 
 #include "common/assert.h"
 #include "common/logging.h"
@@ -145,6 +146,38 @@ void ReleaseFences(DmaPusher& dma_pusher) {
     split.RunTyped(VideoCommon::V2::Ir::Kind::Barrier, body,
                    [rasterizer = dma_pusher.rasterizer] { rasterizer->ReleaseFences(); },
                    VideoCommon::DrainSite::FenceRelease);
+}
+
+// F3-X1 follow-up (019d livelock): makes everything the back holds land, as a job on the back
+// after its current entry (no ring record: the waiter's guard on `consumed` holds): a delayed
+// fence that carries the operations queued without one (SyncOperation, as LandCaptured), the
+// submit of the open command buffer, then the forced release that waits for every fence and
+// runs their operations. Returns false if the back stopped before running it.
+bool LandEverythingPending(VideoCore::RasterizerInterface* rasterizer) {
+    struct Job {
+        VideoCore::RasterizerInterface* rasterizer{};
+        std::atomic<bool> done{false};
+    };
+    // Static: a job a stopping back never ran must not point at a dead frame. Front only.
+    static Job job;
+    job.rasterizer = rasterizer;
+    job.done.store(false, std::memory_order_relaxed);
+    auto& split = VideoCommon::GpuSplit::Get();
+    split.RequestBackJob(
+        [](void* argument) {
+            auto& self = *static_cast<Job*>(argument);
+            VideoCore::g_signaling_query_report_fence = true;
+            self.rasterizer->SignalFence([] {});
+            VideoCore::g_signaling_query_report_fence = false;
+            self.rasterizer->FlushCommands();
+            self.rasterizer->ReleaseFences(true);
+            self.done.store(true, std::memory_order_release);
+        },
+        &job);
+    while (!job.done.load(std::memory_order_acquire) && split.BackRunning()) {
+        std::this_thread::yield();
+    }
+    return job.done.load(std::memory_order_acquire);
 }
 
 namespace V2Stats = VideoCommon::V2::Stats;
@@ -501,12 +534,14 @@ bool Puller::PollAcquireView(DmaPusher& dma_pusher) {
         if (V2::ForcePendingLandings(queued, gpu_written, acquire.submit_requested,
                                      acquire.producer_lands, landings != acquire.landings_seen,
                                      acquire.released_at == split.ConsumedNow() + 1)) {
-            acquire.released_at = split.ConsumedNow() + 1;
             if (V2Stats::Enabled()) [[unlikely]] {
                 V2Stats::NoteDecision(VideoCommon::DrainSite::Acquire, Decision::Waited,
                                       Reason::Valve);
             }
-            ReleaseFences(dma_pusher);
+            LandEverythingPending(dma_pusher.rasterizer);
+            // After it (a job adds no ring record, but other channels' work may have run):
+            // the next force needs new work at the back.
+            acquire.released_at = split.ConsumedNow() + 1;
             acquire.landings_seen = V2::Landing::landed.load(std::memory_order_acquire) +
                                     V2::Landing::untracked_landed.load(std::memory_order_acquire);
             if (Nx2SemaphoreWaiters::Get().Latched(this) ||
