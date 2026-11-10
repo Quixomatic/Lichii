@@ -1419,9 +1419,10 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
                                Nx2Profile::Now() - idle_start >= idle_hook_ns) {
                         hook_ran = true;
                         hook_requested.store(false, std::memory_order_seq_cst);
-                        idle_hook_requested.store(false, std::memory_order_relaxed);
+                        const bool asked =
+                            idle_hook_requested.exchange(false, std::memory_order_seq_cst);
                         ServeCpuLane();
-                        idle_hook(idle_argument);
+                        RunIdleHook(asked);
                     }
                     if (!open && (hook_ran || idle_hook == nullptr)) {
                         break;
@@ -1438,9 +1439,9 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
             }
             if (available == read_position && idle_hook != nullptr && !hook_ran) {
                 hook_requested.store(false, std::memory_order_seq_cst);
-                idle_hook_requested.store(false, std::memory_order_relaxed);
+                const bool asked = idle_hook_requested.exchange(false, std::memory_order_seq_cst);
                 ServeCpuLane();
-                idle_hook(idle_argument);
+                RunIdleHook(asked);
                 available = published.load(std::memory_order_acquire);
             }
             if (available == read_position) {

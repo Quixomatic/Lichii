@@ -59,6 +59,14 @@ struct FlushParams {
     u64 pass_interval_us = 2000;      ///< ... and this long since the last submission
     u64 request_gap_us = 500;         ///< a waiter's request mid-pass, no sooner than this
     u64 mid_pass_interval_us = 8000;  ///< safety net for passes that never end
+
+    /// F4-X2 (MASTER_PLAN §5.5: strong hints after work the guest will read): a strong hint
+    /// submits only while the GPU is idle (pending 0), a waiter asked, or the guest has been
+    /// waiting on unsubmitted work (fast mode, or at least strong_wait_us a frame on average).
+    /// While the GPU is busy and nobody waits, the work rides until the GPU goes idle (the caller
+    /// arms the finish thread's wake: StrongPending).
+    bool strong_needs_idle = false;
+    u64 strong_wait_us = 200;
 };
 
 /// What the heuristic knows about the GPU and the recording thread at a decision.
@@ -140,7 +148,8 @@ public:
         Decision decision{};
         if (state.requested) {
             decision = {FlushAction::Flush, ReasonRequest};
-        } else if (hint >= FlushHint::Strong && chunks >= params.strong_chunks) {
+        } else if (hint >= FlushHint::Strong && chunks >= params.strong_chunks &&
+                   StrongDue(state)) {
             decision = {FlushAction::Flush, ReasonStrong};
         } else if (fast_mode && !state.back_behind && since >= params.fast_interval_us) {
             decision = {FlushAction::Flush, ReasonFast};
@@ -173,6 +182,16 @@ public:
     /// ImplicitStrongHint: enough chunks recorded; no idle shortcut (that flushed after 16 draws).
     [[nodiscard]] bool WantsFlushNow() const noexcept {
         return hint >= FlushHint::Strong && draws >= params.strong_chunks * params.chunk_draws;
+    }
+    /// F4-X2: a strong hint has enough work behind it but waits for the GPU's idle (StrongDue
+    /// said no): the caller arms the wake.
+    [[nodiscard]] bool StrongPending() const noexcept {
+        return params.strong_needs_idle && WantsFlushNow();
+    }
+    /// F4-X2: whether a strong hint may submit now (FlushParams::strong_needs_idle).
+    [[nodiscard]] bool StrongDue(const FlushState& state) const noexcept {
+        return !params.strong_needs_idle || state.pending == 0 || state.requested || fast_mode ||
+               average_wait_us >= params.strong_wait_us;
     }
 
     /// Any submission (heuristic or not) resets the counters.
@@ -212,7 +231,7 @@ public:
 private:
     Decision DecideAtChunk(u32 chunks, const FlushState& state, u64 now_us) const noexcept {
         const u64 since = now_us - last_submit_us;
-        if (hint >= FlushHint::Strong && chunks >= params.strong_chunks) {
+        if (hint >= FlushHint::Strong && chunks >= params.strong_chunks && StrongDue(state)) {
             return {FlushAction::Flush, ReasonStrong};
         }
         if (params.pass_boundaries) {

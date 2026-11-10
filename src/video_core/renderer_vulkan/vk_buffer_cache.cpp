@@ -570,6 +570,7 @@ void BufferCacheRuntime::WaitSubmittedTick(u64 tick) {
     if (!scheduler.IsSubmitted(tick) && VideoCommon::GpuSplit::Get().Active() &&
         !VideoCommon::GpuSplit::OnBackThread()) {
         VideoCommon::Nx2Profile::Scope scope{VideoCommon::Nx2Profile::Zone::ListSubmitWait};
+        scheduler.RequestLazyFlush(tick); // F4-X2: list copies ride the open submission
         if (!scheduler.WaitSubmitted(tick)) {
             scheduler.Wait(tick);
             return;

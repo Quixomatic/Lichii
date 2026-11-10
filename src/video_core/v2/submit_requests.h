@@ -45,4 +45,49 @@ private:
     std::atomic<u64> requested{0};
 };
 
+/// F4-X2 (MASTER_PLAN §5.5 adaptive submission; DXVK: submit when the GPU is about to go idle):
+/// open work that nobody waits for is left in the open submission while the GPU is busy, and the
+/// finish thread wakes the recording thread's idle hook (as a request, which submits) once the
+/// GPU has finished everything handed to it. Arm and OnProgress race: each side publishes its
+/// state, fences, then reads the other's, so at least one of them sees the GPU idle with the
+/// wake armed (the recording thread then submits itself, or the finish thread wakes it).
+class GpuIdleWake {
+public:
+    /// Recording thread: open work waits for the GPU to go idle. False when it is idle already:
+    /// the caller submits now.
+    template <typename Busy>
+    [[nodiscard]] bool Arm(Busy&& gpu_busy) noexcept {
+        armed.store(true, std::memory_order_relaxed);
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        if (gpu_busy()) {
+            return true;
+        }
+        armed.store(false, std::memory_order_relaxed);
+        return false;
+    }
+
+    /// Recording thread: a submission went out (nothing is left for the wake).
+    void Disarm() noexcept {
+        armed.store(false, std::memory_order_relaxed);
+    }
+
+    /// Finish thread, after it published a completed tick: whether to wake the recording thread
+    /// now (once per Arm).
+    template <typename Busy>
+    [[nodiscard]] bool OnProgress(Busy&& gpu_busy) noexcept {
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        if (!armed.load(std::memory_order_relaxed) || gpu_busy()) {
+            return false;
+        }
+        return armed.exchange(false, std::memory_order_relaxed);
+    }
+
+    [[nodiscard]] bool Armed() const noexcept {
+        return armed.load(std::memory_order_relaxed);
+    }
+
+private:
+    std::atomic<bool> armed{false};
+};
+
 } // namespace VideoCommon::V2

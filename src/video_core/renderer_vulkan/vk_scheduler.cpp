@@ -24,6 +24,7 @@
 #include "common/settings.h"
 #include "common/dkb_cpu_trace.h"
 #include "common/thread.h"
+#include "core/core.h"
 #include "video_core/gpu_logging/gpu_logging.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/renderer_vulkan/vk_command_pool.h"
@@ -34,6 +35,7 @@
 #include "video_core/renderer_vulkan/vk_background_readback.h"
 #include "video_core/renderer_vulkan/vk_submit_engine.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
+#include "video_core/v2/front_wake.h"
 #include "video_core/v2/p5b_stats.h"
 #include "video_core/v2/v2_switches.h"
 #include "video_core/vulkan_common/vulkan_device.h"
@@ -173,6 +175,10 @@ Scheduler::Scheduler(const Device& device_, StateTracker& state_tracker_)
         submit_engine = std::make_unique<SubmitEngine>(device, *master_semaphore, submit_mutex,
                                                        submit_thread, transfer_queue.get());
         finish_publishes_tick = submit_thread;
+        if (submit_thread) {
+            submit_engine->SetProgressHook(
+                [](void* self) { static_cast<Scheduler*>(self)->OnGpuProgress(); }, this);
+        }
     }
 
     if (transfer_queue && VideoCommon::V2::On(VideoCommon::V2::Switch::XReadback)) {
@@ -222,6 +228,7 @@ u64 Scheduler::Flush(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
     last_flush = std::chrono::steady_clock::now();
     flush_pending = false;
     submit_wanted = false;
+    gpu_idle_wake.Disarm();
     return signal_value;
 }
 
@@ -240,6 +247,51 @@ void Scheduler::ServeIdleHook() {
                                     lazy_outstanding_tick, CurrentTick())) {
         VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::FlushLazy);
         Flush();
+    }
+}
+
+void Scheduler::ServeSplitIdleHook() {
+    if (!lazy_fences) {
+        FlushDeferred();
+        return;
+    }
+    if (!submit_requests.IdleSubmits(flush_pending, lazy_fences, submit_wanted,
+                                     lazy_outstanding_tick, CurrentTick())) {
+        return;
+    }
+    // F4-X2: a waiter's request (asked, or a requested tick) and DeferFlush's work submit now.
+    // Work nobody waits for yet (lazy fences, list ends, list copies) keeps the GPU fed: it goes
+    // out at once while the GPU is idle, else when the finish thread sees it go idle (or with
+    // the next submission, or when someone asks). Every waiter asks (RequestIdleHook or
+    // RequestLazyFlush + WaitSubmitted), so none depends on the GPU's idle; a guest thread
+    // waiting on a sync gets it now too (its request is served without a wake).
+    const bool asked = flush_pending || submit_requests.Open(CurrentTick()) ||
+                       VideoCommon::GpuSplit::Get().IdleHookAsked() ||
+                       Core::g_nx2_guest_sync_waiters.load(std::memory_order_relaxed) != 0;
+    if (!asked && DeferUntilGpuIdle()) {
+        VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::IdleDeferred);
+        return;
+    }
+    VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::FlushLazy);
+    Flush();
+}
+
+bool Scheduler::DeferUntilGpuIdle() {
+    if (!finish_publishes_tick || !lazy_fences) {
+        return false;
+    }
+    submit_wanted = true;
+    return gpu_idle_wake.Arm([this] { return GpuBusy(); });
+}
+
+void Scheduler::OnGpuProgress() {
+    // Finish thread, a completion published. A front channel suspended on a command list copy
+    // (DmaPusher's pending list tick) may go on: end the front's pending sleep (W-01b).
+    VideoCommon::V2::FrontWake::Ring();
+    // The GPU went idle with deferred work open.
+    if (gpu_idle_wake.OnProgress([this] { return GpuBusy(); })) {
+        VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::GpuIdleWakes);
+        VideoCommon::GpuSplit::Get().RequestIdleHook();
     }
 }
 

@@ -104,6 +104,17 @@ public:
     /// The idle hook (the back goes idle, or another thread asked with RequestIdleHook): what
     /// FlushDeferred submits, plus with lazy fences any work they or WantSubmit wait for.
     void ServeIdleHook();
+    /// The split's registered idle hook: ServeIdleHook, except that when the back only went idle
+    /// (nobody asked, nothing requested or deferred) work that is merely wanted waits for the GPU
+    /// to go idle while it is busy (F4-X2, V2::GpuIdleWake; needs the finish thread).
+    void ServeSplitIdleHook();
+    /// F4-X2, recording thread: whether open work may wait for the GPU to go idle (it is busy and
+    /// the finish thread will wake the idle hook then). Marks the work wanted. False: submit now.
+    [[nodiscard]] bool DeferUntilGpuIdle();
+    /// Whether the GPU still runs handed-off work (by the finish thread's published tick).
+    [[nodiscard]] bool GpuBusy() const noexcept {
+        return master_semaphore->KnownGpuTick() + 1 < master_semaphore->CurrentTick();
+    }
     /// Any thread, F4-02/F4-04: `tick` is submitted when this returns. On the split's back it
     /// submits; other threads ask the back (RequestLazyFlush + WaitSubmitted), or submit
     /// themselves once the back stopped.
@@ -539,6 +550,7 @@ private:
     std::chrono::steady_clock::time_point last_flush{};
     bool flush_pending{};
     VideoCommon::V2::SubmitRequests submit_requests; ///< RequestLazyFlush
+    VideoCommon::V2::GpuIdleWake gpu_idle_wake;      ///< F4-X2: DeferUntilGpuIdle
     bool lazy_fences{};                 ///< F4-02: SetLazyFences
     bool finish_publishes_tick{};       ///< F4-12: FinishThreadPublishesTick
     bool pass_transform_feedback{};     ///< F4-07: NoteTransformFeedback
@@ -669,6 +681,8 @@ private:
                                       u32 dst_access);
     /// F4-X3: the WFI barrier, with every pending tracked write folded into it.
     void RecordWaitForIdleBarrier(u32 stages);
+    /// F4-X2, finish thread (SubmitEngine progress hook): wakes the idle hook for deferred work.
+    void OnGpuProgress();
 
     void UpdateAutoFlush() {
         auto_flush = track_barriers && !targeted_scope && !state.renderpass &&

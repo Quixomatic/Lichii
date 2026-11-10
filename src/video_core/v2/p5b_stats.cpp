@@ -89,7 +89,9 @@ void Report(const char* thread_name, u64 window_ns) {
              "V2 stats {} P5b submission | frames {:.1f}/s, submits {:.1f}/frame ({:.0f}/s), "
              "draws per submit {:.1f} | flush reasons (per s): idle {:.0f}, pending {:.0f}, "
              "strong {:.0f}, weak {:.0f}, interval {:.0f}, fast {:.0f}, max draws {:.0f}, cost "
-             "{:.0f}, other {:.0f}, pass {:.0f}, deferred {:.0f}, lazy/requested {:.0f} | submit "
+             "{:.0f}, other {:.0f}, pass {:.0f}, deferred {:.0f}, lazy/requested {:.0f} | left for "
+             "the GPU's idle (per s): idle hooks {:.0f}, strong hints {:.0f}, list copies riding "
+             "{:.0f}, idle wakes {:.0f} | submit "
              "thread {:.0f}/s, hand-off {:.1f} us, finish {:.0f}/s ({:.1f} us after submit), "
              "recycled contexts {:.0f}/s",
              thread_name, PerSecond(frames, seconds), per_frame(submits),
@@ -103,6 +105,10 @@ void Report(const char* thread_name, u64 window_ns) {
              PerSecond(at(Counter::FlushPass), seconds),
              PerSecond(at(Counter::FlushDeferred), seconds),
              PerSecond(at(Counter::FlushLazy), seconds),
+             PerSecond(at(Counter::IdleDeferred), seconds),
+             PerSecond(at(Counter::StrongDeferred), seconds),
+             PerSecond(at(Counter::ListCopiesRiding), seconds),
+             PerSecond(at(Counter::GpuIdleWakes), seconds),
              PerSecond(at(Counter::SubmitThreadSubmits), seconds),
              Ratio(at(Counter::SubmitLatencyUs), at(Counter::SubmitThreadSubmits)),
              PerSecond(at(Counter::FinishCompletions), seconds),

@@ -330,6 +330,8 @@ private:
     /// Resets the heuristic's counters when any submission happened since it last looked.
     void SyncAdaptiveTick();
     static u64 AdaptNowUs();
+    /// The GPU's progress and the recorder's state for the heuristic's decisions.
+    VideoCommon::V2::FlushState ReadFlushState();
 
     void TraceRenderState(bool is_indexed, const char* outcome, const Framebuffer* framebuffer);
 

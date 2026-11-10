@@ -536,6 +536,15 @@ public:
     [[nodiscard]] static bool OnBackThread() {
         return on_back_thread;
     }
+    /// Back thread, inside the idle hook: whether a thread asked for it (RequestIdleHook) rather
+    /// than the back only going idle (F4-X2: only the latter may leave work for the GPU's idle).
+    [[nodiscard]] bool IdleHookAsked() const {
+        return idle_hook_asked;
+    }
+    /// Front-side waits on the back (WaitFor): whether one is in progress now.
+    [[nodiscard]] bool FrontWaiting() const {
+        return wait_target.load(std::memory_order_relaxed) != ~u64{0};
+    }
     /// Back thread: whether the front published more work past the batch the back is running,
     /// i.e. the back is the bottleneck right now (Perf fix C: the adaptive submission's idle
     /// and fast-flush rules stay off then).
@@ -984,8 +993,14 @@ private:
         if (idle_hook_requested.load(std::memory_order_relaxed) &&
             idle_hook_requested.exchange(false, std::memory_order_seq_cst) &&
             idle_hook != nullptr) {
-            idle_hook(idle_argument);
+            RunIdleHook(true);
         }
+    }
+    /// Back: the idle hook, `asked` when a thread requested it (IdleHookAsked).
+    void RunIdleHook(bool asked) {
+        idle_hook_asked = asked;
+        idle_hook(idle_argument);
+        idle_hook_asked = false;
     }
     /// Back: runs a front job (RequestBackJob) and the CPU lane hook if one was asked for
     /// (EDEN_NX2_V2_CPULANE).
@@ -1122,6 +1137,7 @@ private:
     static inline thread_local bool on_back_thread{};
     void (*idle_hook)(void*){};
     void* idle_argument{};
+    bool idle_hook_asked{}; ///< back only: RunIdleHook's argument while the hook runs
     void (*cpu_lane_hook)(void*){};
     void* cpu_lane_argument{};
     std::atomic<bool> cpu_lane_requested{};

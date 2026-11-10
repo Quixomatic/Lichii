@@ -421,6 +421,9 @@ void SubmitEngine::FinishThread(std::stop_token token) {
             }
         }
         master.PublishFromFinish();
+        if (const auto hook = progress_hook.load(std::memory_order_acquire)) {
+            hook(progress_argument.load(std::memory_order_relaxed));
+        }
         {
             std::scoped_lock lock{finish_mutex};
             finish_queue.pop_front();

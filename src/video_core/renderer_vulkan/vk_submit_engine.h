@@ -140,6 +140,13 @@ public:
     /// finished `tick`.
     void RetireAfter(u64 tick, std::function<void()>&& func);
 
+    /// F4-X2: runs on the finish thread right after each published completion (set before the
+    /// first submission).
+    void SetProgressHook(void (*hook)(void*), void* argument) {
+        progress_argument.store(argument, std::memory_order_relaxed);
+        progress_hook.store(hook, std::memory_order_release);
+    }
+
 private:
     struct Retire {
         u64 tick;
@@ -185,6 +192,9 @@ private:
 
     std::mutex retire_mutex;
     std::deque<Retire> retires;
+
+    std::atomic<void (*)(void*)> progress_hook{};
+    std::atomic<void*> progress_argument{};
 
     std::jthread submit_thread;
     std::jthread finish_thread;
