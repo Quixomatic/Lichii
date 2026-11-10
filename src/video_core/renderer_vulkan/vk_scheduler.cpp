@@ -24,7 +24,6 @@
 #include "common/settings.h"
 #include "common/dkb_cpu_trace.h"
 #include "common/thread.h"
-#include "core/core.h"
 #include "video_core/gpu_logging/gpu_logging.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/renderer_vulkan/vk_command_pool.h"
@@ -255,22 +254,25 @@ void Scheduler::ServeSplitIdleHook() {
         FlushDeferred();
         return;
     }
-    if (!submit_requests.IdleSubmits(flush_pending, lazy_fences, submit_wanted,
-                                     lazy_outstanding_tick, CurrentTick())) {
+    using IdleAction = VideoCommon::V2::SubmitRequests::IdleAction;
+    // F4-X2: DeferFlush's work and an urgent request (a thread blocks on the open tick: a front
+    // list read, a readback, a guest sync wait) submit now. Everything else (lazy fences and
+    // their bounded-time requests, list ends, list copies, strong hints) keeps the GPU fed: it
+    // goes out at once while the GPU is idle, else when the finish thread sees it go idle. A
+    // wake alone (RequestIdleHook: landing polls, lane requests, the GPU-idle wake) is not a
+    // reason: every such waiter is served by one of the two, so none waits on more than the GPU.
+    switch (submit_requests.AtIdleHook(flush_pending, lazy_fences, submit_wanted,
+                                       lazy_outstanding_tick, CurrentTick())) {
+    case IdleAction::None:
         return;
-    }
-    // F4-X2: a waiter's request (asked, or a requested tick) and DeferFlush's work submit now.
-    // Work nobody waits for yet (lazy fences, list ends, list copies) keeps the GPU fed: it goes
-    // out at once while the GPU is idle, else when the finish thread sees it go idle (or with
-    // the next submission, or when someone asks). Every waiter asks (RequestIdleHook or
-    // RequestLazyFlush + WaitSubmitted), so none depends on the GPU's idle; a guest thread
-    // waiting on a sync gets it now too (its request is served without a wake).
-    const bool asked = flush_pending || submit_requests.Open(CurrentTick()) ||
-                       VideoCommon::GpuSplit::Get().IdleHookAsked() ||
-                       Core::g_nx2_guest_sync_waiters.load(std::memory_order_relaxed) != 0;
-    if (!asked && DeferUntilGpuIdle()) {
-        VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::IdleDeferred);
-        return;
+    case IdleAction::AtGpuIdle:
+        if (DeferUntilGpuIdle()) {
+            VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::IdleDeferred);
+            return;
+        }
+        break;
+    case IdleAction::Now:
+        break;
     }
     VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::FlushLazy);
     Flush();

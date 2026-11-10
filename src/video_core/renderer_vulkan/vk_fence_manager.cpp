@@ -88,15 +88,19 @@ void InnerFence::Wait() {
         constexpr auto EscalateWindow = std::chrono::milliseconds{4};
         std::chrono::steady_clock::time_point guest_since{};
         bool requested = false;
+        bool urgent = false;
         for (u32 spins = 0; !scheduler.IsSubmitted(wait_tick); ++spins) {
             const auto now = std::chrono::steady_clock::now();
             if (!VideoCommon::GpuSplit::Get().BackRunning() || now - queued_at >= EscalateWindow) {
                 break;
             }
             const bool guest = Core::g_nx2_guest_sync_waiters.load(std::memory_order_relaxed) != 0;
-            if (!requested && (guest || now - queued_at >= LazyWindow)) {
-                scheduler.RequestLazyFlush(wait_tick);
+            // F4-X2: only a waiting guest makes the request urgent; the window's request may
+            // wait for the GPU's idle at the back's idle hook.
+            if ((!requested && now - queued_at >= LazyWindow) || (guest && !urgent)) {
+                scheduler.RequestLazyFlush(wait_tick, guest);
                 requested = true;
+                urgent = guest;
             }
             if (guest) {
                 if (guest_since == std::chrono::steady_clock::time_point{}) {
@@ -112,7 +116,7 @@ void InnerFence::Wait() {
             }
         }
         if (!requested) {
-            scheduler.RequestLazyFlush(wait_tick);
+            scheduler.RequestLazyFlush(wait_tick, false);
         }
     } else if (lazy && !scheduler.IsSubmitted(wait_tick) && VideoCommon::GpuSplit::Get().Active() &&
         !VideoCommon::GpuSplit::OnBackThread()) {
@@ -121,10 +125,11 @@ void InnerFence::Wait() {
         // waiting, does it ask for one, so the fence operations behind it never wait long.
         constexpr auto LazyWindow = std::chrono::milliseconds{1};
         for (u32 spins = 0; !scheduler.IsSubmitted(wait_tick); ++spins) {
-            if (std::chrono::steady_clock::now() - queued_at >= LazyWindow ||
-                Core::g_nx2_guest_sync_waiters.load(std::memory_order_relaxed) != 0 ||
+            const bool guest =
+                Core::g_nx2_guest_sync_waiters.load(std::memory_order_relaxed) != 0;
+            if (std::chrono::steady_clock::now() - queued_at >= LazyWindow || guest ||
                 !VideoCommon::GpuSplit::Get().BackRunning()) {
-                scheduler.RequestLazyFlush(wait_tick);
+                scheduler.RequestLazyFlush(wait_tick, guest);
                 break;
             }
             if (spins < 16) {

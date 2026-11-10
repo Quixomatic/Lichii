@@ -16,11 +16,13 @@ namespace VideoCommon::V2 {
 
 class SubmitRequests {
 public:
-    /// Any thread: `tick` must be submitted.
-    void Request(u64 tick) noexcept {
-        u64 current = requested.load(std::memory_order_relaxed);
-        while (current < tick &&
-               !requested.compare_exchange_weak(current, tick, std::memory_order_relaxed)) {
+    /// Any thread: `tick` must be submitted. `urgent`: a thread blocks on it now (a reader, a
+    /// guest sync wait); not urgent: a bounded-latency request nobody blocks on yet (a lazy
+    /// fence's window ran out), which the idle hook may leave for the GPU's idle (F4-X2).
+    void Request(u64 tick, bool urgent = true) noexcept {
+        Raise(requested, tick);
+        if (urgent) {
+            Raise(urgent_tick, tick);
         }
     }
 
@@ -28,6 +30,27 @@ public:
     [[nodiscard]] bool Open(u64 open_tick) const noexcept {
         const u64 tick = requested.load(std::memory_order_relaxed);
         return tick != 0 && tick >= open_tick;
+    }
+
+    /// Whether an urgent request's tick is still open.
+    [[nodiscard]] bool Urgent(u64 open_tick) const noexcept {
+        const u64 tick = urgent_tick.load(std::memory_order_relaxed);
+        return tick != 0 && tick >= open_tick;
+    }
+
+    enum class IdleAction : u8 {
+        None,      ///< nothing to submit
+        Now,       ///< deferred work or a thread blocks on the open tick: submit
+        AtGpuIdle, ///< open work nobody blocks on: submit while the GPU is idle, else at its idle
+    };
+    /// F4-X2: the split's idle hook (Scheduler::ServeSplitIdleHook). Only DeferFlush's work and
+    /// an urgent request submit at once; waking the hook (RequestIdleHook) says nothing by itself.
+    [[nodiscard]] IdleAction AtIdleHook(bool flush_pending, bool lazy_fences, bool wanted,
+                                        u64 lazy_fence_tick, u64 open_tick) const noexcept {
+        if (!IdleSubmits(flush_pending, lazy_fences, wanted, lazy_fence_tick, open_tick)) {
+            return IdleAction::None;
+        }
+        return flush_pending || Urgent(open_tick) ? IdleAction::Now : IdleAction::AtGpuIdle;
     }
 
     /// The idle hook's decision (the recording thread goes idle, or a waiter woke it). Submits
@@ -42,7 +65,15 @@ public:
     }
 
 private:
+    static void Raise(std::atomic<u64>& value, u64 tick) noexcept {
+        u64 current = value.load(std::memory_order_relaxed);
+        while (current < tick &&
+               !value.compare_exchange_weak(current, tick, std::memory_order_relaxed)) {
+        }
+    }
+
     std::atomic<u64> requested{0};
+    std::atomic<u64> urgent_tick{0};
 };
 
 /// F4-X2 (MASTER_PLAN §5.5 adaptive submission; DXVK: submit when the GPU is about to go idle):

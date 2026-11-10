@@ -78,8 +78,10 @@ public:
     void FlushDeferred();
     /// Any thread: a lazy fence (early downloads) waited long enough for `tick` to be submitted;
     /// the back submits it at its next idle hook. Follow with WaitSubmitted.
-    void RequestLazyFlush(u64 tick) {
-        submit_requests.Request(tick);
+    /// `urgent` (F4-X2): the caller blocks on the tick now; a lazy fence's bounded-time request
+    /// passes false and may wait for the GPU's idle at the idle hook.
+    void RequestLazyFlush(u64 tick, bool urgent = true) {
+        submit_requests.Request(tick, urgent);
     }
 
     /// F4-02 (EDEN_NX2_V2_ADAPTSUBMIT, MASTER_PLAN §6 classes A/B, Ryujinx SyncManager non-strict
@@ -104,9 +106,9 @@ public:
     /// The idle hook (the back goes idle, or another thread asked with RequestIdleHook): what
     /// FlushDeferred submits, plus with lazy fences any work they or WantSubmit wait for.
     void ServeIdleHook();
-    /// The split's registered idle hook: ServeIdleHook, except that when the back only went idle
-    /// (nobody asked, nothing requested or deferred) work that is merely wanted waits for the GPU
-    /// to go idle while it is busy (F4-X2, V2::GpuIdleWake; needs the finish thread).
+    /// The split's registered idle hook: ServeIdleHook, except that open work no thread blocks on
+    /// (no urgent request, nothing deferred) waits for the GPU to go idle while it is busy
+    /// (F4-X2, SubmitRequests::AtIdleHook, V2::GpuIdleWake; needs the finish thread).
     void ServeSplitIdleHook();
     /// F4-X2, recording thread: whether open work may wait for the GPU to go idle (it is busy and
     /// the finish thread will wake the idle hook then). Marks the work wanted. False: submit now.

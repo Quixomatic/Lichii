@@ -932,6 +932,63 @@ TEST_CASE("V2 P5b flush decisions at pass boundaries", "[video_core][v2_p5b]") {
     }
 }
 
+TEST_CASE("V2 P5b the idle hook submits nothing while the GPU is busy and nobody waits",
+          "[video_core][v2_p5b]") {
+    // F4-X2 (f1d05e9625: 54 idle-hook submits a frame): waking the hook, wanted work and a lazy
+    // fence's bounded-time request are no reason to submit while the GPU is busy; only
+    // DeferFlush's work or a thread blocking on the open tick (an urgent request) are.
+    using VideoCommon::V2::GpuIdleWake;
+    using VideoCommon::V2::SubmitRequests;
+    using Action = SubmitRequests::IdleAction;
+    constexpr u64 open = 10;
+    const auto busy = [] { return true; };
+    SubmitRequests requests;
+    GpuIdleWake wake;
+    u32 submits = 0;
+    const auto idle_hook = [&](bool flush_pending, bool wanted, u64 lazy_tick) {
+        switch (requests.AtIdleHook(flush_pending, true, wanted, lazy_tick, open)) {
+        case Action::None:
+            return;
+        case Action::AtGpuIdle:
+            if (wake.Arm(busy)) {
+                return;
+            }
+            break;
+        case Action::Now:
+            break;
+        }
+        ++submits;
+        wake.Disarm();
+    };
+    // Nothing open: nothing to do.
+    idle_hook(false, false, 0);
+    REQUIRE(requests.AtIdleHook(false, true, false, 0, open) == Action::None);
+    // Wanted work (list copies, list ends, strong hints) and an open lazy fence, woken many times.
+    for (u32 i = 0; i < 100; ++i) {
+        idle_hook(false, true, open);
+    }
+    REQUIRE(submits == 0);
+    REQUIRE(wake.Armed());
+    // The lazy fence's window ran out (not urgent): still left for the GPU's idle.
+    requests.Request(open, false);
+    REQUIRE(requests.Open(open));
+    REQUIRE_FALSE(requests.Urgent(open));
+    idle_hook(false, true, open);
+    REQUIRE(submits == 0);
+    // The GPU goes idle: the finish thread wakes the hook, which submits.
+    REQUIRE(wake.OnProgress([] { return false; }));
+    REQUIRE(requests.AtIdleHook(false, true, true, open, open) == Action::AtGpuIdle);
+    REQUIRE_FALSE(wake.Arm([] { return false; }));
+    // A thread blocking on the open tick, or DeferFlush's work: at once, GPU busy or not.
+    SubmitRequests blocked;
+    blocked.Request(open);
+    REQUIRE(blocked.Urgent(open));
+    REQUIRE(blocked.AtIdleHook(false, true, false, 0, open) == Action::Now);
+    REQUIRE(requests.AtIdleHook(true, true, false, 0, open) == Action::Now);
+    // Submitted ticks are no longer urgent.
+    REQUIRE_FALSE(blocked.Urgent(open + 1));
+}
+
 TEST_CASE("V2 P5b work left for the GPU's idle is submitted when it goes idle",
           "[video_core][v2_p5b]") {
     // F4-X2 / SESSION_HANDOFF §5g: the back's idle hook leaves wanted work open while the GPU is
