@@ -63,7 +63,10 @@ concept StateView = requires(const V& v, size_t index) {
 /// The live engine (the commit thread, and every path with EDEN_NX2_V2_PARALLEL off).
 class LiveView final {
 public:
-    explicit LiveView(const Tegra::Engines::Maxwell3D& engine_) noexcept : engine{&engine_} {}
+    /// `indexed_`: the rasterizer's is_indexed for Draw(). draw_state.draw_indexed is only the
+    /// draw.end state machine's flag (DrawPredicted, DrawIndex and DrawIndexSmall leave it false).
+    explicit LiveView(const Tegra::Engines::Maxwell3D& engine_, bool indexed_ = false) noexcept
+        : engine{&engine_}, indexed{indexed_} {}
 
     [[nodiscard]] const MaxwellRegs& Regs() const noexcept {
         return engine->regs;
@@ -89,7 +92,6 @@ public:
     }
     [[nodiscard]] ViewDraw Draw() const noexcept {
         const auto& draw = engine->draw_manager.draw_state;
-        const bool indexed = draw.draw_indexed;
         return ViewDraw{
             .first = indexed ? draw.index_buffer.first : draw.vertex_buffer.first,
             .count = indexed ? draw.index_buffer.count : draw.vertex_buffer.count,
@@ -108,6 +110,7 @@ public:
 
 private:
     const Tegra::Engines::Maxwell3D* engine;
+    bool indexed;
 };
 
 /// A shard's state at a draw: its mirror (the segment's snapshot plus the replayed deltas) and

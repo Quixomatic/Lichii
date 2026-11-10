@@ -1,7 +1,10 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <algorithm>
+
 #include <fmt/format.h>
+#include <fmt/ranges.h>
 
 #include "video_core/nx2_profile.h"
 #include "video_core/v2/commit.h"
@@ -108,6 +111,128 @@ bool HasProxies(const ResolvedDraw& record) {
         proxy |= Commit::IsProxy(entry.buffer.id);
     }
     return proxy;
+}
+
+std::string DescribeRecordGroup(const ResolvedDraw& resolved, const ResolvedDraw& observed,
+                                RecordGroup group) {
+    const DrawHeader& r = resolved.h;
+    const DrawHeader& o = observed.h;
+    // The first entry of two lists whose formatted fields differ (or the counts).
+    const auto lists = [&]<class T>(T*, Seg rs, Seg os, auto&& format) -> std::string {
+        const auto lhs = resolved.Span<const T>(rs);
+        const auto rhs = observed.Span<const T>(os);
+        for (size_t i = 0; i < (std::min)(lhs.size(), rhs.size()); ++i) {
+            std::string a = format(lhs[i]);
+            std::string b = format(rhs[i]);
+            if (a != b) {
+                return fmt::format("[{}] record {{{}}} configure {{{}}}", i, a, b);
+            }
+        }
+        return fmt::format("{} entries vs {}", lhs.size(), rhs.size());
+    };
+    const auto ref = [](const Versions::WeakRef& value) {
+        return Commit::IsProxy(value.id) ? fmt::format("proxy {}", Commit::ProxyIndex(value.id))
+                                         : fmt::format("{}", value.id);
+    };
+    switch (group) {
+    case RecordGroup::Views:
+        return lists(static_cast<ResolvedView*>(nullptr), r.views, o.views,
+                     [&](const ResolvedView& v) {
+                         return fmt::format("tic {} view {} stage {} kind {} blacklist {}",
+                                            v.tic_index, ref(v.view), v.stage, v.kind,
+                                            v.blacklist);
+                     });
+    case RecordGroup::Samplers:
+        return lists(static_cast<ResolvedSampler*>(nullptr), r.samplers, o.samplers,
+                     [&](const ResolvedSampler& v) {
+                         return fmt::format("tsc {} sampler {}", v.tsc_index, ref(v.sampler));
+                     });
+    case RecordGroup::Vertex:
+        return fmt::format("mask {:#x} vs {:#x}; ", r.vertex_mask, o.vertex_mask) +
+               lists(static_cast<ResolvedVertex*>(nullptr), r.vertex, o.vertex,
+                     [&](const ResolvedVertex& v) {
+                         return fmt::format("slot {} buffer {} daddr {:#x} size {:#x} stride {}",
+                                            v.slot, ref(v.buffer), v.daddr, v.size, v.stride);
+                     });
+    case RecordGroup::Index: {
+        const auto index = [&](const ResolvedIndex& v) {
+            return fmt::format("valid {} buffer {} daddr {:#x} size {:#x} format {} first {} "
+                               "count {}",
+                               v.valid, ref(v.buffer), v.daddr, v.size, v.format, v.first,
+                               v.count);
+        };
+        return fmt::format("record {{{}}} configure {{{}}}", index(r.index), index(o.index));
+    }
+    case RecordGroup::Ubo:
+        return lists(static_cast<ResolvedUbo*>(nullptr), r.ubo, o.ubo, [&](const ResolvedUbo& v) {
+            return fmt::format("stage {} slot {} buffer {} daddr {:#x} size {:#x} version {}",
+                               v.stage, v.slot, ref(v.buffer), v.daddr, v.size, v.version);
+        });
+    case RecordGroup::Ssbo:
+        return lists(static_cast<ResolvedSsbo*>(nullptr), r.ssbo, o.ssbo,
+                     [&](const ResolvedSsbo& v) {
+                         return fmt::format("stage {} index {} written {} buffer {} daddr {:#x} "
+                                            "va {:#x} size {:#x}",
+                                            v.stage, v.index, v.written, ref(v.buffer), v.daddr,
+                                            v.gpu_addr, v.size);
+                     });
+    case RecordGroup::Tbo:
+        return lists(static_cast<ResolvedTbo*>(nullptr), r.tbo, o.tbo, [&](const ResolvedTbo& v) {
+            return fmt::format("stage {} index {} written {} image {} buffer {} daddr {:#x} va "
+                               "{:#x} size {:#x} format {}",
+                               v.stage, v.index, v.written, v.image, ref(v.buffer), v.daddr,
+                               v.gpu_addr, v.size, v.format);
+        });
+    case RecordGroup::Rt:
+        return fmt::format("record {} configure {}", fmt::join(r.rt_ids, ","),
+                           fmt::join(o.rt_ids, ","));
+    case RecordGroup::RenderArea:
+        return fmt::format("record {} {}x{} configure {} {}x{}", r.render_area.uses,
+                           r.render_area.w, r.render_area.h, o.render_area.uses, o.render_area.w,
+                           o.render_area.h);
+    case RecordGroup::Dynamic: {
+        const auto* lhs = reinterpret_cast<const u8*>(&r.dynamic);
+        const auto* rhs = reinterpret_cast<const u8*>(&o.dynamic);
+        for (size_t i = 0; i < sizeof(DynamicState); ++i) {
+            if (lhs[i] != rhs[i]) {
+                return fmt::format("first byte {} of {}: {:#x} vs {:#x}", i, sizeof(DynamicState),
+                                   lhs[i], rhs[i]);
+            }
+        }
+        return {};
+    }
+    case RecordGroup::Reads:
+        return lists(static_cast<DrawCache::InputRead*>(nullptr), r.reads, o.reads,
+                     [&](const DrawCache::InputRead& v) {
+                         u32 word = 0;
+                         std::memcpy(&word, v.bytes.data(), sizeof(word));
+                         return fmt::format("va {:#x} size {} first word {:#x}", v.address, v.size,
+                                            word);
+                     });
+    default:
+        return {};
+    }
+}
+
+u32 PredictKnownViewProxies(ResolvedDraw& record, std::span<const Commit::Request> textures) {
+    u32 replaced = 0;
+    for (ResolvedView& entry : record.Span<ResolvedView>(record.h.views)) {
+        if (!Commit::IsProxy(entry.view.id)) {
+            continue;
+        }
+        for (const Commit::Request& request : textures) {
+            if (request.proxy != entry.view.id) {
+                continue;
+            }
+            if (request.kind == Commit::Kind::ViewBind && request.slot != Commit::InvalidSlot &&
+                !Commit::IsProxy(request.slot)) {
+                entry.view = {request.slot, 0};
+                ++replaced;
+            }
+            break;
+        }
+    }
+    return replaced;
 }
 
 bool CompareRecords(const ResolvedDraw& resolved, const ResolvedDraw& observed, u32 created_mask,

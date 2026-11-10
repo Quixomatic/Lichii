@@ -23,6 +23,10 @@
 // runs the cache mutations it requests and EncodeDraw records the draw from it. Every handle is
 // a slot id with a generation (or a commit proxy), every address a VA or device address, so a
 // record can be copied (a recipe template, a continued draw) and checked by stamps.
+namespace VideoCommon::V2::Commit {
+struct Request;
+}
+
 namespace VideoCommon::V2::Resolve {
 
 enum class ResolveStatus : u8 { Ready, Stale, CommitOnly };
@@ -416,8 +420,19 @@ struct ResolveContext {
                                   u32 created_mask, std::string& reasons, u32* mismatched_groups,
                                   u32* dependent);
 
+/// The first difference of one group between two records, with both sides' fields (the
+/// verify logs print one per group).
+[[nodiscard]] std::string DescribeRecordGroup(const ResolvedDraw& resolved,
+                                              const ResolvedDraw& observed, RecordGroup group);
+
 /// Whether any handle of the record is still a commit proxy (not usable as a template).
 [[nodiscard]] bool HasProxies(const ResolvedDraw& record);
+
+/// DRAWREC=verify: replaces the view proxies of table updates whose view the lookup already
+/// knows (ViewBind requests: a cached view or the null view) with that view, so the compare
+/// with the old configure is exact for them. Creations keep their proxies (dependent).
+/// Returns how many were replaced.
+u32 PredictKnownViewProxies(ResolvedDraw& record, std::span<const Commit::Request> textures);
 
 struct RecordStats {
     std::atomic<u64> drawrec_draws{};

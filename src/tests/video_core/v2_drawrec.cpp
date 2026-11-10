@@ -213,6 +213,61 @@ TEST_CASE("V2 DRAWREC: a proxy matches a resource created in the draw", "[video_
     REQUIRE(reasons == "vertex");
 }
 
+TEST_CASE("V2 DRAWREC: a table update to a known view compares as that view",
+          "[video_core][v2_drawrec]") {
+    // F2e (c236: views differ on 13% of draws): a ViewBind proxy (the TIC entry changed, its
+    // view is cached) creates nothing, so the created rule rejected it. Verify replaces it with
+    // the view the lookup found; creations stay proxies.
+    namespace C = V2::Commit;
+    R::ResolvedDraw resolved = SampleRecord();
+    C::RequestList textures;
+    textures.Reset(1);
+    C::Request bind{};
+    bind.kind = C::Kind::ViewBind;
+    bind.resource = C::Resource::ImageView;
+    bind.slot = 11;
+    const u32 bind_proxy = textures.Push(bind, true);
+    C::Request create{};
+    create.kind = C::Kind::ViewCreate;
+    create.resource = C::Resource::ImageView;
+    const u32 create_proxy = textures.Push(create, true);
+    auto views = resolved.Span<R::ResolvedView>(resolved.h.views);
+    views[0].view = {bind_proxy, 0};
+    views[1].view = {create_proxy, 0};
+
+    const R::ResolvedDraw observed = SampleRecord();
+    std::string reasons;
+    REQUIRE_FALSE(R::CompareRecords(resolved, observed, 0, reasons, nullptr, nullptr));
+    REQUIRE(R::PredictKnownViewProxies(resolved, textures.Requests()) == 1);
+    REQUIRE(views[0].view.id == 11);
+    REQUIRE(C::IsProxy(views[1].view.id));
+    constexpr u32 views_created = 1U << static_cast<u32>(R::RecordGroup::Views);
+    u32 dependent = 0;
+    reasons.clear();
+    REQUIRE(R::CompareRecords(resolved, observed, views_created, reasons, nullptr, &dependent));
+    REQUIRE(dependent == 1);
+    // A wrong prediction stays a mismatch.
+    views[0].view.id = 10;
+    reasons.clear();
+    REQUIRE_FALSE(R::CompareRecords(resolved, observed, views_created, reasons, nullptr, nullptr));
+    REQUIRE(reasons == "views");
+}
+
+TEST_CASE("V2 DRAWREC: a mismatch log names the first differing entry of its group",
+          "[video_core][v2_drawrec]") {
+    const R::ResolvedDraw resolved = SampleRecord();
+    R::ResolvedDraw observed = SampleRecord();
+    observed.Span<R::ResolvedView>(observed.h.views)[1].view.id = 13;
+    observed.h.index.size = 0x258;
+    const std::string views = R::DescribeRecordGroup(resolved, observed, R::RecordGroup::Views);
+    REQUIRE(views.find("[1]") != std::string::npos);
+    REQUIRE(views.find("view 12") != std::string::npos);
+    REQUIRE(views.find("view 13") != std::string::npos);
+    const std::string index = R::DescribeRecordGroup(resolved, observed, R::RecordGroup::Index);
+    REQUIRE(index.find("size 0x48") != std::string::npos);
+    REQUIRE(index.find("size 0x258") != std::string::npos);
+}
+
 namespace {
 
 /// A register file of pseudo-random words with the fields the helpers index made valid.

@@ -1797,6 +1797,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
             VideoCommon::V2::Resolve::GetRecordStats().verify_draws);
         GraphicsPipeline::DrawRecObserver& observer = drawrec_observer_state;
         observer.resolved = &drawrec_record;
+        observer.textures = &drawrec_textures;
         observer.features = &drawrec_features;
         observer.views_before = texture_cache.ImageViewSlots();
         observer.samplers_before = texture_cache.SamplerSlots();
@@ -5429,7 +5430,8 @@ VideoCommon::V2::Resolve::ResolveStatus RasterizerVulkan::ResolveDrawRecord(
         drawrec_buffers.Reset(commit->next_segment++);
         const DrawRecPurity before = check ? TakeDrawRecPurity() : DrawRecPurity{};
         const R::ResolveStatus status =
-            pipeline.ResolveDraw(R::LiveView{*maxwell3d}, ctx, drawrec_record, drawrec_textures,
+            pipeline.ResolveDraw(R::LiveView{*maxwell3d, is_indexed}, ctx, drawrec_record,
+                                 drawrec_textures,
                                  drawrec_buffers);
         if (check && TakeDrawRecPurity() != before) [[unlikely]] {
             R::CountRecordStat(stats.purity_violations);
@@ -5464,22 +5466,25 @@ VideoCommon::V2::Resolve::ResolveStatus RasterizerVulkan::ResolveDrawRecord(
         reuse.previous = base;
         drawrec_scratch_buffers.Reset(commit->next_segment++);
         drawrec_scratch_textures.Reset(commit->next_segment++);
-        if (pipeline.ResolveDraw(R::LiveView{*maxwell3d}, reuse, drawrec_scratch,
+        if (pipeline.ResolveDraw(R::LiveView{*maxwell3d, is_indexed}, reuse, drawrec_scratch,
                                  drawrec_scratch_textures,
                                  drawrec_scratch_buffers) == R::ResolveStatus::Ready) {
             std::string reasons;
             u32 groups = 0;
             if (!R::CompareRecords(drawrec_record, drawrec_scratch, ~0U, reasons, &groups,
                                    nullptr)) {
+                static std::array<std::atomic<u32>, R::NumRecordGroups> logged{};
                 for (u32 bits = groups; bits != 0; bits &= bits - 1) {
-                    R::CountRecordStat(stats.mismatches[std::countr_zero(bits)]);
-                }
-                static std::atomic<u32> logged{};
-                if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
-                    LOG_WARNING(Render_Vulkan,
-                                "V2 draw record verify: draw {} resolved with the last record's "
-                                "sub-records differs: {}",
-                                ctx.ordinal, reasons);
+                    const auto group = static_cast<size_t>(std::countr_zero(bits));
+                    R::CountRecordStat(stats.mismatches[group]);
+                    if (logged[group].fetch_add(1, std::memory_order_relaxed) < 4) {
+                        LOG_WARNING(Render_Vulkan,
+                                    "V2 draw record verify: draw {} resolved with the last "
+                                    "record's sub-records differs in {} ({}): {}",
+                                    ctx.ordinal, R::record_group_names[group], reasons,
+                                    R::DescribeRecordGroup(drawrec_record, drawrec_scratch,
+                                                           static_cast<R::RecordGroup>(group)));
+                    }
                 }
             }
         }
@@ -5534,13 +5539,13 @@ VideoCommon::V2::Resolve::ResolveStatus RasterizerVulkan::ResolveRecordFromBase(
         .features = &DrawRecFeatures(),
     };
     buffers.Reset(commit->next_segment++);
-    R::ResolveStatus status = pipeline.ResolveFromBase(R::LiveView{*maxwell3d}, ctx, base, out,
-                                                       buffers);
+    const R::LiveView view{*maxwell3d, is_indexed};
+    R::ResolveStatus status = pipeline.ResolveFromBase(view, ctx, base, out, buffers);
     if (status == R::ResolveStatus::Stale) {
         R::CountRecordStat(R::GetRecordStats().stale);
         texture_cache.SyncDescriptorTables(out.h.tables);
         buffers.Reset(commit->next_segment++);
-        status = pipeline.ResolveFromBase(R::LiveView{*maxwell3d}, ctx, base, out, buffers);
+        status = pipeline.ResolveFromBase(view, ctx, base, out, buffers);
     }
     return status;
 }
@@ -5684,15 +5689,18 @@ void RasterizerVulkan::VerifyTemplateRecord(GraphicsPipeline& pipeline, bool is_
     u32 dependent = 0;
     R::RecordStats& stats = R::GetRecordStats();
     if (!R::CompareRecords(drawrec_record, drawrec_scratch, ~0U, reasons, &groups, &dependent)) {
+        static std::array<std::atomic<u32>, R::NumRecordGroups> logged{};
         for (u32 bits = groups; bits != 0; bits &= bits - 1) {
-            R::CountRecordStat(stats.mismatches[std::countr_zero(bits)]);
-        }
-        static std::atomic<u32> logged{};
-        if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
-            LOG_WARNING(Render_Vulkan,
-                        "V2 draw record verify: the recipe template of draw {} differs from the "
-                        "full resolve: {}",
-                        drawrec_record.h.ordinal, reasons);
+            const auto group = static_cast<size_t>(std::countr_zero(bits));
+            R::CountRecordStat(stats.mismatches[group]);
+            if (logged[group].fetch_add(1, std::memory_order_relaxed) < 4) {
+                LOG_WARNING(Render_Vulkan,
+                            "V2 draw record verify: the recipe template of draw {} differs from "
+                            "the full resolve in {} ({}): {}",
+                            drawrec_record.h.ordinal, R::record_group_names[group], reasons,
+                            R::DescribeRecordGroup(drawrec_record, drawrec_scratch,
+                                                   static_cast<R::RecordGroup>(group)));
+            }
         }
     }
     R::CountRecordStat(stats.dependent, dependent);

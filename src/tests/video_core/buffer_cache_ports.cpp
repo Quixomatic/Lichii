@@ -859,6 +859,50 @@ TEST_CASE("Record buffer twins peek, resolve and encode without the update passe
     REQUIRE(f.cache->PeekBuffer(0x40000, 0x100, false) == created);
 }
 
+TEST_CASE("The record's index binding takes the draw's index range, not the vertex range",
+          "[buffer_ports][v2_drawrec]") {
+    // F2e (c236 DRAWREC=verify: index mismatches on 96% of draws): DrawPredicted, DrawIndex and
+    // DrawIndexSmall never set draw_state.draw_indexed, so a view reading that flag sized the
+    // index range from vertex_buffer.first/count. The view takes the rasterizer's is_indexed.
+    namespace R = VideoCommon::V2::Resolve;
+    Fixture f;
+    Tegra::Control::ChannelState state{0};
+    state.memory_manager = &*f.memory;
+    state.payload.emplace(f.system, *f.memory, state);
+    VideoCommon::BufferCacheChannelInfo channel{state};
+    VideoCommon::UniformBufferSizes sizes{};
+    channel.uniform_buffer_sizes = &sizes;
+    const auto id = Access::Add(*f.cache, 0x20000, 0x10000);
+    Access::UseChannel(*f.cache, channel);
+    auto& engine = channel.maxwell3d;
+    auto& regs = engine.regs;
+    regs.index_buffer.start_addr_high = 0;
+    regs.index_buffer.start_addr_low = 0x110000;
+    regs.index_buffer.limit_addr_high = 0;
+    regs.index_buffer.limit_addr_low = 0x110400;
+    regs.index_buffer.format = R::MaxwellRegs::IndexFormat::UnsignedShort;
+    auto& draw = engine.draw_manager.draw_state;
+    draw.index_buffer = regs.index_buffer;
+    draw.index_buffer.first = 4;
+    draw.index_buffer.count = 8;
+    draw.vertex_buffer.first = 0;
+    draw.vertex_buffer.count = 300;
+    draw.draw_indexed = false; // as DrawPredicted leaves it
+
+    const R::ResolvedIndex index = f.cache->ResolveIndexBinding(R::LiveView{engine, true});
+    REQUIRE(index.valid);
+    REQUIRE(index.first == 4);
+    REQUIRE(index.count == 8);
+    REQUIRE(index.daddr == 0x20000);
+    // UpdateIndexBuffer's range: (first + count) * 2 bytes.
+    const auto range = Cache::IndexRange(*f.memory, 0x110000, 0x110400, 4, 8, 2);
+    REQUIRE(index.size == range.size);
+    REQUIRE(index.size == 24);
+    REQUIRE(index.buffer.id == id.index);
+    REQUIRE(R::LiveView{engine, true}.Draw().indexed);
+    REQUIRE_FALSE(R::LiveView{engine}.Draw().indexed);
+}
+
 TEST_CASE("Draw cache buffer replay binds a uniform on the path its bind takes now",
           "[buffer_ports][v2_p4]") {
     // F2-X1: a recorded uniform is replayed only on the path BindHostGraphicsUniformBuffer

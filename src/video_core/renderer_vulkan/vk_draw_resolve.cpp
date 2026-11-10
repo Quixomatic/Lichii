@@ -16,6 +16,7 @@
 #include <vector>
 
 #include <boost/container/small_vector.hpp>
+#include <fmt/ranges.h>
 
 #include "common/logging.h"
 #include "video_core/buffer_cache/buffer_cache.h"
@@ -309,6 +310,8 @@ R::ResolveStatus GraphicsPipeline::ResolveBuffers(const View& view, const R::Res
                 resolve_buffer(out.h.index.buffer, out.h.index.daddr, out.h.index.size);
             }
         }
+    } else {
+        out.h.index = {}; // a base copied from an indexed draw (ResolveFromBase)
     }
     // UpdateVertexBuffers: every slot (a clean slot holds what its registers give).
     boost::container::small_vector<R::ResolvedVertex, VideoCommon::NUM_VERTEX_BUFFERS> vertex;
@@ -774,11 +777,19 @@ void GraphicsPipeline::ObserveDrawRecord(std::span<const VideoCommon::ImageViewI
     if (buffer_cache.BufferSlots() > observer.buffers_before) {
         created |= bit(R::RecordGroup::Vertex);
     }
+    // A table update to a view the lookup found binds that view: compared as the view.
+    R::ResolvedDraw& predicted = observer.predicted;
+    predicted.h = resolved.h;
+    predicted.arena.assign(resolved.arena.begin(), resolved.arena.end());
+    if (observer.textures != nullptr) {
+        R::PredictKnownViewProxies(predicted, observer.textures->Requests());
+    }
     R::RecordStats& stats = R::GetRecordStats();
     std::string reasons;
     u32 groups = 0;
     u32 dependent = 0;
-    const bool equal = R::CompareRecords(resolved, observed, created, reasons, &groups, &dependent);
+    const bool equal =
+        R::CompareRecords(predicted, observed, created, reasons, &groups, &dependent);
     constexpr u32 encoded_groups = (1U << static_cast<u32>(R::RecordGroup::Views)) |
                                    (1U << static_cast<u32>(R::RecordGroup::Samplers)) |
                                    (1U << static_cast<u32>(R::RecordGroup::Vertex)) |
@@ -788,17 +799,22 @@ void GraphicsPipeline::ObserveDrawRecord(std::span<const VideoCommon::ImageViewI
                                    (1U << static_cast<u32>(R::RecordGroup::Tbo));
     observer.buffers_match = (groups & encoded_groups) == 0;
     if (!equal) {
+        // A log budget per group: a frequent group must not hide the examples of the others.
+        static std::array<std::atomic<u32>, R::NumRecordGroups> logged{};
         for (size_t group = 0; group < R::NumRecordGroups; ++group) {
-            if ((groups >> group) & 1) {
-                R::CountRecordStat(stats.mismatches[group]);
+            if (((groups >> group) & 1) == 0) {
+                continue;
             }
-        }
-        static std::atomic<u32> logged{};
-        if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
-            LOG_WARNING(Render_Vulkan,
-                        "V2 draw record verify: draw {} pipeline {:016x}: the record differs "
-                        "from the old configure in {}",
-                        resolved.h.ordinal, state_hash, reasons);
+            R::CountRecordStat(stats.mismatches[group]);
+            if (logged[group].fetch_add(1, std::memory_order_relaxed) < 4) {
+                LOG_WARNING(Render_Vulkan,
+                            "V2 draw record verify: draw {} pipeline {:016x}: the record differs "
+                            "from the old configure in {} ({}): {}",
+                            resolved.h.ordinal, state_hash, R::record_group_names[group],
+                            reasons,
+                            R::DescribeRecordGroup(predicted, observed,
+                                                   static_cast<R::RecordGroup>(group)));
+            }
         }
     }
     R::CountRecordStat(stats.dependent, dependent);
@@ -1411,14 +1427,32 @@ void GraphicsPipeline::VerifyDrawEncode(const R::ResolvedDraw& record) {
         R::CountRecordStat(stats.mismatches[static_cast<size_t>(R::RecordGroup::Push)]);
     }
     if (!payload_equal || !push_equal) {
-        static std::atomic<u32> logged{};
-        if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+        // The first differing payload entry, as raw words (which descriptor it is follows from
+        // the pipeline's layout order: uniform, storage, texel, image buffers, then images).
+        std::string detail;
+        if (!payload_equal && count == observer->payload.size()) {
+            const DescriptorUpdateEntry* const encoded = guest_descriptor_queue.UpdateData();
+            for (size_t i = 0; i < count; ++i) {
+                if (std::memcmp(&encoded[i], &observer->payload[i], sizeof(DescriptorUpdateEntry)) !=
+                    0) {
+                    std::array<u64, sizeof(DescriptorUpdateEntry) / sizeof(u64)> lhs{};
+                    std::array<u64, sizeof(DescriptorUpdateEntry) / sizeof(u64)> rhs{};
+                    std::memcpy(lhs.data(), &encoded[i], sizeof(lhs));
+                    std::memcpy(rhs.data(), &observer->payload[i], sizeof(rhs));
+                    detail = fmt::format(": entry {} record {:#x} configure {:#x}", i,
+                                         fmt::join(lhs, ","), fmt::join(rhs, ","));
+                    break;
+                }
+            }
+        }
+        static std::array<std::atomic<u32>, 2> logged{};
+        if (logged[payload_equal ? 1 : 0].fetch_add(1, std::memory_order_relaxed) < 8) {
             LOG_WARNING(Render_Vulkan,
                         "V2 draw record verify: draw {} pipeline {:016x}: the encode's {} differ "
-                        "from the old configure's ({} payload entries vs {})",
+                        "from the old configure's ({} payload entries vs {}){}",
                         record.h.ordinal, state_hash,
                         !payload_equal ? "descriptor payload" : "push words", count,
-                        observer->payload.size());
+                        observer->payload.size(), detail);
         }
     }
 }

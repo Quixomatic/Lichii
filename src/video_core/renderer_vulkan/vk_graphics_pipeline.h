@@ -471,8 +471,10 @@ public:
     /// leaves behind and compares it with `resolved` before recording the draw. Null in v1.
     struct DrawRecObserver {
         const VideoCommon::V2::Resolve::ResolvedDraw* resolved{};
+        const VideoCommon::V2::Commit::RequestList* textures{}; ///< the resolve's texture requests
         const VideoCommon::V2::Resolve::DynamicFeatures* features{};
         VideoCommon::V2::Resolve::ResolvedDraw observed;
+        VideoCommon::V2::Resolve::ResolvedDraw predicted; ///< `resolved`, known proxies replaced
         size_t views_before{};
         size_t samplers_before{};
         size_t buffers_before{};
