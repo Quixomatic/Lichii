@@ -228,6 +228,7 @@ struct ViewCheck {
     u64 landing{}; ///< MetByQueued on a release still to land: its landing ticket
     u64 release{}; ///< MetByQueued: the ring position of the release that decided
     u64 qmd_target{}; ///< The QMD producer an Equal/Mask acquire waits for (GpuSplit::QmdTargetFor)
+    bool by_reductions{}; ///< MetByQueued on the pending QMD reductions (QmdReductionView)
 };
 
 /// CheckWithView's `qmd_target` when the acquire is parsed: snapshot the producer now.
@@ -286,6 +287,20 @@ ViewCheck CheckWithView(DmaPusher& dma_pusher, GPUVAddr address, u32 value, V2::
         // `landed` after the operation wrote memory): read memory again, which now holds it.
         memory_word = memory.Read<u32>(address);
     }
+    if (word.kind == V2::HazardResult::Kind::Clear &&
+        !split.UnknownQmdMayWrite(*device, sizeof(u32))) {
+        // Fix F3h (chunk C2: U-02 / R2-F3-05, §6 class A, diagram 2.3): only QMD reduction and
+        // max releases the front's exact model saw write the word. Since d5e451eebf they land
+        // at their fence; the word they leave is known now: memory plus the pending ones in
+        // order. Met by it: the in-order back applies them before the acquire's channel goes on
+        // (class B ordering, landing rule), so the channel goes on now instead of waiting for
+        // the fence (67e9: ~817 such waits/s). Not met by it: decided as before.
+        const auto view = split.QmdReductionView(*device, memory, address);
+        if (view.known && view.any && V2::SemaphoreMet(op, view.value, value)) {
+            return {V2::AcquireVerdict::MetByQueued, Reason::None, false, 0, view.position,
+                    qmd_target, true};
+        }
+    }
     // The producer stops counting once its entry ran and its operations landed.
     const u64 pending_qmd = split.QmdTargetSettled(qmd_target) ? 0 : qmd_target;
     const V2::AcquireDecision decision =
@@ -297,19 +312,6 @@ ViewCheck CheckWithView(DmaPusher& dma_pusher, GPUVAddr address, u32 value, V2::
         return {decision.verdict, Reason::None, false, word.landing ? word.position : 0,
                 V2::RingPositionOf(word), qmd_target};
     case V2::AcquireVerdict::NotMet:
-        if (word.kind == V2::HazardResult::Kind::Clear && op == V2::SemaphoreOp::Gequal &&
-            !split.UnknownQmdMayWrite(*device, sizeof(u32))) {
-            // Fix F3h (U-02, R2-F3-05, class A): QMD ADD reductions the front's model saw to
-            // the word, queued ahead on the in-order back: memory plus their operands is what
-            // the word holds once they ran (at least), before the acquire's channel goes on.
-            const auto adds = split.QueuedQmdAdds(*device);
-            const u64 reached = u64{memory_word} + adds.sum;
-            if (adds.known && reached <= 0xffffffffULL &&
-                V2::SemaphoreMet(op, static_cast<u32>(reached), value)) {
-                return {V2::AcquireVerdict::MetByQueued, Reason::None, false, 0, adds.position,
-                        qmd_target};
-            }
-        }
         return {decision.verdict,
                 word.kind == V2::HazardResult::Kind::Forward ? Reason::QueuedNotMet
                                                               : Reason::NotMet,
@@ -357,7 +359,9 @@ void NoteViewDecision(const ViewCheck& check) {
     }
     const auto site = VideoCommon::DrainSite::Acquire;
     if (check.verdict == V2::AcquireVerdict::MetByQueued) {
-        V2Stats::NoteDecision(site, Decision::Forwarded);
+        // F3h chunk C2: passed by the pending QMD reductions (class A) counted apart.
+        V2Stats::NoteDecision(site, Decision::Forwarded,
+                              check.by_reductions ? Reason::ReductionView : Reason::None);
     } else if (Passes(check)) {
         V2Stats::NoteDecision(site, check.narrowed ? Decision::Narrowed : Decision::Avoided);
     } else {

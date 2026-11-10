@@ -97,6 +97,8 @@ enum class Reason : u8 {
     /// A suspended acquire with the back idle made its pending operations land (F3h: the
     /// waiter's back job: fence, submit, forced release; only while an operation is pending)
     Forced,
+    /// An acquire passed (forwarded) on the word its pending QMD reductions leave (F3h, class A)
+    ReductionView,
     Count,
 };
 

@@ -2797,6 +2797,52 @@ TEST_CASE("V2 landing: one write table, tickets without IR cuts, ordered landing
         Access::SetBack(split, 230, false);
     }
 
+    SECTION("chunk C2: the word pending QMD reductions leave decides any acquire (class A)") {
+        // 67e9: every reduction lands at its fence since d5e451eebf, so Equal acquires waited
+        // for fences b0da passed at once (~817/s). The view: memory (0 here: an unmapped GPU
+        // address) plus the pending reduction and max releases in order.
+        namespace Landing = V2::Landing;
+        using ReleaseKind = VideoCommon::GpuSplit::ReleaseKind;
+        constexpr u64 gpu_word = 0x7000'0000ULL; // not mapped: reads 0
+        Landing::ResetUntracked();
+        Access::SetBack(split, 100, true);
+        Access::SetEnd(split, 200);
+        split.RememberQmdRelease(word_a, 3, ReleaseKind::QmdReduction, 0); // ADD 3
+        Access::SetEnd(split, 210);
+        split.RememberQmdRelease(word_a, 2, ReleaseKind::QmdReduction, 0); // ADD 2
+        auto view = split.QmdReductionView(word_a, f.memory, gpu_word);
+        CHECK(view.known);
+        CHECK(view.any);
+        CHECK(view.value == 5);
+        CHECK(view.position == 210);
+        // A max release after them, in order: max(5, 9).
+        Access::SetEnd(split, 220);
+        split.RememberQmdRelease(word_a, 9, ReleaseKind::QmdMax);
+        CHECK(split.QmdReductionView(word_a, f.memory, gpu_word).value == 9);
+        // Another word: nothing pending.
+        view = split.QmdReductionView(word_b, f.memory, gpu_word);
+        CHECK(view.known);
+        CHECK(!view.any);
+        // An entry the back ran whose operations may be part landed: not known.
+        Landing::tag = 200;
+        u64 first = 0;
+        {
+            const Landing::Untracked untracked;
+            first = Landing::CaptureUntracked(word_a, 4);
+            (void)Landing::CaptureUntracked(word_a, 4);
+        }
+        Landing::tag = 0;
+        Access::SetBack(split, 205, true);
+        Landing::NoteUntracked(first);
+        CHECK(!split.QmdReductionView(word_a, f.memory, gpu_word).known);
+        Landing::ResetUntracked();
+        // A payload release pending to the word: not known (it may move it anywhere).
+        Access::SetEnd(split, 230);
+        split.RememberQmdRelease(word_a, 1, ReleaseKind::QmdPayload);
+        CHECK(!split.QmdReductionView(word_a, f.memory, gpu_word).known);
+        Access::SetBack(split, 230, false);
+    }
+
     SECTION("R2-F3-03: an unmapped acquire word waits only for a map still queued") {
         // 0fe4: unmapped words took the v1 drain and forced fences (50/s). Now the view decides
         // on the guest's read unless a Map record the back hasn't run may map the word.

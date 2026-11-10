@@ -481,6 +481,23 @@ public:
         }
         return adds;
     }
+    /// Front (Fix F3h, chunk C2: U-02 / R2-F3-05 for every acquire op, MASTER_PLAN §6 class A,
+    /// diagram 2.3 "value known at parse time"): the word at `device_address` as it will be once
+    /// the QMD reduction and max releases the front's exact model saw to it have landed, in
+    /// order. Memory holds exactly the landed ones (they land in capture order since d5e451eebf
+    /// tracks them); the pending ones are applied over it in ring order. Not known when any
+    /// pending writer of the word is another kind (a payload release, one whose payload depends
+    /// on a landing), an entry's operations may be partly landed, the memory read raced a
+    /// landing, or the ring may have dropped a pending one. `any`: at least one is pending.
+    struct ReductionView {
+        bool known = false;
+        bool any = false;
+        u32 value = 0;
+        u64 position = 0; ///< The newest pending one's ring position
+    };
+    [[nodiscard]] ReductionView QmdReductionView(u64 device_address,
+                                                 const Tegra::MemoryManager& memory,
+                                                 u64 gpu_address) const;
     /// Front (Fix F3h): an unknown QMD (an unbounded QmdRelease note) may write the range: still
     /// queued, or run with an operation over the range still to land.
     [[nodiscard]] bool UnknownQmdMayWrite(u64 device_address, u64 size) {

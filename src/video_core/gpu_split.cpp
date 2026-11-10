@@ -516,6 +516,68 @@ V2::HazardResult GpuSplit::FindUntracked(u64 device_address, u64 size, u64 done,
     return result;
 }
 
+GpuSplit::ReductionView GpuSplit::QmdReductionView(u64 device_address,
+                                                   const Tegra::MemoryManager& memory,
+                                                   u64 gpu_address) const {
+    // `consumed` first: entries the back runs later are pending, and every operation of the
+    // entries up to it was captured before the tickets below are read. The newest untracked
+    // ticket landed, around the memory read: a landing in between would make memory hold an
+    // operation counted as pending (or the reverse).
+    const u64 done = ConsumedNow();
+    const u64 landed_before = V2::Landing::untracked_landed.load(std::memory_order_acquire);
+    const u32 base = memory.Read<u32>(gpu_address);
+    const u64 landed = V2::Landing::untracked_landed.load(std::memory_order_acquire);
+    if (landed != landed_before) {
+        return {};
+    }
+    // Operations land in capture order: every one of an entry before the newest landed one's
+    // entry has landed; none of a later entry has; that entry itself may be part landed.
+    const u64 landed_entry = V2::Landing::UntrackedPosition(landed);
+    const bool all_landed = landed >= V2::Landing::untracked_issued.load(std::memory_order_acquire);
+    ReductionView view{.known = true, .any = false, .value = base, .position = 0};
+    u64 oldest_kept = ~u64{0};
+    const size_t size = recent_releases.size();
+    for (size_t i = 0; i < size; ++i) {
+        // Oldest first: the ring's order is the order the front sent them.
+        const RecentRelease& entry = recent_releases[(recent_release_head + i) % size];
+        if (entry.position == 0 || entry.landing) {
+            continue;
+        }
+        oldest_kept = std::min(oldest_kept, entry.position);
+        if (entry.address != device_address || entry.kind == ReleaseKind::Release ||
+            entry.kind == ReleaseKind::Report) {
+            continue; // Releases and reports: the acquire's own view (FindWrites) decides
+        }
+        // In memory already: its entry ran and every operation of it landed.
+        const bool in_memory =
+            entry.position <= done && (entry.position < landed_entry || all_landed);
+        if (in_memory) {
+            continue;
+        }
+        if (entry.position <= done && entry.position == landed_entry) {
+            return {}; // Its entry's operations may be part landed
+        }
+        if (entry.kind == ReleaseKind::QmdReduction) {
+            view.value = Tegra::ReduceSemaphore(entry.op & 7, (entry.op >> 3) & 1, view.value,
+                                                entry.value);
+        } else if (entry.kind == ReleaseKind::QmdMax) {
+            view.value = std::max(view.value, entry.value);
+        } else {
+            return {}; // A payload release, or one whose payload depends on a landing
+        }
+        view.any = true;
+        view.position = std::max(view.position, entry.position);
+    }
+    // A pending one may have fallen out of the ring: every entry older than the oldest kept must
+    // be in memory already.
+    const bool evicted_landed =
+        oldest_kept <= landed_entry || (all_landed && oldest_kept <= done + 1);
+    if (recent_release_head > size && !evicted_landed) {
+        return {};
+    }
+    return view;
+}
+
 bool GpuSplit::WaitUntrackedLanded(u64 ticket, DrainSite site, u64 timeout_us) {
     const auto landed = [ticket] {
         return V2::Landing::untracked_landed.load(std::memory_order_acquire) >= ticket;
