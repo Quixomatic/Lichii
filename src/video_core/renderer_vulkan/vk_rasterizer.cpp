@@ -5735,7 +5735,8 @@ bool RasterizerVulkan::PrepareDrawRecord(GraphicsPipeline& pipeline, bool is_ind
 
 VideoCommon::V2::Resolve::ResolveStatus RasterizerVulkan::ResolveRecordFromBase(
     GraphicsPipeline& pipeline, bool is_indexed, const VideoCommon::V2::Resolve::ResolvedDraw& base,
-    VideoCommon::V2::Resolve::ResolvedDraw& out, VideoCommon::V2::Commit::RequestList& buffers) {
+    VideoCommon::V2::Resolve::ResolvedDraw& out, VideoCommon::V2::Commit::RequestList& buffers,
+    bool base_inputs_hold) {
     namespace R = VideoCommon::V2::Resolve;
     namespace Versions = VideoCommon::V2::Versions;
     const R::ResolveContext ctx{
@@ -5747,6 +5748,7 @@ VideoCommon::V2::Resolve::ResolveStatus RasterizerVulkan::ResolveRecordFromBase(
         .sampled_recording = RecordingSampledTextures(),
         .ordinal = drawrec_ordinal++,
         .previous = &base,
+        .previous_inputs_hold = base_inputs_hold,
         .features = &DrawRecFeatures(),
     };
     buffers.Reset(commit->next_segment++);
@@ -5772,7 +5774,7 @@ GraphicsPipeline::RecipeResult RasterizerVulkan::PrepareTemplateRecord(
     // or the template's own entries while their inputs hold), its dynamic state computed from
     // the view.
     if (ResolveRecordFromBase(pipeline, is_indexed, recipe.record.Get(), drawrec_record,
-                              drawrec_buffers) != R::ResolveStatus::Ready) {
+                              drawrec_buffers, true) != R::ResolveStatus::Ready) {
         return GraphicsPipeline::RecipeResult::Rebuild;
     }
     const u64 resolved = Profile::Ticks();
@@ -5894,7 +5896,7 @@ void RasterizerVulkan::VerifyTemplateRecord(GraphicsPipeline& pipeline, bool is_
     }
     drawrec_scratch_buffers.Reset(commit->next_segment++);
     if (ResolveRecordFromBase(pipeline, is_indexed, recipe.record.Get(), drawrec_scratch,
-                              drawrec_scratch_buffers) != R::ResolveStatus::Ready) {
+                              drawrec_scratch_buffers, true) != R::ResolveStatus::Ready) {
         return;
     }
     std::string reasons;

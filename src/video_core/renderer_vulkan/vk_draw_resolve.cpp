@@ -355,6 +355,12 @@ R::ResolveStatus GraphicsPipeline::ResolveBuffers(const View& view, const R::Res
     const auto previous_tbos = same_buffers && previous_views.size() == views.size()
                                    ? previous->Span<const R::ResolvedTbo>(previous->h.tbo)
                                    : std::span<const R::ResolvedTbo>{};
+    // S0-04: a validated hit's storage descriptors are the template's (the key holds their
+    // buffers' bindings, the hit compared their words): its entries hold while no buffer was
+    // remapped or deleted.
+    const auto previous_ssbos = same_buffers && ctx.previous_inputs_hold
+                                    ? previous->Span<const R::ResolvedSsbo>(previous->h.ssbo)
+                                    : std::span<const R::ResolvedSsbo>{};
     u32 reused_ubos = 0;
     u32 reused_tbos = 0;
     for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
@@ -388,6 +394,15 @@ R::ResolveStatus GraphicsPipeline::ResolveBuffers(const View& view, const R::Res
         }
         u32 ssbo_index = 0;
         for (const auto& desc : info.storage_buffers_descriptors) {
+            if (const size_t at = ssbos.size(); at < previous_ssbos.size()) {
+                const R::ResolvedSsbo& kept = previous_ssbos[at];
+                if (kept.stage == stage && kept.index == ssbo_index && kept.table_pointer == 0 &&
+                    !C::IsProxy(kept.buffer.id)) {
+                    ssbos.push_back(kept);
+                    ++ssbo_index;
+                    continue;
+                }
+            }
             bool multi_range = false;
             R::ResolvedSsbo ssbo = buffer_cache.ResolveStorageBinding(
                 view, stage, ssbo_index, desc.cbuf_index, desc.cbuf_offset, desc.is_written,

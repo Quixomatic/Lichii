@@ -215,7 +215,7 @@ private:
         GraphicsPipeline& pipeline, bool is_indexed,
         const VideoCommon::V2::Resolve::ResolvedDraw& base,
         VideoCommon::V2::Resolve::ResolvedDraw& out,
-        VideoCommon::V2::Commit::RequestList& buffers);
+        VideoCommon::V2::Commit::RequestList& buffers, bool base_inputs_hold = false);
     /// DRAWREC=1 (step 16): a recipe hit from its template in place of ConfigureRecipe.
     [[nodiscard]] GraphicsPipeline::RecipeResult PrepareTemplateRecord(
         GraphicsPipeline& pipeline, bool is_indexed, VideoCommon::V2::DrawCache::Recipe& recipe,

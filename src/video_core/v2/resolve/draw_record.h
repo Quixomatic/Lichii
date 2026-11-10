@@ -409,6 +409,9 @@ struct ResolveContext {
     bool sampled_recording{};  ///< the frame dump records sampled inputs
     u64 ordinal{};
     const ResolvedDraw* previous{}; ///< the pipeline's last record (record diff), may be null
+    /// S0-04: `previous` is the template of a recipe hit whose inputs were validated: the key
+    /// holds its storage-descriptor buffers' bindings and the descriptor words compared equal.
+    bool previous_inputs_hold{};
     const DynamicFeatures* features{};
     /// EDEN_NX2_V2_PARALLEL R5: this draw's dynamic state from a shard (computed with
     /// `features`), used instead of ComputeDynamic; null: compute it.
