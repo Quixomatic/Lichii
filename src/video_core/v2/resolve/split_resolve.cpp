@@ -403,7 +403,7 @@ SerialReason SplitTraits::Resolve(Shard& shard, const Input& input, std::vector<
             pre.has_key = key.has_key;
             pre.has_full = key.has_full;
         }
-        records.push_back(pre);
+        records.push_back(std::move(pre));
     };
     // S1 classified runs (§5.6 step 2): plain stores of the front's deltas, its groups, its
     // draws; no second run of the register semantics.
