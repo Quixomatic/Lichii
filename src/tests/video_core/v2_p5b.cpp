@@ -812,14 +812,15 @@ TEST_CASE("V2 P5b flush decisions at pass boundaries", "[video_core][v2_p5b]") {
         const auto pending = heuristic.Advance(1, two, 100'000);
         REQUIRE(pending.action == FlushAction::Flush);
         REQUIRE(pending.reason == FlushHeuristic::ReasonPending);
-        // max draws still applies (a busy GPU with a higher threshold).
+        // Many in flight: the threshold caps at max_chunk_threshold (20) chunks.
         const FlushState many{.pending = 10, .back_behind = false};
-        for (u32 i = heuristic.Draws(); i < params.max_draws - 1; ++i) {
+        for (u32 i = heuristic.Draws(); i < params.max_chunk_threshold * params.chunk_draws - 1;
+             ++i) {
             REQUIRE(heuristic.Advance(1, many, 100'000).action != FlushAction::Flush);
         }
         const auto last = heuristic.Advance(1, many, 100'000);
         REQUIRE(last.action == FlushAction::Flush);
-        REQUIRE(last.reason == FlushHeuristic::ReasonMaxDraws);
+        REQUIRE(last.reason == FlushHeuristic::ReasonPending);
     }
     SECTION("SYNC rule C mid-pass: the GPU about to go idle, min draws and the interval") {
         FlushHeuristic heuristic{params};
@@ -1008,6 +1009,57 @@ TEST_CASE("V2 P5b the idle hook submits nothing while the GPU is busy and nobody
     REQUIRE(requests.AtIdleHook(true, true, false, 0, open, false) == Action::Deferred);
     // Submitted ticks are no longer urgent.
     REQUIRE_FALSE(blocked.Urgent(open + 1));
+}
+
+TEST_CASE("SYNC 5b06 boot hang: every channel suspended, the back idle, a lazy fence open: it "
+          "is submitted and the reductions behind it land",
+          "[video_core][v2_p5b]") {
+    // 5b06b426d9 hung at 44 s: three channels on words 0x13 short (19 QMD reductions) and one
+    // still 0, row "no writer" (memory polled every pass). The reductions sat in fences behind a
+    // lazy fence in the open tick; no draw followed (all channels suspended), so no pass boundary
+    // or chunk came, rule I left the open tick (draws == 0) and the fencing thread waited for its
+    // submission forever. Model: the fencing thread pops fences in order; a fence's operations
+    // run once it popped; a fence pops once its tick is submitted.
+    using VideoCommon::V2::SubmitRequests;
+    using Action = SubmitRequests::IdleAction;
+    FlushParams params;
+    params.pass_boundaries = true;
+    FlushHeuristic heuristic{params};
+    heuristic.NoteSubmit(1000); // nothing recorded since
+    constexpr u64 open = 30;
+    SubmitRequests requests;
+    u32 word = 0x607;
+    bool submitted = false;
+    const bool back_idle = true;
+    const auto idle_hook = [&](u32 pending) {
+        // RasterizerVulkan's rule I: an open lazy fence is worth a submission with the GPU about
+        // to go idle; the heuristic alone says no (draws == 0).
+        const FlushState state{.pending = pending, .back_behind = false};
+        const bool lazy_fence_open = true;
+        const bool due = (pending < params.busy_pending && lazy_fence_open) ||
+                         heuristic.SyncPointDue(state, 1'000'000);
+        const auto action = requests.AtIdleHook(false, true, false, open, open, due);
+        submitted |= action != Action::None && action != Action::Leave;
+    };
+    // Two submissions in flight when the back went idle: left for now.
+    idle_hook(2);
+    REQUIRE_FALSE(submitted);
+    // The fencing thread blocks on the open tick and sees the back idle: it files rule W.
+    if (back_idle) {
+        requests.Request(open, true);
+    }
+    idle_hook(2); // served at once by the woken idle hook, however many are in flight
+    REQUIRE(submitted);
+    // The lazy fence pops, then the fences behind it: the reductions land.
+    word += 0x13;
+    REQUIRE(word == 0x61a);
+    // Rule I alone (no request) also submits once fewer than two are in flight.
+    SubmitRequests fresh;
+    submitted = false;
+    const FlushState one{.pending = 1, .back_behind = false};
+    REQUIRE_FALSE(heuristic.SyncPointDue(one, 1'000'000));
+    const auto action = fresh.AtIdleHook(false, true, false, open, open, true);
+    REQUIRE(action == Action::Sync);
 }
 
 TEST_CASE("SYNC step 9: the post-pass list runs in order after the pass, before the submit",

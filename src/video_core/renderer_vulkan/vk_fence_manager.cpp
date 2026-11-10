@@ -101,7 +101,12 @@ void InnerFence::Wait() {
             if (!split.BackRunning()) {
                 break;
             }
-            if (!requested && host_waits()) {
+            // 5b06 boot hang (every channel suspended, back idle, no draw after the lazy fence):
+            // with the back idle no pass boundary or chunk will come, so this wait would block
+            // every later fence's operations (the reductions the acquires wait for) for good.
+            // The blocked fencing thread then files rule W itself (SESSION_HANDOFF §5: a wait
+            // must not wait on a submission nobody submits).
+            if (!requested && (host_waits() || split.BackIdle())) {
                 scheduler.RequestLazyFlush(wait_tick, true);
                 split.RequestIdleHook();
                 requested = true;

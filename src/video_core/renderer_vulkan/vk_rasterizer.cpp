@@ -4937,9 +4937,11 @@ void RasterizerVulkan::ServeSplitIdleHook() {
             // still to land (a deferred QMD reduction, a counter report) is a synchronization
             // point (DXVK): with the GPU about to go idle it is worth a submission, so it lands
             // although no draw follows it and nobody blocks on it yet.
+            // Any lazy fence in the open tick is such a point: the fencing thread pops fences in
+            // order, so later fences' operations wait behind it (5b06 boot hang).
             if (state.pending < self.flush_heuristic.Params().busy_pending &&
-                VideoCommon::V2::LandingFence::TickForPending() >=
-                    self.scheduler.CurrentTick()) {
+                (VideoCommon::V2::LandingFence::TickForPending() >= self.scheduler.CurrentTick() ||
+                 self.scheduler.LazyOutstandingTick() >= self.scheduler.CurrentTick())) {
                 return true;
             }
             if (!self.adaptive_flush_fed) {
