@@ -273,20 +273,56 @@ R::ResolveStatus GraphicsPipeline::ResolveBuffers(const View& view, const R::Res
         ref.id = buffers.Push(buffer_cache.MakeCreateRequest(device_addr, size, false), true);
         ref.generation = 0;
     };
+    // Step 17: a sub-record of the previous record (same pipeline, buffers neither remapped nor
+    // deleted since, its handles patched) is reused when its register groups hash equal.
+    const R::ResolvedDraw* const previous = ctx.previous;
+    const bool reusable = previous != nullptr && previous->h.pipeline == ctx.pipeline &&
+                          previous->h.status == R::ResolveStatus::Ready && out.h.groups_valid &&
+                          previous->h.groups_valid &&
+                          previous->h.map_serial == out.h.map_serial &&
+                          previous->h.buffer_deletions == out.h.buffer_deletions;
+    const auto same_groups = [&](std::initializer_list<VideoCommon::V2::RegGroup> groups) {
+        for (const VideoCommon::V2::RegGroup group : groups) {
+            const size_t index = static_cast<size_t>(group);
+            if (previous->h.group_hashes[index] != out.h.group_hashes[index]) {
+                return false;
+            }
+        }
+        return true;
+    };
     // UpdateIndexBuffer.
     if (ctx.is_indexed) {
         if (view.InlineIndexDraw()) {
             return CommitOnly(out, R::CommitOnlyReason::InlineIndex);
         }
-        out.h.index = buffer_cache.ResolveIndexBinding(view);
-        if (out.h.index.valid) {
-            resolve_buffer(out.h.index.buffer, out.h.index.daddr, out.h.index.size);
+        if (reusable && previous->h.indexed && previous->h.index.valid &&
+            !C::IsProxy(previous->h.index.buffer.id) &&
+            std::memcmp(&previous->h.draw, &out.h.draw, sizeof(out.h.draw)) == 0 &&
+            same_groups({VideoCommon::V2::RegGroup::IndexBuffer,
+                         VideoCommon::V2::RegGroup::DrawParams})) {
+            out.h.index = previous->h.index;
+        } else {
+            out.h.index = buffer_cache.ResolveIndexBinding(view);
+            if (out.h.index.valid) {
+                resolve_buffer(out.h.index.buffer, out.h.index.daddr, out.h.index.size);
+            }
         }
     }
     // UpdateVertexBuffers: every slot (a clean slot holds what its registers give).
     boost::container::small_vector<R::ResolvedVertex, VideoCommon::NUM_VERTEX_BUFFERS> vertex;
     out.h.vertex_mask = 0;
-    for (u32 slot = 0; slot < VideoCommon::NUM_VERTEX_BUFFERS; ++slot) {
+    const auto previous_vertex = reusable && same_groups({VideoCommon::V2::RegGroup::VertexStreams})
+                                     ? previous->Span<const R::ResolvedVertex>(previous->h.vertex)
+                                     : std::span<const R::ResolvedVertex>{};
+    const bool reuse_vertex =
+        !previous_vertex.empty() && std::ranges::none_of(previous_vertex, [](const auto& entry) {
+            return C::IsProxy(entry.buffer.id);
+        });
+    if (reuse_vertex) {
+        vertex.assign(previous_vertex.begin(), previous_vertex.end());
+        out.h.vertex_mask = previous->h.vertex_mask;
+    }
+    for (u32 slot = 0; !reuse_vertex && slot < VideoCommon::NUM_VERTEX_BUFFERS; ++slot) {
         std::optional<R::ResolvedVertex> binding = buffer_cache.ResolveVertexBinding(view, slot);
         if (!binding) {
             continue;
@@ -398,6 +434,8 @@ R::ResolveStatus GraphicsPipeline::ResolveDraw(const View& view, const R::Resolv
     // 1. Header and stamps.
     h.ordinal = ctx.ordinal;
     h.fingerprint = view.Groups().Fingerprint(VideoCommon::V2::AllGroups);
+    h.group_hashes = view.Groups().hashes;
+    h.groups_valid = view.Groups().valid;
     h.draw = view.Draw();
     h.topology = view.Topology();
     h.indexed = ctx.is_indexed;
@@ -505,6 +543,8 @@ R::ResolveStatus GraphicsPipeline::ResolveFromBase(const View& view, const R::Re
     R::DrawHeader& h = out.h;
     h.ordinal = ctx.ordinal;
     h.fingerprint = view.Groups().Fingerprint(VideoCommon::V2::AllGroups);
+    h.group_hashes = view.Groups().hashes;
+    h.groups_valid = view.Groups().valid;
     h.draw = view.Draw();
     h.topology = view.Topology();
     h.indexed = ctx.is_indexed;

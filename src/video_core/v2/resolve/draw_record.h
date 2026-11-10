@@ -281,6 +281,10 @@ struct DrawHeader {
     u64 ordinal{};
     u64 segment{};
     u64 fingerprint{}; ///< view.Groups().Fingerprint(AllGroups)
+    /// view.Groups().hashes (step 17: a group equal to the previous record's reuses its
+    /// sub-record); `groups_valid`: the tracker had computed them.
+    std::array<u64, NumRegGroups> group_hashes{};
+    bool groups_valid{};
     ViewDraw draw{};
     MaxwellRegs::PrimitiveTopology topology{};
     bool indexed{};

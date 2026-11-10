@@ -224,6 +224,13 @@ private:
                               const VideoCommon::V2::DrawCache::Recipe& recipe);
     VideoCommon::V2::Resolve::ResolvedDraw drawrec_scratch;
     VideoCommon::V2::Commit::RequestList drawrec_scratch_buffers;
+    VideoCommon::V2::Commit::RequestList drawrec_scratch_textures;
+    /// The last draw went through the record path (its pipeline's last record is its base).
+    bool drawrec_last_drawn{};
+    /// DRAWREC=1 (step 17): a continued draw from the pipeline's last record in place of
+    /// ConfigureDelta. False with `recorded` unset: not taken (ConfigureDelta runs).
+    [[nodiscard]] bool PrepareDeltaRecord(GraphicsPipeline& pipeline, bool is_indexed,
+                                          bool& recorded);
     /// DRAWREC=verify (step 10): what a cache mutation moves, around a pure resolve.
     struct DrawRecPurity {
         u64 flags{};

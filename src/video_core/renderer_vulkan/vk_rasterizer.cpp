@@ -1837,7 +1837,18 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     if (replayed) {
         // Recorded from the recipe; the pipeline keeps its views for delta draws after it.
     } else if (path == DrawPath::Delta) {
-        if (Profile::Scope scope{Profile::Zone::Configure}; !pipeline->ConfigureDelta(is_indexed)) {
+        Profile::Scope scope{Profile::Zone::Configure};
+        bool configured = false;
+        if (drawrec == VideoCommon::V2::Mode::On && drawrec_last_drawn &&
+            pipeline->LastRecord().h.pipeline == pipeline) [[unlikely]] {
+            configured = PrepareDeltaRecord(*pipeline, is_indexed, drawrec_drawn);
+        }
+        if (!drawrec_drawn) {
+            configured = pipeline->ConfigureDelta(is_indexed);
+        } else if (!configured) {
+            drawrec_drawn = false;
+        }
+        if (!configured) {
             report_failure("configure failed");
             TraceRenderState(is_indexed, "configure-failed", nullptr);
             return;
@@ -1925,7 +1936,13 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         // Step 16: a recipe this draw built keeps the record (proxies looked up again by the
         // DeriveOnly apply) as its template.
         DrawCache().AttachRecordTemplate(drawrec_record);
+        // Step 17: the base the next resolve of this pipeline reuses sub-records from (R-13).
+        if (drawrec_record.h.status == VideoCommon::V2::Resolve::ResolveStatus::Ready &&
+            !VideoCommon::V2::Resolve::HasProxies(drawrec_record)) {
+            pipeline->StoreLastRecord(drawrec_record);
+        }
     }
+    drawrec_last_drawn = drawrec_drawn;
 
 #ifdef EGLANTINE_STREAMLINE
     TrackOcarinaCamera();
@@ -5414,7 +5431,9 @@ VideoCommon::V2::Resolve::ResolveStatus RasterizerVulkan::ResolveDrawRecord(
         .frame_dump = frame_dump.Capturing(),
         .sampled_recording = RecordingSampledTextures(),
         .ordinal = drawrec_ordinal++,
-        .previous = nullptr,
+        // Step 17: DRAWREC=1 reuses unchanged sub-records of the pipeline's last record; verify
+        // resolves without it and compares the reusing resolve below (R-13).
+        .previous = check ? nullptr : &pipeline.LastRecord(),
         .features = &DrawRecFeatures(),
     };
     const auto resolve = [&] {
@@ -5449,6 +5468,33 @@ VideoCommon::V2::Resolve::ResolveStatus RasterizerVulkan::ResolveDrawRecord(
     }
     if (status == R::ResolveStatus::CommitOnly) {
         R::CountRecordStat(stats.commit_only[static_cast<size_t>(drawrec_record.h.reason)]);
+    }
+    if (check && status == R::ResolveStatus::Ready &&
+        pipeline.LastRecord().h.pipeline == &pipeline) {
+        // R-13: the resolve reusing the last record's sub-records gives the same record.
+        R::ResolveContext reuse = ctx;
+        reuse.previous = &pipeline.LastRecord();
+        drawrec_scratch_buffers.Reset(commit->next_segment++);
+        drawrec_scratch_textures.Reset(commit->next_segment++);
+        if (pipeline.ResolveDraw(R::LiveView{*maxwell3d}, reuse, drawrec_scratch,
+                                 drawrec_scratch_textures,
+                                 drawrec_scratch_buffers) == R::ResolveStatus::Ready) {
+            std::string reasons;
+            u32 groups = 0;
+            if (!R::CompareRecords(drawrec_record, drawrec_scratch, ~0U, reasons, &groups,
+                                   nullptr)) {
+                for (u32 bits = groups; bits != 0; bits &= bits - 1) {
+                    R::CountRecordStat(stats.mismatches[std::countr_zero(bits)]);
+                }
+                static std::atomic<u32> logged{};
+                if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+                    LOG_WARNING(Render_Vulkan,
+                                "V2 draw record verify: draw {} resolved with the last record's "
+                                "sub-records differs: {}",
+                                ctx.ordinal, reasons);
+                }
+            }
+        }
     }
     return status;
 }
@@ -5539,6 +5585,35 @@ GraphicsPipeline::RecipeResult RasterizerVulkan::PrepareTemplateRecord(
     R::CountRecordStat(stats.by_path[2]);
     recorded = true;
     return GraphicsPipeline::RecipeResult::Recorded;
+}
+
+bool RasterizerVulkan::PrepareDeltaRecord(GraphicsPipeline& pipeline, bool is_indexed,
+                                          bool& recorded) {
+    namespace R = VideoCommon::V2::Resolve;
+    recorded = false;
+    // Step 17: the record diff. The last record keeps its textures; buffers (storage
+    // descriptors read again), render targets and dynamic state are resolved from the view.
+    if (ResolveRecordFromBase(pipeline, is_indexed, pipeline.LastRecord(), drawrec_record,
+                              drawrec_buffers) != R::ResolveStatus::Ready) {
+        return false;
+    }
+    drawrec_textures.Reset(commit->next_segment++);
+    if (pipeline.ApplyDraw(drawrec_record, drawrec_textures, drawrec_buffers, drawrec_apply,
+                           GraphicsPipeline::ApplyMode::Normal, commit->stage) !=
+        GraphicsPipeline::ApplyResult::Ok) {
+        recorded = true; // as ConfigureDelta returning false: the draw can't be recorded
+        return false;
+    }
+    if (!pipeline.EncodeDraw(drawrec_record, drawrec_apply, &pipeline.LastRecord(),
+                             GraphicsPipeline::EncodeMode::Normal)) {
+        recorded = true;
+        return false;
+    }
+    R::RecordStats& stats = R::GetRecordStats();
+    R::CountRecordStat(stats.drawrec_draws);
+    R::CountRecordStat(stats.by_path[1]);
+    recorded = true;
+    return true;
 }
 
 void RasterizerVulkan::VerifyTemplateRecord(GraphicsPipeline& pipeline, bool is_indexed,
