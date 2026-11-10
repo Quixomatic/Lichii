@@ -581,6 +581,8 @@ void GraphicsPipeline::ResolveTargetsAndDynamic(const View& view, const R::Resol
     };
     if (same_dynamic()) {
         h.dynamic = dynamic_base->h.dynamic;
+    } else if (ctx.shard_dynamic != nullptr) {
+        h.dynamic = *ctx.shard_dynamic; // R5: computed from the same registers on a shard
     } else {
         h.dynamic = R::ComputeDynamic(view, *ctx.features);
     }

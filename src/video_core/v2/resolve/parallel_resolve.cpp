@@ -128,9 +128,18 @@ void ReportStats(const char* thread_name, u64 window_ns) {
     }
     const u64 commit_draws = Take(stats.commit_draws);
     const u64 commit_draw_ns = Take(stats.commit_draw_ns);
+    // F1-36: draws per segment from the draws the commit thread ran (a stolen segment has no
+    // records, so records per segment understated the segment size), and the share of draws a
+    // shard pre-resolved.
+    const double draws_each =
+        segments != 0 ? static_cast<double>(commit_draws) / static_cast<double>(segments) : 0.0;
+    const double draws_by_shards =
+        commit_draws != 0 ? 100.0 * static_cast<double>(pre) / static_cast<double>(commit_draws)
+                          : 0.0;
     LOG_INFO(
         HW_GPU,
-        "V2 stats {} P6 parallel resolve | segments {:.0f}/s ({:.1f} draws each), by shards "
+        "V2 stats {} P6 parallel resolve | segments {:.0f}/s ({:.1f} draws each, {:.1f} records; "
+        "draws by shards {:.1f}%), by shards "
         "{:.1f}%, serial {:.1f}% ({}) | cuts: {} | size {} | shards {} ({:.1f}% busy overall): {} | "
         "commit {:.2f} ms/s, merge wait {:.2f} ms/s ({} waits), serial resolve on commit {:.2f} "
         "ms/s | refused {}, stolen before submit {}, while queued {}, early submits {} (abandoned {}) | front snapshot {:.2f} ms/s, blocks copied {:.0f}/s, shared {:.1f}% | pre-resolved draws "
@@ -138,8 +147,9 @@ void ReportStats(const char* thread_name, u64 window_ns) {
         "mismatches ({} dependent); {} draws, {} mismatches; {} snapshots, {} mismatches | determinism: {} "
         "in order, {} out of order | steps on shards: {} | commit per draw {:.2f} us ({:.0f} "
         "draws/s)",
-        thread_name, static_cast<double>(segments) / seconds,
+        thread_name, static_cast<double>(segments) / seconds, draws_each,
         segments != 0 ? static_cast<double>(records) / static_cast<double>(segments) : 0.0,
+        draws_by_shards,
         segments != 0 ? 100.0 * static_cast<double>(by_shard) / static_cast<double>(segments) : 0.0,
         segments != 0 ? 100.0 * static_cast<double>(serial_total) / static_cast<double>(segments)
                       : 0.0,

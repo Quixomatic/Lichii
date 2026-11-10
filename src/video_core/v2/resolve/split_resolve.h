@@ -119,6 +119,17 @@ struct PreDraw;
 using ShardPipelineFn = void (*)(const SnapshotView& view, uintptr_t memory, PreDraw& pre);
 inline ShardPipelineFn g_shard_pipeline = nullptr;
 
+struct DynamicState;
+struct DynamicFeatures;
+/// R5: the device features the record path computes dynamic state with, published by the
+/// commit thread before its draws use them (a copy is kept per change; shards compute with the
+/// current one). Returns the generation `features` have.
+u64 PublishDynamicFeatures(const DynamicFeatures& features);
+/// R5: a draw's dynamic state from a shard's view with the published features (null: none
+/// published yet, or EDEN_NX2_V2_DRAWREC off). `generation`: the features' generation.
+[[nodiscard]] std::shared_ptr<const DynamicState> ShardDynamic(const SnapshotView& view,
+                                                               u64& generation);
+
 /// A draw resolved by a shard.
 struct PreDraw {
     u64 fingerprint = 0; ///< the Draw record's (equals the back's group fingerprint at the draw)
@@ -137,6 +148,10 @@ struct PreDraw {
     u64 program_generation = 0; ///< ProgramGeneration() before the hashes were read
     std::array<u64, 6> hashes{};
     bool has_pipeline = false;
+    /// R5: the draw's dynamic state (ComputeDynamic on the shard's view; null: none), computed
+    /// with the published features of `dynamic_generation`.
+    std::shared_ptr<const DynamicState> dynamic;
+    u64 dynamic_generation = 0;
     uintptr_t engine = 0;
     uintptr_t memory = 0;
     u32 relevant = 0;
@@ -281,6 +296,12 @@ public:
     /// draw's pipeline is chosen (EndDraw), so a step of a later draw never sees it.
     void SetTaken(const PreDraw* pre) {
         taken = pre;
+        record_taken = pre;
+    }
+    /// R5: the accepted record for the draw's record resolve (after its pipeline is chosen),
+    /// once. Valid during the draw it was taken for (the next draw's SetTaken replaces it).
+    [[nodiscard]] const PreDraw* TakeRecordInputs() {
+        return std::exchange(record_taken, nullptr);
     }
     void EndDraw() {
         taken = nullptr;
@@ -328,7 +349,22 @@ private:
     /// The last early submission, released at shutdown if its end was never published.
     SegmentProgress* last_early = nullptr;
     void ReclaimReleased();
-    std::deque<SegmentInput> closed;
+    /// F1-36: closed segments waiting for a slot, submitted by whichever thread gets there
+    /// first: the front at a publish, or the commit when it releases a slot (a front stalled in
+    /// a wait used to leave them unsubmitted until the commit stole them). The front pushes at
+    /// `closed_tail`; the submitter (one at a time, `submitting`) pops at `closed_head`.
+    static constexpr u64 ClosedCapacity = 1024;
+    std::unique_ptr<std::array<SegmentInput, ClosedCapacity>> closed;
+    alignas(64) std::atomic<u64> closed_head{0};
+    alignas(64) std::atomic<u64> closed_tail{0};
+    std::atomic<bool> submitting{false};
+    std::atomic<bool> drain_again{false};
+    /// Either thread: submits closed segments whose end is at or before `published`.
+    void DrainClosed(u64 published);
+    [[nodiscard]] bool ClosedEmpty() const {
+        return closed_head.load(std::memory_order_acquire) ==
+               closed_tail.load(std::memory_order_acquire);
+    }
     u32 applied_size = 0;
     /// Draws of submitted segments the commit has not taken yet (front adds, back subtracts).
     std::atomic<u32> in_flight_draws{0};
@@ -339,6 +375,7 @@ private:
     Resolver::Result* current = nullptr;
     size_t cursor = 0;
     const PreDraw* taken = nullptr;
+    const PreDraw* record_taken = nullptr;
     AdaptiveSize adaptive;
     u64 last_report_ns = 0;
 

@@ -410,6 +410,9 @@ struct ResolveContext {
     u64 ordinal{};
     const ResolvedDraw* previous{}; ///< the pipeline's last record (record diff), may be null
     const DynamicFeatures* features{};
+    /// EDEN_NX2_V2_PARALLEL R5: this draw's dynamic state from a shard (computed with
+    /// `features`), used instead of ComputeDynamic; null: compute it.
+    const DynamicState* shard_dynamic{};
 };
 
 /// Compares a resolved record with the one observed from the old Configure. `created_mask`:

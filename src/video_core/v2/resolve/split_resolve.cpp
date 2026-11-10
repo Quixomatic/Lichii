@@ -12,6 +12,8 @@
 #include "video_core/gpu_split.h"
 #include "video_core/v2/draw_model.h"
 #include "video_core/v2/regsem_3d.h"
+#include "video_core/v2/resolve/draw_record.h"
+#include "video_core/v2/resolve/dynamic_state.h"
 #include "video_core/v2/resolve/split_resolve.h"
 #include "video_core/v2/resolve/state_view.h"
 #include "video_core/v2/s1_deltas.h"
@@ -205,6 +207,64 @@ u64 ProgramGeneration() {
     return g_program_generation.load(std::memory_order_acquire);
 }
 
+// ---- Published dynamic-state features (R5) --------------------------------------------------------
+
+namespace {
+
+struct PublishedFeatures {
+    DynamicFeatures features;
+    u64 generation;
+};
+/// Every set of features ever published (commit thread only): they change with the program
+/// and a setting, a handful of times a session, and a shard may still compute with an old one.
+std::vector<std::unique_ptr<PublishedFeatures>>& FeatureCopies() {
+    static std::vector<std::unique_ptr<PublishedFeatures>> copies;
+    return copies;
+}
+std::atomic<const PublishedFeatures*> g_features{nullptr};
+
+} // Anonymous namespace
+
+u64 PublishDynamicFeatures(const DynamicFeatures& features) {
+    const PublishedFeatures* const current = g_features.load(std::memory_order_relaxed);
+    if (current != nullptr &&
+        std::memcmp(&current->features, &features, sizeof(DynamicFeatures)) == 0) {
+        return current->generation;
+    }
+    auto copy = std::make_unique<PublishedFeatures>();
+    std::memcpy(&copy->features, &features, sizeof(DynamicFeatures));
+    copy->generation = current != nullptr ? current->generation + 1 : 1;
+    const PublishedFeatures* const published = copy.get();
+    FeatureCopies().push_back(std::move(copy));
+    g_features.store(published, std::memory_order_release);
+    return published->generation;
+}
+
+std::shared_ptr<const DynamicState> ShardDynamic(const SnapshotView& view, u64& generation) {
+    const PublishedFeatures* const published = g_features.load(std::memory_order_acquire);
+    if (published == nullptr || !On(Switch::DrawRec)) {
+        return nullptr;
+    }
+    generation = published->generation;
+    // ComputeDynamic reads these groups and the topology (the record path's same_dynamic
+    // rule): a shard reuses its last result while their hashes and the features hold.
+    constexpr u32 groups = GroupBit(RegGroup::Pipeline) | GroupBit(RegGroup::Viewport) |
+                           GroupBit(RegGroup::VertexStreams) | GroupBit(RegGroup::IndexBuffer) |
+                           GroupBit(RegGroup::RenderTargets);
+    static_assert((groups & ~HashedGroups) == 0);
+    u64 inputs = view.Groups().Fingerprint(groups);
+    inputs = Mix64(inputs ^ static_cast<u64>(view.Topology()));
+    inputs = Mix64(inputs ^ published->generation);
+    thread_local std::shared_ptr<const DynamicState> last;
+    thread_local u64 last_inputs = 0;
+    if (last != nullptr && last_inputs == inputs && view.Groups().valid) {
+        return last;
+    }
+    last = std::make_shared<const DynamicState>(ComputeDynamic(view, published->features));
+    last_inputs = inputs;
+    return last;
+}
+
 // ---- Shards ---------------------------------------------------------------------------------------
 
 namespace {
@@ -315,6 +375,8 @@ SerialReason SplitTraits::Resolve(Shard& shard, const Input& input, std::vector<
                 if (pre.pipeline_key != nullptr && g_shard_pipeline != nullptr) {
                     g_shard_pipeline(view, snapshot.memory, pre);
                 }
+                // R5: the draw's dynamic state (scale-independent: the view alone).
+                pre.dynamic = ShardDynamic(view, pre.dynamic_generation);
             }
             // The draw-cache shape holds the pipeline key's hash: only the canonical key the
             // serial path uses with EDEN_NX2_V2_PIPEKEY equals the shard's.
@@ -382,7 +444,10 @@ SerialReason SplitTraits::Resolve(Shard& shard, const Input& input, std::vector<
             }
             const std::optional<u64> available = WaitPublished(input, position);
             if (!available) {
-                return SerialReason::Stolen;
+                // F1-36: the commit reached the segment while the front still writes it. The
+                // draws resolved so far are published ones: the commit takes them (TakeDraw
+                // matches the prefix, the rest resolve live) instead of none.
+                return records.empty() ? SerialReason::Stolen : SerialReason::None;
             }
             limit = *available;
             if (position >= limit) {
@@ -534,6 +599,16 @@ const char* SplitTraits::Compare(const Record& a, const Record& b) {
         }
         return a.hashes != b.hashes ? "pipeline shader hashes" : "pipeline object";
     }
+    // R5: the dynamic state (features published in between: dependent).
+    if ((a.dynamic == nullptr) != (b.dynamic == nullptr) ||
+        (a.dynamic != nullptr && a.dynamic != b.dynamic &&
+         std::memcmp(a.dynamic.get(), b.dynamic.get(), sizeof(DynamicState)) != 0)) {
+        if (a.dynamic_generation != b.dynamic_generation) {
+            Count(GetStats().verify_dependent);
+            return nullptr;
+        }
+        return "dynamic state";
+    }
     return nullptr;
 }
 
@@ -550,6 +625,7 @@ SplitResolve::SplitResolve(GpuSplit& split_, const u64* ring_, const Ir::Payload
     config.resolve_stolen = false; // a stolen segment's draws decide on the commit thread live
     config.stats = true;           // the commit stats are cheap and feed the adaptive size
     resolver = std::make_unique<Resolver>(config, [](u32) { return SplitTraits::Shard{}; });
+    closed = std::make_unique<std::array<SegmentInput, ClosedCapacity>>();
     segmenter.Reset(1);
     applied_size = segmenter.Size();
     adaptive_size.store(applied_size, std::memory_order_relaxed);
@@ -673,7 +749,15 @@ void SplitResolve::FrontDraw(const FrontView& view, const EngineInfo& engine,
             } else {
                 open_input.end = position;
                 open_input.serial = closing_reason;
-                closed.push_back(std::move(open_input));
+                const u64 tail = closed_tail.load(std::memory_order_relaxed);
+                if (tail - closed_head.load(std::memory_order_acquire) < ClosedCapacity) {
+                    (*closed)[tail % ClosedCapacity] = open_input;
+                    closed_tail.store(tail + 1, std::memory_order_release);
+                } else {
+                    // Every queued slot taken: the id is given up (the commit resolves it
+                    // serially); a refused submission tells the shards to move past it.
+                    resolver->Submit(open_input.id, std::move(open_input), SerialReason::BackPressure);
+                }
             }
         }
         open = true;
@@ -701,30 +785,50 @@ void SplitResolve::ReclaimReleased() {
     progress_pool.Reclaim(through);
 }
 
-void SplitResolve::OnPublish(u64 position) {
-    while (!closed.empty() && closed.front().end <= position) {
-        SegmentInput& input = closed.front();
-        const u64 id = input.id;
-        const SerialReason reason = input.serial;
-        const u32 draws = input.draws;
-        const u32 in_flight = in_flight_draws.load(std::memory_order_acquire);
-        if (in_flight != 0 && in_flight + draws > InFlightDraws) {
-            break; // the shards hold enough draws: submitted at a later publish
+void SplitResolve::DrainClosed(u64 published) {
+    for (;;) {
+        if (submitting.exchange(true, std::memory_order_acquire)) {
+            // The other thread submits: it looks again when it is done.
+            drain_again.store(true, std::memory_order_release);
+            return;
         }
-        bool retry = false;
-        in_flight_draws.fetch_add(draws, std::memory_order_acq_rel); // before the commit sees it
-        if (!resolver->Submit(id, std::move(input), reason, &retry)) {
-            in_flight_draws.fetch_sub(draws, std::memory_order_acq_rel);
-            if (retry) {
-                break; // every slot busy: submitted again at the next publish
+        u64 head = closed_head.load(std::memory_order_relaxed);
+        const u64 tail = closed_tail.load(std::memory_order_acquire);
+        while (head != tail) {
+            SegmentInput& input = (*closed)[head % ClosedCapacity];
+            if (input.end > published) {
+                break;
             }
+            const u32 draws = input.draws;
+            const u32 in_flight = in_flight_draws.load(std::memory_order_acquire);
+            if (in_flight != 0 && in_flight + draws > InFlightDraws) {
+                break; // the shards hold enough draws: submitted when the commit takes some
+            }
+            bool retry = false;
+            in_flight_draws.fetch_add(draws, std::memory_order_acq_rel); // before the commit sees it
+            if (!resolver->Submit(input.id, SegmentInput{input}, input.serial, &retry)) {
+                in_flight_draws.fetch_sub(draws, std::memory_order_acq_rel);
+                if (retry) {
+                    break; // every slot busy: submitted when the commit releases one
+                }
+            }
+            ++head;
         }
-        closed.pop_front();
+        closed_head.store(head, std::memory_order_release);
+        submitting.store(false, std::memory_order_release);
+        if (!drain_again.exchange(false, std::memory_order_acq_rel)) {
+            return;
+        }
+        published = (std::max)(published, split.published.load(std::memory_order_acquire));
     }
+}
+
+void SplitResolve::OnPublish(u64 position) {
+    DrainClosed(position);
     // The open segment goes once its start is published and it holds a few draws, so the back
     // does not reach it before a shard could start (AP6 §1.3(a)). Ids stay in order: only when
     // every closed segment went.
-    if (!open || open_progress != nullptr || !closed.empty() || open_input.begin > position ||
+    if (!open || open_progress != nullptr || !ClosedEmpty() || open_input.begin > position ||
         open_input.draws < EarlySubmitDraws || segmenter.OpenReason() != SerialReason::None ||
         open_input.snapshot == nullptr) {
         return;
@@ -762,8 +866,12 @@ void SplitResolve::OnSegment(const Ir::SegmentBody& body, const u32* back_regs,
         resolver->Release(held_id);
         holding = false;
         current = nullptr;
+        // F1-36: the freed slot takes the next closed segment now, not at the front's next
+        // publish (a front waiting on this thread publishes nothing meanwhile).
+        DrainClosed(split.published.load(std::memory_order_acquire));
     }
     taken = nullptr;
+    record_taken = nullptr; // it pointed into the released segment's records
     Resolver::Result& result = resolver->Take(body.id);
     // Segments are taken in id order and Take returns once no shard reads `body.id`: every older
     // one's input is done with (the front reuses their snapshots, F1-30).

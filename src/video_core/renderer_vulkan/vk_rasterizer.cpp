@@ -5548,11 +5548,63 @@ const VideoCommon::V2::Resolve::ResolvedDraw* RasterizerVulkan::DrawRecBase(
     return nearest;
 }
 
+namespace {
+
+/// EDEN_NX2_V2_PARALLEL R5: the dynamic state a shard computed for the draw being recorded,
+/// when it used these `features` (published here first). Under PARALLEL=verify or a checking
+/// resolve it goes to `verify` instead (compared, not used).
+const VideoCommon::V2::Resolve::DynamicState* TakeShardDynamic(
+    const VideoCommon::V2::Resolve::DynamicFeatures& features, bool check,
+    const VideoCommon::V2::Resolve::DynamicState*& verify) {
+    namespace R = VideoCommon::V2::Resolve;
+    verify = nullptr;
+    R::SplitResolve* const parallel = R::SplitResolve::t_commit;
+    if (parallel == nullptr) [[likely]] {
+        return nullptr;
+    }
+    const u64 generation = R::PublishDynamicFeatures(features);
+    const R::PreDraw* const pre = parallel->TakeRecordInputs();
+    const bool usable =
+        pre != nullptr && pre->dynamic != nullptr && pre->dynamic_generation == generation;
+    if (usable && (check || parallel->Verify())) {
+        verify = pre->dynamic.get();
+        return nullptr;
+    }
+    R::Count(usable ? R::GetStats().step_shard[static_cast<size_t>(R::Step::Dynamic)]
+                    : R::GetStats().step_commit[static_cast<size_t>(R::Step::Dynamic)]);
+    return usable ? pre->dynamic.get() : nullptr;
+}
+
+/// PARALLEL=verify: the shard's dynamic state against the one the record holds.
+void VerifyShardDynamic(const VideoCommon::V2::Resolve::DynamicState* shard,
+                        const VideoCommon::V2::Resolve::ResolvedDraw& record) {
+    namespace R = VideoCommon::V2::Resolve;
+    if (shard == nullptr || record.h.status != R::ResolveStatus::Ready) {
+        return;
+    }
+    R::Count(R::GetStats().verify_draws);
+    if (std::memcmp(shard, &record.h.dynamic, sizeof(R::DynamicState)) == 0) {
+        return;
+    }
+    R::Count(R::GetStats().verify_draw_mismatches);
+    if (R::ShouldLogMismatch(R::MismatchLog::Draw)) {
+        LOG_WARNING(Render_Vulkan,
+                    "V2 parallel verify: draw {}'s dynamic state from the shard differs from the "
+                    "serial resolve",
+                    record.h.ordinal);
+    }
+}
+
+} // Anonymous namespace
+
 VideoCommon::V2::Resolve::ResolveStatus RasterizerVulkan::ResolveDrawRecord(
     GraphicsPipeline& pipeline, bool is_indexed, bool is_indirect, bool check) {
     namespace R = VideoCommon::V2::Resolve;
     namespace Versions = VideoCommon::V2::Versions;
     R::RecordStats& stats = R::GetRecordStats();
+    const R::DynamicFeatures& features = DrawRecFeatures();
+    const R::DynamicState* verify_dynamic = nullptr;
+    const R::DynamicState* const shard_dynamic = TakeShardDynamic(features, check, verify_dynamic);
     const R::ResolveContext ctx{
         .pipeline = &pipeline,
         .pipeline_epoch = Versions::Gens().GetEpoch(Versions::Epoch::Pipelines),
@@ -5565,7 +5617,8 @@ VideoCommon::V2::Resolve::ResolveStatus RasterizerVulkan::ResolveDrawRecord(
         // shape's template or the pipeline's last record); verify resolves without it and
         // compares the reusing resolve below (R-13).
         .previous = check ? nullptr : DrawRecBase(pipeline),
-        .features = &DrawRecFeatures(),
+        .features = &features,
+        .shard_dynamic = shard_dynamic,
     };
     const auto resolve = [&] {
         drawrec_textures.Reset(commit->next_segment++);
@@ -5601,6 +5654,7 @@ VideoCommon::V2::Resolve::ResolveStatus RasterizerVulkan::ResolveDrawRecord(
     if (status == R::ResolveStatus::CommitOnly) {
         R::CountRecordStat(stats.commit_only[static_cast<size_t>(drawrec_record.h.reason)]);
     }
+    VerifyShardDynamic(verify_dynamic, drawrec_record);
     const R::ResolvedDraw* const base = check ? DrawRecBase(pipeline) : nullptr;
     if (check && status == R::ResolveStatus::Ready && base->h.pipeline == &pipeline) {
         // R-13: the resolve reusing the nearest record's sub-records gives the same record.

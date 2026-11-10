@@ -53,11 +53,12 @@ enum class Step : u8 {
     DrawKey,     ///< P4 draw-cache key with the constant buffer bindings
     PipelineKey, ///< P3 pipeline key (FixedPipelineState) and its hash
     Pipeline,    ///< R3: the pipeline lookup (shader hashes + variant table)
+    Dynamic,     ///< R5: the record's dynamic state (EDEN_NX2_V2_DRAWREC full resolves)
     Count,
 };
 inline constexpr size_t NumSteps = static_cast<size_t>(Step::Count);
 inline constexpr std::array<const char*, NumSteps> step_names{"shape", "draw key", "pipeline key",
-                                                              "pipeline"};
+                                                              "pipeline", "dynamic state"};
 
 struct Stats {
     static constexpr size_t MaxShards = 16;
@@ -532,6 +533,20 @@ private:
         Count(GetStats().verify_dependent, requests.dependent);
         const char* field = requests.field;
         size_t index = 0;
+        // F1-36: an abandoned early segment holds the prefix its shard resolved before the
+        // commit reached it (the serial resolve stops at what is published by now): only the
+        // common prefix is compared.
+        bool partial = false;
+        if constexpr (requires { slot.input.progress->abandon; }) {
+            partial = slot.input.progress != nullptr &&
+                      slot.input.progress->abandon.load(std::memory_order_acquire);
+        }
+        if (partial) {
+            const auto common = static_cast<std::ptrdiff_t>(
+                (std::min)(result.records.size(), verify_records.size()));
+            result.records.erase(result.records.begin() + common, result.records.end());
+            verify_records.erase(verify_records.begin() + common, verify_records.end());
+        }
         if constexpr (requires(const Record& r) { r.ordinal; }) {
             // Records pair up by their draw ordinal: a draw only one side kept is reported as
             // that, not as a difference in every draw after it.

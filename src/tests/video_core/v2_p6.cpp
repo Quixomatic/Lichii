@@ -27,6 +27,8 @@
 #include "video_core/v2/epoch_publish.h"
 #include "video_core/v2/pipeline_lookup.h"
 #include "video_core/v2/resolve/cow_regs.h"
+#include "video_core/v2/resolve/draw_record.h"
+#include "video_core/v2/resolve/dynamic_state.h"
 #include "video_core/v2/resolve/multifront.h"
 #include "video_core/v2/resolve/parallel_resolve.h"
 #include "video_core/v2/resolve/segment.h"
@@ -990,6 +992,63 @@ TEST_CASE("V2 P6: an early-submitted segment's shard stops at the end the front 
     CHECK(wrong == 0);
 }
 
+TEST_CASE("V2 P6: an abandoned early segment keeps the draws its shard resolved (F1-36)",
+          "[video_core][v2_p6]") {
+    ScopedSystemTestContext context;
+    Core::System system;
+    Core::DeviceMemory physical;
+    Tegra::MaxwellDeviceMemoryManager device_memory{physical};
+    Tegra::MemoryManager memory{system, device_memory, 32, 1ULL << 31};
+    Tegra::Engines::Maxwell3D engine{memory};
+    auto snapshot = std::make_unique<Resolve::FrontSnapshot>();
+    Resolve::SnapshotBuilder<0xe00> builder;
+    const std::vector<u32> zero(0xe00, 0);
+    snapshot->regs = builder.Take(zero.data());
+    snapshot->engine_ref = 3;
+    const Resolve::ShardKeyFn saved = Resolve::g_shard_key;
+    Resolve::g_shard_key = &FakeShardKey;
+    V2::Ir::DrawBody body{};
+    body.op = V2::Ir::DrawOp::Predicted;
+    body.engine = 3;
+    body.num_draws = 1;
+    body.draws[0].kind = V2::Ir::DrawKind::Array;
+    for (const u32 published_draws : {0U, 5U}) {
+        RingBuilder ring;
+        std::atomic<u64> published{0};
+        Resolve::SegmentProgress progress;
+        progress.Reset();
+        for (u32 draw = 0; draw < published_draws; ++draw) {
+            ring.Draw(body);
+        }
+        published.store(ring.position);
+        Resolve::SegmentInput input;
+        input.id = 1;
+        input.snapshot = snapshot.get();
+        input.ring = ring.ring.data();
+        input.arena = &ring.arena;
+        input.progress = &progress;
+        input.published = &published;
+        std::vector<Resolve::PreDraw> records;
+        SerialReason reason = SerialReason::None;
+        std::jthread shard{[&] {
+            Resolve::SplitTraits::Shard state;
+            Commit::RequestList requests;
+            requests.Reset(1);
+            reason = Resolve::SplitTraits::Resolve(state, input, records, requests);
+        }};
+        // The commit reaches the segment while the shard waits for more of it.
+        while (!progress.waiting.load()) {
+            std::this_thread::yield();
+        }
+        progress.abandon.store(true);
+        shard.join();
+        INFO("published draws " << published_draws);
+        CHECK(records.size() == published_draws);
+        CHECK(reason == (published_draws == 0 ? SerialReason::Stolen : SerialReason::None));
+    }
+    Resolve::g_shard_key = saved;
+}
+
 // ---- R3: the pipeline lookup on the shards -------------------------------------------------------
 
 TEST_CASE("V2 P6 R3: thread epoch sections register once and nest", "[video_core][v2_p6]") {
@@ -1252,6 +1311,77 @@ TEST_CASE("V2 P6 R3: shards look up each draw's pipeline; verify compares the ob
     CHECK(Resolve::SplitTraits::Compare(records[0], serial) != nullptr);
     serial.program_generation += 1;
     CHECK(Resolve::SplitTraits::Compare(records[0], serial) == nullptr);
+}
+
+TEST_CASE("V2 P6 R5: a shard's dynamic state equals ComputeDynamic on the same view",
+          "[video_core][v2_p6]") {
+    using Tegra::Engines::Maxwell3D;
+    // A Maxwell3D builds the register semantics table.
+    ScopedSystemTestContext context;
+    Core::System system;
+    Core::DeviceMemory physical;
+    Tegra::MaxwellDeviceMemoryManager device_memory{physical};
+    Tegra::MemoryManager memory{system, device_memory, 32, 1ULL << 31};
+    Maxwell3D engine{memory};
+    auto& mode = V2::g_modes[static_cast<size_t>(V2::Switch::DrawRec)];
+    const V2::Mode saved = mode;
+    mode = V2::Mode::Off;
+    std::vector<u32> regs(Maxwell3D::Regs::NUM_REGS, 0);
+    std::mt19937 rng{17};
+    const V2::RegSem::Table3D& table = V2::RegSem::GetTable3D();
+    for (u32 i = 0; i < 4000; ++i) {
+        const u32 index = 0x200 + rng() % 0xb00;
+        if (table.groups[index] != V2::RegGroup::Misc) {
+            regs[index] = rng() % 4; // small: register fields stay valid enum and index values
+        }
+    }
+    const Resolve::CbufTable cbufs{};
+    V2::GroupTracker groups;
+    V2::RegSem::Rehash3D(groups, regs.data());
+    const Resolve::SnapshotView view{regs.data(),
+                                     &cbufs,
+                                     &groups,
+                                     Maxwell3D::Regs::PrimitiveTopology::Triangles,
+                                     Resolve::ViewDraw{.count = 3},
+                                     false};
+    u64 generation = 0;
+    Resolve::DynamicFeatures features{};
+    features.eds1 = features.eds2 = features.eds3_enables = true;
+    features.depth_bounds = true;
+    // No features published yet, or DRAWREC off: nothing (the commit computes).
+    CHECK(Resolve::ShardDynamic(view, generation) == nullptr);
+    const u64 first = Resolve::PublishDynamicFeatures(features);
+    CHECK(Resolve::PublishDynamicFeatures(features) == first); // unchanged: same generation
+    CHECK(Resolve::ShardDynamic(view, generation) == nullptr);
+    mode = V2::Mode::On;
+    const auto dynamic = Resolve::ShardDynamic(view, generation);
+    REQUIRE(dynamic != nullptr);
+    CHECK(generation == first);
+    const Resolve::DynamicState serial = Resolve::ComputeDynamic(view, features);
+    CHECK(std::memcmp(dynamic.get(), &serial, sizeof(serial)) == 0);
+    // Unchanged groups, topology and features: the same result, not computed again.
+    CHECK(Resolve::ShardDynamic(view, generation) == dynamic);
+    // New features: a new generation and a new result.
+    features.eds3_blending = true;
+    const u64 second = Resolve::PublishDynamicFeatures(features);
+    CHECK(second != first);
+    const auto again = Resolve::ShardDynamic(view, generation);
+    REQUIRE(again != nullptr);
+    CHECK(again != dynamic);
+    CHECK(generation == second);
+    const Resolve::DynamicState serial2 = Resolve::ComputeDynamic(view, features);
+    CHECK(std::memcmp(again.get(), &serial2, sizeof(serial2)) == 0);
+    // Verify: another dynamic state at the same generation is a mismatch, else dependent.
+    Resolve::PreDraw a;
+    a.dynamic = dynamic;
+    a.dynamic_generation = first;
+    Resolve::PreDraw b = a;
+    CHECK(Resolve::SplitTraits::Compare(a, b) == nullptr);
+    b.dynamic = again;
+    CHECK(Resolve::SplitTraits::Compare(a, b) != nullptr);
+    b.dynamic_generation = second;
+    CHECK(Resolve::SplitTraits::Compare(a, b) == nullptr);
+    mode = saved;
 }
 
 TEST_CASE("V2 P6: published shapes are found by the shards", "[video_core][v2_p6]") {
