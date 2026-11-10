@@ -49,6 +49,7 @@
 #include "video_core/texture_cache/types.h"
 #include "video_core/v2/commit.h"
 #include "video_core/v2/draw_cache.h"
+#include "video_core/v2/resolve/draw_record.h"
 #include "video_core/v2/va_map.h"
 
 namespace VideoCommon {
@@ -578,6 +579,67 @@ public:
     /// the lock-free page map (NULL_BUFFER_ID when none does; any thread reads it, P6 shards
     /// validate the slot by its generation).
     [[nodiscard]] BufferId LookupBuffer(DAddr device_addr, u32 size) const;
+
+    // Pipeline v2 P6 Step 0 (EDEN_NX2_V2_DRAWREC, notes/STEP0_SPEC.md §2 items 11-12): pure
+    // twins of the fused update calls, and the appliers ApplyDraw/EncodeDraw run.
+    /// FindBuffer's owner-side lookup without creating: the buffer holding the range,
+    /// NULL_BUFFER_ID for no address, an invalid id when a creation is due.
+    [[nodiscard]] BufferId PeekBuffer(DAddr device_addr, u32 size, bool sparse_compatible) const;
+    /// The BufferCreate request FindBuffer queues for a range (with its predicted effects).
+    [[nodiscard]] V2::Commit::Request MakeCreateRequest(DAddr device_addr, u32 size,
+                                                        bool sparse_compatible) const;
+    /// An index or vertex buffer range as UpdateIndexBuffer / UpdateVertexBuffer compute it.
+    struct GeometryRange {
+        DAddr device_addr{};
+        u32 size{};
+        bool valid{}; ///< false: NULL_BINDING
+    };
+    template <class Memory>
+    [[nodiscard]] static GeometryRange IndexRange(Memory& memory, GPUVAddr begin, GPUVAddr end,
+                                                  u32 first, u32 count, u32 format_size);
+    template <class Memory>
+    [[nodiscard]] static GeometryRange VertexRange(Memory& memory, GPUVAddr begin, bool enabled,
+                                                   GPUVAddr limit_address, bool native,
+                                                   u64 native_size);
+    template <class View>
+    [[nodiscard]] V2::Resolve::ResolvedIndex ResolveIndexBinding(const View& view) const;
+    template <class View>
+    [[nodiscard]] std::optional<V2::Resolve::ResolvedVertex> ResolveVertexBinding(
+        const View& view, u32 slot) const;
+    template <class View>
+    [[nodiscard]] V2::Resolve::ResolvedUbo ResolveUniformBinding(const View& view, size_t stage,
+                                                                 u32 slot) const;
+    /// BindGraphicsStorageBuffer + UpdateStorageBuffers without writing anything.
+    /// `multi_range`: the binding may need split segments (the record path can't take it).
+    template <class View>
+    [[nodiscard]] V2::Resolve::ResolvedSsbo ResolveStorageBinding(
+        const View& view, size_t stage, u32 ssbo_index, u32 cbuf_index, u32 cbuf_offset,
+        bool is_written, u32 indirect_offset, bool& multi_range) const;
+    /// A texture buffer binding of a ready view (BindGraphicsTextureBuffer + UpdateTextureBuffers).
+    [[nodiscard]] V2::Resolve::ResolvedTbo ResolveTextureBufferBinding(size_t stage, u32 index,
+                                                                       GPUVAddr gpu_addr, u32 size,
+                                                                       PixelFormat format,
+                                                                       bool is_written,
+                                                                       bool is_image) const;
+    /// Applies one request of a draw record's buffer list (BufferCreate as V2ApplyCreates does).
+    u32 ApplyDrawRequest(const V2::Commit::Request& request);
+    /// Whether a buffer was deleted since the last call (and clears it).
+    [[nodiscard]] bool TakeDeletedBuffers() noexcept {
+        return std::exchange(channel_state->has_deleted_buffers, false);
+    }
+    /// Opens a deferred bind scope as DoUpdateGraphicsBuffers leaves one.
+    void BeginBindScope() {
+        V2BeginBindScope();
+    }
+    /// Writes the graphics bindings of a record into the channel state as the Update* calls
+    /// leave them (in BufferOperations, as DoUpdateGraphicsBuffers runs).
+    void EncodeGraphicsBindings(const V2::Resolve::ResolvedDraw& record);
+    [[nodiscard]] u32 BufferGeneration(BufferId id) const noexcept {
+        return V2::Versions::Gens().Get(V2::Versions::Kind::Buffer, id.index);
+    }
+    [[nodiscard]] u64 BufferDeletions() const noexcept {
+        return buffer_deletions;
+    }
 
     Runtime& runtime;
     // EDEN_NX2_V2_DRAWCACHE buffer replay (ReplayGraphicsBuffers): bindings bound from the recipe

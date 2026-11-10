@@ -87,6 +87,25 @@ public:
         return &result.first->second.segments;
     }
 
+    /// Pipeline v2 P6 Step 0: what Query would return from the cache alone, without walking or
+    /// caching (pure). Null when it would walk (a miss, a size it didn't keep, pending unmaps).
+    template <typename Memory = Tegra::MemoryManager>
+    const VirtualSegments* Peek(Memory& memory, GPUVAddr gpu_addr, u32 size) const {
+        if (has_deferred.load(std::memory_order_acquire)) {
+            return nullptr;
+        }
+        const size_t as_id = memory.GetID();
+        const auto it = entries.find(MakeKey(as_id, gpu_addr));
+        if (it == entries.end() || it->second.as_id != as_id || it->second.gpu_addr != gpu_addr) {
+            return nullptr;
+        }
+        const Entry& cached = it->second;
+        if (cached.size == size || (cached.segments.size() == 1 && size < cached.size)) {
+            return &cached.segments;
+        }
+        return nullptr;
+    }
+
     void Unmap(size_t as_id, GPUVAddr gpu_addr, u64 size) {
         if (size == 0) {
             return;

@@ -762,6 +762,103 @@ TEST_CASE("Draw cache buffer replay binds unchanged cached uniforms without sync
     REQUIRE(f.cache->CountStaleRecipeRanges(moved, memo) == 0);
 }
 
+TEST_CASE("Index and vertex ranges are computed as the update passes compute them",
+          "[buffer_ports][v2_drawrec]") {
+    // P6 Step 0: UpdateIndexBuffer/UpdateVertexBuffer and the record resolve share these.
+    Fixture f;
+    // 16-bit indices 4..11 of a 0x400-byte buffer: what the draw reads, within the buffer.
+    auto range = Cache::IndexRange(*f.memory, 0x100000, 0x100400, 4, 8, 2);
+    REQUIRE(range.valid);
+    REQUIRE(range.device_addr == 0x10000);
+    REQUIRE(range.size == 24);
+    // A buffer shorter than the draw: the buffer's size.
+    range = Cache::IndexRange(*f.memory, 0x100000, 0x100010, 4, 8, 2);
+    REQUIRE(range.size == 0x10);
+    REQUIRE_FALSE(Cache::IndexRange(*f.memory, 0x100000, 0x100400, 0, 0, 2).valid);
+    REQUIRE_FALSE(Cache::IndexRange(*f.memory, 0x900000, 0x900400, 0, 8, 2).valid);
+
+    // A vertex stream ends at its limit (inclusive), a native one after its size.
+    range = Cache::VertexRange(*f.memory, 0x100000, true, 0x1000ff, false, 0);
+    REQUIRE(range.valid);
+    REQUIRE(range.device_addr == 0x10000);
+    REQUIRE(range.size == 0x100);
+    range = Cache::VertexRange(*f.memory, 0x100100, true, 0, true, 0x80);
+    REQUIRE(range.device_addr == 0x10100);
+    REQUIRE(range.size == 0x80);
+    REQUIRE_FALSE(Cache::VertexRange(*f.memory, 0x100000, false, 0x1000ff, false, 0).valid);
+    REQUIRE_FALSE(Cache::VertexRange(*f.memory, 0x900000, true, 0x9000ff, false, 0).valid);
+    // A stream of 64 MiB or more stops where the mapping does.
+    range = Cache::VertexRange(*f.memory, 0x10f000, true, 0x10f000 + 0x4000000ULL - 1, false, 0);
+    REQUIRE(range.size == 0x1000);
+    REQUIRE_THROWS(Cache::VertexRange(*f.memory, 0x100000, true, 0, true, 0x100000000ULL));
+}
+
+TEST_CASE("Record buffer twins peek, resolve and encode without the update passes",
+          "[buffer_ports][v2_drawrec]") {
+    namespace R = VideoCommon::V2::Resolve;
+    Fixture f;
+    Tegra::Control::ChannelState state{0};
+    state.memory_manager = &*f.memory;
+    state.payload.emplace(f.system, *f.memory, state);
+    VideoCommon::BufferCacheChannelInfo channel{state};
+    VideoCommon::UniformBufferSizes sizes{};
+    channel.uniform_buffer_sizes = &sizes;
+    const auto id = Access::Add(*f.cache, 0x20000, 0x10000);
+    Access::UseChannel(*f.cache, channel);
+
+    // PeekBuffer: the holding buffer, a creation due, or no address.
+    REQUIRE(f.cache->PeekBuffer(0x20100, 0x100, false) == id);
+    REQUIRE_FALSE(static_cast<bool>(f.cache->PeekBuffer(0x2ff00, 0x200, false)));
+    REQUIRE(f.cache->PeekBuffer(0, 0x100, false) == VideoCommon::NULL_BUFFER_ID);
+
+    // A storage descriptor read through the view gives StorageBufferBinding's binding.
+    f.Descriptor(0x100040, 0x80);
+    const R::LiveView view{channel.maxwell3d};
+    bool multi_range = true;
+    const R::ResolvedSsbo ssbo =
+        f.cache->ResolveStorageBinding(view, 0, 0, 0, 0x100000, false, ~0U, multi_range);
+    const VideoCommon::Binding expected = f.Bind();
+    REQUIRE(ssbo.daddr == expected.device_addr);
+    REQUIRE(ssbo.gpu_addr == expected.gpu_addr);
+    REQUIRE(ssbo.size == expected.size);
+    // Disabled bindings resolve to nothing.
+    REQUIRE(f.cache->ResolveUniformBinding(view, 0, 3).size == 0);
+    REQUIRE_FALSE(f.cache->ResolveVertexBinding(view, 0).has_value());
+    REQUIRE_FALSE(f.cache->ResolveIndexBinding(view).valid);
+
+    // The record's bindings land in the channel state as the update passes leave them.
+    R::ResolvedDraw record;
+    record.h.stages[0] = true;
+    const std::array vertex{R::ResolvedVertex{
+        .slot = 2, .buffer = {id.index, 0}, .daddr = 0x20000, .size = 0x400, .stride = 16}};
+    record.h.vertex = record.Push(std::span<const R::ResolvedVertex>(vertex));
+    const std::array ubo{R::ResolvedUbo{
+        .stage = 0, .slot = 1, .daddr = 0x20400, .size = 0x100, .buffer = {id.index, 0}}};
+    record.h.ubo = record.Push(std::span<const R::ResolvedUbo>(ubo));
+    const std::array storage{R::ResolvedSsbo{.stage = 0, .index = 3, .written = 1,
+                                             .daddr = 0x20800, .gpu_addr = 0x100800,
+                                             .size = 0x40, .buffer = {id.index, 0}}};
+    record.h.ssbo = record.Push(std::span<const R::ResolvedSsbo>(storage));
+    channel.vertex_buffers[5] = {.device_addr = 0x20000, .size = 4, .buffer_id = id};
+    f.cache->EncodeGraphicsBindings(record);
+    REQUIRE(channel.vertex_buffers[2].device_addr == 0x20000);
+    REQUIRE(channel.vertex_buffers[2].buffer_id == id);
+    REQUIRE(channel.vertex_buffers[5].buffer_id == VideoCommon::NULL_BUFFER_ID);
+    REQUIRE(channel.uniform_buffers[0][1].device_addr == 0x20400);
+    REQUIRE(channel.enabled_storage_buffers[0] == (u64{1} << 3));
+    REQUIRE(channel.written_storage_buffers[0] == (u64{1} << 3));
+    REQUIRE(channel.storage_buffers[0][3].gpu_addr == 0x100800);
+
+    // A creation request applies as V2ApplyCreates does: the lookup creates.
+    VideoCommon::V2::Commit::Request create{};
+    create.kind = VideoCommon::V2::Commit::Kind::BufferCreate;
+    create.address = 0x40000;
+    create.size = 0x100;
+    const VideoCommon::BufferId created{f.cache->ApplyDrawRequest(create)};
+    REQUIRE(static_cast<bool>(created));
+    REQUIRE(f.cache->PeekBuffer(0x40000, 0x100, false) == created);
+}
+
 TEST_CASE("Draw cache buffer replay binds a uniform on the path its bind takes now",
           "[buffer_ports][v2_p4]") {
     // F2-X1: a recorded uniform is replayed only on the path BindHostGraphicsUniformBuffer

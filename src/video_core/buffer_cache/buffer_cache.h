@@ -1636,6 +1636,313 @@ VideoCommon::V2::DrawCache::BufferBind::Kind BufferCache<P>::UniformBindKind(
     return use_fast_buffer ? Kind::Version : Kind::Cached;
 }
 
+// Pipeline v2 P6 Step 0 (EDEN_NX2_V2_DRAWREC): pure twins and record appliers.
+
+template <class P>
+BufferId BufferCache<P>::PeekBuffer(DAddr device_addr, u32 size, bool sparse_compatible) const {
+    const u64 page = device_addr >> CACHING_PAGEBITS;
+    if (device_addr == 0 || page >= page_table.size()) {
+        return NULL_BUFFER_ID;
+    }
+    // F2-20: the owner's page table (FindBuffer's commit branch).
+    const BufferId found = page_table[page];
+    if (!found || !slot_buffers[found].IsInBounds(device_addr, size)) {
+        return BufferId{};
+    }
+    if constexpr (requires { slot_buffers[found].IsSparseCompatible(); }) {
+        if (sparse_compatible && !slot_buffers[found].IsSparseCompatible()) {
+            return BufferId{};
+        }
+    }
+    return found;
+}
+
+template <class P>
+V2::Commit::Request BufferCache<P>::MakeCreateRequest(DAddr device_addr, u32 size,
+                                                      bool sparse_compatible) const {
+    V2::Commit::Request request{};
+    request.kind = V2::Commit::Kind::BufferCreate;
+    request.resource = V2::Commit::Resource::Buffer;
+    request.address = device_addr;
+    request.size = size;
+    request.arg = sparse_compatible ? 1U : 0U;
+    const u64 begin = Common::AlignDown(device_addr, CACHING_PAGESIZE);
+    const u64 end = Common::AlignUp(device_addr + (std::max)(size, 1U), CACHING_PAGESIZE);
+    bool merges = false;
+    for (u64 at = begin; at < end && !merges; at += CACHING_PAGESIZE) {
+        merges = v2_pages->Load(at) != 0;
+    }
+    request.effects = V2::Commit::EffectCreate | (merges ? V2::Commit::EffectDelete : 0);
+    return request;
+}
+
+template <class P>
+template <class Memory>
+auto BufferCache<P>::IndexRange(Memory& memory, GPUVAddr begin, GPUVAddr end, u32 first,
+                                u32 count, u32 format_size) -> GeometryRange {
+    const std::optional<DAddr> device_addr = memory.GpuToCpuAddress(begin);
+    const u32 address_size = static_cast<u32>(end - begin);
+    const u32 draw_size = (count + first) * format_size;
+    const u32 size = (std::min)(address_size, draw_size);
+    if (size == 0 || !device_addr) {
+        return {};
+    }
+    return {*device_addr, size, true};
+}
+
+template <class P>
+template <class Memory>
+auto BufferCache<P>::VertexRange(Memory& memory, GPUVAddr begin, bool enabled,
+                                 GPUVAddr limit_address, bool native, u64 native_size)
+    -> GeometryRange {
+    if (native && enabled && native_size > (std::numeric_limits<u32>::max)()) {
+        throw std::runtime_error("Native vertex stream exceeds supported 32-bit buffer size");
+    }
+    const GPUVAddr end = native ? begin + native_size : limit_address + 1;
+    const std::optional<DAddr> device_addr = memory.GpuToCpuAddress(begin);
+    u32 size = static_cast<u32>(end - begin);
+    if (!enabled || size == 0 || !device_addr) {
+        return {};
+    }
+    if (!memory.IsWithinGPUAddressRange(end) || size >= 64_MiB) {
+        size = static_cast<u32>(memory.MaxContinuousRange(begin, size));
+    }
+    return {*device_addr, size, true};
+}
+
+template <class P>
+template <class View>
+V2::Resolve::ResolvedIndex BufferCache<P>::ResolveIndexBinding(const View& view) const {
+    // UpdateIndexBuffer: the draw state's index buffer is the registers' with the draw's
+    // first and count (DrawManager).
+    const auto& index_buffer = view.Regs().index_buffer;
+    const V2::Resolve::ViewDraw draw = view.Draw();
+    const GeometryRange range =
+        IndexRange(*gpu_memory, index_buffer.StartAddress(), index_buffer.EndAddress(),
+                   draw.first, draw.count, u32(index_buffer.FormatSizeInBytes()));
+    V2::Resolve::ResolvedIndex index{};
+    index.format = static_cast<u32>(index_buffer.format);
+    index.first = draw.first;
+    index.count = draw.count;
+    if (!range.valid) {
+        index.buffer = {NULL_BUFFER_ID.index, BufferGeneration(NULL_BUFFER_ID)};
+        return index;
+    }
+    const BufferId id = PeekBuffer(range.device_addr, range.size, false);
+    index.buffer = {id.index, BufferGeneration(id)};
+    index.daddr = range.device_addr;
+    index.size = range.size;
+    index.valid = true;
+    return index;
+}
+
+template <class P>
+template <class View>
+std::optional<V2::Resolve::ResolvedVertex> BufferCache<P>::ResolveVertexBinding(const View& view,
+                                                                                u32 slot) const {
+    const auto& regs = view.Regs();
+    const auto& array = regs.vertex_streams[slot];
+    const bool native = view.NativeTuring();
+    const u64 native_size = native ? regs.NativeVertexStreamSize(slot) : 0;
+    const GeometryRange range =
+        VertexRange(*gpu_memory, array.Address(), array.enable != 0,
+                    regs.vertex_stream_limits[slot].Address(), native, native_size);
+    if (!range.valid) {
+        return std::nullopt;
+    }
+    const BufferId id = PeekBuffer(range.device_addr, range.size, false);
+    V2::Resolve::ResolvedVertex vertex{};
+    vertex.slot = static_cast<u8>(slot);
+    vertex.buffer = {id.index, BufferGeneration(id)};
+    vertex.daddr = range.device_addr;
+    vertex.size = range.size;
+    vertex.stride = array.stride;
+    return vertex;
+}
+
+template <class P>
+template <class View>
+V2::Resolve::ResolvedUbo BufferCache<P>::ResolveUniformBinding(const View& view, size_t stage,
+                                                               u32 slot) const {
+    // BindGraphicsUniformBuffer at the constant buffer bind (R-10: translated at the draw), then
+    // UpdateUniformBuffers' lookup.
+    V2::Resolve::ResolvedUbo ubo{};
+    ubo.stage = static_cast<u8>(stage);
+    ubo.slot = static_cast<u8>(slot);
+    ubo.buffer = {NULL_BUFFER_ID.index, BufferGeneration(NULL_BUFFER_ID)};
+    const V2::Resolve::CbufBinding cbuf = view.Cbuf(stage, slot);
+    if (cbuf.enabled == 0) {
+        return ubo;
+    }
+    const std::optional<DAddr> device_addr = gpu_memory->GpuToCpuAddress(cbuf.address);
+    if (!device_addr) {
+        return ubo;
+    }
+    const BufferId id = PeekBuffer(*device_addr, cbuf.size, false);
+    ubo.daddr = *device_addr;
+    ubo.size = cbuf.size;
+    ubo.buffer = {id.index, BufferGeneration(id)};
+    return ubo;
+}
+
+template <class P>
+template <class View>
+V2::Resolve::ResolvedSsbo BufferCache<P>::ResolveStorageBinding(
+    const View& view, size_t stage, u32 ssbo_index, u32 cbuf_index, u32 cbuf_offset,
+    bool is_written, u32 indirect_offset, bool& multi_range) const {
+    V2::Resolve::ResolvedSsbo ssbo{};
+    ssbo.stage = static_cast<u8>(stage);
+    ssbo.index = static_cast<u8>(ssbo_index);
+    ssbo.written = is_written ? 1 : 0;
+    ssbo.table_pointer = indirect_offset != ~0U ? 1 : 0;
+    ssbo.buffer = {NULL_BUFFER_ID.index, BufferGeneration(NULL_BUFFER_ID)};
+    multi_range = false;
+    GPUVAddr ssbo_addr = view.Cbuf(stage, cbuf_index).address + cbuf_offset;
+    if (indirect_offset != ~0U) {
+        const GPUVAddr holder = gpu_memory->Read<u64>(ssbo_addr);
+        if (holder == 0) {
+            return ssbo;
+        }
+        ssbo_addr = holder + indirect_offset;
+    }
+    const Binding binding =
+        StorageBufferBinding(ssbo_addr, cbuf_index, is_written,
+                             view.NativeTuring() || indirect_offset != ~0U, indirect_offset != ~0U);
+    const BufferId id = PeekBuffer(binding.device_addr, binding.size, false);
+    ssbo.daddr = binding.device_addr;
+    ssbo.gpu_addr = binding.gpu_addr;
+    ssbo.size = binding.size;
+    ssbo.buffer = {id.index, BufferGeneration(id)};
+    if constexpr (requires { runtime.BindMultiRangeStorageBuffer(u64{}, bool{}); }) {
+        // ResolveMultiRangeStorage's test, through the range cache's pure peek: two or more
+        // segments (or a range it never walked) can't be resolved without walking it.
+        if (binding.gpu_addr != 0 && binding.size != 0 &&
+            (!is_written || runtime.PrefersSparseSources())) {
+            const VirtualSegments* const found =
+                virtual_ranges.Peek(*gpu_memory, binding.gpu_addr, binding.size);
+            multi_range = found == nullptr || found->size() >= 2;
+        }
+    }
+    return ssbo;
+}
+
+template <class P>
+V2::Resolve::ResolvedTbo BufferCache<P>::ResolveTextureBufferBinding(
+    size_t stage, u32 index, GPUVAddr gpu_addr, u32 size, PixelFormat format, bool is_written,
+    bool is_image) const {
+    V2::Resolve::ResolvedTbo tbo{};
+    tbo.stage = static_cast<u8>(stage);
+    tbo.index = static_cast<u8>(index);
+    tbo.written = is_written ? 1 : 0;
+    tbo.image = is_image ? 1 : 0;
+    tbo.gpu_addr = gpu_addr;
+    // GetTextureBufferBinding, then UpdateTextureBuffers' lookup.
+    const std::optional<DAddr> device_addr = gpu_memory->GpuToCpuAddress(gpu_addr);
+    if (!device_addr || size == 0) {
+        tbo.format = static_cast<u32>(PixelFormat::Invalid);
+        tbo.buffer = {NULL_BUFFER_ID.index, BufferGeneration(NULL_BUFFER_ID)};
+        return tbo;
+    }
+    const BufferId id = PeekBuffer(*device_addr, size, false);
+    tbo.daddr = *device_addr;
+    tbo.size = size;
+    tbo.format = static_cast<u32>(format);
+    tbo.buffer = {id.index, BufferGeneration(id)};
+    return tbo;
+}
+
+template <class P>
+u32 BufferCache<P>::ApplyDrawRequest(const V2::Commit::Request& request) {
+    if (request.kind != V2::Commit::Kind::BufferCreate) {
+        return request.slot;
+    }
+    // As V2ApplyCreates applies a creation: the lookup creates (joining what overlaps).
+    const bool proxy_finds = std::exchange(v2_proxy_finds, false);
+    const BufferId id =
+        FindBuffer(request.address, static_cast<u32>(request.size), request.arg != 0);
+    v2_proxy_finds = proxy_finds;
+    return id.index;
+}
+
+template <class P>
+void BufferCache<P>::EncodeGraphicsBindings(const V2::Resolve::ResolvedDraw& record) {
+    namespace R = V2::Resolve;
+    const auto binding_of = [](DAddr device_addr, u32 size, const V2::Versions::WeakRef& buffer) {
+        return Binding{
+            .device_addr = device_addr,
+            .size = size,
+            .buffer_id = BufferId{buffer.id},
+        };
+    };
+    BufferOperations([&]() {
+        graphics_segments.clear();
+        const R::DrawHeader& h = record.h;
+        if (h.indexed) {
+            channel_state->index_buffer =
+                h.index.valid ? binding_of(h.index.daddr, h.index.size, h.index.buffer)
+                              : NULL_BINDING;
+        }
+        // Every slot as UpdateVertexBuffer leaves it: the record's, NULL for disabled ones.
+        std::array<const R::ResolvedVertex*, NUM_VERTEX_BUFFERS> vertex{};
+        for (const R::ResolvedVertex& entry : record.Span<R::ResolvedVertex>(h.vertex)) {
+            if (entry.slot < NUM_VERTEX_BUFFERS) {
+                vertex[entry.slot] = &entry;
+            }
+        }
+        for (u32 index = 0; index < NUM_VERTEX_BUFFERS; ++index) {
+            const Binding binding = vertex[index] != nullptr
+                                        ? binding_of(vertex[index]->daddr, vertex[index]->size,
+                                                     vertex[index]->buffer)
+                                        : NULL_BINDING;
+            channel_state->vertex_buffers[index] = binding;
+            UpdateVertexBufferSlot(index, binding);
+        }
+        for (const R::ResolvedUbo& ubo : record.Span<R::ResolvedUbo>(h.ubo)) {
+            channel_state->uniform_buffers[ubo.stage][ubo.slot] =
+                ubo.buffer.id == NULL_BUFFER_ID.index && ubo.size == 0
+                    ? NULL_BINDING
+                    : binding_of(ubo.daddr, ubo.size, ubo.buffer);
+        }
+        for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
+            if (stage < h.stages.size() && h.stages[stage]) {
+                // UnbindGraphicsStorageBuffers / UnbindGraphicsTextureBuffers (no dynamic
+                // storage buffer limit under DRAWREC).
+                channel_state->enabled_storage_buffers[stage] = 0;
+                channel_state->written_storage_buffers[stage] = 0;
+                channel_state->enabled_texture_buffers[stage] = 0;
+                channel_state->written_texture_buffers[stage] = 0;
+                channel_state->image_texture_buffers[stage] = 0;
+            }
+        }
+        for (const R::ResolvedSsbo& ssbo : record.Span<R::ResolvedSsbo>(h.ssbo)) {
+            channel_state->enabled_storage_buffers[ssbo.stage] |= u64{1} << ssbo.index;
+            channel_state->written_storage_buffers[ssbo.stage] |= u64{ssbo.written} << ssbo.index;
+            Binding binding = binding_of(ssbo.daddr, ssbo.size, ssbo.buffer);
+            binding.gpu_addr = ssbo.gpu_addr;
+            if (ssbo.daddr == 0 && ssbo.size == 0) {
+                binding = NULL_BINDING;
+            }
+            channel_state->storage_buffers[ssbo.stage][ssbo.index] = binding;
+        }
+        for (const R::ResolvedTbo& tbo : record.Span<R::ResolvedTbo>(h.tbo)) {
+            channel_state->enabled_texture_buffers[tbo.stage] |= 1U << tbo.index;
+            channel_state->written_texture_buffers[tbo.stage] |= u32{tbo.written} << tbo.index;
+            if constexpr (SEPARATE_IMAGE_BUFFERS_BINDINGS) {
+                channel_state->image_texture_buffers[tbo.stage] |= u32{tbo.image} << tbo.index;
+            }
+            TextureBufferBinding binding{};
+            binding.device_addr = tbo.daddr;
+            binding.size = tbo.size;
+            binding.buffer_id = BufferId{tbo.buffer.id};
+            binding.format = static_cast<PixelFormat>(tbo.format);
+            channel_state->texture_buffers[tbo.stage][tbo.index] = binding;
+        }
+        auto& flags = maxwell3d->dirty.flags;
+        flags[Dirty::VertexBuffers] = false;
+        flags[Dirty::IndexBuffer] = false;
+    });
+}
+
 template <class P>
 void BufferCache<P>::ReplayGraphicsStorageBuffer(size_t stage, size_t ssbo_index,
                                                  DAddr device_addr, GPUVAddr gpu_addr, u32 size,
@@ -3250,20 +3557,18 @@ void BufferCache<P>::UpdateIndexBuffer() {
         return;
     }
 
-    const GPUVAddr gpu_addr_begin = index_buffer_ref.StartAddress();
-    const GPUVAddr gpu_addr_end = index_buffer_ref.EndAddress();
-    const std::optional<DAddr> device_addr = gpu_memory->GpuToCpuAddress(gpu_addr_begin);
-    const u32 address_size = static_cast<u32>(gpu_addr_end - gpu_addr_begin);
-    const u32 draw_size = (index_buffer_ref.count + index_buffer_ref.first) * u32(index_buffer_ref.FormatSizeInBytes());
-    const u32 size = (std::min)(address_size, draw_size);
-    if (size == 0 || !device_addr) {
+    const GeometryRange range =
+        IndexRange(*gpu_memory, index_buffer_ref.StartAddress(), index_buffer_ref.EndAddress(),
+                   index_buffer_ref.first, index_buffer_ref.count,
+                   u32(index_buffer_ref.FormatSizeInBytes()));
+    if (!range.valid) {
         channel_state->index_buffer = NULL_BINDING;
         return;
     }
     channel_state->index_buffer = Binding{
-        .device_addr = *device_addr,
-        .size = size,
-        .buffer_id = FindBuffer(*device_addr, size, false),
+        .device_addr = range.device_addr,
+        .size = range.size,
+        .buffer_id = FindBuffer(range.device_addr, range.size, false),
     };
 }
 
@@ -3287,28 +3592,20 @@ void BufferCache<P>::UpdateVertexBuffer(u32 index) {
     }
     const auto& array = maxwell3d->regs.vertex_streams[index];
     const auto& limit = maxwell3d->regs.vertex_stream_limits[index];
-    const GPUVAddr gpu_addr_begin = array.Address();
     const bool native = maxwell3d->GetNativeMacroEngine().native_turing;
     const u64 native_size = native ? maxwell3d->regs.NativeVertexStreamSize(index) : 0;
-    if (native && array.enable != 0 && native_size > (std::numeric_limits<u32>::max)()) {
-        throw std::runtime_error("Native vertex stream exceeds supported 32-bit buffer size");
-    }
-    const GPUVAddr gpu_addr_end = native ? gpu_addr_begin + native_size : limit.Address() + 1;
-    const std::optional<DAddr> device_addr = gpu_memory->GpuToCpuAddress(gpu_addr_begin);
-    const u32 address_size = static_cast<u32>(gpu_addr_end - gpu_addr_begin);
-    u32 size = address_size; // TODO: Analyze stride and number of vertices
-    if (array.enable == 0 || size == 0 || !device_addr) {
+    // TODO: Analyze stride and number of vertices
+    const GeometryRange range = VertexRange(*gpu_memory, array.Address(), array.enable != 0,
+                                            limit.Address(), native, native_size);
+    if (!range.valid) {
         channel_state->vertex_buffers[index] = NULL_BINDING;
         UpdateVertexBufferSlot(index, NULL_BINDING);
         return;
     }
-    if (!gpu_memory->IsWithinGPUAddressRange(gpu_addr_end) || size >= 64_MiB) {
-        size = static_cast<u32>(gpu_memory->MaxContinuousRange(gpu_addr_begin, size));
-    }
-    const BufferId buffer_id = FindBuffer(*device_addr, size, false);
+    const BufferId buffer_id = FindBuffer(range.device_addr, range.size, false);
     const Binding binding{
-        .device_addr = *device_addr,
-        .size = size,
+        .device_addr = range.device_addr,
+        .size = range.size,
         .buffer_id = buffer_id,
     };
     channel_state->vertex_buffers[index] = binding;
@@ -3754,17 +4051,7 @@ BufferId BufferCache<P>::FindBuffer(DAddr device_addr, u32 size, bool sparse_com
         // are owned (the owner, or under their locks), so it reads the owner's page table; the
         // published map (LookupBuffer) is the shard readers' copy of it.
         const BufferId found = page_table[page];
-        const bool usable = [&] {
-            if (!found || !slot_buffers[found].IsInBounds(device_addr, size)) {
-                return false;
-            }
-            if constexpr (requires { slot_buffers[found].IsSparseCompatible(); }) {
-                if (sparse_compatible && !slot_buffers[found].IsSparseCompatible()) {
-                    return false;
-                }
-            }
-            return true;
-        }();
+        const bool usable = static_cast<bool>(PeekBuffer(device_addr, size, sparse_compatible));
         auto& stats = V2::Commit::Stats::Get();
         if (commit->stats) {
             V2::Commit::Stats::Count(usable ? stats.lookup_hits : stats.lookup_misses);
@@ -3774,20 +4061,8 @@ BufferId BufferCache<P>::FindBuffer(DAddr device_addr, u32 size, bool sparse_com
             // address; the end of the update pass creates (joining whatever overlaps: a merge
             // resolves the proxy to the merged buffer, the offset comes from the address) and
             // patches it.
-            V2::Commit::Request request{};
-            request.kind = V2::Commit::Kind::BufferCreate;
-            request.resource = V2::Commit::Resource::Buffer;
-            request.address = device_addr;
-            request.size = size;
-            request.arg = sparse_compatible ? 1U : 0U;
-            const u64 begin = Common::AlignDown(device_addr, CACHING_PAGESIZE);
-            const u64 end = Common::AlignUp(device_addr + (std::max)(size, 1U), CACHING_PAGESIZE);
-            bool merges = false;
-            for (u64 at = begin; at < end && !merges; at += CACHING_PAGESIZE) {
-                merges = v2_pages->Load(at) != 0;
-            }
-            request.effects = V2::Commit::EffectCreate | (merges ? V2::Commit::EffectDelete : 0);
-            return BufferId{v2_creates.Push(request, true)};
+            return BufferId{
+                v2_creates.Push(MakeCreateRequest(device_addr, size, sparse_compatible), true)};
         }
         if (!usable && commit->stats) {
             V2::Commit::Stats::Count(
