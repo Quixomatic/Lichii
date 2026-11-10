@@ -2473,7 +2473,7 @@ void KeplerCompute::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& s
         }
         return true;
     };
-    const auto live = [&](auto& live_emit) {
+    const auto live = [&](auto& live_read, auto& live_emit) {
 #ifdef ARCHITECTURE_x86_64
         if (!macro.native_jit) {
             macro.native_jit = std::make_shared<TuringMacroJit>();
@@ -2481,10 +2481,10 @@ void KeplerCompute::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& s
         macro.native_jit->Prepare(macro.native_code, macro.native_code_generation);
         return macro.native_jit->Execute(start, fs.parameters,
                                          std::span<u32>{*macro.native_interpreter.active_dram},
-                                         read, live_emit);
+                                         live_read, live_emit);
 #else
-        return macro.native_interpreter.Execute(macro.native_code, start, fs.parameters, read,
-                                                live_emit);
+        return macro.native_interpreter.Execute(macro.native_code, start, fs.parameters,
+                                                live_read, live_emit);
 #endif
     };
     const VideoCommon::V2::Mode memo = VideoCommon::V2::Get(VideoCommon::V2::Switch::MacroMemo);
@@ -2517,7 +2517,7 @@ void KeplerCompute::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& s
         result = MacroMemo::Call(*fs.v2_memo, macro.native_interpreter, call, live, read, emit,
                                  no_dma);
     } else {
-        result = live(emit);
+        result = live(read, emit);
     }
     if (!result.success) {
         macro.native_execution_failed = true;

@@ -22,7 +22,7 @@ u64 Hash(u32 start, std::span<const u32> parameters) {
     return hash;
 }
 
-Memo::Memo() = default;
+Memo::Memo() : ways(Sets * 2) {}
 
 void Memo::Synchronize(u64 code_generation) {
     if (code_generation != generation) {
@@ -32,15 +32,73 @@ void Memo::Synchronize(u64 code_generation) {
     }
 }
 
-bool Memo::Wanted(u32 start) const {
-    const StartInfo& info = starts[start % starts.size()];
-    return info.start != start || !info.bypass;
+Memo::StartInfo& Memo::Info(u32 start) {
+    return starts[start % starts.size()];
+}
+
+bool Memo::MayUseDataRam(std::span<const u32> code, u32 start) {
+    // The instructions from `start` through the one after the first end bit (as Identify),
+    // with every branch and loop target inside them; else the code it reaches is unknown.
+    constexpr u32 MaxInstructions = 4096;
+    u32 last = start;
+    bool end_next = false;
+    for (u32 pc = start;; ++pc) {
+        if (pc >= start + MaxInstructions || size_t{pc} * 3 + 2 >= code.size()) {
+            return true;
+        }
+        last = pc;
+        if (end_next) {
+            break;
+        }
+        end_next = (code[size_t{pc} * 3 + 2] & 1) != 0;
+    }
+    for (u32 pc = start; pc <= last; ++pc) {
+        const std::array<u32, 3> bits{code[size_t{pc} * 3 + 2], code[size_t{pc} * 3 + 1],
+                                      code[size_t{pc} * 3]};
+        const auto d = Tegra::TuringMacroInterpreter::Decode(bits);
+        for (u32 lane = 0; lane < 2; ++lane) {
+            const u32 op = d.op[lane];
+            const u32 imm = d.imm[lane];
+            if (op == 30 || op == 31) {
+                return true; // DREAD / DWRITE
+            }
+            s64 target = pc;
+            if (op == 23) {
+                target = s64{pc} + imm - 1; // loop end
+            } else if (op == 24) {
+                target = s64{pc} + (imm & 0x7fff);
+            } else if (op >= 25 && op <= 29) {
+                const s32 offset = static_cast<s32>(imm << 19) >> 19;
+                target = offset == -4096 ? pc : s64{pc} + offset;
+            }
+            if (target < start || target > last) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+bool Memo::Wanted(u32 start, std::span<const u32> code) {
+    StartInfo& info = Info(start);
+    if (info.start != start) [[unlikely]] {
+        info = StartInfo{.start = start, .jit_recordable = !MayUseDataRam(code, start)};
+    }
+    if (info.never) {
+        return false;
+    }
+    if (info.bypass_left != 0) {
+        --info.bypass_left;
+        return false;
+    }
+    return true;
 }
 
 size_t Memo::RecordWords(const u32* header) {
-    // start, parameters, reads, data RAM reads, data RAM writes, writes, DMA reads, DMA words.
-    return HeaderWords + header[1] + size_t{3} * header[2] +
-           size_t{2} * (header[3] + header[4] + header[5] + header[6]) + header[7];
+    // start, parameters, guards, reads, data RAM reads, data RAM writes, writes, DMA reads, DMA
+    // words.
+    return HeaderWords + header[1] + size_t{2} * header[2] + size_t{3} * header[3] +
+           size_t{2} * (header[4] + header[5] + header[6] + header[7]) + header[8];
 }
 
 bool Memo::Match(u32 offset, u32 start, std::span<const u32> parameters, const u32* regs,
@@ -52,66 +110,90 @@ bool Memo::Match(u32 offset, u32 start, std::span<const u32> parameters, const u
         return false;
     }
     const u32* it = header + HeaderWords + header[1];
-    record.reads = {it, size_t{3} * header[2]};
-    for (size_t i = 0; i < record.reads.size(); i += 3) {
-        const u32 address = record.reads[i];
-        if (address == stale_register ||
-            (address < num_regs ? regs[address] : 0U) != record.reads[i + 1]) {
+    // Each register the call read, once (Store kept those below num_regs: the rest read 0).
+    const u32* const guards_end = it + size_t{2} * header[2];
+    for (const u32* guard = it; guard != guards_end; guard += 2) {
+        if (regs[guard[0]] != guard[1] || guard[0] == stale_register) {
             return false;
         }
     }
+    it = guards_end;
+    if (header[4] != 0) [[unlikely]] {
+        const u32* const dram_reads = it + size_t{3} * header[3];
+        for (size_t i = 0; i < size_t{2} * header[4]; i += 2) {
+            const u32 index = dram_reads[i];
+            if (index >= dram.size() || dram[index] != dram_reads[i + 1]) {
+                return false;
+            }
+        }
+    }
+    record.guards = {header + HeaderWords + header[1], size_t{2} * header[2]};
+    record.reads = {it, size_t{3} * header[3]};
     it += record.reads.size();
-    record.dram_reads = {it, size_t{2} * header[3]};
-    for (size_t i = 0; i < record.dram_reads.size(); i += 2) {
-        const u32 index = record.dram_reads[i];
-        if (index >= dram.size() || dram[index] != record.dram_reads[i + 1]) {
-            return false;
-        }
-    }
+    record.dram_reads = {it, size_t{2} * header[4]};
     it += record.dram_reads.size();
-    record.dram_writes = {it, size_t{2} * header[4]};
+    record.dram_writes = {it, size_t{2} * header[5]};
     it += record.dram_writes.size();
-    record.writes = {it, size_t{2} * header[5]};
+    record.writes = {it, size_t{2} * header[6]};
     it += record.writes.size();
-    record.dma = {it, size_t{2} * header[6]};
+    record.dma = {it, size_t{2} * header[7]};
     it += record.dma.size();
-    record.dma_words = {it, header[7]};
+    record.dma_words = {it, header[8]};
     return true;
 }
 
-bool Memo::Find(u32 start, std::span<const u32> parameters, const u32* regs, size_t num_regs,
-                std::span<const u32> dram, Record& record, u32 stale_register) {
-    StartInfo& info = starts[start % starts.size()];
-    // Many calls repeat the macro's previous call: try its record before hashing.
-    if (info.start == start && info.last != NoRecord &&
+bool Memo::Find(u64 key, u32 start, std::span<const u32> parameters, const u32* regs,
+                size_t num_regs, std::span<const u32> dram, Record& record,
+                u32 stale_register) {
+    StartInfo& info = Info(start);
+    // Many calls repeat the macro's previous call: try its record before the table.
+    if (info.last != NoRecord &&
         Match(info.last, start, parameters, regs, num_regs, dram, record, stale_register)) {
         ++statistics.slot_hits;
         return true;
     }
-    const auto it = entries.find(Hash(start, parameters));
-    if (it == entries.end()) {
-        ++statistics.misses;
-        return false;
+    Way* const set = ways.data() + (key & (Sets - 1)) * 2;
+    bool keyed = false;
+    for (size_t way = 0; way < 2; ++way) {
+        if (set[way].key != key || set[way].offset == NoRecord) {
+            continue;
+        }
+        keyed = true;
+        if (set[way].offset != info.last &&
+            Match(set[way].offset, start, parameters, regs, num_regs, dram, record,
+                  stale_register)) {
+            info.last = set[way].offset;
+            if (way != 0) {
+                std::swap(set[0], set[1]); // way 0: the most recently used
+            }
+            return true;
+        }
     }
-    if (!Match(it->second, start, parameters, regs, num_regs, dram, record, stale_register)) {
-        ++statistics.guard_failures; // or another call with the same hash
-        return false;
-    }
-    if (info.start == start) {
-        info.last = it->second;
-    }
-    return true;
+    ++(keyed ? statistics.guard_failures : statistics.misses);
+    return false;
 }
 
-void Memo::Store(u32 start, std::span<const u32> parameters, const Trace& recorded,
+void Memo::Store(u64 key, u32 start, std::span<const u32> parameters, const Trace& recorded,
                  std::span<const std::pair<u32, u32>> dram_reads,
-                 std::span<const std::pair<u32, u32>> dram_writes) {
+                 std::span<const std::pair<u32, u32>> dram_writes, size_t num_regs) {
     ++statistics.stores;
-    const u64 hash = Hash(start, parameters);
+    // Guards: each register read before any write of the call, once (a read after its own
+    // write made the call unmemoisable), within the register file (the rest read as 0).
+    guard_scratch.clear();
+    for (const Trace::Read& read : recorded.reads) {
+        if (read.address < num_regs &&
+            std::ranges::find(guard_scratch, read.address, &std::pair<u32, u32>::first) ==
+                guard_scratch.end()) {
+            guard_scratch.emplace_back(read.address, read.value);
+        }
+    }
+    // The full read trace only serves an interpreter finish after a refetched DMA read.
+    const size_t reads = recorded.dma.empty() ? 0 : recorded.reads.size();
     const std::array<u32, HeaderWords> header{
         start,
         static_cast<u32>(parameters.size()),
-        static_cast<u32>(recorded.reads.size()),
+        static_cast<u32>(guard_scratch.size()),
+        static_cast<u32>(reads),
         static_cast<u32>(dram_reads.size()),
         static_cast<u32>(dram_writes.size()),
         static_cast<u32>(recorded.writes.size()),
@@ -119,27 +201,39 @@ void Memo::Store(u32 start, std::span<const u32> parameters, const Trace& record
         static_cast<u32>(recorded.dma_words.size()),
     };
     const size_t words = RecordWords(header.data());
+    // The least recently used way takes it (way 0 is the most recently used): a key whose
+    // context just failed keeps that one too, so a macro alternating between two register
+    // contexts hits both.
+    Way* set = ways.data() + (key & (Sets - 1)) * 2;
+    const size_t way = set[0].offset == NoRecord ? 0 : 1;
     u32 offset;
-    // A call stored again (its reads no longer held) usually has the same shape: rewrite its
-    // record in place, or the arena fills with stale copies.
-    if (const auto it = entries.find(hash); it != entries.end() &&
-                                            arena[it->second] == start &&
-                                            RecordWords(arena.data() + it->second) == words) {
-        offset = it->second;
+    // A record replaced by one of the same size is rewritten in place (no stale copies).
+    if (set[way].offset != NoRecord && RecordWords(arena.data() + set[way].offset) == words) {
+        offset = set[way].offset;
     } else {
         if (arena.size() + words > MaxArenaWords) {
             Compact();
+            set = ways.data() + (key & (Sets - 1)) * 2;
         }
         offset = static_cast<u32>(arena.size());
         arena.resize(arena.size() + words);
-        entries.insert_or_assign(hash, offset);
+    }
+    // A StartInfo::last left on a replaced record stays harmless: Match checks its start and
+    // parameters, and a record left in the arena still holds for the code it was made with.
+    set[way] = Way{key, offset};
+    if (way != 0) {
+        std::swap(set[0], set[1]);
     }
     u32* out = std::copy(header.begin(), header.end(), arena.data() + offset);
     out = std::copy(parameters.begin(), parameters.end(), out);
-    for (const Trace::Read& read : recorded.reads) {
-        *out++ = read.address;
-        *out++ = read.value;
-        *out++ = read.writes_before;
+    for (const auto& [address, value] : guard_scratch) {
+        *out++ = address;
+        *out++ = value;
+    }
+    for (size_t i = 0; i < reads; ++i) {
+        *out++ = recorded.reads[i].address;
+        *out++ = recorded.reads[i].value;
+        *out++ = recorded.reads[i].writes_before;
     }
     for (const auto pairs : {dram_reads, dram_writes}) {
         for (const auto& [index, value] : pairs) {
@@ -156,33 +250,51 @@ void Memo::Store(u32 start, std::span<const u32> parameters, const Trace& record
         *out++ = dma.words;
     }
     std::copy(recorded.dma_words.begin(), recorded.dma_words.end(), out);
-    StartInfo& info = starts[start % starts.size()];
-    if (info.start != start) {
-        info = StartInfo{.start = start};
+    StartInfo& info = Info(start);
+    if (info.start == start) {
+        info.last = offset;
     }
-    info.last = offset;
 }
 
 void Memo::NoteOutcome(u32 start, bool hit, bool stored) {
-    StartInfo& info = starts[start % starts.size()];
+    StartInfo& info = Info(start);
     if (info.start != start) {
-        info = StartInfo{.start = start};
+        return; // Wanted sets it up first
     }
+    ++info.calls;
     if (hit) {
         ++info.hits;
+        ++info.lifetime_hits;
         info.unstored = 0;
+    } else {
+        info.unstored = stored ? 0 : info.unstored + 1;
+        // Calls that can't be stored never pay for their recordings.
+        if (info.unstored >= 16 && info.lifetime_hits == 0) {
+            info.never = true;
+            return;
+        }
+    }
+    if (info.calls < Window) {
         return;
     }
-    ++info.other;
-    info.unstored = stored ? 0 : info.unstored + 1;
-    // Recording runs the interpreter: give up on macros whose calls can't be stored or rarely
-    // repeat (until the code changes).
-    info.bypass = (info.unstored >= 16 && info.hits == 0) ||
-                  (info.other >= 1024 && u64{info.hits} * 8 < info.other);
+    // A hit saves a JIT run; a miss or guard failure costs a recording (a JIT run with callbacks,
+    // or the interpreter for code that may touch data RAM) and a store. Below the break-even
+    // hit rate the macro runs on the JIT for a while, then the memo tries again.
+    const u64 needed = info.jit_recordable ? Window * 3 / 5 : Window * 17 / 20;
+    if (info.hits < needed) {
+        info.bypass_left = BypassCalls;
+    }
+    info.calls = 0;
+    info.hits = 0;
+}
+
+size_t Memo::Size() const {
+    return static_cast<size_t>(std::ranges::count_if(
+        ways, [](const Way& way) { return way.offset != NoRecord; }));
 }
 
 void Memo::Clear() {
-    entries.clear();
+    std::ranges::fill(ways, Way{});
     arena.clear();
     for (StartInfo& info : starts) {
         info.last = NoRecord;
@@ -191,13 +303,16 @@ void Memo::Clear() {
 }
 
 void Memo::Compact() {
-    // Copies the records still in the map: a call stored again with another shape left its old
-    // record behind. Clears only when the live records alone would fill most of it.
+    // Copies the records still in the table: a record replaced by one of another size was left
+    // behind. Clears only when the live records alone would fill most of it.
     compacted.clear();
-    for (auto& entry : entries) {
-        const u32* const record = arena.data() + entry.second;
+    for (Way& way : ways) {
+        if (way.offset == NoRecord) {
+            continue;
+        }
+        const u32* const record = arena.data() + way.offset;
         const size_t words = RecordWords(record);
-        entry.second = static_cast<u32>(compacted.size());
+        way.offset = static_cast<u32>(compacted.size());
         compacted.insert(compacted.end(), record, record + words);
     }
     arena.swap(compacted);
@@ -236,23 +351,35 @@ void LogRecordFailure(u32 start, std::string_view error) {
 } // namespace Detail
 
 void CallStats::Note(const char* engine, u32 start, std::span<const u32> parameters,
-                     std::span<const u32> code, u64 code_generation, const Statistics* memo) {
+                     std::span<const u32> code, u64 code_generation, const Statistics* memo,
+                     u64 key) {
     if (code_generation != generation) {
         Fold();
+        by_start.fill({}); // the identities belong to the old code
         generation = code_generation;
     }
-    auto [it, inserted] = by_start.try_emplace(start);
-    if (inserted) {
-        it->second.hash = MacroHle::Identify(code, start).hash;
+    StartCounts& counts = by_start[start % by_start.size()];
+    if (counts.start != start) [[unlikely]] {
+        if (counts.start != ~0U && counts.counts.calls != 0) {
+            // Another start's counts so far, folded under its hash.
+            Counts& folded = by_hash[counts.counts.hash];
+            folded.hash = counts.counts.hash;
+            folded.calls += counts.counts.calls;
+            folded.repeats += counts.counts.repeats;
+        }
+        counts.start = start;
+        counts.counts = Counts{.hash = MacroHle::Identify(code, start).hash};
     }
-    const u64 key = Hash(start, parameters);
+    if (key == 0) {
+        key = Hash(start, parameters);
+    }
     u64& slot = recent[key % recent.size()];
     const bool repeat = slot == key;
     slot = key;
-    ++it->second.calls;
+    ++counts.counts.calls;
     ++calls;
     if (repeat) {
-        ++it->second.repeats;
+        ++counts.counts.repeats;
         ++repeats;
     }
     if ((calls & 4095) != 0) {
@@ -274,13 +401,17 @@ void CallStats::Note(const char* engine, u32 start, std::span<const u32> paramet
 }
 
 void CallStats::Fold() {
-    for (const auto& [start, counts] : by_start) {
-        Counts& folded = by_hash[counts.hash];
-        folded.hash = counts.hash;
-        folded.calls += counts.calls;
-        folded.repeats += counts.repeats;
+    for (StartCounts& slot : by_start) {
+        if (slot.start == ~0U || slot.counts.calls == 0) {
+            continue;
+        }
+        Counts& folded = by_hash[slot.counts.hash];
+        folded.hash = slot.counts.hash;
+        folded.calls += slot.counts.calls;
+        folded.repeats += slot.counts.repeats;
+        slot.counts.calls = 0;
+        slot.counts.repeats = 0;
     }
-    by_start.clear();
 }
 
 void CallStats::Report(const char* engine, const Statistics* memo, double seconds) {
@@ -304,13 +435,15 @@ void CallStats::Report(const char* engine, const Statistics* memo, double second
         text += fmt::format(
             " | memo: hits {:.0f} ({:.1f}% of calls, {:.0f} on the last record), misses {:.0f}, "
             "guard failures {:.0f}, unmemoisable {:.0f}, JIT only {:.0f}, DMA refetches {:.0f}, "
-            "stores {:.0f}, verified {:.0f} ({:.0f} mismatches), clears {:.0f}",
+            "stores {:.0f}, JIT recordings {:.0f}, verified {:.0f} ({:.0f} mismatches), "
+            "clears {:.0f}",
             delta(&Statistics::hits),
             percent(memo->hits - memo_start.hits, memo->calls - memo_start.calls),
             delta(&Statistics::slot_hits), delta(&Statistics::misses),
             delta(&Statistics::guard_failures), delta(&Statistics::unmemoisable),
             delta(&Statistics::bypassed), delta(&Statistics::refetches),
-            delta(&Statistics::stores), delta(&Statistics::verified),
+            delta(&Statistics::stores), delta(&Statistics::jit_records),
+            delta(&Statistics::verified),
             delta(&Statistics::verify_mismatches), delta(&Statistics::clears));
     }
     text += " | top:";

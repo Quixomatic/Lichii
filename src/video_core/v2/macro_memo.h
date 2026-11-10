@@ -63,7 +63,8 @@ struct Trace {
 
 /// A stored call; the spans point into the memo and stay valid until the next Store.
 struct Record {
-    std::span<const u32> reads;       ///< (address, value, writes_before)
+    std::span<const u32> guards;      ///< (address, value): each register read once, in range
+    std::span<const u32> reads;       ///< (address, value, writes_before); calls with DMA only
     std::span<const u32> dram_reads;  ///< (index, value)
     std::span<const u32> dram_writes; ///< (index, value) in order
     std::span<const u32> writes;      ///< (method, value) in order
@@ -80,6 +81,7 @@ struct Statistics {
     u64 unmemoisable{};
     u64 bypassed{}; ///< Calls of macros the memo gave up on (JIT only)
     u64 stores{};
+    u64 jit_records{}; ///< Recordings the JIT made (code that can't touch data RAM)
     u64 refetches{}; ///< Hits whose DMA read returned other words
     u64 verified{};
     u64 verify_mismatches{};
@@ -89,63 +91,88 @@ struct Statistics {
 /// The key's hash (also the exact-repeat statistic's).
 [[nodiscard]] u64 Hash(u32 start, std::span<const u32> parameters);
 
+/// Fix F3F5b-3 (report 7833a32: Find 5.5% + Match 1.5% of the front, 41k guard failures/s):
+/// the key (start, parameters) is hashed once per call; records sit in a direct-mapped table of
+/// two-way sets indexed by it (no map, no scan), each way holding the full key as its
+/// fingerprint, so a probe compares two keys and then only the record whose key matched; Match
+/// compares the parameters and the deduplicated registers the call read (its guards), not the
+/// read trace. Two ways keep two register contexts of one key (a macro alternating between two
+/// states no longer re-records on every call). Misses of code that can't touch data RAM are
+/// recorded by the JIT; macros whose records keep failing are left to the JIT for a while.
 class Memo {
 public:
     Memo();
 
     /// Forgets every call when the macro code is no longer the code they ran.
     void Synchronize(u64 code_generation);
-    /// Whether calls of the macro at `start` go through the memo: not when it keeps missing or
-    /// its calls can't be stored (the interpreter's recording costs more than the JIT).
-    [[nodiscard]] bool Wanted(u32 start) const;
+    /// Whether calls of the macro at `start` (in `code`) go through the memo: not when its calls
+    /// can't be stored, or while its hit rate doesn't pay for the recordings.
+    [[nodiscard]] bool Wanted(u32 start, std::span<const u32> code);
+    /// Whether misses of the macro at `start` may be recorded by the JIT (its code can't read or
+    /// write data RAM: the JIT doesn't report those). Valid after Wanted.
+    [[nodiscard]] bool JitRecordable(u32 start) const {
+        const StartInfo& info = starts[start % starts.size()];
+        return info.start == start && info.jit_recordable;
+    }
     /// An earlier call with this key whose reads still hold (`regs[address]`, or 0 past
-    /// `num_regs`, as the engines' MME STATE reads; `dram` words).
-    [[nodiscard]] bool Find(u32 start, std::span<const u32> parameters, const u32* regs,
+    /// `num_regs`, as the engines' MME STATE reads; `dram` words). `key`: Hash(start, parameters).
+    [[nodiscard]] bool Find(u64 key, u32 start, std::span<const u32> parameters, const u32* regs,
                             size_t num_regs, std::span<const u32> dram, Record& record,
                             u32 stale_register = ~0U);
-    void Store(u32 start, std::span<const u32> parameters, const Trace& recorded,
+    void Store(u64 key, u32 start, std::span<const u32> parameters, const Trace& recorded,
                std::span<const std::pair<u32, u32>> dram_reads,
-               std::span<const std::pair<u32, u32>> dram_writes);
+               std::span<const std::pair<u32, u32>> dram_writes, size_t num_regs);
     /// After each call through the memo: decides Wanted.
     void NoteOutcome(u32 start, bool hit, bool stored);
 
-    [[nodiscard]] size_t Size() const {
-        return entries.size();
-    }
+    /// Records in the table.
+    [[nodiscard]] size_t Size() const;
+
+    /// Whether the macro at `start` may read or write data RAM (DREAD/DWRITE in any lane of
+    /// the code it can reach; true when its branches leave the code it was scanned in).
+    [[nodiscard]] static bool MayUseDataRam(std::span<const u32> code, u32 start);
 
     Statistics statistics;
     Trace trace;                     ///< The recording run's (reused)
     std::vector<u32> appended;       ///< Words each replayed DMA read appended (reused)
     Pairs captured;                  ///< Verify: the JIT's writes (reused)
     std::vector<u32> captured_words; ///< Verify: its DMA words (reused)
+    std::vector<std::pair<u32, u32>> guard_scratch; ///< Store's deduplicated reads (reused)
 
 private:
-    struct Identity {
-        using is_avalanching = std::true_type;
-        size_t operator()(u64 key) const noexcept {
-            return static_cast<size_t>(key);
-        }
-    };
     static constexpr u32 NoRecord = ~0U;
     struct StartInfo {
         u32 start{~0U};
         u32 last{NoRecord}; ///< Offset of the last record found or stored
-        u32 hits{};
-        u32 other{};    ///< Calls that were no hit
-        u32 unstored{}; ///< Unmemoisable calls in a row
-        bool bypass{};
+        u32 hits{};         ///< In the current window
+        u32 calls{};        ///< Calls through the memo in the current window
+        u32 unstored{};     ///< Unmemoisable calls in a row
+        u32 lifetime_hits{};
+        u32 bypass_left{}; ///< Calls left to the JIT before the memo tries again
+        bool never{};      ///< Gave up until the code changes (calls can't be stored)
+        bool jit_recordable{};
     };
-    static constexpr size_t HeaderWords = 8;
+    struct Way {
+        u64 key{};
+        u32 offset{NoRecord};
+    };
+    static constexpr size_t Sets = 4096;
+    static constexpr size_t Window = 2048;   ///< Calls per hit-rate decision
+    static constexpr u32 BypassCalls = 32768; ///< Calls left to the JIT after a poor window
+    // Header: start, parameters, guards, reads, data RAM reads, data RAM writes, writes,
+    // DMA reads, DMA words.
+    static constexpr size_t HeaderWords = 9;
     static constexpr size_t MaxArenaWords = size_t{1} << 22;
 
     [[nodiscard]] bool Match(u32 offset, u32 start, std::span<const u32> parameters,
                              const u32* regs, size_t num_regs, std::span<const u32> dram,
                              Record& record, u32 stale_register) const;
     [[nodiscard]] static size_t RecordWords(const u32* header);
+    [[nodiscard]] StartInfo& Info(u32 start);
     void Clear();
     void Compact();
 
-    std::unordered_map<u64, u32, Identity> entries;
+    std::vector<Way> ways; ///< Sets x 2; way 0 the most recently used of its set
     std::vector<u32> arena;
     std::vector<u32> compacted;
     std::array<StartInfo, 256> starts{};
@@ -169,6 +196,8 @@ struct CallInfo {
     /// A register whose value in `regs` may be stale (~0: none): a record that read it is a
     /// guard failure, and the recording's `read` gets the current value.
     u32 stale_register = ~0U;
+    /// Hash(start, parameters) when the caller has it (0: Call computes it).
+    u64 key = 0;
 };
 
 namespace Detail {
@@ -177,13 +206,15 @@ void LogVerifyMismatch(u32 start, std::span<const u32> record_writes,
 void LogRecordFailure(u32 start, std::string_view error);
 } // namespace Detail
 
-/// Runs the interpreter for a call, recording it, with the first `prefix` writes already made
-/// (their reads served from `served`, their DMA words already in the FIFO, `prefix_words`
-/// each). Stores the call if it can be.
-template <typename Read, typename Write, typename Dma>
+/// Runs a call recording it, with the first `prefix` writes already made (their reads served
+/// from `served`, their DMA words already in the FIFO, `prefix_words` each): the interpreter,
+/// or `live(read, emit)` (the JIT) for a whole call of code that can't touch data RAM. Stores
+/// the call if it can be.
+template <typename Live, typename Read, typename Write, typename Dma>
 Result RecordCall(Memo& memo, Tegra::TuringMacroInterpreter& interpreter, const CallInfo& call,
-                  size_t num_parameters, size_t prefix, std::span<const u32> served,
-                  std::span<const u32> prefix_words, Read& read, Write& write, Dma& dma) {
+                  u64 key, size_t num_parameters, size_t prefix, std::span<const u32> served,
+                  std::span<const u32> prefix_words, Live& live, Read& read, Write& write,
+                  Dma& dma) {
     Trace& trace = memo.trace;
     trace.Clear();
     std::vector<u32>& fifo = *call.fifo;
@@ -243,27 +274,42 @@ Result RecordCall(Memo& memo, Tegra::TuringMacroInterpreter& interpreter, const 
         }
         return true;
     };
-    // The JIT reads never-written MME registers as 0; so does the recording.
-    interpreter.allow_uninitialized = true;
-    const Result result = interpreter.Execute(call.code, call.start, fifo, read_fn, emit_fn);
-    interpreter.allow_uninitialized = false;
-    const bool stored = result.success && trace.memoisable && !interpreter.reread_data_ram &&
-                        *call.generation == generation;
-    if (stored) {
-        memo.Store(call.start, std::span<const u32>{fifo.data(), num_parameters}, trace,
-                   interpreter.data_ram_reads, interpreter.data_ram_writes);
-    } else if (result.success) {
-        ++memo.statistics.unmemoisable;
+    Result result;
+    bool stored;
+    if (prefix == 0 && memo.JitRecordable(call.start)) {
+        // No data RAM access in the code: the JIT's register reads and writes are all of it.
+        ++memo.statistics.jit_records;
+        result = live(read_fn, emit_fn);
+        stored = result.success && trace.memoisable && *call.generation == generation;
+        if (stored) {
+            memo.Store(key, call.start, std::span<const u32>{fifo.data(), num_parameters},
+                       trace, {}, {}, call.num_regs);
+        }
     } else {
+        // The JIT reads never-written MME registers as 0; so does the recording.
+        interpreter.allow_uninitialized = true;
+        result = interpreter.Execute(call.code, call.start, fifo, read_fn, emit_fn);
+        interpreter.allow_uninitialized = false;
+        stored = result.success && trace.memoisable && !interpreter.reread_data_ram &&
+                 *call.generation == generation;
+        if (stored) {
+            memo.Store(key, call.start, std::span<const u32>{fifo.data(), num_parameters},
+                       trace, interpreter.data_ram_reads, interpreter.data_ram_writes,
+                       call.num_regs);
+        }
+    }
+    if (!stored && result.success) {
+        ++memo.statistics.unmemoisable;
+    } else if (!result.success) {
         Detail::LogRecordFailure(call.start, result.error);
     }
     memo.NoteOutcome(call.start, false, stored);
     return result;
 }
 
-/// A macro call through the memo. `live(emit)` runs it the old way (the JIT) with `emit`;
-/// `read(address)` is the MME STATE read; `write(method, value)` the front's write of a macro
-/// method (false: not one); `dma(method, value)` the MME DMA read that write starts.
+/// A macro call through the memo. `live(read, emit)` runs it the old way (the JIT) with those
+/// callbacks; `read(address)` is the MME STATE read; `write(method, value)` the front's write of
+/// a macro method (false: not one); `dma(method, value)` the MME DMA read that write starts.
 template <typename Live, typename Read, typename Write, typename Dma>
 Result Call(Memo& memo, Tegra::TuringMacroInterpreter& interpreter, const CallInfo& call,
             Live&& live, Read&& read, Write&& write, Dma&& dma) {
@@ -278,15 +324,17 @@ Result Call(Memo& memo, Tegra::TuringMacroInterpreter& interpreter, const CallIn
         }
         return true;
     };
-    if (!memo.Wanted(call.start)) {
+    if (!memo.Wanted(call.start, call.code)) {
         ++memo.statistics.bypassed;
-        return live(live_emit);
+        return live(read, live_emit);
     }
     const size_t num_parameters = fifo.size();
+    const u64 key = call.key != 0 ? call.key : Hash(call.start, fifo);
     Record record;
-    if (!memo.Find(call.start, fifo, call.regs, call.num_regs, call.dram, record,
+    if (!memo.Find(key, call.start, fifo, call.regs, call.num_regs, call.dram, record,
                    call.stale_register)) {
-        return RecordCall(memo, interpreter, call, num_parameters, 0, {}, {}, read, write, dma);
+        return RecordCall(memo, interpreter, call, key, num_parameters, 0, {}, {}, live, read,
+                          write, dma);
     }
     if (call.verify) {
         // The JIT makes the writes; the record must have predicted them.
@@ -305,7 +353,7 @@ Result Call(Memo& memo, Tegra::TuringMacroInterpreter& interpreter, const CallIn
             }
             return true;
         };
-        const Result result = live(capture);
+        const Result result = live(read, capture);
         ++memo.statistics.hits;
         ++memo.statistics.verified;
         const bool same_words = std::ranges::equal(memo.captured_words, record.dma_words);
@@ -357,8 +405,8 @@ Result Call(Memo& memo, Tegra::TuringMacroInterpreter& interpreter, const CallIn
             ++memo.statistics.refetches;
             const std::vector<u32> served{record.reads.begin(), record.reads.end()};
             const std::vector<u32> prefix_words = memo.appended;
-            return RecordCall(memo, interpreter, call, num_parameters, i + 1, served,
-                              prefix_words, read, write, dma);
+            return RecordCall(memo, interpreter, call, key, num_parameters, i + 1, served,
+                              prefix_words, live, read, write, dma);
         }
         word_offset += words;
         ++next_dma;
@@ -375,9 +423,11 @@ Result Call(Memo& memo, Tegra::TuringMacroInterpreter& interpreter, const CallIn
 /// and parameters), logged every 10 s with the memo's counters.
 class CallStats {
 public:
-    /// `engine` names the log line; `code` identifies new starts.
+    /// `engine` names the log line; `code` identifies new starts. `key`: Hash(start,
+    /// parameters) when the caller has it (0: computed here).
     void Note(const char* engine, u32 start, std::span<const u32> parameters,
-              std::span<const u32> code, u64 code_generation, const Statistics* memo);
+              std::span<const u32> code, u64 code_generation, const Statistics* memo,
+              u64 key = 0);
 
 private:
     struct Counts {
@@ -385,10 +435,16 @@ private:
         u64 calls{};
         u64 repeats{};
     };
+    struct StartCounts {
+        u32 start{~0U};
+        Counts counts;
+    };
     void Fold();
     void Report(const char* engine, const Statistics* memo, double seconds);
 
-    std::unordered_map<u32, Counts> by_start;
+    /// Counts by start, direct-mapped (F3F5b-3: no map lookup per call); a start that takes
+    /// another's slot folds the old one's counts first.
+    std::array<StartCounts, 256> by_start{};
     std::unordered_map<u64, Counts> by_hash; ///< Folded at code changes and reports
     std::array<u64, 4096> recent{};
     u64 generation{~u64{0}};

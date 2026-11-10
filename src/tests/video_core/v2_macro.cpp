@@ -65,6 +65,7 @@ struct Front {
     u64 generation = 1;
     bool status_d00 = false; ///< Register 0xd00 reads back 1 (a status the engine sets)
     u32 stale = ~0U;         ///< CallInfo::stale_register
+    u32 live_runs = 0;       ///< Calls of the JIT stand-in (bypassed, verify, JIT recordings)
     Tegra::TuringMacroInterpreter interpreter;
     MacroMemo::Memo memo;
 
@@ -128,10 +129,12 @@ struct Front {
         const auto read = [&](u32 address) { return address < regs.size() ? regs[address] : 0U; };
         const auto write = [&](u32 method, u32 value) { return Write(method, value); };
         const auto dma = [&](u32 method, u32 value) { Dma(fifo, method, value); };
-        const auto live = [&](auto& emit) {
+        const auto live = [&](auto& live_read, auto& emit) {
+            ++live_runs;
             Tegra::TuringMacroInterpreter jit;
             jit.active_dram = interpreter.active_dram;
-            return jit.Execute(code, 0, fifo, read, emit);
+            jit.allow_uninitialized = true; // as the JIT
+            return jit.Execute(code, 0, fifo, live_read, emit);
         };
         const auto result = MacroMemo::Call(memo, interpreter, call, live, read, write, dma);
         REQUIRE(result.success);
@@ -187,6 +190,59 @@ TEST_CASE("V2 macro memo: a stale register is not checked against its copy",
     CHECK(front.memo.statistics.hits == 1);
 }
 
+TEST_CASE("V2 macro memo: direct-mapped table, JIT recordings, adaptive bypass",
+          "[video_core][v2_macro]") {
+    // F3F5b-3 (report 7833a32: Find 5.5% + Match 1.5% of the front, 41k guard failures/s).
+    SECTION("only code that can reach DREAD/DWRITE is recorded by the interpreter") {
+        CHECK(MacroMemo::Memo::MayUseDataRam(Code(data_ram_code), 0));
+        CHECK(!MacroMemo::Memo::MayUseDataRam(Code(state_read_code), 0));
+        CHECK(!MacroMemo::Memo::MayUseDataRam(Code(render_enable_code), 0));
+        // Code past the end of the uploaded RAM is unknown.
+        CHECK(MacroMemo::Memo::MayUseDataRam(std::vector<u32>(6, 0), 0));
+    }
+    SECTION("a miss of such code is recorded by the JIT; the replay doesn't run it") {
+        Front front{state_read_code};
+        front.regs[0x48c] = 3;
+        const Pairs expected = front.Plain({5});
+        CHECK(front.Memoised({5}) == expected);
+        CHECK(front.memo.statistics.jit_records == 1);
+        CHECK(front.memo.statistics.stores == 1);
+        CHECK(front.live_runs == 1);
+        CHECK(front.Memoised({5}) == expected);
+        CHECK(front.memo.statistics.hits == 1);
+        CHECK(front.live_runs == 1);
+    }
+    SECTION("two register contexts of one key both hit") {
+        Front front{state_read_code};
+        front.regs[0x48c] = 3;
+        const Pairs three = front.Plain({5});
+        front.regs[0x48c] = 2;
+        const Pairs two = front.Plain({5});
+        for (int round = 0; round < 4; ++round) {
+            front.regs[0x48c] = 3;
+            CHECK(front.Memoised({5}) == three);
+            front.regs[0x48c] = 2;
+            CHECK(front.Memoised({5}) == two);
+        }
+        CHECK(front.memo.statistics.stores == 2); // each context recorded once
+        CHECK(front.memo.statistics.guard_failures == 1);
+        CHECK(front.memo.statistics.hits == 6);
+        CHECK(front.memo.Size() == 2);
+    }
+    SECTION("a macro whose calls rarely repeat is left to the JIT for a while") {
+        Front front{state_read_code};
+        front.regs[0x48c] = 1;
+        for (u32 call = 0; call < 2048; ++call) {
+            front.Memoised({call}); // every key new: no hit
+        }
+        CHECK(front.memo.statistics.bypassed == 0);
+        const u64 stores = front.memo.statistics.stores;
+        CHECK(front.Memoised({7}) == front.Plain({7}));
+        CHECK(front.memo.statistics.bypassed == 1);
+        CHECK(front.memo.statistics.stores == stores); // no recording while bypassed
+    }
+}
+
 TEST_CASE("V2 macro memo: data RAM reads and writes", "[video_core][v2_macro]") {
     Front front{data_ram_code};
     front.dram[0x53b] = 7;
@@ -198,12 +254,17 @@ TEST_CASE("V2 macro memo: data RAM reads and writes", "[video_core][v2_macro]") 
     CHECK(front.Memoised({9}).empty());
     CHECK(front.memo.statistics.hits == 1);
     front.dram[0x53b] = 7;
-    CHECK(front.Memoised({9}) == Pairs{{0x376, 9}}); // recorded again
-    CHECK(front.dram[0x53b] == 9);
-    front.dram[0x53b] = 7;
+    // The key's other way still holds the first record (F3F5b-3: two contexts per key).
     CHECK(front.Memoised({9}) == Pairs{{0x376, 9}});
     CHECK(front.dram[0x53b] == 9); // the replay's data RAM write
     CHECK(front.memo.statistics.hits == 2);
+    CHECK(front.memo.statistics.stores == 2);
+    front.dram[0x53b] = 7;
+    CHECK(front.Memoised({9}) == Pairs{{0x376, 9}});
+    CHECK(front.dram[0x53b] == 9);
+    CHECK(front.memo.statistics.hits == 3);
+    // Code that touches data RAM is recorded by the interpreter, never the JIT.
+    CHECK(front.memo.statistics.jit_records == 0);
 }
 
 TEST_CASE("V2 macro memo: DMA words checked at their place in the replay",

@@ -2629,13 +2629,15 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
     bool dumping = false;
     const MacroHle::Entry* check_entry = nullptr; // MACROHLE=verify: compared after the run
     MacroHle::Identity identity{};
+    u64 call_key = 0; // MacroMemo::Hash of the call, made once for the stats and the memo
     if (VideoCommon::V2::Stats::Enabled() && engine.native_turing) [[unlikely]] {
         if (!fs.v2_call_stats) {
             fs.v2_call_stats = std::make_unique<VideoCommon::V2::MacroMemo::CallStats>();
         }
+        call_key = VideoCommon::V2::MacroMemo::Hash(start, fs.parameters);
         fs.v2_call_stats->Note("3D", start, fs.parameters, engine.native_code,
                                engine.native_code_generation,
-                               fs.v2_memo ? &fs.v2_memo->statistics : nullptr);
+                               fs.v2_memo ? &fs.v2_memo->statistics : nullptr, call_key);
     }
     if ((dump || hle != VideoCommon::V2::Mode::Off) && engine.native_turing) [[unlikely]] {
         if (fs.v2_macro_generation != engine.native_code_generation) {
@@ -2754,17 +2756,18 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
             }
             return true;
         };
-        const auto live = [&](auto& live_emit) {
+        const auto live = [&](auto& live_read, auto& live_emit) {
 #ifdef ARCHITECTURE_x86_64
             if (!engine.native_jit) {
                 engine.native_jit = std::make_shared<TuringMacroJit>();
             }
             engine.native_jit->Prepare(engine.native_code, engine.native_code_generation);
             return engine.native_jit->Execute(start, fs.parameters,
-                                              std::span<u32>{native_data_ram}, read, live_emit);
+                                              std::span<u32>{native_data_ram}, live_read,
+                                              live_emit);
 #else
             return engine.native_interpreter.Execute(engine.native_code, start, fs.parameters,
-                                                     read, live_emit);
+                                                     live_read, live_emit);
 #endif
         };
         const VideoCommon::V2::Mode memo = VideoCommon::V2::Get(VideoCommon::V2::Switch::MacroMemo);
@@ -2796,11 +2799,12 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
                 // A record that read the mode the back evaluates isn't checked against the
                 // front's copy until `read` took the back's.
                 .stale_register = fs.v2_render_enable_unknown ? RenderEnableMode : ~0U,
+                .key = call_key,
             };
             result = MacroMemo::Call(*fs.v2_memo, engine.native_interpreter, call, live, read,
                                      write, dma);
         } else {
-            result = live(emit);
+            result = live(read, emit);
         }
         if (!result.success) {
             engine.native_execution_failed = true;
