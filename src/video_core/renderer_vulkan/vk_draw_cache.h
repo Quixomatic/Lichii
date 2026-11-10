@@ -17,12 +17,14 @@ class MemoryManager;
 
 namespace VideoCommon::V2::Resolve {
 struct PreDraw;
+struct ResolvedDraw;
 }
 
 namespace Vulkan {
 
 class ComputePipeline;
 class GraphicsPipeline;
+struct DrawApplyOut;
 
 /// EDEN_NX2_V2_DRAWCACHE: the Vulkan side of the P4 draw cache (v2/draw_cache.h holds the pure
 /// parts: keys, recipes, the table, validation and the ladder). Owned by the rasterizer and used by
@@ -64,6 +66,14 @@ public:
     void FinishDrawCapture(GraphicsPipeline& pipeline, const Decision& decision, bool is_indexed,
                            const Tegra::Engines::Maxwell3D& maxwell3d, Tegra::MemoryManager& memory,
                            TextureCache& texture_cache, BufferCache& buffer_cache);
+    /// DRAWREC (step 15): FinishDrawCapture for a draw the record path resolved, applied and
+    /// encoded instead of a capturing Configure: the recipe comes from the record (kept in it as
+    /// the template a hit copies).
+    void FinishDrawRecord(GraphicsPipeline& pipeline, const Decision& decision, bool is_indexed,
+                          const VideoCommon::V2::Resolve::ResolvedDraw& record,
+                          const DrawApplyOut& out, const Tegra::Engines::Maxwell3D& maxwell3d,
+                          Tegra::MemoryManager& memory, TextureCache& texture_cache,
+                          BufferCache& buffer_cache);
     /// The replay recorded the draw.
     void NoteReplayed(Recipe& recipe);
     /// The replay found a reason to resolve after all (Rebuild).
@@ -124,6 +134,13 @@ private:
     /// captured (crosses a page, memory moved under it).
     [[nodiscard]] bool FillFromCapture(Recipe& recipe, bool compute, Tegra::MemoryManager& memory,
                                        TextureCache& texture_cache);
+    /// The graphics recipe from the filled capture and the bound state, stored (with the record
+    /// template when `record` is set).
+    void BuildGraphicsRecipe(GraphicsPipeline& pipeline, const Decision& decision, bool is_indexed,
+                             const VideoCommon::V2::Resolve::ResolvedDraw* record,
+                             const Tegra::Engines::Maxwell3D& maxwell3d,
+                             Tegra::MemoryManager& memory, TextureCache& texture_cache,
+                             BufferCache& buffer_cache);
     /// Builds into the table, or aside and compares (verify).
     void Store(VideoCommon::V2::DrawCache::RecipeTable& table, u64 key, Recipe& built,
                const Decision& decision, bool compute);

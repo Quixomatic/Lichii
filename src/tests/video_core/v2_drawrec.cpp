@@ -107,6 +107,24 @@ TEST_CASE("V2 DRAWREC: record arena push, span and copy", "[video_core][v2_drawr
     REQUIRE(record.h.views.count == 0);
 }
 
+TEST_CASE("V2 DRAWREC: a recipe keeps its record template", "[video_core][v2_drawrec]") {
+    const R::ResolvedDraw record = SampleRecord();
+    VideoCommon::V2::DrawCache::Recipe recipe;
+    REQUIRE(!recipe.record.Valid());
+    recipe.record.Store(record);
+    REQUIRE(recipe.record.Valid());
+    REQUIRE(std::memcmp(&recipe.record.Get().h, &record.h, sizeof(R::DrawHeader)) == 0);
+    REQUIRE(recipe.record.Get().arena == record.arena);
+    // A recipe copy is deep; Clear drops the template.
+    const VideoCommon::V2::DrawCache::Recipe copy = recipe;
+    recipe.Clear();
+    REQUIRE(!recipe.record.Valid());
+    REQUIRE(copy.record.Valid());
+    REQUIRE(copy.record.Get().arena == record.arena);
+    std::string reasons;
+    REQUIRE(R::CompareRecords(copy.record.Get(), record, 0, reasons, nullptr, nullptr));
+}
+
 TEST_CASE("V2 DRAWREC: record compare names the differing groups", "[video_core][v2_drawrec]") {
     const R::ResolvedDraw resolved = SampleRecord();
     std::string reasons;

@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <memory>
 #include <utility>
 #include <span>
 #include <string>
@@ -404,6 +405,46 @@ struct BufferRecipe {
 [[nodiscard]] bool CompareBufferRecipes(const BufferRecipe& hit, const BufferRecipe& fresh,
                                         const Versions::Generations& gens, std::string& reasons);
 
+} // namespace VideoCommon::V2::DrawCache
+
+namespace VideoCommon::V2::Resolve {
+struct ResolvedDraw;
+}
+
+namespace VideoCommon::V2::DrawCache {
+
+/// P6 Step 0 (step 15, EDEN_NX2_V2_DRAWREC): a recipe's ResolvedDraw template, proxies patched.
+/// Held through a pointer because v2/resolve/draw_record.h includes this header; copies are deep
+/// (draw_record.cpp). Invalidate keeps the storage for the next build.
+class RecordTemplate {
+public:
+    RecordTemplate() = default;
+    RecordTemplate(const RecordTemplate& other);
+    RecordTemplate& operator=(const RecordTemplate& other);
+    RecordTemplate(RecordTemplate&&) noexcept = default;
+    RecordTemplate& operator=(RecordTemplate&&) noexcept = default;
+    ~RecordTemplate() = default;
+
+    [[nodiscard]] bool Valid() const noexcept {
+        return valid;
+    }
+    /// The template; only while Valid.
+    [[nodiscard]] const Resolve::ResolvedDraw& Get() const noexcept {
+        return *record;
+    }
+    void Store(const Resolve::ResolvedDraw& source);
+    void Invalidate() noexcept {
+        valid = false;
+    }
+
+private:
+    struct Deleter {
+        void operator()(Resolve::ResolvedDraw* pointer) const noexcept;
+    };
+    std::unique_ptr<Resolve::ResolvedDraw, Deleter> record;
+    bool valid{};
+};
+
 /// Everything a hit needs to record the draw (or dispatch) without resolving it again.
 struct Recipe {
     u64 key{};
@@ -433,9 +474,12 @@ struct Recipe {
     u64 heap_releases{~0ULL};
     u64 heap_tick{};
     u64 uses{};
+    /// DRAWREC: the record the recipe was built from (a hit copies it, step 16).
+    RecordTemplate record;
 
     void Clear() {
         const u64 kept_key = key;
+        record.Invalidate();
         residency = {};
         heap_releases = ~0ULL;
         heap_tick = 0;

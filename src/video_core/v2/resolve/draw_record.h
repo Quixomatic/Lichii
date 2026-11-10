@@ -39,7 +39,6 @@ enum class CommitOnlyReason : u8 {
     TextureBufferViewCreate,
     FrameDump,
     SampledRecording,
-    Capture,
     Retry,
     Count,
 };
@@ -47,7 +46,7 @@ inline constexpr size_t NumCommitOnlyReasons = static_cast<size_t>(CommitOnlyRea
 inline constexpr std::array<const char*, NumCommitOnlyReasons> commit_only_names{
     "none",   "mesh",          "emulated mesh",      "transform feedback",
     "inline index", "indirect", "multi-range storage", "texture buffer view create",
-    "frame dump", "sampled recording", "capture",     "retry",
+    "frame dump", "sampled recording", "retry",
 };
 
 enum class StaleReason : u8 { None, DescriptorTables };

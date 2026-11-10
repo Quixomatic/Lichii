@@ -1858,17 +1858,13 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         bool configured;
         {
             Profile::Scope scope{Profile::Zone::Configure};
-            if (recipe_capture != nullptr) {
-                // A recipe capture stays the old configure until recipes come from records
-                // (step 15).
-                if (drawrec == VideoCommon::V2::Mode::On) [[unlikely]] {
-                    VideoCommon::V2::Resolve::CountRecordStat(
-                        VideoCommon::V2::Resolve::GetRecordStats().commit_only[static_cast<size_t>(
-                            VideoCommon::V2::Resolve::CommitOnlyReason::Capture)]);
-                }
+            if (drawrec == VideoCommon::V2::Mode::On) [[unlikely]] {
+                // Step 15: a recipe capture takes the record path too (its recipe comes from
+                // the record); a commit-only draw captures in the old configure.
+                configured = PrepareDrawRecord(*pipeline, is_indexed, is_indirect, drawrec_drawn,
+                                               recipe_capture != nullptr);
+            } else if (recipe_capture != nullptr) {
                 configured = pipeline->ConfigureCapture(is_indexed);
-            } else if (drawrec == VideoCommon::V2::Mode::On) [[unlikely]] {
-                configured = PrepareDrawRecord(*pipeline, is_indexed, is_indirect, drawrec_drawn);
             } else {
                 configured = pipeline->Configure(is_indexed);
             }
@@ -1882,8 +1878,14 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
             return;
         }
         if (recipe_capture != nullptr) [[unlikely]] {
-            DrawCache().FinishDrawCapture(*pipeline, cache_decision, is_indexed, *maxwell3d,
-                                          *gpu_memory, texture_cache, buffer_cache);
+            if (drawrec_drawn) {
+                DrawCache().FinishDrawRecord(*pipeline, cache_decision, is_indexed,
+                                             drawrec_record, drawrec_apply, *maxwell3d,
+                                             *gpu_memory, texture_cache, buffer_cache);
+            } else {
+                DrawCache().FinishDrawCapture(*pipeline, cache_decision, is_indexed, *maxwell3d,
+                                              *gpu_memory, texture_cache, buffer_cache);
+            }
         }
         const bool view_mismatch = verify_views && pipeline->DeltaMismatch();
         const bool binding_mismatch =
@@ -5441,12 +5443,12 @@ VideoCommon::V2::Resolve::ResolveStatus RasterizerVulkan::ResolveDrawRecord(
 }
 
 bool RasterizerVulkan::PrepareDrawRecord(GraphicsPipeline& pipeline, bool is_indexed,
-                                         bool is_indirect, bool& recorded) {
+                                         bool is_indirect, bool& recorded, bool capture) {
     namespace R = VideoCommon::V2::Resolve;
     recorded = false;
     if (ResolveDrawRecord(pipeline, is_indexed, is_indirect, false) != R::ResolveStatus::Ready) {
         // D3: what Step 0 doesn't resolve takes the old configure (counted by reason).
-        return pipeline.Configure(is_indexed);
+        return capture ? pipeline.ConfigureCapture(is_indexed) : pipeline.Configure(is_indexed);
     }
     R::RecordStats& stats = R::GetRecordStats();
     R::CountRecordStat(stats.drawrec_draws);

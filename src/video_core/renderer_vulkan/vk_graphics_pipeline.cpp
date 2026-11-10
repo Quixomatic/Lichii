@@ -338,8 +338,8 @@ void ReportTextureMemo() {
                  hits, misses, g_memo_mismatches.load(std::memory_order_relaxed));
     }
 }
+} // Anonymous namespace
 
-/// EDEN_NX2_V2_DRAWCACHE: the push data and heap words a configure records (recipe verify).
 void NoteRecipePush(VideoCommon::V2::DrawCache::RecipeCapture& capture,
                     const RescalingPushConstant& rescaling,
                     const RenderAreaPushConstant& render_area, const std::vector<u32>& heap_words) {
@@ -354,7 +354,6 @@ void NoteRecipePush(VideoCommon::V2::DrawCache::RecipeCapture& capture,
     }
     capture.heap_words = heap_words;
 }
-} // Anonymous namespace
 
 std::chrono::nanoseconds GraphicsPipeline::TakeHoldTime() noexcept {
     return std::chrono::nanoseconds{hold_time_ns.exchange(0, std::memory_order::relaxed)};

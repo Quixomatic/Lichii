@@ -549,6 +549,30 @@ void DrawCacheGlue::FinishDrawCapture(GraphicsPipeline& pipeline, const Decision
         return;
     }
     pending_draw.capturing = false;
+    BuildGraphicsRecipe(pipeline, decision, is_indexed, nullptr, maxwell3d, memory, texture_cache,
+                        buffer_cache);
+}
+
+void DrawCacheGlue::FinishDrawRecord(GraphicsPipeline& pipeline, const Decision& decision,
+                                     bool is_indexed, const V2::Resolve::ResolvedDraw& record,
+                                     const DrawApplyOut& out,
+                                     const Tegra::Engines::Maxwell3D& maxwell3d,
+                                     Tegra::MemoryManager& memory, TextureCache& texture_cache,
+                                     BufferCache& buffer_cache) {
+    if (!pending_draw.capturing) {
+        return;
+    }
+    pending_draw.capturing = false;
+    pipeline.FillRecipeCapture(record, out, capture);
+    BuildGraphicsRecipe(pipeline, decision, is_indexed, &record, maxwell3d, memory, texture_cache,
+                        buffer_cache);
+}
+
+void DrawCacheGlue::BuildGraphicsRecipe(GraphicsPipeline& pipeline, const Decision& decision,
+                                        bool is_indexed, const V2::Resolve::ResolvedDraw* record,
+                                        const Tegra::Engines::Maxwell3D& maxwell3d,
+                                        Tegra::MemoryManager& memory, TextureCache& texture_cache,
+                                        BufferCache& buffer_cache) {
     const Versions::Generations& gens = Versions::Gens();
     Recipe& recipe = built;
     recipe.pipeline = &pipeline;
@@ -591,6 +615,9 @@ void DrawCacheGlue::FinishDrawCapture(GraphicsPipeline& pipeline, const Decision
     recipe.targets[DC::NumRecipeTargets - 1] = {depth, gens.Get(Versions::Kind::ImageView, depth)};
     if (Framebuffer* const framebuffer = texture_cache.GetFramebuffer()) {
         recipe.render_pass = reinterpret_cast<u64>(framebuffer->RenderPass());
+    }
+    if (record != nullptr) {
+        recipe.record.Store(*record);
     }
     // The shape learnt what its shaders use when DecideDraw met it.
     Store(graphics_table, pending_draw.key, recipe, decision, false);

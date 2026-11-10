@@ -6,6 +6,38 @@
 #include "video_core/v2/commit.h"
 #include "video_core/v2/resolve/draw_record.h"
 
+namespace VideoCommon::V2::DrawCache {
+
+void RecordTemplate::Deleter::operator()(Resolve::ResolvedDraw* pointer) const noexcept {
+    delete pointer;
+}
+
+RecordTemplate::RecordTemplate(const RecordTemplate& other) {
+    *this = other;
+}
+
+RecordTemplate& RecordTemplate::operator=(const RecordTemplate& other) {
+    if (this == &other) {
+        return *this;
+    }
+    valid = false;
+    if (other.valid) {
+        Store(*other.record);
+    }
+    return *this;
+}
+
+void RecordTemplate::Store(const Resolve::ResolvedDraw& source) {
+    if (!record) {
+        record.reset(new Resolve::ResolvedDraw{});
+    }
+    record->h = source.h;
+    record->arena.assign(source.arena.begin(), source.arena.end());
+    valid = true;
+}
+
+} // namespace VideoCommon::V2::DrawCache
+
 namespace VideoCommon::V2::Resolve {
 
 namespace {
