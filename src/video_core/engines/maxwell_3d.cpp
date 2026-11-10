@@ -2272,6 +2272,12 @@ struct CbufRingEnv {
     u64 Maps() {
         return VideoCommon::GpuSplit::MapsExecuted();
     }
+    VideoCommon::V2::CbufWatch::Snap Words(u64 device, u32 size) {
+        return VideoCommon::V2::CbufWatch::Get().Take(device, size);
+    }
+    void Arm(u64 device, u32 size) {
+        VideoCommon::V2::CbufWatch::Get().RequestArm(device, size);
+    }
 };
 
 } // Anonymous namespace

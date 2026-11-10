@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "common/common_types.h"
+#include "video_core/v2/cbuf_watch.h"
 
 // Pipeline v2 F2-02 (EDEN_NX2_V2_CBUFRING): decode-time constant buffer versions in a ring
 // (MASTER_PLAN §5.3, §2.1). S1 (the front) makes a version when it decodes constant buffer data:
@@ -234,6 +235,8 @@ struct Shared {
     std::atomic<u64> overlap_patches{}; ///< F2-03: data through one window patched another
     std::atomic<u64> cow_versions{};    ///< ... a published one, copied first
     std::atomic<u64> write_drops{};     ///< windows dropped by another producer's ranged write
+    std::atomic<u64> trusted_versions{}; ///< versions published trusted
+    std::atomic<u64> trust_upgrades{};   ///< versions trusted after one compare at a bind
     /// F2-03: the live decoders (one per 3D front). Versions are trusted only while there is
     /// exactly one: a decoder patches the windows it knows, not another channel's.
     std::atomic<u32> decoders{};
@@ -351,8 +354,36 @@ public:
         }
         Ring& ring = shared->ring;
         if (window.valid && window.position >= ring.Retired()) {
-            if (window.written ||
-                env.Same(va, size, shared->shadow.get() + ring.Offset(window.position))) {
+            const u8* const bytes = shared->shadow.get() + ring.Offset(window.position);
+            bool current = false;
+            if constexpr (requires { env.Words(u64{}, u32{}); }) {
+                if (watch && window.device != NoPosition) {
+                    // F2-03: a trusted version whose pages saw no write since needs no compare.
+                    // Otherwise one compare, after the words: equal bytes on armed pages with
+                    // nothing in flight make it trusted from now on.
+                    const CbufWatch::Snap snap = env.Words(window.device, size);
+                    if (Trusted(window) && snap.words == window.words) {
+                        return;
+                    }
+                    if (!snap.armed) {
+                        env.Arm(window.device, size);
+                        if (window.written) {
+                            return; // as without the watch: the back's compare decides
+                        }
+                        current = env.Same(va, size, bytes);
+                    } else if (env.Writers(va, size) != 0) {
+                        current = window.written || env.Same(va, size, bytes);
+                    } else if (env.Same(va, size, bytes)) {
+                        current = true;
+                        Trust(window, snap);
+                    }
+                } else {
+                    current = window.written || env.Same(va, size, bytes);
+                }
+            } else {
+                current = window.written || env.Same(va, size, bytes);
+            }
+            if (current) {
                 return;
             }
         }
@@ -379,7 +410,8 @@ public:
             window.dirty = false;
             if (ready && window.valid && window.position >= ring.Retired()) {
                 const u64 offset = ring.Offset(window.position);
-                if (shared->mapped != nullptr) {
+                // A published version only learnt its trust (Trust): its bytes are there.
+                if (shared->mapped != nullptr && !window.published) {
                     std::memcpy(shared->mapped + offset, shared->shadow.get() + offset,
                                 window.size);
                 }
@@ -412,6 +444,9 @@ private:
         u64 position{};
         u64 device{NoPosition}; ///< F2-03: where the window was located (Locate), indexed there
         u64 maps{};             ///< ... the env's Maps() then
+        u64 words{};            ///< ... the watch's page words before the version's bytes
+        u32 epoch{};            ///< ... the decoder's epoch when trusted
+        bool trusted{};
         bool located{};
         bool valid{};
         bool published{};
@@ -601,6 +636,15 @@ private:
     template <typename Env>
     bool NewVersion(Window& window, u32 cbuf_bit, Env& env, bool may_keep = true) {
         Ring& ring = shared->ring;
+        // F2-03: the pages' words before any byte is read (a write after this moves them).
+        CbufWatch::Snap snap{};
+        bool watched = false;
+        if constexpr (requires { env.Words(u64{}, u32{}); }) {
+            watched = watch && window.device != NoPosition;
+            if (watched) {
+                snap = env.Words(window.device, window.size);
+            }
+        }
         // Nothing in flight: guest memory is current (a guest CPU write since included).
         // Only this window's own data in flight: the previous version holds it; without one,
         // guest memory (the words in flight may be written again before the draw; the back's
@@ -635,10 +679,36 @@ private:
             return false;
         }
         shared->versions.fetch_add(1, std::memory_order_relaxed);
+        // Trusted: every page armed at the snapshot, and the base exact for it: guest memory
+        // with nothing in flight, or a trusted previous version whose pages saw no write since
+        // (bases read while constant buffer data was in flight never are, G2).
+        const bool trusted =
+            watched && snap.armed &&
+            (kept ? Trusted(window) && window.words == snap.words : writers == 0);
+        window.trusted = trusted;
+        window.words = snap.words;
+        window.epoch = epoch;
+        if constexpr (requires { env.Arm(u64{}, u32{}); }) {
+            if (watched && !snap.armed) {
+                env.Arm(window.device, window.size);
+            }
+        }
         window.position = *position;
         window.valid = true;
         window.published = false;
         return true;
+    }
+
+    [[nodiscard]] bool Trusted(const Window& window) const {
+        return window.trusted && window.epoch == epoch;
+    }
+    /// F2-03: the current version equals guest memory read after `snap` with nothing in flight.
+    void Trust(Window& window, const CbufWatch::Snap& snap) {
+        window.trusted = true;
+        window.words = snap.words;
+        window.epoch = epoch;
+        MarkDirty(window); // the back's entry learns it (no copy: the bytes did not change)
+        shared->trust_upgrades.fetch_add(1, std::memory_order_relaxed);
     }
 
     void MarkDirty(Window& window) {

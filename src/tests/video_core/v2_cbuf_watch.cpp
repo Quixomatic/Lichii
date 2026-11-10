@@ -300,6 +300,15 @@ struct WatchEnv {
     u64 Maps() {
         return maps;
     }
+    W::Watch* watch = nullptr; ///< the write watch (none: never armed)
+    W::Snap Words(u64 device, u32 size) {
+        return watch != nullptr ? watch->Take(device, size) : W::Snap{};
+    }
+    void Arm(u64 device, u32 size) {
+        if (watch != nullptr) {
+            watch->RequestArm(device, size);
+        }
+    }
 };
 
 struct Version {
@@ -386,4 +395,71 @@ TEST_CASE("V2 F2-03: constant buffer data through one window reaches every windo
     for (const Version& version : versions) {
         REQUIRE(version.position == V2::CbufRing::NoPosition);
     }
+}
+
+TEST_CASE("V2 F2-03: a version on armed pages is trusted until its pages see a write",
+          "[video_core][v2_cbufwatch]") {
+    static V2::CbufRing::Shared shared;
+    std::vector<u8> mapped(V2::CbufRing::Shared::Capacity);
+    shared.Init(mapped.data(), 256);
+    auto watch = std::make_unique<W::Watch>();
+    W::Arming arming{*watch};
+    FakeCounts counts;
+    auto decode = std::make_unique<V2::CbufRing::Decode>(shared, true);
+    WatchEnv env;
+    env.watch = watch.get();
+    constexpr u32 cbuf_bit = V2::ProducerBit(V2::Producer::CbData);
+    constexpr u64 page = DeviceBase + 0x2000;
+    env.memory[0x2000] = 0x42;
+    // A version taken on an unarmed page asks for the arm and is not trusted.
+    decode->Bind(0x2000, 0x100, cbuf_bit, env);
+    auto versions = PublishAll(*decode);
+    REQUIRE(versions.size() == 1);
+    const u64 first = versions[0].position;
+    REQUIRE(watch->stats.requests.load() == 1);
+    arming.Tick(1, false, counts);
+    REQUIRE(watch->Take(page, 0x100).armed);
+    // Armed now: one compare at the next bind trusts it, and the back hears of it (same
+    // position, no new version).
+    const u32 upgrades = static_cast<u32>(shared.trust_upgrades.load());
+    decode->Bind(0x2000, 0x100, cbuf_bit, env);
+    REQUIRE(shared.trust_upgrades.load() == upgrades + 1);
+    versions = PublishAll(*decode);
+    REQUIRE(versions.size() == 1);
+    REQUIRE(versions[0].position == first);
+    // Trusted with its words unchanged: no compare at all.
+    const u32 compares = env.same_calls;
+    for (int i = 0; i < 4; ++i) {
+        decode->Bind(0x2000, 0x100, cbuf_bit, env);
+    }
+    REQUIRE(env.same_calls == compares);
+    REQUIRE(PublishAll(*decode).empty());
+    // A trapped CPU store: the words move, the next bind compares and takes the new bytes.
+    watch->OnCpuWrite(page + 0x10, 4, [&](u64 p) {
+        counts.Hold(std::span<const std::pair<u64, u64>>{std::array{std::pair{p, W::PageSize}}},
+                    -1);
+    });
+    env.memory[0x2010] = 0x99;
+    decode->Bind(0x2000, 0x100, cbuf_bit, env);
+    REQUIRE(env.same_calls == compares + 1);
+    versions = PublishAll(*decode);
+    REQUIRE(versions.size() == 1);
+    REQUIRE(versions[0].position != first);
+    REQUIRE(mapped[shared.ring.Offset(versions[0].position) + 0x10] == 0x99);
+    REQUIRE(counts.Count(page) == 0);
+    // A foreign write the front did not decode also ends the trust (the page is re-armed after
+    // its backoff and trusted again after one compare).
+    arming.Tick(2, false, counts);
+    arming.Tick(10, false, counts);
+    REQUIRE(watch->Take(page, 0x100).armed);
+    decode->Bind(0x2000, 0x100, cbuf_bit, env); // trusted again (one compare)
+    const u32 before_foreign = env.same_calls;
+    decode->Bind(0x2000, 0x100, cbuf_bit, env);
+    REQUIRE(env.same_calls == before_foreign);
+    watch->NoteForeign(page + 0x20, 4);
+    decode->Bind(0x2000, 0x100, cbuf_bit, env);
+    REQUIRE(env.same_calls == before_foreign + 1);
+    PublishAll(*decode);
+    arming.ReleaseAll(counts);
+    REQUIRE(counts.Count(page) == 0);
 }
