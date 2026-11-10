@@ -3325,8 +3325,9 @@ public:
     void RunMacroHleDraw(Core::System& system, const VideoCommon::V2::MacroHle::Draw& draw);
     /// EDEN_NX2_V2_MACROHLE (back): the render enable mode a conditional render macro computes
     /// from the report pair at `source` (its MME DMA read), written as the macro writes it.
+    /// `tracked`: the front ran it under shadow RAM tracking (v2_hle_tracked_mode keeps it).
     void RunMacroHleRenderEnable(Core::System& system, GPUVAddr source, u32 bytes, bool invert,
-                                 bool s1);
+                                 bool s1, bool tracked);
 
     /// EDEN_NX2_V2_REGSEM=verify: register file mismatches the table-driven copy found.
     [[nodiscard]] u64 V2BackMismatches() const {
@@ -3519,6 +3520,18 @@ private:
     void FrontCheckHle(const VideoCommon::V2::MacroHle::Entry& entry, u64 hash,
                        std::span<const u32> parameters,
                        const VideoCommon::V2::MacroHle::Observation& observation);
+    /// MACROHLE: the back's render_enable.mode into the front's registers (drains; before an
+    /// MME read of it while FrontState::v2_render_enable_unknown).
+    void FrontSyncRenderEnable(VideoCommon::GpuSplit& split, FrontState& state);
+    /// MACROHLE: the shadow copy of render_enable.mode the back evaluated under shadow RAM
+    /// tracking into the front's shadow RAM (drains; before a Replay can read it).
+    void FrontSyncShadowRenderEnable(VideoCommon::GpuSplit& split, FrontState& state);
+    /// After a SET_SHADOW_RAM_CONTROL write the front made: a switch to Replay takes the
+    /// shadow copy above.
+    void FrontShadowControlWritten(VideoCommon::GpuSplit& split, FrontState& state);
+    /// MACROHLE (back writes, front reads after a drain): the mode the last conditional render
+    /// HLE call evaluated under shadow RAM tracking.
+    u32 v2_hle_tracked_mode{};
     // EDEN_NX2_V2_REGSEM on the executing engine: the register update through the semantics
     // table (=1), or the engine's own path compared with it on a register copy (verify).
     void CallMethodV2(u32 method, u32 method_argument, bool is_last_call, bool fast);

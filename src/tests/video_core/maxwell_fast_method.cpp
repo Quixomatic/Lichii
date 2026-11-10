@@ -1833,6 +1833,21 @@ struct Maxwell3DTestAccess {
     static bool EndMacro(Maxwell3D& engine, Core::System& system, VideoCommon::GpuSplit& split) {
         return engine.FrontEndMacro(system, split, engine.Front(system, split));
     }
+    static u32 FrontRegister(Maxwell3D& engine, Core::System& system,
+                             VideoCommon::GpuSplit& split, u32 method) {
+        return engine.Front(system, split).regs[method];
+    }
+    static u32 FrontShadow(Maxwell3D& engine, Core::System& system, VideoCommon::GpuSplit& split,
+                           u32 method) {
+        return engine.Front(system, split).shadow[method];
+    }
+    static bool RenderEnableUnknown(Maxwell3D& engine, Core::System& system,
+                                    VideoCommon::GpuSplit& split) {
+        return engine.Front(system, split).v2_render_enable_unknown;
+    }
+    static u32 TrackedMode(const Maxwell3D& engine) {
+        return engine.v2_hle_tracked_mode;
+    }
 };
 
 } // namespace Tegra::Engines
@@ -1945,6 +1960,68 @@ TEST_CASE("V2 S1 check: constant buffer runs of any length check exactly against
     const auto [entries, mismatches] = engine.S1CheckCounts();
     CHECK(entries > 1000);
     REQUIRE(mismatches == 0);
+}
+
+TEST_CASE("V2 macro HLE: a conditional render under shadow RAM tracking runs on the back",
+          "[video_core][gpu_split_dispatch][v2_macro]") {
+    // F3F5b-4 (report 7833a32: no HLE line at all): the entry applied only under Passthrough,
+    // and OoT runs with shadow RAM tracking (the default), so every call ran the macro and its
+    // front DMA read. Under Track the front makes the macro's register writes, the back
+    // evaluates the mode, and the front's shadow copy of it is taken from the back when a
+    // Replay could read it.
+    using Access = VideoCommon::GpuSplitTestAccess;
+    using M3Access = Tegra::Engines::Maxwell3DTestAccess;
+    using VideoCommon::V2::Mode;
+    using VideoCommon::V2::Switch;
+    // 966aeb0e43e7a13c as dumped (three words per instruction).
+    constexpr std::array<u32, 27> code{
+        0x00940003, 0x18c00455, 0x31c10300, 0x8a600003, 0x18c01856, 0x318c0300,
+        0x00000007, 0x18c00400, 0x359c1f00, 0x00000003, 0x1d000000, 0x31c08300,
+        0x00000003, 0x18c00000, 0x3bcc0300, 0x00000003, 0xa003c000, 0x3810bf00,
+        0x00000003, 0x18c00000, 0x0010bb00, 0x0018155b, 0x18c00000, 0x72213c29,
+        0x00200003, 0x18c00000, 0x302c0300,
+    };
+    constexpr u32 Mode556 = MAXWELL3D_REG_INDEX(render_enable.mode);
+    constexpr u32 ShadowControl = MAXWELL3D_REG_INDEX(shadow_ram_control);
+    Fixture f;
+    f.system.Initialize();
+    auto& engine = f.fast;
+    RecordingRasterizer draws{f.gpu};
+    draws.engine = &engine;
+    engine.BindRasterizer(&draws);
+    const V2SwitchScope hle{Switch::MacroHle, Mode::On};
+    VideoCommon::GpuSplit split;
+    Access::Initialize(split, f.system);
+    engine.SetNativeTuringMacroMode(true);
+    engine.FrontCallMethod(f.system, split, MAXWELL3D_REG_INDEX(load_mme.instruction_ptr), 0,
+                           true);
+    engine.FrontCallMultiMethod(f.system, split, MAXWELL3D_REG_INDEX(load_mme.instruction),
+                                code.data(), code.size(), code.size());
+    engine.FrontCallMethod(f.system, split, MAXWELL3D_REG_INDEX(load_mme.start_address_ptr), 0,
+                           true);
+    engine.FrontCallMethod(f.system, split, MAXWELL3D_REG_INDEX(load_mme.start_address), 0,
+                           true);
+    engine.FrontCallMethod(f.system, split, ShadowControl,
+                           static_cast<u32>(Maxwell3D::Regs::ShadowRamControl::Track), true);
+    Access::RunBack(split);
+    // IfEqual (p0 = 1) on the pair at 0x21'13760dc0 (unmapped here: the back reads zeros,
+    // equal pairs, mode 1).
+    engine.FrontCallMethod(f.system, split, 0xe00, 1, false);
+    engine.FrontCallMethod(f.system, split, 0xe01, 0x21, false);
+    engine.FrontCallMethod(f.system, split, 0xe01, 0x13760dc0, true);
+    CHECK(M3Access::FrontRegister(engine, f.system, split, 0x154) == 0x21);
+    CHECK(M3Access::FrontRegister(engine, f.system, split, 0x155) == 0x13760dc0);
+    CHECK(M3Access::RenderEnableUnknown(engine, f.system, split));
+    CHECK(M3Access::FrontShadow(engine, f.system, split, Mode556) == ~0U);
+    Access::RunBack(split);
+    CHECK(engine.regs.reg_array[Mode556] == 1);
+    CHECK(M3Access::TrackedMode(engine) == 1);
+    // A switch to Replay takes the back's mode into the front's shadow RAM (drained: nothing
+    // is queued here).
+    engine.FrontCallMethod(f.system, split, ShadowControl,
+                           static_cast<u32>(Maxwell3D::Regs::ShadowRamControl::Replay), true);
+    CHECK(M3Access::FrontShadow(engine, f.system, split, Mode556) == 1);
+    Access::RunBack(split);
 }
 
 TEST_CASE("V2 S1 deltas applied on the back match the method executor on random streams",

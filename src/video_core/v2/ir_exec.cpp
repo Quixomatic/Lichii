@@ -109,7 +109,7 @@ void Readback(const Ir::RecordView& record, const Ir::ReadbackBody& body,
     case Ir::ReadbackOp::MacroRenderEnable:
         static_cast<Tegra::Engines::Maxwell3D*>(object)->RunMacroHleRenderEnable(
             context.system, body.address, static_cast<u32>(body.bytes), (body.cache & 1) != 0,
-            (body.cache & 2) != 0);
+            (body.cache & 2) != 0, (body.cache & 4) != 0);
         return;
     case Ir::ReadbackOp::Count:
         break;

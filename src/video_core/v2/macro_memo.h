@@ -101,7 +101,8 @@ public:
     /// An earlier call with this key whose reads still hold (`regs[address]`, or 0 past
     /// `num_regs`, as the engines' MME STATE reads; `dram` words).
     [[nodiscard]] bool Find(u32 start, std::span<const u32> parameters, const u32* regs,
-                            size_t num_regs, std::span<const u32> dram, Record& record);
+                            size_t num_regs, std::span<const u32> dram, Record& record,
+                            u32 stale_register = ~0U);
     void Store(u32 start, std::span<const u32> parameters, const Trace& recorded,
                std::span<const std::pair<u32, u32>> dram_reads,
                std::span<const std::pair<u32, u32>> dram_writes);
@@ -139,7 +140,7 @@ private:
 
     [[nodiscard]] bool Match(u32 offset, u32 start, std::span<const u32> parameters,
                              const u32* regs, size_t num_regs, std::span<const u32> dram,
-                             Record& record) const;
+                             Record& record, u32 stale_register) const;
     [[nodiscard]] static size_t RecordWords(const u32* header);
     void Clear();
     void Compact();
@@ -165,6 +166,9 @@ struct CallInfo {
     u32 dma_fifoed; ///< MME_DMA_READ_FIFOED's method (~0: none)
     u32 dma_ram;    ///< MME_DMA_READ's method (~0: none)
     bool verify;
+    /// A register whose value in `regs` may be stale (~0: none): a record that read it is a
+    /// guard failure, and the recording's `read` gets the current value.
+    u32 stale_register = ~0U;
 };
 
 namespace Detail {
@@ -280,7 +284,8 @@ Result Call(Memo& memo, Tegra::TuringMacroInterpreter& interpreter, const CallIn
     }
     const size_t num_parameters = fifo.size();
     Record record;
-    if (!memo.Find(call.start, fifo, call.regs, call.num_regs, call.dram, record)) {
+    if (!memo.Find(call.start, fifo, call.regs, call.num_regs, call.dram, record,
+                   call.stale_register)) {
         return RecordCall(memo, interpreter, call, num_parameters, 0, {}, {}, read, write, dma);
     }
     if (call.verify) {

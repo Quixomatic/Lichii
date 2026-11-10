@@ -3185,19 +3185,30 @@ void Maxwell3D::FrontHleRenderEnable(Core::System& system, VideoCommon::GpuSplit
     const bool invert = entry.invert.Get(fs.parameters) != 0;
     const u32 bytes = entry.words * sizeof(u32);
     const bool s1 = fs.s1_exec;
+    const bool tracked = fs.control == Regs::ShadowRamControl::Track ||
+                         fs.control == Regs::ShadowRamControl::TrackWithFilter;
     fs.parameters.clear();
+    // The mode is the back's from now on (F3F5b-4): read back when the front needs it.
+    fs.v2_render_enable_unknown = true;
+    if (tracked) {
+        fs.shadow[RenderEnableMode] = ShadowUnknown;
+    }
     const VideoCommon::V2::Ir::ReadbackBody body{
         .op = VideoCommon::V2::Ir::ReadbackOp::MacroRenderEnable,
         .object = split.Ref(this),
         .object2 = VideoCommon::V2::Ir::NoObject,
-        .cache = (invert ? 1U : 0U) | (s1 ? 2U : 0U),
+        .cache = (invert ? 1U : 0U) | (s1 ? 2U : 0U) | (tracked ? 4U : 0U),
         .address = source,
         .bytes = bytes,
     };
     split.Emit(VideoCommon::V2::Ir::Kind::Readback, body,
-               [this, system_ptr = &system, source, bytes, invert, s1] {
-                   RunMacroHleRenderEnable(*system_ptr, source, bytes, invert, s1);
+               [this, system_ptr = &system, source, bytes, invert, s1, tracked] {
+                   RunMacroHleRenderEnable(*system_ptr, source, bytes, invert, s1, tracked);
                });
+    static u64 calls{}; // Front thread only
+    if ((++calls & 0xfffff) == 1) {
+        LOG_INFO(HW_GPU, "V2 macro HLE: {} conditional render calls evaluated on the back", calls);
+    }
     FrontEndMacro(system, split, fs);
     if (FrontVerifyEnabled() && (++fs.calls & 4095) == 0) [[unlikely]] {
         FrontVerify(split, fs);
@@ -3205,7 +3216,7 @@ void Maxwell3D::FrontHleRenderEnable(Core::System& system, VideoCommon::GpuSplit
 }
 
 void Maxwell3D::RunMacroHleRenderEnable(Core::System& system, GPUVAddr source, u32 bytes,
-                                        bool invert, bool s1) {
+                                        bool invert, bool s1, bool tracked) {
     // The macro's DMA read with the flushes the v1 macro made, here where everything before it
     // in command order ran on the back.
     VideoCommon::V2::IrExec::MacroDmaFlush(memory_manager, *rasterizer, source, bytes);
@@ -3214,6 +3225,9 @@ void Maxwell3D::RunMacroHleRenderEnable(Core::System& system, GPUVAddr source, u
                                    std::min<size_t>(bytes, sizeof(words)));
     const u32 mode = VideoCommon::V2::MacroHle::RenderEnableValue(invert, words);
     constexpr u32 method = MAXWELL3D_REG_INDEX(render_enable.mode);
+    if (tracked) {
+        v2_hle_tracked_mode = mode; // The front's shadow copy (FrontSyncShadowRenderEnable)
+    }
     if (s1) {
         // As an S1 Exec entry of the macro's write.
         namespace S1 = VideoCommon::V2::S1;
@@ -3242,6 +3256,42 @@ void Maxwell3D::FrontCheckHle(const VideoCommon::V2::MacroHle::Entry& entry, u64
     if ((checked & 0xffff) == 1) {
         LOG_INFO(HW_GPU, "V2 macro HLE verify: {} calls checked, {} mismatches", checked,
                  mismatches.load());
+    }
+}
+
+void Maxwell3D::FrontSyncRenderEnable(VideoCommon::GpuSplit& split, FrontState& fs) {
+    // The back ran every evaluation sent: its register is the macro's value (or a later write's).
+    split.Drain(VideoCommon::DrainSite::FrontVerify);
+    fs.v2_render_enable_unknown = false;
+    const u32 value = regs.reg_array[RenderEnableMode];
+    if (fs.v2_on) {
+        // The groups hashed the front's old value: change it as a write would.
+        VideoCommon::V2::RegSem::Store3D(fs, *fs.v2_table, RenderEnableMode, value);
+    } else {
+        fs.regs[RenderEnableMode] = value;
+        if (fs.v2 != nullptr) {
+            FrontRegSemResync(fs); // REGSEM=verify: the mirror and groups follow
+        }
+    }
+    // Each one drains: a macro that reads the mode every call would make this costly.
+    static u64 syncs{}; // Front thread only
+    if ((++syncs & 1023) == 1) {
+        LOG_INFO(HW_GPU, "V2 macro HLE: an MME read of render_enable.mode took the back's ({} so far)",
+                 syncs);
+    }
+}
+
+void Maxwell3D::FrontSyncShadowRenderEnable(VideoCommon::GpuSplit& split, FrontState& fs) {
+    if (fs.shadow[RenderEnableMode] != ShadowUnknown) {
+        return;
+    }
+    split.Drain(VideoCommon::DrainSite::FrontVerify);
+    fs.shadow[RenderEnableMode] = v2_hle_tracked_mode;
+}
+
+void Maxwell3D::FrontShadowControlWritten(VideoCommon::GpuSplit& split, FrontState& fs) {
+    if (fs.control == Regs::ShadowRamControl::Replay) [[unlikely]] {
+        FrontSyncShadowRenderEnable(split, fs);
     }
 }
 
@@ -3605,6 +3655,7 @@ void Maxwell3D::FrontVerify(VideoCommon::GpuSplit& split, FrontState& fs) {
             fs.regs[i] = expected[i];
         }
     }
+    fs.v2_render_enable_unknown = false; // The back's value, just taken
     if (fs.s1_exec) {
         // S1: the shadow RAM lives on the front only (the back never sees the method words).
         if (fs.v2 != nullptr) {
@@ -3622,7 +3673,7 @@ void Maxwell3D::FrontVerify(VideoCommon::GpuSplit& split, FrontState& fs) {
     }
     for (u32 i = 0; i < Regs::NUM_REGS; ++i) {
         if (fs.shadow[i] != shadow_state.reg_array[i]) {
-            if (control_differences++ < 16) {
+            if (i != hle_register && control_differences++ < 16) {
                 LOG_WARNING(HW_GPU, "Split front shadow register {:#x}: front {:#x}, back {:#x}", i,
                             fs.shadow[i], shadow_state.reg_array[i]);
             }

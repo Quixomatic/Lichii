@@ -64,6 +64,7 @@ struct Front {
     u32 dma_reads = 0;
     u64 generation = 1;
     bool status_d00 = false; ///< Register 0xd00 reads back 1 (a status the engine sets)
+    u32 stale = ~0U;         ///< CallInfo::stale_register
     Tegra::TuringMacroInterpreter interpreter;
     MacroMemo::Memo memo;
 
@@ -122,6 +123,7 @@ struct Front {
             .dma_fifoed = 0x158,
             .dma_ram = 0x157,
             .verify = verify,
+            .stale_register = stale,
         };
         const auto read = [&](u32 address) { return address < regs.size() ? regs[address] : 0U; };
         const auto write = [&](u32 method, u32 value) { return Write(method, value); };
@@ -166,6 +168,23 @@ TEST_CASE("V2 macro memo: register reads guard the replay", "[video_core][v2_mac
     front.generation = 2; // new code: everything recorded is forgotten
     CHECK(front.Memoised({5}) == fewer);
     CHECK(front.memo.statistics.misses == 3);
+}
+
+TEST_CASE("V2 macro memo: a stale register is not checked against its copy",
+          "[video_core][v2_macro]") {
+    // F3F5b-4: after a conditional render HLE call the front's render_enable.mode is the
+    // back's; a record that read it misses, and the recording's read takes the current value.
+    Front front{state_read_code};
+    front.regs[0x48c] = 3;
+    const Pairs expected = front.Plain({5});
+    CHECK(front.Memoised({5}) == expected);
+    front.stale = 0x48c;
+    CHECK(front.Memoised({5}) == expected);
+    CHECK(front.memo.statistics.hits == 0);
+    CHECK(front.memo.statistics.guard_failures == 1);
+    front.stale = 0x123; // another register: the record holds
+    CHECK(front.Memoised({5}) == expected);
+    CHECK(front.memo.statistics.hits == 1);
 }
 
 TEST_CASE("V2 macro memo: data RAM reads and writes", "[video_core][v2_macro]") {

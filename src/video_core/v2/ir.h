@@ -305,7 +305,8 @@ enum class ReadbackOp : u32 {
     ListPages,        ///< rasterizer->FlushGpuWrittenCommandListPages(payload device pages)
     WordReadback,     ///< object2 (V2::WordReadback)->Run(rasterizer, device address, bytes)
     /// Engine (Maxwell3D)->RunMacroHleRenderEnable(gpu address, bytes, cache bit 0 invert,
-    /// bit 1 S1 entry): macro HLE of a conditional render macro (Fix F5-03)
+    /// bit 1 S1 entry, bit 2 shadow RAM tracking): macro HLE of a conditional render macro
+    /// (Fix F5-03)
     MacroRenderEnable,
     Count,
 };

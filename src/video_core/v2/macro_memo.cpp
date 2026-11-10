@@ -44,7 +44,8 @@ size_t Memo::RecordWords(const u32* header) {
 }
 
 bool Memo::Match(u32 offset, u32 start, std::span<const u32> parameters, const u32* regs,
-                 size_t num_regs, std::span<const u32> dram, Record& record) const {
+                 size_t num_regs, std::span<const u32> dram, Record& record,
+                 u32 stale_register) const {
     const u32* const header = arena.data() + offset;
     if (header[0] != start || header[1] != parameters.size() ||
         !std::equal(parameters.begin(), parameters.end(), header + HeaderWords)) {
@@ -54,7 +55,8 @@ bool Memo::Match(u32 offset, u32 start, std::span<const u32> parameters, const u
     record.reads = {it, size_t{3} * header[2]};
     for (size_t i = 0; i < record.reads.size(); i += 3) {
         const u32 address = record.reads[i];
-        if ((address < num_regs ? regs[address] : 0U) != record.reads[i + 1]) {
+        if (address == stale_register ||
+            (address < num_regs ? regs[address] : 0U) != record.reads[i + 1]) {
             return false;
         }
     }
@@ -78,11 +80,11 @@ bool Memo::Match(u32 offset, u32 start, std::span<const u32> parameters, const u
 }
 
 bool Memo::Find(u32 start, std::span<const u32> parameters, const u32* regs, size_t num_regs,
-                std::span<const u32> dram, Record& record) {
+                std::span<const u32> dram, Record& record, u32 stale_register) {
     StartInfo& info = starts[start % starts.size()];
     // Many calls repeat the macro's previous call: try its record before hashing.
     if (info.start == start && info.last != NoRecord &&
-        Match(info.last, start, parameters, regs, num_regs, dram, record)) {
+        Match(info.last, start, parameters, regs, num_regs, dram, record, stale_register)) {
         ++statistics.slot_hits;
         return true;
     }
@@ -91,7 +93,7 @@ bool Memo::Find(u32 start, std::span<const u32> parameters, const u32* regs, siz
         ++statistics.misses;
         return false;
     }
-    if (!Match(it->second, start, parameters, regs, num_regs, dram, record)) {
+    if (!Match(it->second, start, parameters, regs, num_regs, dram, record, stale_register)) {
         ++statistics.guard_failures; // or another call with the same hash
         return false;
     }
