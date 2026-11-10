@@ -169,4 +169,24 @@ private:
     u64 write_serial = 0;
 };
 
+/// F4-X3 (MASTER_PLAN §5.5 targeted barriers): what the guest's wait-for-idle records with the
+/// tracker on. Its one barrier (shader and transfer writes plus every pending tracked write ->
+/// all later commands) is the only global barrier; it ends a pass only when needed.
+enum class WfiAction : u8 {
+    Barrier,   ///< no pass is active: the barrier now
+    AtPassEnd, ///< the pass's draws wrote only attachments: the pass goes on, the barrier is
+               ///< recorded when it ends, and a later draw sampling a render target or storing
+               ///< breaks it (the fragment barrier rule)
+    EndPass,   ///< the pass stored to memory or ran transform feedback: later draws may read that,
+               ///< so the pass ends and the barrier follows
+};
+
+[[nodiscard]] constexpr WfiAction DecideWaitForIdle(bool pass_active, bool pass_stores,
+                                                    bool pass_transform_feedback) noexcept {
+    if (!pass_active) {
+        return WfiAction::Barrier;
+    }
+    return pass_stores || pass_transform_feedback ? WfiAction::EndPass : WfiAction::AtPassEnd;
+}
+
 } // namespace VideoCommon::V2

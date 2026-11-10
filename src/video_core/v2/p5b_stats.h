@@ -85,6 +85,9 @@ enum class Counter : u32 {
     StagingCreateBytes,
     StagingFrees,       ///< staging buffers released to the driver
     BufferCacheDeletes, ///< buffer cache buffers deleted (joins, GC)
+    WfiBarriers,        ///< F4-X3: wait-for-idle barriers (pending tracked writes folded in)
+    WfiDeferred,        ///< F4-X3: wait-for-idles inside a pass, barrier at its end
+    WfiPassEnds,        ///< F4-X3: wait-for-idles that ended a pass (stores or XFB in it)
     Count,
 };
 

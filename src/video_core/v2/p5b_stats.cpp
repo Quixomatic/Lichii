@@ -127,12 +127,15 @@ void Report(const char* thread_name, u64 window_ns) {
     LOG_INFO(HW_GPU,
              "V2 stats {} P5b passes | {:.1f}/frame ({:.0f}% dynamic), {:.1f} draws each | "
              "barriers per frame: pass-end {:.1f}, targeted {:.1f}, full {:.1f}; pass ends "
-             "without a barrier {:.1f}/frame, hazard breaks {:.1f}/frame | uploads hoisted out "
-             "of passes {:.0f}/s",
+             "without a barrier {:.1f}/frame, hazard breaks {:.1f}/frame | wait-for-idle: "
+             "barriers {:.1f}/frame, in a pass deferred {:.1f}/frame, ended it {:.1f}/frame | "
+             "uploads hoisted out of passes {:.0f}/s",
              thread_name, per_frame(passes), 100.0 * Ratio(at(Counter::DynamicPasses), passes),
              Ratio(at(Counter::PassDraws), passes), per_frame(at(Counter::PassEndBarriers)),
              per_frame(at(Counter::TargetedBarriers)), per_frame(at(Counter::FullBarriers)),
              per_frame(at(Counter::SkippedBarriers)), per_frame(at(Counter::HazardBreaks)),
+             per_frame(at(Counter::WfiBarriers)), per_frame(at(Counter::WfiDeferred)),
+             per_frame(at(Counter::WfiPassEnds)),
              PerSecond(at(Counter::HoistedUploads), seconds));
     LOG_INFO(HW_GPU,
              "V2 stats {} P5b transfer queue | batches {:.0f}/s, buffer copies {:.0f}/s ({:.0f} "

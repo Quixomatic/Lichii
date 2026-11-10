@@ -3948,6 +3948,13 @@ void RasterizerVulkan::WaitForIdle() {
         fence_manager.SignalOrdering();
         return;
     }
+    if (scheduler.TracksBarriers()) [[unlikely]] {
+        // F4-X3 (EDEN_NX2_V2_DYNRENDER): one barrier with the tracked writes folded in, and no
+        // pass end unless the pass stored to memory or ran transform feedback.
+        scheduler.WaitForIdleTracked(flags);
+        fence_manager.SignalOrdering();
+        return;
+    }
     scheduler.RequestOutsideRenderPassOperationContext();
     scheduler.Record([flags](vk::CommandBuffer cmdbuf) {
         // Later work waits for the earlier work and sees its writes.

@@ -979,6 +979,51 @@ void Scheduler::RequestOutsideRenderPassForDispatch(std::source_location locatio
     read_hazard = {};
 }
 
+void Scheduler::WaitForIdleTracked(u32 stages, std::source_location location) {
+    // F4-X3: the old WFI ended the pass, flushed every pending write with a full barrier and
+    // recorded its own barrier after it (~90 full barriers and ~70 pass ends a frame at Castle
+    // Town). Now one barrier, and the pass goes on while its draws wrote only attachments.
+    using VideoCommon::V2::WfiAction;
+    namespace P5b = VideoCommon::V2::P5bStats;
+    switch (VideoCommon::V2::DecideWaitForIdle(state.renderpass != VK_NULL_HANDLE,
+                                                render_pass_has_stores,
+                                                pass_transform_feedback)) {
+    case WfiAction::AtPassEnd:
+        // Draws before it wrote only attachments, which the pass's later draws see in
+        // rasterization order unless they sample them; work recorded before the pass is ordered
+        // for its draws by that work's own barriers (compute: the pass begin's). A later draw that
+        // samples a render target or stores ends the pass (the fragment barrier rule); the pass
+        // end records the barrier.
+        wfi_at_pass_end |= stages;
+        fragment_barrier.Defer(true);
+        P5b::Add(P5b::Counter::WfiDeferred);
+        return;
+    case WfiAction::EndPass:
+        CountRenderPassEnd(location.file_name(), location.line());
+        P5b::Add(P5b::Counter::WfiPassEnds);
+        wfi_at_pass_end |= stages;
+        EndRenderPass();
+        return;
+    case WfiAction::Barrier:
+        break;
+    }
+    // Realizes a deferred clear as the old pass end did (a deferred WFI is recorded with it).
+    EndRenderPass();
+    RecordWaitForIdleBarrier(stages);
+}
+
+void Scheduler::RecordWaitForIdleBarrier(u32 stages) {
+    // The global barrier (MASTER_PLAN §5.5: the WFI is the only one): every pending write the
+    // tracker holds folds into it, so later readers find nothing pending, as after the old
+    // full flush, without a second barrier.
+    const auto pending = barrier_tracker.TakeAll();
+    const auto reads = std::exchange(read_hazard, {});
+    VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::WfiBarriers);
+    RecordHazardBarrierUncounted(stages | pending.stages | reads.stages,
+                                 VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                 VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+}
+
 bool Scheduler::UpdateGraphicsPipeline(GraphicsPipeline* pipeline) {
     if (state.graphics_pipeline == pipeline) {
         if (pipeline && pipeline->UsesExtendedDynamicState() &&
@@ -1582,6 +1627,10 @@ void Scheduler::EndRenderPass()
             state.dynamic = false;
             num_renderpass_images = 0;
             UpdateAutoFlush();
+            if (wfi_at_pass_end != 0) [[unlikely]] {
+                // F4-X3: a wait-for-idle recorded inside the pass.
+                RecordWaitForIdleBarrier(std::exchange(wfi_at_pass_end, 0));
+            }
             return;
         }
         VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::PassEndBarriers);

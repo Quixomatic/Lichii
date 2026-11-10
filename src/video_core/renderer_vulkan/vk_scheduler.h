@@ -221,6 +221,10 @@ public:
     /// orders its reads).
     void RequestOutsideRenderPassForDispatch(
         std::source_location location = std::source_location::current());
+    /// F4-X3 (tracker on): the guest's wait-for-idle (V2::DecideWaitForIdle). `stages`: the
+    /// source stages of its barrier (shader and transfer writes -> every later command).
+    void WaitForIdleTracked(u32 stages,
+                            std::source_location location = std::source_location::current());
     [[nodiscard]] bool TracksBarriers() const noexcept {
         return track_barriers;
     }
@@ -538,7 +542,8 @@ private:
     bool lazy_fences{};                 ///< F4-02: SetLazyFences
     bool finish_publishes_tick{};       ///< F4-12: FinishThreadPublishesTick
     bool pass_transform_feedback{};     ///< F4-07: NoteTransformFeedback
-    bool submit_wanted{};               ///< F4-02: work waits for the next idle hook or boundary
+    u32 wfi_at_pass_end{};              ///< F4-X3: barrier stages of a WFI in the active pass
+    bool submit_wanted{};             ///< F4-02: work waits for the next idle hook or boundary
     u64 lazy_outstanding_tick{};        ///< F4-02: newest lazy fence's tick (recording thread)
 
     class Command {
@@ -662,6 +667,9 @@ private:
     /// The barrier without the targeted-barrier count (a full barrier counts as that).
     void RecordHazardBarrierUncounted(u32 src_stages, u32 src_access, u32 dst_stages,
                                       u32 dst_access);
+    /// F4-X3: the WFI barrier, with every pending tracked write folded into it.
+    void RecordWaitForIdleBarrier(u32 stages);
+
     void UpdateAutoFlush() {
         auto_flush = track_barriers && !targeted_scope && !state.renderpass &&
                      !barrier_tracker.Empty();

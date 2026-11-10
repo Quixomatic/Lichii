@@ -150,6 +150,18 @@ TEST_CASE("V2 P5b barrier tracker range math", "[video_core][v2_p5b]") {
     }
 }
 
+TEST_CASE("V2 P5b wait-for-idle keeps store-free passes open", "[video_core][v2_p5b]") {
+    // F4-X3: outside a pass the barrier is recorded at once; inside a pass whose draws wrote only
+    // attachments (tracked) it waits for the pass end; stores or transform feedback end the pass.
+    using VideoCommon::V2::DecideWaitForIdle;
+    using VideoCommon::V2::WfiAction;
+    REQUIRE(DecideWaitForIdle(false, false, false) == WfiAction::Barrier);
+    REQUIRE(DecideWaitForIdle(false, true, true) == WfiAction::Barrier);
+    REQUIRE(DecideWaitForIdle(true, false, false) == WfiAction::AtPassEnd);
+    REQUIRE(DecideWaitForIdle(true, true, false) == WfiAction::EndPass);
+    REQUIRE(DecideWaitForIdle(true, false, true) == WfiAction::EndPass);
+}
+
 TEST_CASE("V2 P5b flush heuristic decisions", "[video_core][v2_p5b]") {
     FlushParams params;
     const FlushState idle{.pending = 0, .back_behind = false};
