@@ -96,6 +96,7 @@ add_executable(tests
     video_core/v2_p5b.cpp
     video_core/v2_p6.cpp
     video_core/v2_drawrec.cpp
+    video_core/v2_cbuf_watch.cpp
     hid_core/sensor_info.cpp
     common/paged_scalar.cpp
     common/queue_lifetime.cpp

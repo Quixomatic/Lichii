@@ -132,6 +132,8 @@ add_library(video_core STATIC
     v2/commit.h
     v2/epoch_publish.h
     v2/cbuf_ring.h
+    v2/cbuf_watch.cpp
+    v2/cbuf_watch.h
     v2/cbuf_version.h
     v2/continued_draw.h
     v2/desc_cache.h
