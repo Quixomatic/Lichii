@@ -242,10 +242,25 @@ std::string TakeRecordStatsText(double seconds) {
         return {}; // another thread's window took them, or the path did not run
     }
     const u64 draws = take(stats.drawrec_draws);
-    std::string commit_only;
+    std::array<u64, NumCommitOnlyReasons> reasons{};
+    u64 commit_only_total = 0;
     for (size_t i = 1; i < NumCommitOnlyReasons; ++i) {
-        if (const u64 value = take(stats.commit_only[i]); value != 0) {
-            commit_only += fmt::format(" {} {:.0f}", commit_only_names[i], rate(value));
+        reasons[i] = take(stats.commit_only[i]);
+        commit_only_total += reasons[i];
+    }
+    // The share of each reason among the draws the record path met (R-14, S0-03).
+    const auto share = [&](u64 value) {
+        const u64 total = draws + commit_only_total;
+        return total != 0 ? 100.0 * static_cast<double>(value) / static_cast<double>(total) : 0.0;
+    };
+    std::string commit_only;
+    if (commit_only_total != 0) {
+        commit_only = fmt::format(" {:.1f}%", share(commit_only_total));
+    }
+    for (size_t i = 1; i < NumCommitOnlyReasons; ++i) {
+        if (reasons[i] != 0) {
+            commit_only += fmt::format(" {} {:.0f} ({:.1f}%)", commit_only_names[i],
+                                       rate(reasons[i]), share(reasons[i]));
         }
     }
     std::string mismatches;
