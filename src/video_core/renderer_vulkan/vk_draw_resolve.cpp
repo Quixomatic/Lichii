@@ -902,6 +902,7 @@ GraphicsPipeline::ApplyResult GraphicsPipeline::ApplyDraw(
     R::DrawHeader& h = record.h;
     const bool derive_only = mode == ApplyMode::DeriveOnly;
     const bool from_template = mode == ApplyMode::Template && recipe != nullptr;
+    bool views_relooked = false; ///< the deleted-images loop looked the views up again
     out.Clear();
     if (derive_only) {
         RelookupRecordProxies(record);
@@ -939,7 +940,7 @@ GraphicsPipeline::ApplyResult GraphicsPipeline::ApplyDraw(
         // or a blacklisted image scaled down, looks the views up again).
         const bool blacklist = (h.flags & R::DrawFlagBlacklistedImages) != 0;
         static_cast<void>(texture_cache.TakeDeletedImages());
-        bool looped = false;
+        bool& looped = views_relooked;
         for (;;) {
             bool has_blacklisted = false;
             stage.Apply(textures, [&](const C::Request& request) {
@@ -994,7 +995,24 @@ GraphicsPipeline::ApplyResult GraphicsPipeline::ApplyDraw(
     // once per submission.
     const u64 heap_releases =
         heap_pipeline && heap_push.heap != nullptr ? heap_push.heap->Releases() : 0;
-    if (from_template && HeapWordsReplayable(*recipe)) {
+    namespace Versions = VideoCommon::V2::Versions;
+    const u64 rescale_epoch = Versions::Gens().GetEpoch(Versions::Epoch::Rescale);
+    // Step 18: a continued draw samples the last draw's views and samplers; its words hold while
+    // no heap slot was recycled or freed and the rescale epoch is the same.
+    const bool keepable = heap_pipeline && heap_push.heap != nullptr && !heap_push.verify &&
+                          HeapImagesOnly();
+    if (mode == ApplyMode::Continued && keepable && !views_relooked &&
+        kept_heap_releases == heap_releases &&
+        kept_rescale_epoch == rescale_epoch &&
+        kept_rescaling.size() == out.rescaling.Data().size()) {
+        out.heap_words.assign(kept_heap_words.begin(), kept_heap_words.end());
+        out.rescaling.Assign(std::span<const u32>(kept_rescaling.data(), kept_rescaling.size()));
+        out.heap_replayed = true;
+        if (const u64 tick = scheduler.CurrentTick(); kept_heap_tick != tick) {
+            kept_heap_tick = tick;
+            TouchHeapWords(kept_heap_words);
+        }
+    } else if (from_template && HeapWordsReplayable(*recipe)) {
         out.heap_words.assign(recipe->heap_words.begin(), recipe->heap_words.end());
         out.rescaling.Assign(std::span<const u32>(recipe->push.data(), out.rescaling.Data().size()));
         out.heap_replayed = true;
@@ -1022,6 +1040,14 @@ GraphicsPipeline::ApplyResult GraphicsPipeline::ApplyDraw(
             recipe->heap_releases = heap_releases;
             recipe->heap_tick = scheduler.CurrentTick();
         }
+    }
+    if (keepable && !derive_only && !(mode == ApplyMode::Continued && out.heap_replayed)) {
+        // The words of the views a continued draw after this one samples (whatever path).
+        kept_heap_words.assign(out.heap_words.begin(), out.heap_words.end());
+        kept_rescaling.assign(out.rescaling.Data().begin(), out.rescaling.Data().end());
+        kept_heap_releases = heap_push.heap->Releases();
+        kept_rescale_epoch = rescale_epoch;
+        kept_heap_tick = scheduler.CurrentTick();
     }
     if (!derive_only) {
         // 6. The heap slots reserved get their descriptors.

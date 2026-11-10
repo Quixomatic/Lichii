@@ -443,7 +443,9 @@ public:
     /// (heap slots reserved), the heap committed, the render targets updated, the feedback-loop
     /// check. Template: a recipe hit (heap words replayed while valid). DeriveOnly (verify):
     /// nothing applied, proxies looked up again, slots peeked. False: the draw can't be recorded.
-    enum class ApplyMode : u8 { Normal, Template, DeriveOnly };
+    /// Continued (step 18, F2-04(2)): a continued draw keeps the heap and rescaling words the
+    /// pipeline's last record path draw derived while no heap slot moved.
+    enum class ApplyMode : u8 { Normal, Template, DeriveOnly, Continued };
     /// Rebuild (Template only): the recipe no longer holds (views not resident, other render
     /// targets); the draw resolves in full, as for ConfigureRecipe.
     enum class ApplyResult : u8 { Ok, Rebuild, Failed };
@@ -547,6 +549,13 @@ private:
     /// The recipe build (slot, stamp) last_record was copied from (null: a resolve).
     const void* last_record_recipe{};
     u64 last_record_stamp{};
+    /// Step 18: the heap and rescaling words the last record path draw derived (heap-only
+    /// pipelines), the heap release count and rescale epoch they hold under (~0: none).
+    std::vector<u32> kept_heap_words;
+    std::vector<u32> kept_rescaling;
+    u64 kept_heap_releases{~0ULL};
+    u64 kept_rescale_epoch{};
+    u64 kept_heap_tick{};
     /// ApplyDraw's pieces: record proxies patched from a list (or looked up again), bindings
     /// peeked again after a deletion, texture buffers from the views again.
     void PatchRecordViews(VideoCommon::V2::Resolve::ResolvedDraw& record,

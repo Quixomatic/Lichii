@@ -5599,7 +5599,7 @@ bool RasterizerVulkan::PrepareDeltaRecord(GraphicsPipeline& pipeline, bool is_in
     }
     drawrec_textures.Reset(commit->next_segment++);
     if (pipeline.ApplyDraw(drawrec_record, drawrec_textures, drawrec_buffers, drawrec_apply,
-                           GraphicsPipeline::ApplyMode::Normal, commit->stage) !=
+                           GraphicsPipeline::ApplyMode::Continued, commit->stage) !=
         GraphicsPipeline::ApplyResult::Ok) {
         recorded = true; // as ConfigureDelta returning false: the draw can't be recorded
         return false;
