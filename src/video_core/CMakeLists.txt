@@ -184,6 +184,7 @@ add_library(video_core STATIC
     v2/va_map.h
     v2/versions.cpp
     v2/versions.h
+    v2/word_readback.h
     pending_maps.h
     present.h
     pte_kind.h

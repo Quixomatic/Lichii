@@ -33,6 +33,7 @@
 #include "video_core/v2/hazard.h"
 #include "video_core/v2/v2_stats.h"
 #include "video_core/v2/versions.h"
+#include "video_core/v2/word_readback.h"
 
 namespace Tegra::Engines {
 
@@ -196,8 +197,9 @@ struct ViewCheck {
 // `wait`: a decision that needs a queued dispatch to run first waits for it here. Without it
 // (ACQUIRE=1) such an acquire is not met yet: the channel suspends and its polls decide once the
 // back ran the dispatch (MASTER_PLAN §6: suspend, don't block the front).
+// `word_landed`: a GPU-written word was just read back (V2::WordReadback): memory holds it.
 ViewCheck CheckWithView(DmaPusher& dma_pusher, GPUVAddr address, u32 value, V2::SemaphoreOp op,
-                        bool wait = true) {
+                        bool wait = true, bool word_landed = false) {
     auto& split = VideoCommon::GpuSplit::Get();
     // Macros on the back send 3D reports the front doesn't see.
     if (!split.Active() || !split.FrontMacros() || !ReleasesLandAtOnce()) {
@@ -208,8 +210,8 @@ ViewCheck CheckWithView(DmaPusher& dma_pusher, GPUVAddr address, u32 value, V2::
     if (!device) {
         return {V2::AcquireVerdict::Fallback, Reason::Unmapped, false};
     }
-    // A word the buffer cache may hold newer than memory is read through the back.
-    if (Nx2MayBeGpuWritten(*device, sizeof(u32))) {
+    // A word the buffer cache may hold newer than memory is read back first (class C).
+    if (!word_landed && Nx2MayBeGpuWritten(*device, sizeof(u32))) {
         return {V2::AcquireVerdict::Fallback, Reason::GpuWritten, false};
     }
     V2::HazardFilter filter;
@@ -239,7 +241,7 @@ ViewCheck CheckWithView(DmaPusher& dma_pusher, GPUVAddr address, u32 value, V2::
         }
         split.WaitForPosition(decision.position, VideoCommon::DrainSite::Acquire);
         // The dispatch waited for may have written the word through the buffer cache.
-        if (Nx2MayBeGpuWritten(*device, sizeof(u32))) {
+        if (!word_landed && Nx2MayBeGpuWritten(*device, sizeof(u32))) {
             return {V2::AcquireVerdict::Fallback, Reason::GpuWritten, true};
         }
         const bool met = V2::SemaphoreMet(op, memory.Read<u32>(address), value);
@@ -260,6 +262,14 @@ bool Passes(const ViewCheck& check) {
            check.verdict == V2::AcquireVerdict::MetByQueued;
 }
 
+// EDEN_NX2_V2_ACQUIRE=1 (MASTER_PLAN §6, Fix F3-05): an acquire the view doesn't pass suspends
+// the channel; no drain, no forced fence. Only settings the view doesn't model (accurate GPU,
+// delayed fences, macros on the back) take the old path.
+bool SuspendsOnView(const ViewCheck& check) {
+    return check.verdict == V2::AcquireVerdict::NotMet ||
+           (check.verdict == V2::AcquireVerdict::Fallback && check.reason != Reason::Settings);
+}
+
 void NoteViewDecision(const ViewCheck& check) {
     if (!V2Stats::Enabled()) [[likely]] {
         return;
@@ -277,9 +287,19 @@ void NoteViewDecision(const ViewCheck& check) {
 // EDEN_NX2_V2_ACQUIRE=verify: the view decided, the old path ran; logs where they disagree.
 // The serious case is a pass the old path doesn't make. A poll the view keeps waiting that the
 // old path resumes only costs time (the latch or the valve resumes it); it is counted too.
+// `landing`: the view passed on a release still to land (class B). The drained path reads memory,
+// which gets the release only when its operation runs: the comparison waits for that landing and
+// asks memory again, so only a pass the landed release doesn't confirm counts (Fix F3-04).
 void ReportViewMismatch(DmaPusher& dma_pusher, GPUVAddr address, u32 value, u32 operation,
-                        bool view_passes, bool old_passed, const char* where) {
+                        bool view_passes, bool old_passed, const char* where, u64 landing = 0,
+                        V2::SemaphoreOp op = V2::SemaphoreOp::Gequal) {
     if (view_passes == old_passed) {
+        return;
+    }
+    if (view_passes && landing != 0 &&
+        VideoCommon::GpuSplit::Get().WaitLanded(landing, VideoCommon::DrainSite::Acquire,
+                                                200'000) &&
+        V2::SemaphoreMet(op, dma_pusher.memory_manager.Read<u32>(address), value)) {
         return;
     }
     // The view waiting where the drained path goes on is benign: a release landed between the two
@@ -301,6 +321,9 @@ void ReportViewMismatch(DmaPusher& dma_pusher, GPUVAddr address, u32 value, u32 
 } // Anonymous namespace
 
 bool Puller::PendingAcquire::Matches(u32 current) const {
+    if (sem_execute) {
+        return V2::SemaphoreMet(static_cast<V2::SemaphoreOp>(view_op), current, value);
+    }
     switch (static_cast<GpuSemaphoreOperation>(operation)) {
     case GpuSemaphoreOperation::AcquireEqual:
         return current == value;
@@ -331,37 +354,72 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
 }
 
 bool Puller::PollAcquireView(DmaPusher& dma_pusher) {
-    // A poll of a suspended channel decided without draining the split (upstream ea4340a5b4):
-    // until the back runs a release, nothing sent to the word meets it, and the back's release
-    // latches the waiter. Work only a drain finishes still lands: an unmet poll drains at most
-    // once per 1 ms (PantACRO4life's valve, 53bd961ab4), which also reports waits over 2 s.
+    // A poll of a suspended channel decided without draining the split (upstream ea4340a5b4,
+    // MASTER_PLAN §6): until a release meets the acquire the channel stays suspended, and a
+    // release landing latches the waiter. No 1 ms valve drain (Fix F3-03): a release the back
+    // ran lands once its fence's submission is on the GPU; the fencing thread asks the back to
+    // submit that tick (InnerFence::Wait), and an unmet poll with releases still to land asks
+    // for a deferred submit too, never a drain.
     auto& split = VideoCommon::GpuSplit::Get();
     const bool verify = split.AcquireMode() == V2::Mode::Verify;
     PendingAcquire& acquire = *pending_acquire;
     const GPUVAddr address = acquire.address;
     const u32 value = acquire.value;
     const u32 operation = acquire.operation;
-    const ViewCheck check = CheckWithView(dma_pusher, address, value, ViewOp(operation), verify);
+    const auto op = static_cast<V2::SemaphoreOp>(acquire.view_op);
+    bool word_landed = false;
+    if (acquire.readback_sent && !verify) {
+        // Class C (Fix F3-06): the GPU-written word's readback, sent behind its writers.
+        if (!word_readback->Ready()) {
+            return false;
+        }
+        word_readback->Land();
+        acquire.readback_sent = false;
+        word_landed = true;
+    }
+    const ViewCheck check =
+        CheckWithView(dma_pusher, address, value, op, verify, word_landed);
     bool decided = false;
     bool passes = false;
     if (Passes(check)) {
         decided = true;
         passes = true;
         NoteViewDecision(check);
-    } else if (check.verdict == V2::AcquireVerdict::NotMet) {
-        if (Nx2SemaphoreWaiters::Get().Latched(this)) {
-            decided = true;
-            passes = true;
-        } else if (const auto now = std::chrono::steady_clock::now();
-                   now - acquire.last_drain < std::chrono::milliseconds{1}) {
-            decided = true;
-        } else {
-            acquire.last_drain = now;
+    } else if (Nx2SemaphoreWaiters::Get().Latched(this)) {
+        decided = true;
+        passes = true;
+    } else if (!verify && SuspendsOnView(check)) {
+        decided = true;
+        const auto now = std::chrono::steady_clock::now();
+        if (check.reason == Reason::GpuWritten) {
+            // Read the word back again once the back ran what was sent since (at most per
+            // 200 us): no drain, no synchronous download on the back.
+            if (now - acquire.last_request >= std::chrono::microseconds{200}) {
+                acquire.last_request = now;
+                SendWordReadback(dma_pusher);
+            }
+        } else if (split.LandingPending() &&
+                   now - acquire.last_request >= std::chrono::milliseconds{1}) {
+            // Releases still to land: their fences may sit in a deferred submission.
+            acquire.last_request = now;
+            split.RequestIdleHook();
         }
         if (V2Stats::Enabled()) [[unlikely]] {
-            V2Stats::NoteDecision(VideoCommon::DrainSite::Acquire,
-                                  decided ? Decision::Avoided : Decision::Waited,
-                                  decided ? Reason::None : Reason::Valve);
+            V2Stats::NoteDecision(VideoCommon::DrainSite::Acquire, Decision::Avoided);
+        }
+        if (!acquire.reported && now - acquire.since > std::chrono::seconds{2}) {
+            acquire.reported = true;
+            LOG_WARNING(HW_GPU,
+                        "Channel {} waits on semaphore {:#x} (op {}, {:#x}, now {:#x}) for 2 s "
+                        "(view: {})",
+                        dma_pusher.channel_state.bind_id, address, operation, value,
+                        dma_pusher.memory_manager.Read<u32>(address),
+                        static_cast<u32>(check.reason));
+            if (acquire.sem_execute) {
+                // SEM_EXECUTE acquires never blocked before: keep a stuck one from hanging the
+                // channel for good.
+                return true;
+            }
         }
     } else {
         NoteViewDecision(check);
@@ -370,7 +428,7 @@ bool Puller::PollAcquireView(DmaPusher& dma_pusher) {
         const bool old_passed = PollAcquire(dma_pusher);
         if (verify && decided) {
             ReportViewMismatch(dma_pusher, address, value, operation, passes, old_passed,
-                               "poll");
+                               "poll", check.landing, op);
         }
         return old_passed;
     }
@@ -379,6 +437,54 @@ bool Puller::PollAcquireView(DmaPusher& dma_pusher) {
         split.NoteSync();
     }
     return passes;
+}
+
+void Puller::SendWordReadback(DmaPusher& dma_pusher) {
+    PendingAcquire& acquire = *pending_acquire;
+    const auto device = dma_pusher.memory_manager.GpuToCpuAddress(acquire.address);
+    if (!device) {
+        return;
+    }
+    if (!word_readback) {
+        word_readback = std::make_shared<V2::WordReadback>();
+    }
+    auto& split = VideoCommon::GpuSplit::Get();
+    const V2::Ir::ReadbackBody body{
+        .op = V2::Ir::ReadbackOp::WordReadback,
+        .object = split.Ref(dma_pusher.rasterizer),
+        .object2 = split.Ref(word_readback.get()),
+        .cache = 0,
+        .address = *device,
+        .bytes = sizeof(u32),
+    };
+    split.Emit(V2::Ir::Kind::Readback, body,
+               [rasterizer = dma_pusher.rasterizer, slot = word_readback.get(), device = *device] {
+                   slot->Run(*rasterizer, device, sizeof(u32));
+               });
+    split.Publish();
+    acquire.readback_sent = true;
+}
+
+void Puller::SuspendOnView(DmaPusher& dma_pusher, PendingAcquire acquire, bool gpu_written) {
+    // operation 0: a SEM_EXECUTE comparison the latch can't make (circular, mask zero); the polls
+    // read the word.
+    auto& waiters = Nx2SemaphoreWaiters::Get();
+    if (const auto device = dma_pusher.memory_manager.GpuToCpuAddress(acquire.address);
+        device && acquire.operation != 0) {
+        waiters.Add(this, *device, acquire.value, acquire.operation);
+    }
+    // Releases only what already signalled (nothing with async fences): the fencing thread lands
+    // releases as the GPU passes them, and a release among them latches the waiter.
+    OnBackBarrier(dma_pusher, VideoCommon::V2::Ir::BarrierOp::ReleaseFences,
+                  [rasterizer = dma_pusher.rasterizer] { rasterizer->ReleaseFences(false); },
+                  VideoCommon::V2::Ir::ReleaseFencesUnforced);
+    acquire.last_request = std::chrono::steady_clock::now();
+    pending_acquire = acquire;
+    if (gpu_written) {
+        SendWordReadback(dma_pusher);
+    }
+    dma_pusher.suspensions.fetch_add(1, std::memory_order_release);
+    VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AcquireWaits, 1);
 }
 
 bool Puller::PollAcquire(DmaPusher& dma_pusher) {
@@ -580,8 +686,9 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
             .operation = static_cast<u32>(op),
             .since = std::chrono::steady_clock::now(),
             .last_fences = std::chrono::steady_clock::now(),
-            .last_drain = std::chrono::steady_clock::now(),
+            .last_request = std::chrono::steady_clock::now(),
             .reported = false,
+            .view_op = static_cast<u8>(ViewOp(static_cast<u32>(op))),
         };
         if (op != GpuSemaphoreOperation::AcquireEqual && op != GpuSemaphoreOperation::AcquireGequal &&
             op != GpuSemaphoreOperation::AcquireMask) {
@@ -598,36 +705,25 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
         // EDEN_NX2_V2_ACQUIRE: met by memory (class A) or by a release queued ahead (B) passes
         // without draining; anything else takes the path below, as before.
         bool view_passes = false;
+        u64 view_landing = 0;
         const V2::Mode view_mode = split.AcquireMode();
         if (view_mode != V2::Mode::Off) [[unlikely]] {
             const ViewCheck view =
                 CheckWithView(dma_pusher, acquire.address, acquire.value,
                               ViewOp(acquire.operation), view_mode != V2::Mode::On);
             view_passes = Passes(view);
-            if (view.verdict == V2::AcquireVerdict::NotMet && view_mode == V2::Mode::On) {
-                // Nothing sent to the word meets it: a drain can't change that, only a release
-                // the back runs later (or the CPU's). Suspend at once: register the latch and
-                // let the polls decide, without waiting for the back here. The fencing thread
-                // releases pending fences as the GPU passes them (a release among them latches
-                // it), so the back only releases those already signalled: no forced fence,
-                // submit and GPU wait (MASTER_PLAN §6). The 1 ms valve keeps the forced form.
+            view_landing = view.landing;
+            if (view_mode == V2::Mode::On && SuspendsOnView(view)) {
+                // Not met yet (nothing sent to the word meets it, the newest write doesn't, or
+                // only a counter/unmapped/GPU-written word decides): a drain can't settle it,
+                // only a later release, its landing or the word's readback. Suspend at once:
+                // latch, no forced fence, submit and back GPU wait (MASTER_PLAN §6, F3-05).
                 if (V2Stats::Enabled()) [[unlikely]] {
                     V2Stats::NoteDecision(VideoCommon::DrainSite::Acquire, Decision::Avoided);
                 }
-                auto& waiters = Nx2SemaphoreWaiters::Get();
-                if (const auto device = dma_pusher.memory_manager.GpuToCpuAddress(acquire.address)) {
-                    waiters.Add(this, *device, acquire.value, acquire.operation);
-                }
-                OnBackBarrier(dma_pusher, VideoCommon::V2::Ir::BarrierOp::ReleaseFences,
-                              [rasterizer = dma_pusher.rasterizer] {
-                                  rasterizer->ReleaseFences(false);
-                              },
-                              VideoCommon::V2::Ir::ReleaseFencesUnforced);
                 NoteAcquireRecord(dma_pusher, acquire.address, acquire.value, acquire.operation,
                                   static_cast<u32>(view.verdict));
-                pending_acquire = acquire;
-                dma_pusher.suspensions.fetch_add(1, std::memory_order_release);
-                VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AcquireWaits, 1);
+                SuspendOnView(dma_pusher, acquire, view.reason == Reason::GpuWritten);
                 return;
             }
             NoteViewDecision(view);
@@ -647,7 +743,8 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
         const auto verify_result = [&](bool old_passed) {
             if (view_passes) [[unlikely]] {
                 ReportViewMismatch(dma_pusher, acquire.address, acquire.value,
-                                   acquire.operation, true, old_passed, "acquire");
+                                   acquire.operation, true, old_passed, "acquire", view_landing,
+                                   ViewOp(acquire.operation));
             }
         };
         const bool v2_stats = V2Stats::Enabled();
@@ -782,18 +879,48 @@ void Puller::ProcessSemaphoreExecute(DmaPusher& dma_pusher, u32 argument) {
             : V2Stats::SyncClass::Count;
     const V2Stats::AcquireContext context{sync_class};
     bool view_passes = false;
+    u64 view_landing = 0;
+    static constexpr std::array<V2::SemaphoreOp, 6> view_ops{
+        V2::SemaphoreOp::Equal,  V2::SemaphoreOp::Equal, V2::SemaphoreOp::Gequal,
+        V2::SemaphoreOp::CircularGequal, V2::SemaphoreOp::Mask, V2::SemaphoreOp::MaskZero,
+    };
     if (const V2::Mode view_mode = VideoCommon::GpuSplit::Get().AcquireMode();
         view_mode != V2::Mode::Off && operation < 6 && operation != 1) [[unlikely]] {
-        // EDEN_NX2_V2_ACQUIRE: these acquires never block; one the view meets skips the drain
-        // and the fence release.
-        static constexpr std::array<V2::SemaphoreOp, 6> view_ops{
-            V2::SemaphoreOp::Equal,  V2::SemaphoreOp::Equal, V2::SemaphoreOp::Gequal,
-            V2::SemaphoreOp::CircularGequal, V2::SemaphoreOp::Mask, V2::SemaphoreOp::MaskZero,
-        };
-        const ViewCheck view = CheckWithView(dma_pusher, address, payload, view_ops[operation]);
-        NoteViewDecision(view);
+        // EDEN_NX2_V2_ACQUIRE: one the view meets skips the drain and the fence release; with
+        // =1 one it doesn't suspends the channel.
+        const bool on = view_mode == V2::Mode::On;
+        const ViewCheck view =
+            CheckWithView(dma_pusher, address, payload, view_ops[operation], !on);
         view_passes = Passes(view);
-        if (view_passes && view_mode == V2::Mode::On) {
+        view_landing = view.landing;
+        if (on && SuspendsOnView(view)) {
+            // Fix F3-07: suspended like a trigger acquire (MASTER_PLAN §6), not drained, fenced
+            // and then run past unmet.
+            if (V2Stats::Enabled()) [[unlikely]] {
+                V2Stats::NoteDecision(VideoCommon::DrainSite::Acquire, Decision::Avoided);
+            }
+            VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Fence);
+            VideoCommon::V2::Versions::HookEpoch(VideoCommon::V2::Versions::EpochReason::Acquire);
+            // The latch's comparisons (GpuSemaphoreOperation); 0: none fits, the polls decide.
+            static constexpr std::array<u32, 6> latch_ops{0x1, 0x1, 0x4, 0x0, 0x8, 0x0};
+            const auto now = std::chrono::steady_clock::now();
+            SuspendOnView(dma_pusher,
+                          PendingAcquire{
+                              .address = address,
+                              .value = payload,
+                              .operation = latch_ops[operation],
+                              .since = now,
+                              .last_fences = now,
+                              .last_request = now,
+                              .reported = false,
+                              .view_op = static_cast<u8>(view_ops[operation]),
+                              .sem_execute = true,
+                          },
+                          view.reason == Reason::GpuWritten);
+            return;
+        }
+        NoteViewDecision(view);
+        if (view_passes && on) {
             if (view.verdict == V2::AcquireVerdict::MetByQueued) {
                 VideoCommon::GpuSplit::Get().NoteSync();
             }
@@ -820,7 +947,9 @@ void Puller::ProcessSemaphoreExecute(DmaPusher& dma_pusher, u32 argument) {
         V2Stats::NoteAcquire(sync_class, false, ready);
     }
     if (view_passes) [[unlikely]] {
-        ReportViewMismatch(dma_pusher, address, payload, operation, true, ready, "SEM_EXECUTE");
+        ReportViewMismatch(dma_pusher, address, payload, operation, true, ready, "SEM_EXECUTE",
+                           view_landing,
+                           operation < 6 ? view_ops[operation] : V2::SemaphoreOp::Equal);
     }
     if (!ready) {
         static std::atomic<u32> reported{};

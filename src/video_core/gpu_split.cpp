@@ -286,6 +286,11 @@ void GpuSplit::Stop() {
     ticket_position = 0;
     ticket_sub = 0;
     last_ticket = 0;
+    if (V2::Landing::verify) {
+        LOG_INFO(HW_GPU, "V2 landing verify: {} tickets landed out of order",
+                 V2::Landing::order_violations.load(std::memory_order_relaxed));
+        V2::Landing::verify = false;
+    }
     V2::Landing::landed.store(0, std::memory_order_relaxed);
     SetCpuLaneHook(nullptr, nullptr);
     cpu_lane_requested.store(false, std::memory_order_relaxed);

@@ -19,6 +19,7 @@
 #include "video_core/v2/ir_check.h"
 #include "video_core/v2/ir_exec.h"
 #include "video_core/v2/macro_hle.h"
+#include "video_core/v2/word_readback.h"
 
 namespace VideoCommon::V2::IrExec {
 
@@ -100,6 +101,10 @@ void Readback(const Ir::RecordView& record, const Ir::ReadbackBody& body,
             std::span<const DAddr>{pages, record.payload.words});
         return;
     }
+    case Ir::ReadbackOp::WordReadback:
+        context.objects.As<WordReadback>(body.object2)
+            ->Run(*static_cast<RasterizerInterface*>(object), body.address, body.bytes);
+        return;
     case Ir::ReadbackOp::Count:
         break;
     }

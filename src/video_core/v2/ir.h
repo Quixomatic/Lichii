@@ -303,6 +303,7 @@ enum class ReadbackOp : u32 {
     QueryFlush,       ///< QueryDma::FlushPending(memory, rasterizer2, gpu address, bytes)
     SegmentDirty,     ///< engine->current_dirty = memory2->IsMemoryDirty(gpu address, bytes)
     ListPages,        ///< rasterizer->FlushGpuWrittenCommandListPages(payload device pages)
+    WordReadback,     ///< object2 (V2::WordReadback)->Run(rasterizer, device address, bytes)
     Count,
 };
 
