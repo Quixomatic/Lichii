@@ -184,16 +184,26 @@ public:
     void Insert(const Hashes& hashes, u64 state_hash, const void* key, size_t size, Value* value) {
         std::scoped_lock lock{mutex};
         auto [it, is_new] = sets.try_emplace(hashes);
+        ShaderSet* set = it->second.get();
+        const bool new_variant = is_new || set->variants.Find(state_hash, key, size) == nullptr;
+        if (new_variant) {
+            BeginChange();
+        }
         if (is_new) {
             it->second = std::make_unique<ShaderSet>();
             it->second->hashes = hashes;
+            set = it->second.get();
+            if (published) {
+                published->Insert(hashes, Mix(hashes), reinterpret_cast<uintptr_t>(set));
+            }
         }
-        ShaderSet* const set = it->second.get();
-        if (set->variants.Find(state_hash, key, size) == nullptr) {
+        if (new_variant) {
             set->variants.Insert(state_hash, key, size, value);
         }
         (*cache)[Slot(hashes)].store(set, std::memory_order_release);
-        serial.fetch_add(1, std::memory_order_release);
+        if (new_variant) {
+            EndChange();
+        }
     }
 
     /// Forgets every entry (pipelines were destroyed). With a domain (SetDomain) the shader sets
@@ -201,12 +211,16 @@ public:
     /// values they found are stale from the generation this moves to.
     void Clear() {
         std::scoped_lock lock{mutex};
+        BeginChange();
         for (auto& slot : *cache) {
             slot.store(nullptr, std::memory_order_relaxed);
         }
-        // After the cache is empty: a reader that sees the new generation sees no old set.
+        if (published) {
+            published->Clear();
+        }
+        // After the tables are empty: a reader that sees the new generation sees no old set.
         generation.fetch_add(1, std::memory_order_release);
-        serial.fetch_add(1, std::memory_order_release);
+        EndChange();
         if (domain != nullptr && !sets.empty()) {
             using Retired = std::vector<std::unique_ptr<ShaderSet>>;
             auto* const retired = new Retired;
@@ -222,26 +236,49 @@ public:
     /// EDEN_NX2_V2_PARALLEL R3: lookups off the owner's thread. Readers (FindShared) run inside
     /// an epoch section of `domain_`; set before any reader starts.
     void SetDomain(EpochDomain* domain_) {
+        std::scoped_lock lock{mutex};
         domain = domain_;
+        published.reset();
+        if (domain != nullptr) {
+            // F6-X1: every set inserted so far, then each new one as Insert makes it.
+            published = std::make_unique<PublishedMap<Hashes, u64>>(*domain, 64);
+            for (const auto& [set_hashes, set] : sets) {
+                published->Insert(set_hashes, Mix(set_hashes), reinterpret_cast<uintptr_t>(set.get()));
+            }
+        }
     }
     /// Moves at every Clear: a value FindShared returned is still valid (not destroyed) while
     /// this has the value read before the lookup.
     [[nodiscard]] u64 Generation() const {
         return generation.load(std::memory_order_acquire);
     }
-    /// Moves at every Insert and Clear: two lookups of one key with equal serials answer the
-    /// same (verify tells dependent differences from real ones by it).
+    /// A sequence lock over what lookups can answer (F6-X1): odd while an Insert or Clear
+    /// changes the tables, even otherwise. Two FindShared calls of one key that both read the
+    /// same even serial before (Serial) and after (SerialHolds) answer the same; verify tells
+    /// dependent differences from real ones by it.
     [[nodiscard]] u64 Serial() const {
         return serial.load(std::memory_order_acquire);
     }
-    /// Any thread, inside an epoch section of the domain: the level-1 cache only (no lock, no
-    /// counters). A shader set not cached there yet is a miss; the owner's Find caches it.
+    /// After a lookup that read `before` from Serial(): no change overlapped it.
+    [[nodiscard]] bool SerialHolds(u64 before) const {
+        std::atomic_thread_fence(std::memory_order_acquire);
+        return (before & 1) == 0 && serial.load(std::memory_order_relaxed) == before;
+    }
+    /// Any thread, inside an epoch section of the domain (SetDomain first): the published,
+    /// insert-only shader set table (MASTER_PLAN §5.3: pure lookups). The answer depends only on
+    /// the Inserts and Clears before it, never on which set the owner's direct-mapped cache holds
+    /// (F6-X1: a cache slot two sets share made two lookups of one key with equal serials differ).
     [[nodiscard]] Value* FindShared(const Hashes& hashes, u64 state_hash, const void* key,
                                     size_t size) const {
-        const ShaderSet* const set = (*cache)[Slot(hashes)].load(std::memory_order_acquire);
-        if (set == nullptr || set->hashes != hashes) {
+        const PublishedMap<Hashes, u64>* const map = published.get();
+        if (map == nullptr) {
             return nullptr;
         }
+        const u64 found = map->Find(hashes, Mix(hashes));
+        if (found == PublishedMap<Hashes, u64>::Missing) {
+            return nullptr;
+        }
+        const ShaderSet* const set = reinterpret_cast<const ShaderSet*>(static_cast<uintptr_t>(found));
         return set->variants.Find(state_hash, key, size);
     }
 
@@ -272,6 +309,17 @@ private:
         return static_cast<size_t>(Mix(hashes)) & (CacheEntries - 1);
     }
 
+    /// Writers hold `mutex`.
+    void BeginChange() {
+        serial.store(serial.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+        std::atomic_thread_fence(std::memory_order_release);
+    }
+    void EndChange() {
+        serial.store(serial.load(std::memory_order_relaxed) + 1, std::memory_order_release);
+    }
+
+    /// The owner's lookup: the direct-mapped cache is its accelerator only (FindShared does not
+    /// read it, so restoring an evicted set here changes no shard's answer).
     ShaderSet* FindSet(const Hashes& hashes) {
         ShaderSet* const cached = (*cache)[Slot(hashes)].load(std::memory_order_acquire);
         if (cached != nullptr && cached->hashes == hashes) {
@@ -293,8 +341,10 @@ private:
     std::mutex mutex;
     Counters counters; ///< Owner thread only (Find); shards count nothing here
     EpochDomain* domain = nullptr;
+    /// F6-X1: shader sets for FindShared (null until SetDomain).
+    std::unique_ptr<PublishedMap<Hashes, u64>> published;
     std::atomic<u64> generation{1};
-    std::atomic<u64> serial{1};
+    std::atomic<u64> serial{2};
 };
 
 } // namespace VideoCommon::V2

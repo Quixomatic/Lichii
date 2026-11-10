@@ -1224,6 +1224,156 @@ TEST_CASE("V2 P6 R3: published programs answer by memory and address", "[video_c
     CHECK(!Resolve::FindProgram(0x1000, 0x8000, &hash));
 }
 
+TEST_CASE("V2 P6 F6-X1: shard lookups answer by what was inserted, not by the owner's cache",
+          "[video_core][v2_p6]") {
+    using Lookup = V2::PipelineLookup<u64>;
+    V2::EpochDomain domain;
+    Lookup lookup;
+    lookup.SetDomain(&domain);
+    // More shader sets than the owner's direct-mapped cache has entries: sets share slots, and
+    // the owner's Find keeps moving the one a slot holds.
+    constexpr u32 Sets = static_cast<u32>(Lookup::CacheEntries) + 1024;
+    std::vector<u64> values(Sets);
+    const auto hashes_of = [](u32 set) { return Lookup::Hashes{set * 7 + 1, set, 0, 0, 0, 3}; };
+    const std::array<u8, 16> key{1, 2, 3};
+    for (u32 set = 0; set < Sets; ++set) {
+        values[set] = set;
+        lookup.Insert(hashes_of(set), 5, key.data(), key.size(), &values[set]);
+    }
+    const u64 serial = lookup.Serial();
+    CHECK((serial & 1) == 0);
+    std::mt19937 rng{29};
+    for (u32 round = 0; round < 4 * Sets; ++round) {
+        const u32 set = rng() % Sets;
+        static_cast<void>(lookup.Find(hashes_of(set), 5, key.data(), key.size()));
+    }
+    // The owner's lookups move nothing a shard reads.
+    CHECK(lookup.Serial() == serial);
+    u32 wrong = 0;
+    std::thread{[&] {
+        const V2::ThreadEpochGuard guard{domain};
+        for (u32 set = 0; set < Sets; ++set) {
+            const u64* const found = lookup.FindShared(hashes_of(set), 5, key.data(), key.size());
+            wrong += found == &values[set] ? 0 : 1;
+        }
+    }}.join();
+    CHECK(wrong == 0);
+    CHECK(lookup.SerialHolds(serial));
+    // Inserting a variant that exists changes nothing; a new one moves the serial by a whole
+    // change (even again), and a read that straddled it does not hold.
+    lookup.Insert(hashes_of(0), 5, key.data(), key.size(), &values[0]);
+    CHECK(lookup.Serial() == serial);
+    const std::array<u8, 16> other{9};
+    lookup.Insert(hashes_of(0), 6, other.data(), other.size(), &values[1]);
+    CHECK(lookup.Serial() == serial + 2);
+    CHECK(!lookup.SerialHolds(serial));
+    lookup.Clear();
+    CHECK((lookup.Serial() & 1) == 0);
+    std::thread{[&] {
+        const V2::ThreadEpochGuard guard{domain};
+        CHECK(lookup.FindShared(hashes_of(0), 5, key.data(), key.size()) == nullptr);
+    }}.join();
+    domain.Reclaim();
+}
+
+TEST_CASE("V2 P6 F6-X1: published programs are insert-only and their generation is stable",
+          "[video_core][v2_p6]") {
+    Resolve::ClearPrograms();
+    // More programs than the old direct-mapped table had entries: none evicts another.
+    constexpr u32 Programs = 6000;
+    for (u32 i = 0; i < Programs; ++i) {
+        Resolve::PublishProgram(0x1000, 0x10000 + i * 0x100, 0x5000 + i);
+    }
+    const u64 generation = Resolve::ProgramGeneration();
+    CHECK((generation & 1) == 0);
+    u32 wrong = 0;
+    std::thread{[&] {
+        const V2::ThreadEpochGuard guard{Commit::Epochs()};
+        for (u32 i = 0; i < Programs; ++i) {
+            u64 hash = 0;
+            wrong += Resolve::FindProgram(0x1000, 0x10000 + i * 0x100, &hash) && hash == 0x5000 + i
+                         ? 0
+                         : 1;
+        }
+    }}.join();
+    CHECK(wrong == 0);
+    CHECK(Resolve::ProgramGenerationHolds(generation));
+    Resolve::PublishProgram(0x1000, 0x10000, 0x77);
+    CHECK(!Resolve::ProgramGenerationHolds(generation));
+    CHECK(!Resolve::ProgramGenerationHolds(generation + 1)); // a read during a publish
+    Resolve::ClearPrograms();
+}
+
+TEST_CASE("V2 P6 F6-X1: verify treats unstable table reads as dependent", "[video_core][v2_p6]") {
+    Resolve::PreDraw a;
+    a.has_pipeline = true;
+    a.pipeline = reinterpret_cast<const void*>(uintptr_t{0x100});
+    a.lookup_serial = 8;
+    a.program_generation = 4;
+    Resolve::PreDraw b = a;
+    b.pipeline = reinterpret_cast<const void*>(uintptr_t{0x200});
+    CHECK(Resolve::SplitTraits::Compare(a, b) != nullptr); // equal stable serials: real
+    b.lookup_serial = Resolve::UnstableGeneration;
+    CHECK(Resolve::SplitTraits::Compare(a, b) == nullptr);
+    a.lookup_serial = b.lookup_serial = Resolve::UnstableGeneration;
+    CHECK(Resolve::SplitTraits::Compare(a, b) == nullptr); // both unstable: still dependent
+    a.lookup_serial = b.lookup_serial = 8;
+    a.program_generation = b.program_generation = Resolve::UnstableGeneration;
+    CHECK(Resolve::SplitTraits::Compare(a, b) == nullptr);
+}
+
+TEST_CASE("V2 P6 F6-X1: render_enable.mode is not an input of any shard resolve",
+          "[video_core][v2_p6]") {
+    using Tegra::Engines::Maxwell3D;
+    // A Maxwell3D builds the register semantics table.
+    ScopedSystemTestContext context;
+    Core::System system;
+    Core::DeviceMemory physical;
+    Tegra::MaxwellDeviceMemoryManager device_memory{physical};
+    Tegra::MemoryManager memory{system, device_memory, 32, 1ULL << 31};
+    Maxwell3D engine{memory};
+    constexpr u32 mode_index = MAXWELL3D_REG_INDEX(render_enable.mode);
+    const V2::RegSem::Table3D& table = V2::RegSem::GetTable3D();
+    // Not hashed: the group fingerprints (shapes, keys, segment checks) never see it.
+    CHECK((V2::GroupBit(table.groups[mode_index]) & V2::HashedGroups) == 0);
+    std::vector<u32> regs(Maxwell3D::Regs::NUM_REGS, 0);
+    std::mt19937 rng{31};
+    for (u32 i = 0; i < 4000; ++i) {
+        const u32 index = 0x200 + rng() % 0xb00;
+        if (table.groups[index] != V2::RegGroup::Misc) {
+            regs[index] = rng() % 4;
+        }
+    }
+    const Resolve::CbufTable cbufs{};
+    V2::GroupTracker groups;
+    V2::RegSem::Rehash3D(groups, regs.data());
+    Resolve::DynamicFeatures features{};
+    features.eds1 = features.eds2 = features.eds3_enables = true;
+    Vulkan::DynamicFeatures key_features{};
+    const auto resolve = [&](u32 mode, Resolve::DynamicState& dynamic,
+                             Vulkan::FixedPipelineState& state) {
+        regs[mode_index] = mode;
+        const Resolve::SnapshotView view{regs.data(),
+                                         &cbufs,
+                                         &groups,
+                                         Maxwell3D::Regs::PrimitiveTopology::Triangles,
+                                         Resolve::ViewDraw{.count = 3},
+                                         false};
+        dynamic = Resolve::ComputeDynamic(view, features);
+        std::memset(&state, 0, sizeof(state));
+        state.RefreshFull(view.Regs(), Vulkan::KeyInputs{.topology = view.Topology()},
+                          key_features);
+    };
+    Resolve::DynamicState dynamic_a{};
+    Resolve::DynamicState dynamic_b{};
+    Vulkan::FixedPipelineState key_a;
+    Vulkan::FixedPipelineState key_b;
+    resolve(0, dynamic_a, key_a);
+    resolve(1, dynamic_b, key_b);
+    CHECK(std::memcmp(&dynamic_a, &dynamic_b, sizeof(dynamic_a)) == 0);
+    CHECK(std::memcmp(&key_a, &key_b, sizeof(key_a)) == 0);
+}
+
 namespace {
 
 std::shared_ptr<const Resolve::PipelineKey> FakePipelineKey(const Resolve::SnapshotView& view) {

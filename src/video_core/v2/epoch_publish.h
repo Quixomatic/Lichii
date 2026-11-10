@@ -218,12 +218,14 @@ private:
     Entry* current = nullptr;
 };
 
-template <typename Key>
+/// `Value`: an unsigned integer (u32 slot ids; F6-X1 stores u64 object addresses).
+template <typename Key, typename Value = u32>
 class PublishedMap {
     static_assert(std::is_trivially_copyable_v<Key>);
+    static_assert(std::is_unsigned_v<Value>);
 
 public:
-    static constexpr u32 Missing = ~0U;
+    static constexpr Value Missing = static_cast<Value>(~Value{0});
 
     explicit PublishedMap(EpochDomain& domain_, size_t initial_capacity = 64) : domain{domain_} {
         size_t capacity = 16;
@@ -241,7 +243,7 @@ public:
     PublishedMap& operator=(const PublishedMap&) = delete;
 
     /// Any thread, inside an EpochGuard of the map's domain (or on the writer thread).
-    [[nodiscard]] u32 Find(const Key& key, u64 hash) const {
+    [[nodiscard]] Value Find(const Key& key, u64 hash) const {
         hash = Normalize(hash);
         const Table* const current = table.load(std::memory_order_acquire);
         const size_t mask = current->capacity - 1;
@@ -260,7 +262,7 @@ public:
     }
 
     /// Writer only: inserts or overwrites.
-    void Insert(const Key& key, u64 hash, u32 value) {
+    void Insert(const Key& key, u64 hash, Value value) {
         hash = Normalize(hash);
         Table* current = table.load(std::memory_order_relaxed);
         if ((current->used + 1) * 4 > current->capacity * 3) {
@@ -323,7 +325,7 @@ public:
             if (entry.hash.load(std::memory_order_relaxed) == 0) {
                 continue;
             }
-            const u32 value = entry.value.load(std::memory_order_relaxed);
+            const Value value = entry.value.load(std::memory_order_relaxed);
             if (value != Missing && pred(value)) {
                 entry.value.store(Missing, std::memory_order_release);
                 --current->live;
@@ -347,7 +349,7 @@ public:
 private:
     struct Entry {
         std::atomic<u64> hash{0}; ///< 0 = empty; published last
-        std::atomic<u32> value{Missing};
+        std::atomic<Value> value{Missing};
         Key key{};
     };
     struct Table {
@@ -370,7 +372,7 @@ private:
         for (size_t index = 0; index < old->capacity; ++index) {
             const Entry& entry = old->entries[index];
             const u64 hash = entry.hash.load(std::memory_order_relaxed);
-            const u32 value = entry.value.load(std::memory_order_relaxed);
+            const Value value = entry.value.load(std::memory_order_relaxed);
             if (hash == 0 || value == Missing) {
                 continue;
             }

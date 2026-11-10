@@ -558,26 +558,33 @@ void ShardPipeline(const VideoCommon::V2::Resolve::SnapshotView& view, uintptr_t
         (view.NativeTuring() && view.Regs().IsMeshEnabled())) {
         return;
     }
-    pre.program_generation = Resolve::ProgramGeneration();
-    std::array<u64, 6> hashes{};
-    for (size_t index = 0; index < hashes.size(); ++index) {
-        const GPUVAddr address = Resolve::ProgramAddress(view, index);
-        if (address != 0 && !Resolve::FindProgram(memory, address, &hashes[index])) {
-            return;
-        }
-    }
+    // The published programs and shader sets are read inside the section (F6-X1).
     const V2::ThreadEpochGuard guard{V2::Commit::Epochs()};
     if (!guard.Valid()) {
         return;
     }
+    // F6-X1: both tables are insert-only and their generations are sequence locks, so two
+    // lookups with equal stable generations answer alike (verify: a real mismatch otherwise).
+    const u64 program_generation = Resolve::ProgramGeneration();
+    std::array<u64, 6> hashes{};
+    for (size_t index = 0; index < hashes.size(); ++index) {
+        const GPUVAddr address = Resolve::ProgramAddress(view, index);
+        if (address != 0 && !Resolve::FindProgram(memory, address, &hashes[index])) {
+            return; // lookup_serial stays unstable: verify counts a difference as dependent
+        }
+    }
+    pre.program_generation = Resolve::ProgramGenerationHolds(program_generation)
+                                 ? program_generation
+                                 : Resolve::UnstableGeneration;
     const auto& lookup = cache->V2Lookup();
     // Before the lookup: a clear after this read makes the commit refuse what it finds.
     pre.lookup_generation = lookup.Generation();
-    pre.lookup_serial = lookup.Serial();
+    const u64 serial = lookup.Serial();
     FixedPipelineState state;
     std::memcpy(&state, pre.pipeline_key->bytes.data(), sizeof(state));
     GraphicsPipeline* const pipeline =
         lookup.FindShared(hashes, pre.pipeline_key->hash, &state, state.Size());
+    pre.lookup_serial = lookup.SerialHolds(serial) ? serial : Resolve::UnstableGeneration;
     pre.hashes = hashes;
     pre.pipeline = pipeline;
     pre.has_pipeline = pipeline != nullptr;
@@ -2016,10 +2023,9 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineV2() {
             shard_key = nullptr;
             shard_pre = nullptr;
         }
-        // R3: the programs behind these hashes, for the shards' lookups (again when the shader
-        // set changed, or a shard could not name it: a published entry may have been replaced).
-        if (graphics_key.unique_hashes != v2_published_hashes || maxwell3d != v2_published_engine ||
-            (shard_pre != nullptr && !shard_pre->has_pipeline)) {
+        // R3: the programs behind these hashes, for the shards' lookups, when the shader set
+        // changed (F6-X1: the table is insert-only, so a published program stays published).
+        if (graphics_key.unique_hashes != v2_published_hashes || maxwell3d != v2_published_engine) {
             const V2::Resolve::LiveView live{*maxwell3d};
             if (!(live.NativeTuring() && maxwell3d->regs.IsMeshEnabled())) {
                 const auto memory = reinterpret_cast<uintptr_t>(gpu_memory);

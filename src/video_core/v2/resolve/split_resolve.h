@@ -89,8 +89,13 @@ void PublishShape(u64 shape, u32 relevant_groups, const std::array<u32, CbufStag
 [[nodiscard]] bool FindShape(u64 shape, u32* relevant_groups,
                              std::array<u32, CbufStages>* key_cbufs);
 void ClearShapes();
-/// The shape table's publish generation (moves at every PublishShape and ClearShapes).
+/// The shape table's publish generation (a sequence lock: odd during PublishShape and
+/// ClearShapes, moves twice at each).
 [[nodiscard]] u64 ShapeGeneration();
+/// After reading the table with `before` from ShapeGeneration(): no publish overlapped it.
+[[nodiscard]] bool ShapeGenerationHolds(u64 before);
+/// A table generation read around a lookup that a publish overlapped: never equal to another.
+inline constexpr u64 UnstableGeneration = 0;
 /// The hash of a shape's key constant buffer slots (the commit checks the full key used these).
 [[nodiscard]] u64 CbufMasksHash(const std::array<u32, CbufStages>& key_cbufs);
 
@@ -106,12 +111,15 @@ inline PipelineKeyFn g_pipeline_key = nullptr;
 
 /// R3 (S0-02): the graphics programs' shader hashes the commit thread found, published for the
 /// shards by (memory manager, program GPU address). Single writer (the commit thread), lock-free
-/// readers. Best effort: the commit compares the hashes a shard used with its own.
+/// readers inside an epoch section of Commit::Epochs() (or the writer). Insert-only (F6-X1): an
+/// address's hash is replaced only by a newer hash for that address. The commit compares the
+/// hashes a shard used with its own.
 void PublishProgram(uintptr_t memory, GPUVAddr address, u64 unique_hash);
 [[nodiscard]] bool FindProgram(uintptr_t memory, GPUVAddr address, u64* unique_hash);
 void ClearPrograms();
-/// Moves at every PublishProgram and ClearPrograms.
+/// A sequence lock as ShapeGeneration's, over PublishProgram and ClearPrograms.
 [[nodiscard]] u64 ProgramGeneration();
+[[nodiscard]] bool ProgramGenerationHolds(u64 before);
 
 struct PreDraw;
 /// R3: the draw's pipeline looked up on the shard from its key (set by the Vulkan pipeline
@@ -144,8 +152,10 @@ struct PreDraw {
     /// generation is `lookup_generation`.
     const void* pipeline = nullptr;
     u64 lookup_generation = 0;
-    u64 lookup_serial = 0;      ///< the lookup's Serial() (verify: dependent differences)
-    u64 program_generation = 0; ///< ProgramGeneration() before the hashes were read
+    /// The lookup's Serial() around FindShared, UnstableGeneration when an insert overlapped
+    /// (verify: dependent differences).
+    u64 lookup_serial = 0;
+    u64 program_generation = 0; ///< ProgramGeneration() around the hash reads (or unstable)
     std::array<u64, 6> hashes{};
     bool has_pipeline = false;
     /// R5: the draw's dynamic state (ComputeDynamic on the shard's view; null: none), computed
@@ -170,6 +180,11 @@ struct FrontSnapshot {
     GroupTracker groups;
     const CbufTable* cbufs = nullptr; ///< P6c: shared while the bindings don't change
     u32 control = 0;
+    /// F6-X1 (R2-F1-02): render_enable.mode (0x556) is the back's here, not the front's: a
+    /// MACROHLE conditional render was sent as a Readback the back evaluates (S3, in ring order,
+    /// before every draw after it), and the front's copy is stale until it takes the back's.
+    /// No shard resolve reads the register (Misc, unhashed); the snapshot compare skips it.
+    bool render_enable_unknown = false;
     bool instance_loop = false;
     bool sink_pending = false;
     bool draw_pending = false;
@@ -243,6 +258,8 @@ public:
         bool instance_loop;
         bool sink_pending;
         bool draw_pending;
+        /// F6-X1: FrontState::v2_render_enable_unknown (FrontSnapshot::render_enable_unknown).
+        bool render_enable_unknown = false;
         /// The writer's dirty-block mask (null: compare every block); cleared by the snapshot.
         u64* dirty_blocks = nullptr;
         /// S1: the shards apply plain deltas and read no shadow RAM (none is snapshotted).

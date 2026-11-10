@@ -3197,6 +3197,7 @@ void Maxwell3D::FrontParallelDraw(VideoCommon::GpuSplit& split, FrontState& fs,
         .instance_loop = fs.instance_loop,
         .sink_pending = fs.sink_pending,
         .draw_pending = fs.draw_pending,
+        .render_enable_unknown = fs.v2_render_enable_unknown,
         .dirty_blocks = &fs.v2_dirty_blocks,
         .deltas = fs.s1_exec,
     };

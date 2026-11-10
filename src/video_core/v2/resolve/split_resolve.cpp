@@ -9,8 +9,11 @@
 #include <thread>
 
 #include "common/logging.h"
+#include "common/scope_exit.h"
 #include "video_core/gpu_split.h"
+#include "video_core/v2/commit.h"
 #include "video_core/v2/draw_model.h"
+#include "video_core/v2/epoch_publish.h"
 #include "video_core/v2/regsem_3d.h"
 #include "video_core/v2/resolve/draw_record.h"
 #include "video_core/v2/resolve/dynamic_state.h"
@@ -43,9 +46,24 @@ size_t ShapeSlot(u64 shape) {
     return static_cast<size_t>((shape * 0x9e3779b97f4a7c15ULL) >> 52) % ShapeEntries;
 }
 
-/// Moves at every publish and clear: two resolves of one draw that read the table at different
-/// generations may differ in what the table answered (AP6 §3.2).
-std::atomic<u64> g_shape_generation{0};
+/// A sequence lock over the table (F6-X1): odd while a publish or clear writes it. Two resolves
+/// of one draw that read the same even generation before and after (GenerationHolds) got the
+/// same answers; otherwise a difference is explained by a publish in between (AP6 §3.2).
+std::atomic<u64> g_shape_generation{2};
+
+void BeginGeneration(std::atomic<u64>& generation) {
+    generation.store(generation.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+    std::atomic_thread_fence(std::memory_order_release);
+}
+
+void EndGeneration(std::atomic<u64>& generation) {
+    generation.store(generation.load(std::memory_order_relaxed) + 1, std::memory_order_release);
+}
+
+bool GenerationHolds(const std::atomic<u64>& generation, u64 before) {
+    std::atomic_thread_fence(std::memory_order_acquire);
+    return (before & 1) == 0 && generation.load(std::memory_order_relaxed) == before;
+}
 
 } // Anonymous namespace
 
@@ -57,8 +75,16 @@ u64 ShapeGeneration() {
     return g_shape_generation.load(std::memory_order_acquire);
 }
 
+bool ShapeGenerationHolds(u64 before) {
+    return GenerationHolds(g_shape_generation, before);
+}
+
 void PublishShape(u64 shape, u32 relevant_groups, const std::array<u32, CbufStages>& key_cbufs) {
-    g_shape_generation.fetch_add(1, std::memory_order_acq_rel);
+    // Commit thread only (single writer).
+    BeginGeneration(g_shape_generation);
+    SCOPE_EXIT {
+        EndGeneration(g_shape_generation);
+    };
     ShapeEntry& entry = Shapes()[ShapeSlot(shape)];
     const u64 sequence = entry.sequence.load(std::memory_order_relaxed);
     entry.sequence.store(sequence + 1, std::memory_order_relaxed);
@@ -114,7 +140,10 @@ bool FindShape(u64 shape, u32* relevant_groups, std::array<u32, CbufStages>* key
 }
 
 void ClearShapes() {
-    g_shape_generation.fetch_add(1, std::memory_order_acq_rel);
+    BeginGeneration(g_shape_generation);
+    SCOPE_EXIT {
+        EndGeneration(g_shape_generation);
+    };
     for (ShapeEntry& entry : Shapes()) {
         const u64 sequence = entry.sequence.load(std::memory_order_relaxed);
         entry.sequence.store(sequence + 1, std::memory_order_relaxed);
@@ -129,82 +158,61 @@ void ClearShapes() {
 
 namespace {
 
-struct ProgramEntry {
-    std::atomic<u64> sequence{};
-    std::atomic<u64> memory{};
-    std::atomic<u64> address{};
-    std::atomic<u64> hash{};
+struct ProgramKey {
+    u64 memory;
+    u64 address;
 };
-constexpr size_t ProgramEntries = 4096;
 
-std::array<ProgramEntry, ProgramEntries>& Programs() {
-    static std::array<ProgramEntry, ProgramEntries> entries;
-    return entries;
+u64 ProgramHash(const ProgramKey& key) {
+    return Mix64(key.address ^ Mix64(key.memory));
 }
 
-size_t ProgramSlot(uintptr_t memory, GPUVAddr address) {
-    const u64 key = Mix64(static_cast<u64>(address) ^ (static_cast<u64>(memory) << 1));
-    return static_cast<size_t>(key >> 52) % ProgramEntries;
+/// F6-X1: insert-only (MASTER_PLAN §5.3 pure lookups): a program never evicts another, so what
+/// a shard finds depends only on the publishes before it (the direct-mapped table it replaces
+/// overwrote colliding programs, and the commit republished them on every shard miss).
+PublishedMap<ProgramKey, u64>& Programs() {
+    static PublishedMap<ProgramKey, u64> programs{Commit::Epochs(), 256};
+    return programs;
 }
 
-std::atomic<u64> g_program_generation{0};
+std::atomic<u64> g_program_generation{2};
 
 } // Anonymous namespace
 
 void PublishProgram(uintptr_t memory, GPUVAddr address, u64 unique_hash) {
-    ProgramEntry& entry = Programs()[ProgramSlot(memory, address)];
-    if (entry.memory.load(std::memory_order_relaxed) == memory &&
-        entry.address.load(std::memory_order_relaxed) == address &&
-        entry.hash.load(std::memory_order_relaxed) == unique_hash) {
+    const ProgramKey key{.memory = memory, .address = address};
+    const u64 hash = ProgramHash(key);
+    auto& programs = Programs();
+    if (programs.Find(key, hash) == unique_hash) {
         return;
     }
-    g_program_generation.fetch_add(1, std::memory_order_acq_rel);
-    const u64 sequence = entry.sequence.load(std::memory_order_relaxed);
-    entry.sequence.store(sequence + 1, std::memory_order_relaxed);
-    std::atomic_thread_fence(std::memory_order_release);
-    entry.memory.store(memory, std::memory_order_relaxed);
-    entry.address.store(address, std::memory_order_relaxed);
-    entry.hash.store(unique_hash, std::memory_order_relaxed);
-    entry.sequence.store(sequence + 2, std::memory_order_release);
+    BeginGeneration(g_program_generation);
+    programs.Insert(key, hash, unique_hash);
+    EndGeneration(g_program_generation);
 }
 
 bool FindProgram(uintptr_t memory, GPUVAddr address, u64* unique_hash) {
-    const ProgramEntry& entry = Programs()[ProgramSlot(memory, address)];
-    for (u32 attempt = 0; attempt < 16; ++attempt) {
-        const u64 before = entry.sequence.load(std::memory_order_acquire);
-        if ((before & 1) != 0) {
-            CpuRelax();
-            continue;
-        }
-        const u64 stored_memory = entry.memory.load(std::memory_order_relaxed);
-        const u64 stored_address = entry.address.load(std::memory_order_relaxed);
-        const u64 hash = entry.hash.load(std::memory_order_relaxed);
-        std::atomic_thread_fence(std::memory_order_acquire);
-        if (entry.sequence.load(std::memory_order_relaxed) != before) {
-            continue;
-        }
-        if (stored_memory != memory || stored_address != address || hash == 0) {
-            return false;
-        }
-        *unique_hash = hash;
-        return true;
+    const ProgramKey key{.memory = memory, .address = address};
+    const u64 found = Programs().Find(key, ProgramHash(key));
+    if (found == PublishedMap<ProgramKey, u64>::Missing || found == 0) {
+        return false;
     }
-    return false;
+    *unique_hash = found;
+    return true;
 }
 
 void ClearPrograms() {
-    g_program_generation.fetch_add(1, std::memory_order_acq_rel);
-    for (ProgramEntry& entry : Programs()) {
-        const u64 sequence = entry.sequence.load(std::memory_order_relaxed);
-        entry.sequence.store(sequence + 1, std::memory_order_relaxed);
-        std::atomic_thread_fence(std::memory_order_release);
-        entry.hash.store(0, std::memory_order_relaxed);
-        entry.sequence.store(sequence + 2, std::memory_order_release);
-    }
+    BeginGeneration(g_program_generation);
+    Programs().Clear();
+    EndGeneration(g_program_generation);
 }
 
 u64 ProgramGeneration() {
     return g_program_generation.load(std::memory_order_acquire);
+}
+
+bool ProgramGenerationHolds(u64 before) {
+    return GenerationHolds(g_program_generation, before);
 }
 
 // ---- Published dynamic-state features (R5) --------------------------------------------------------
@@ -394,6 +402,9 @@ SerialReason SplitTraits::Resolve(Shard& shard, const Input& input, std::vector<
                 .state_hash = state_hash ? pre.pipeline_key->hash : 0,
                 .has_state_hash = state_hash,
             });
+            if (!ShapeGenerationHolds(pre.shape_generation)) {
+                pre.shape_generation = UnstableGeneration;
+            }
             pre.shape = key.shape;
             pre.partial = key.partial;
             pre.full = key.full;
@@ -545,6 +556,15 @@ SerialReason SplitTraits::Resolve(Shard& shard, const Input& input, std::vector<
     return SerialReason::None;
 }
 
+namespace {
+
+/// F6-X1: two table reads answered alike unless a publish happened between or during them.
+bool GenerationsDiffer(u64 a, u64 b) {
+    return a != b || a == UnstableGeneration;
+}
+
+} // Anonymous namespace
+
 const char* SplitTraits::Compare(const Record& a, const Record& b) {
     if (a.fingerprint != b.fingerprint || a.indexed != b.indexed || a.ordinal != b.ordinal) {
         return "draw";
@@ -564,7 +584,7 @@ const char* SplitTraits::Compare(const Record& a, const Record& b) {
         (a.pipeline_key == nullptr) != (b.pipeline_key == nullptr) ||
         (a.pipeline_key != nullptr && (a.pipeline_key->hash != b.pipeline_key->hash ||
                                        a.pipeline_key->bytes != b.pipeline_key->bytes));
-    if (key_differs && a.shape_generation != b.shape_generation) {
+    if (key_differs && GenerationsDiffer(a.shape_generation, b.shape_generation)) {
         Count(GetStats().verify_dependent);
         return pipeline_key_differs ? "pipeline key" : nullptr;
     }
@@ -593,7 +613,8 @@ const char* SplitTraits::Compare(const Record& a, const Record& b) {
     // R3: the pipeline object. A lookup insert or clear, or a program published in between,
     // changes what the tables answer (dependent).
     if (a.has_pipeline != b.has_pipeline || a.pipeline != b.pipeline || a.hashes != b.hashes) {
-        if (a.lookup_serial != b.lookup_serial || a.program_generation != b.program_generation) {
+        if (GenerationsDiffer(a.lookup_serial, b.lookup_serial) ||
+            GenerationsDiffer(a.program_generation, b.program_generation)) {
             Count(GetStats().verify_dependent);
             return nullptr;
         }
@@ -722,6 +743,7 @@ void SplitResolve::FrontDraw(const FrontView& view, const EngineInfo& engine,
             Count(GetStats().front_snapshot_ns, NowNs() - snapshot_start);
         }
         snapshot->control = view.control;
+        snapshot->render_enable_unknown = view.render_enable_unknown;
         snapshot->instance_loop = view.instance_loop;
         snapshot->sink_pending = view.sink_pending;
         snapshot->draw_pending = view.draw_pending;
@@ -899,8 +921,13 @@ void SplitResolve::OnSegment(const Ir::SegmentBody& body, const u32* back_regs,
         const SegmentInput& input = resolver->InputOf(body.id);
         if (input.snapshot != nullptr) {
             Count(GetStats().snapshot_checks);
+            // F6-X1: the back owns render_enable.mode while the front's copy is stale.
+            constexpr u32 render_enable_mode =
+                static_cast<u32>(offsetof(MaxwellRegs, render_enable.mode) / sizeof(u32));
+            const u32 back_owned =
+                input.snapshot->render_enable_unknown ? render_enable_mode : ~0U;
             for (u32 index = 0; index < 0xe00; ++index) {
-                if (index == body.pending_method) {
+                if (index == body.pending_method || index == back_owned) {
                     continue;
                 }
                 const u32 snapshot_value = input.snapshot->regs.Read(index);
@@ -918,7 +945,7 @@ void SplitResolve::OnSegment(const Ir::SegmentBody& body, const u32* back_regs,
             if (back_shadow != nullptr) {
                 Count(GetStats().snapshot_checks);
                 for (u32 index = 0; index < 0xe00; ++index) {
-                    if (index == body.pending_method) {
+                    if (index == body.pending_method || index == back_owned) {
                         continue;
                     }
                     const u32 snapshot_value = input.snapshot->shadow.Read(index);
