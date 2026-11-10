@@ -76,6 +76,71 @@ inline u64 Capture() {
     return tag != 0 && pending > landed.load(std::memory_order_acquire);
 }
 
+// Fix F3h (F3-X6b, R2-F3-04, MASTER_PLAN §6): the front decides where each write it could make
+// at once lands (GpuSplit::LandingPending when it notes it: at once, or at an operation by a
+// landing ticket), and the back obeys that verdict instead of classifying again with MustDefer.
+// A back that deferred a write the front noted as made at once (its own tickets pending, for
+// writes the front never numbered) let a narrowed read retire the note and read memory before
+// the write (0fe4 HAZARD=verify: word 0 read 0x1 without the drain, 0x0 after), and every such
+// deferral numbered one ticket more than the front. The verdict travels with the write's ring
+// position (the entry end both sides tag it with) in a front-to-back queue, in order.
+inline constexpr size_t VerdictSlots = size_t{1} << 14;
+inline std::array<std::atomic<u64>, VerdictSlots> verdicts{}; ///< position << 1 | at once
+inline std::atomic<u64> verdict_head{0}; ///< Front: verdicts pushed
+inline std::atomic<u64> verdict_tail{0}; ///< Back: verdicts taken
+/// Front: verdicts dropped because the queue was full; back: writes without a verdict whose own
+/// classification deferred them (R2-B-09; both expected 0).
+inline std::atomic<u64> verdicts_lost{0};
+inline std::atomic<u64> verdicts_missing{0};
+
+/// Front: the verdict for a write it could make at once, noted at ring `position`.
+inline void PushVerdict(u64 position, bool at_once) {
+    const u64 head = verdict_head.load(std::memory_order_relaxed);
+    if (head - verdict_tail.load(std::memory_order_acquire) >= VerdictSlots) [[unlikely]] {
+        verdicts_lost.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    verdicts[head % VerdictSlots].store((position << 1) | (at_once ? 1 : 0),
+                                        std::memory_order_relaxed);
+    verdict_head.store(head + 1, std::memory_order_release);
+}
+
+/// Back: whether a write it could make at once must land at an operation instead (take a
+/// ticket): the front's verdict for it, or, for a write the front noted no verdict for (not
+/// recorded, or the queue was full), MustDefer. Verdicts of earlier entries the back didn't
+/// make a write for are dropped.
+[[nodiscard]] inline bool DeferAtOnceWrite() {
+    if (tag == 0) {
+        return false;
+    }
+    u64 tail = verdict_tail.load(std::memory_order_relaxed);
+    const u64 head = verdict_head.load(std::memory_order_acquire);
+    for (; tail != head; ++tail) {
+        const u64 word = verdicts[tail % VerdictSlots].load(std::memory_order_relaxed);
+        const u64 position = word >> 1;
+        if (position < tag) {
+            continue;
+        }
+        if (position > tag) {
+            break;
+        }
+        verdict_tail.store(tail + 1, std::memory_order_release);
+        return (word & 1) == 0;
+    }
+    verdict_tail.store(tail, std::memory_order_release);
+    const bool defer = MustDefer();
+    if (defer) [[unlikely]] {
+        verdicts_missing.fetch_add(1, std::memory_order_relaxed);
+    }
+    return defer;
+}
+
+/// The split (re)starts: no verdict is queued.
+inline void ResetVerdicts() {
+    verdict_head.store(0, std::memory_order_relaxed);
+    verdict_tail.store(0, std::memory_order_relaxed);
+}
+
 inline void Note(u64 ticket) {
     u64 current = landed.load(std::memory_order_relaxed);
     if (verify && ticket < current) [[unlikely]] {
@@ -91,6 +156,12 @@ inline void Note(u64 ticket) {
 inline thread_local u64 untracked_tag = 0;
 inline thread_local u64 untracked_captured_tag = 0;
 inline thread_local u64 untracked_captured_sub = 0;
+
+/// Back, inside an Untracked scope (QMD releases): whether a write made at once now would pass
+/// an earlier ticketed write still to land (the landing rule; MustDefer outside the scope).
+[[nodiscard]] inline bool MustDeferUntracked() {
+    return untracked_tag != 0 && pending > landed.load(std::memory_order_acquire);
+}
 /// Writes the front never notes by ticket (QMD releases) that land at a delayed operation
 /// (F3F5b-5): the newest untracked ticket queued, and the newest whose operation ran. The front
 /// can't tell their words, but while one is queued a suspended acquire's release may be it: the
@@ -146,8 +217,9 @@ inline size_t untracked_write_head = 0; ///< Back only
 /// The newest ticket whose range fell out of the slots (raised before the slot is reused).
 inline std::atomic<u64> untracked_evicted{0};
 
-/// The split (re)starts: no untracked operation is queued.
+/// The split (re)starts: no untracked operation (and no front verdict) is queued.
 inline void ResetUntracked() {
+    ResetVerdicts();
     untracked_issued.store(0, std::memory_order_relaxed);
     untracked_landed.store(0, std::memory_order_relaxed);
     for (UntrackedWrite& write : untracked_writes) {

@@ -145,9 +145,10 @@ void KeplerCompute::ProcessNativeReportSemaphore(u32 argument) {
         // Written at its fence's operation. Without delayed fences that runs at once, unless an
         // earlier write still has to land (v2/landing.h): then it lands behind it, in order.
         namespace Landing = VideoCommon::V2::Landing;
-        const bool deferred = Landing::MustDefer();
-        const u64 landing =
-            deferred || VideoCommon::V2::FencesDelayed() ? Landing::Capture() : 0;
+        // Fix F3h (F3-X6b): which of the two the front decided (v2/landing.h).
+        const bool delayed = VideoCommon::V2::FencesDelayed();
+        const bool deferred = delayed ? Landing::MustDefer() : Landing::DeferAtOnceWrite();
+        const u64 landing = deferred || delayed ? Landing::Capture() : 0;
         VideoCore::g_signaling_query_report_fence = deferred;
         rasterizer->SignalFence([this, address, payload, reduction, landing] {
             const u32 value =
@@ -415,8 +416,15 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
                 // Fix F3f: only when their fence delays them; otherwise SignalFence runs them at
                 // once, before `consumed` moves, and a ticket landing at once would pass the
                 // delayed queries' tickets still to land (they must land in capture order).
-                const bool at_fence = (flags & ((1U << 26) | (1U << 19))) != 0 && !four_words &&
-                                      VideoCommon::V2::FencesDelayed();
+                const bool reduction_or_max =
+                    (flags & ((1U << 26) | (1U << 19))) != 0 && !four_words;
+                const bool delayed = VideoCommon::V2::FencesDelayed();
+                // Fix F3h (R2-F3-04): the landing rule (v2/landing.h) holds for these too: one
+                // that would land at once while an earlier ticketed write is still to land runs
+                // at its fence, behind it, and reports its landing like the delayed ones.
+                const bool deferred =
+                    reduction_or_max && !delayed && VideoCommon::V2::Landing::MustDeferUntracked();
+                const bool at_fence = reduction_or_max && (delayed || deferred);
                 const auto untracked_device =
                     at_fence ? memory_manager.GpuToCpuAddress(address) : std::nullopt;
                 const u64 untracked =
@@ -424,6 +432,7 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
                                            *untracked_device, sizeof(u32))
                                      : 0;
                 if (flags & (1U << 26)) {
+                    VideoCore::g_signaling_query_report_fence = deferred;
                     rasterizer->SignalFence([this, address, payload, flags, untracked] {
                         const u32 value = ReduceSemaphore((flags >> 20) & 7, (flags >> 24) & 1,
                                                           memory_manager.Read<u32>(address), payload);
@@ -444,6 +453,7 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
                         VideoCommon::TraceNativeQuery(1, memory_manager.GetID(), address,
                             memory_manager.GpuToCpuAddress(address).value_or(0), 0, value, 1U << 26);
                     });
+                    VideoCore::g_signaling_query_report_fence = false;
                 } else if (four_words) {
                     rasterizer->Query(address, VideoCommon::QueryType::Payload,
                         VideoCommon::QueryPropertiesFlags::IsAFence | VideoCommon::QueryPropertiesFlags::HasTimeout,
@@ -452,6 +462,7 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
                     // NVN2 tracks QMD completion with a max release (bit 19) into a word other
                     // releases also advance: a plain write would move it backwards and leave
                     // GEQ acquires waiting forever.
+                    VideoCore::g_signaling_query_report_fence = deferred;
                     rasterizer->SignalFence([this, address, payload, untracked] {
                         const u32 value = (std::max)(memory_manager.Read<u32>(address), payload);
                         memory_manager.Write<u32>(address, value);
@@ -462,6 +473,7 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
                             Tegra::Nx2SemaphoreWaiters::Get().OnWrite(*device, value);
                         }
                     });
+                    VideoCore::g_signaling_query_report_fence = false;
                 } else {
                     static const u64 watch = [] {
                         const char* text = std::getenv("EDEN_NX2_SEM_WATCH");

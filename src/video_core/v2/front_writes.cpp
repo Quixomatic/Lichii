@@ -14,6 +14,7 @@
 #include "video_core/surface.h"
 #include "video_core/textures/decoders.h"
 #include "video_core/v2/front_writes.h"
+#include "video_core/v2/landing.h"
 
 namespace VideoCommon::V2 {
 
@@ -39,12 +40,16 @@ void NoteReleaseWrite(GpuSplit& split, const Tegra::MemoryManager& memory, GPUVA
         return; // The back drops it too (the query cache skips unmapped reports)
     }
     // Where the back writes it (QueryCacheBase::CounterReport, KeplerCompute's reduction): at an
-    // operation, or at once. A write made at once while an earlier one may still land is
-    // deferred by the back (Landing::MustDefer); LandingPending is the front's conservative
-    // view of that.
-    const bool at_once = reduction ? !FencesDelayed()
-                                   : known && !fenced && !Settings::IsGPULevelHigh();
-    if (at_once && !split.LandingPending()) {
+    // operation, or at once. A write that could be made at once lands at an operation while an
+    // earlier one may still land (the landing rule); the front decides which (LandingPending)
+    // and the back obeys (Fix F3h, F3-X6b: Landing::PushVerdict / DeferAtOnceWrite).
+    const bool may_land_at_once = reduction ? !FencesDelayed()
+                                            : known && !fenced && !Settings::IsGPULevelHigh();
+    const bool at_once = may_land_at_once && !split.LandingPending();
+    if (may_land_at_once) {
+        Landing::PushVerdict(split.WritePosition(), at_once);
+    }
+    if (at_once) {
         if (!known) {
             split.NoteRangeWrite(*device, bytes, producer);
         } else if (bytes <= 4) {

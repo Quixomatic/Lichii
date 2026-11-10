@@ -271,10 +271,11 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
     DAddr cpu_addr = *cpu_addr_opt;
     // A payload written at once below High accuracy, unless an earlier write that lands at an
     // operation hasn't landed yet (v2/landing.h, MASTER_PLAN §6 class B): then it lands at an
-    // operation behind it, so the guest CPU never sees it first.
+    // operation behind it, so the guest CPU never sees it first. Fix F3h (F3-X6b): the split's
+    // front decided which, and the back obeys it.
     const bool at_once = !is_fence && !Settings::IsGPULevelHigh() &&
                          counter_type == QueryType::Payload;
-    const bool deferred = at_once && VideoCommon::V2::Landing::MustDefer();
+    const bool deferred = at_once && VideoCommon::V2::Landing::DeferAtOnceWrite();
     const bool immediate = at_once && !deferred;
     const u64 landing = immediate ? 0 : VideoCommon::V2::Landing::Capture();
     // QMD releases (Landing::Untracked) take no ticket; their landing is still reported.

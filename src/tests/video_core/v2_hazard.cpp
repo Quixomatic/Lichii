@@ -683,6 +683,54 @@ TEST_CASE("V2 acquire: a suspended acquire whose release the view never records 
     }
 }
 
+// Fix F3h (F3-X6b, R2-F3-04): 0fe4's HAZARD=verify line. The front noted a release as made at
+// once; the back deferred it (its own ticket for a write the front never numbered was pending),
+// the front's note retired at consumption and the narrowed read took memory's older word. The
+// back now obeys the front's verdict for every write it could make at once.
+TEST_CASE("V2 landing: the back obeys the front's landing verdict", "[video_core][v2_hazard]") {
+    const u64 saved_tag = Landing::tag;
+    const u64 saved_pending = Landing::pending;
+    const u64 saved_landed = Landing::landed.load();
+    Landing::ResetVerdicts();
+    Landing::verdicts_missing.store(0);
+    // Outside the split (v1): nothing is deferred, no verdict is read.
+    Landing::tag = 0;
+    CHECK(!Landing::DeferAtOnceWrite());
+    // A ticket the back captured for a write the front never numbered is still to land.
+    Landing::landed.store(Landing::Ticket(50, 0));
+    Landing::pending = Landing::Ticket(90, 0);
+    Landing::PushVerdict(100, true);  // the front: at once (its own tickets had landed)
+    Landing::PushVerdict(110, false); // the front: at an operation (a ticket it numbered)
+    Landing::PushVerdict(120, true);  // a write the back never makes
+    Landing::tag = 100;
+    CHECK(Landing::MustDefer()); // what the back used to decide on its own
+    CHECK(!Landing::DeferAtOnceWrite());
+    // Landed meanwhile: the front's ticket verdict still takes a ticket (the numbering matches).
+    Landing::landed.store(Landing::pending);
+    Landing::tag = 110;
+    CHECK(!Landing::MustDefer());
+    CHECK(Landing::DeferAtOnceWrite());
+    // No verdict for this entry (120's was for a write the back didn't make): the back's own
+    // classification, counted when it defers.
+    Landing::tag = 130;
+    CHECK(!Landing::DeferAtOnceWrite());
+    Landing::pending = Landing::Ticket(125, 0);
+    CHECK(Landing::DeferAtOnceWrite());
+    CHECK(Landing::verdicts_missing.load() == 1);
+    CHECK(Landing::verdict_tail.load() == Landing::verdict_head.load());
+    // Two writes of one entry take their verdicts in order.
+    Landing::landed.store(Landing::pending);
+    Landing::PushVerdict(140, false);
+    Landing::PushVerdict(140, true);
+    Landing::tag = 140;
+    CHECK(Landing::DeferAtOnceWrite());
+    CHECK(!Landing::DeferAtOnceWrite());
+    Landing::tag = saved_tag;
+    Landing::pending = saved_pending;
+    Landing::landed.store(saved_landed);
+    Landing::ResetVerdicts();
+}
+
 // F3F5b-1/-2: a wait that must see what a report's operation writes (its timestamp, or a release
 // the back deferred behind an earlier one) makes the fence behind the back's captured operations,
 // and waits for the back's own newest ticket, not the front's numbering.
