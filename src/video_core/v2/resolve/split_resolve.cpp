@@ -151,8 +151,12 @@ void LoadMirror(RegSem::Mirror3D& mirror, const FrontSnapshot& snapshot) {
 std::optional<u64> WaitPublished(const SegmentInput& input, u64 position) {
     SegmentProgress& progress = *input.progress;
     for (u32 spins = 0;; ++spins) {
-        const u64 end = progress.end.load(std::memory_order_acquire);
+        // F1-X2: the publish position first. The front stores `end` before it publishes anything
+        // past the cut, so an end read after this acquire is never older than the position read;
+        // in the other order a stale "no end yet" with a newer position read on into the next
+        // segment's draws (PARALLEL=verify "record count" at the size cut).
         const u64 published = input.published->load(std::memory_order_acquire);
+        const u64 end = progress.end.load(std::memory_order_acquire);
         const u64 limit = (std::min)(end, published);
         if (limit > position || position >= end) {
             progress.waiting.store(false, std::memory_order_relaxed);

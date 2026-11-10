@@ -922,6 +922,72 @@ TEST_CASE("V2 P6: a shard replays its segment from the IR ring onto the snapshot
     CHECK(requests.Empty());
 }
 
+TEST_CASE("V2 P6: an early-submitted segment's shard stops at the end the front sets (F1-X2)",
+          "[video_core][v2_p6]") {
+    ScopedSystemTestContext context;
+    Core::System system;
+    Core::DeviceMemory physical;
+    Tegra::MaxwellDeviceMemoryManager device_memory{physical};
+    Tegra::MemoryManager memory{system, device_memory, 32, 1ULL << 31};
+    Tegra::Engines::Maxwell3D engine{memory};
+    auto snapshot = std::make_unique<Resolve::FrontSnapshot>();
+    Resolve::SnapshotBuilder<0xe00> builder;
+    const std::vector<u32> zero(0xe00, 0);
+    snapshot->regs = builder.Take(zero.data());
+    snapshot->engine_ref = 3;
+    const Resolve::ShardKeyFn saved = Resolve::g_shard_key;
+    Resolve::g_shard_key = &FakeShardKey;
+    V2::Ir::DrawBody body{};
+    body.op = V2::Ir::DrawOp::Predicted;
+    body.engine = 3;
+    body.num_draws = 1;
+    body.draws[0].kind = V2::Ir::DrawKind::Array;
+    V2::Ir::DrawBody cut = body;
+    cut.engine = 9; // stands for the next segment's Segment record (not this engine's draw)
+    constexpr u32 Draws = 16;
+    u32 wrong = 0;
+    for (u32 round = 0; round < 200; ++round) {
+        RingBuilder ring;
+        std::atomic<u64> published{0};
+        Resolve::SegmentProgress progress;
+        progress.Reset();
+        Resolve::SegmentInput input;
+        input.id = 1;
+        input.begin = 0;
+        input.snapshot = snapshot.get();
+        input.ring = ring.ring.data();
+        input.arena = &ring.arena;
+        input.progress = &progress;
+        input.published = &published;
+        std::vector<Resolve::PreDraw> records;
+        SerialReason reason = SerialReason::NoSnapshot;
+        std::jthread shard{[&] {
+            Resolve::SplitTraits::Shard state;
+            Commit::RequestList requests;
+            requests.Reset(1);
+            reason = Resolve::SplitTraits::Resolve(state, input, records, requests);
+        }};
+        // The front: its draws, published one by one, the cut (end stored), then the next
+        // segment's draws published as fast as the shard reads.
+        for (u32 draw = 0; draw < Draws; ++draw) {
+            ring.Draw(body);
+            published.store(ring.position, std::memory_order_seq_cst);
+        }
+        ring.Draw(cut);
+        progress.end.store(ring.position, std::memory_order_release);
+        for (u32 draw = 0; draw < Draws; ++draw) {
+            ring.Draw(body);
+            published.store(ring.position, std::memory_order_seq_cst);
+        }
+        shard.join();
+        if (reason != SerialReason::None || records.size() != Draws) {
+            ++wrong;
+        }
+    }
+    Resolve::g_shard_key = saved;
+    CHECK(wrong == 0);
+}
+
 TEST_CASE("V2 P6: published shapes are found by the shards", "[video_core][v2_p6]") {
     Resolve::ClearShapes();
     u32 relevant = 0;
