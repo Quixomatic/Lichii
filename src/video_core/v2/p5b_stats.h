@@ -85,6 +85,7 @@ enum class Counter : u32 {
     StagingCreateBytes,
     StagingFrees,       ///< staging buffers released to the driver
     BufferCacheDeletes, ///< buffer cache buffers deleted (joins, GC)
+    ImageCacheDeletes,  ///< R2-F2-08: texture cache images deleted (GC, aliases, rebuilds)
     WfiBarriers,        ///< F4-X3: wait-for-idle barriers (pending tracked writes folded in)
     WfiDeferred,        ///< F4-X3: wait-for-idles inside a pass, barrier at its end
     WfiPassEnds,        ///< F4-X3: wait-for-idles that ended a pass (stores or XFB in it)
@@ -93,6 +94,13 @@ enum class Counter : u32 {
     IdleSync,           ///< F4-X2: idle-hook submits by DXVK's synchronization rule
     IdleLeft,           ///< F4-X2: idle hooks that left open work for the next boundary
     ListCopiesRiding,   ///< F4-X2: command list copies left in the open submission
+    Clears,             ///< R2-F4-06: RasterizerVulkan::Clear calls that clear something
+    ClearsDeferred,     ///< ... that became the next pass's load ops
+    ClearsInPass,       ///< ... recorded as vkCmdClearAttachments in a pass
+    ClearsBlit,         ///< ... drawn by the blit helper (partial channels or stencil masks)
+    ClearPassEnds,      ///< passes a clear ended
+    ClearPassBegins,    ///< passes a clear began
+    ClearBarriers,      ///< targeted barriers recorded inside a clear
     Count,
 };
 

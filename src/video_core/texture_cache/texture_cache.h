@@ -4361,6 +4361,7 @@ void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
     ImageBase& image = slot_images[image_id];
     ++images_deleted;
     VideoCommon::V2::Stats::CountMutation(VideoCommon::V2::Stats::Mutation::ImageDelete);
+    V2::P5bStats::Add(V2::P5bStats::Counter::ImageCacheDeletes);
     if (commit != nullptr) [[unlikely]] {
         V2::Commit::NoteEffect(commit, V2::Commit::EffectDelete);
         if (v2_sole_newest == &image) {

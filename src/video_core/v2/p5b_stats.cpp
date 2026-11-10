@@ -136,14 +136,19 @@ void Report(const char* thread_name, u64 window_ns) {
              "barriers per frame: pass-end {:.1f}, targeted {:.1f}, full {:.1f}; pass ends "
              "without a barrier {:.1f}/frame, hazard breaks {:.1f}/frame | wait-for-idle: "
              "barriers {:.1f}/frame, in a pass deferred {:.1f}/frame, ended it {:.1f}/frame | "
-             "uploads hoisted out of passes {:.0f}/s",
+             "uploads hoisted out of passes {:.0f}/s | clears {:.1f}/frame: deferred {:.1f}, in a "
+             "pass {:.1f}, blit {:.1f}; passes ended by clears {:.1f}, begun {:.1f}, barriers "
+             "{:.1f}",
              thread_name, per_frame(passes), 100.0 * Ratio(at(Counter::DynamicPasses), passes),
              Ratio(at(Counter::PassDraws), passes), per_frame(at(Counter::PassEndBarriers)),
              per_frame(at(Counter::TargetedBarriers)), per_frame(at(Counter::FullBarriers)),
              per_frame(at(Counter::SkippedBarriers)), per_frame(at(Counter::HazardBreaks)),
              per_frame(at(Counter::WfiBarriers)), per_frame(at(Counter::WfiDeferred)),
              per_frame(at(Counter::WfiPassEnds)),
-             PerSecond(at(Counter::HoistedUploads), seconds));
+             PerSecond(at(Counter::HoistedUploads), seconds), per_frame(at(Counter::Clears)),
+             per_frame(at(Counter::ClearsDeferred)), per_frame(at(Counter::ClearsInPass)),
+             per_frame(at(Counter::ClearsBlit)), per_frame(at(Counter::ClearPassEnds)),
+             per_frame(at(Counter::ClearPassBegins)), per_frame(at(Counter::ClearBarriers)));
     LOG_INFO(HW_GPU,
              "V2 stats {} P5b transfer queue | batches {:.0f}/s, buffer copies {:.0f}/s ({:.0f} "
              "KiB/s), image uploads {:.0f}/s, kept in order {:.0f}/s, acquire joins {:.0f}/s | "
@@ -173,7 +178,7 @@ void Report(const char* thread_name, u64 window_ns) {
              "{:.0f}/s | QMD front model: signals {:.0f}/s, exact {:.1f}%, unknown {:.0f}/s, "
              "dispatches {:.0f}/s, bounded writes {:.0f}/s, invalidations {:.0f}/s, resyncs "
              "{:.0f}/s | GPU allocations: staging buffers created {:.1f}/s ({:.0f} KiB/s), freed "
-             "{:.1f}/s, buffer cache buffers deleted {:.1f}/s",
+             "{:.1f}/s, buffer cache buffers deleted {:.1f}/s, images deleted {:.1f}/s",
              thread_name, PerSecond(at(Counter::GpuDecodes), seconds),
              100.0 * Ratio(gpu_bytes, gpu_bytes + cpu_bytes),
              PerSecond(at(Counter::CpuDecodes), seconds),
@@ -192,7 +197,8 @@ void Report(const char* thread_name, u64 window_ns) {
              PerSecond(at(Counter::StagingCreates), seconds),
              PerSecond(at(Counter::StagingCreateBytes), seconds) / 1024.0,
              PerSecond(at(Counter::StagingFrees), seconds),
-             PerSecond(at(Counter::BufferCacheDeletes), seconds));
+             PerSecond(at(Counter::BufferCacheDeletes), seconds),
+             PerSecond(at(Counter::ImageCacheDeletes), seconds));
 }
 
 } // namespace VideoCommon::V2::P5bStats
