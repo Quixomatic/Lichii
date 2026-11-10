@@ -27,8 +27,10 @@
 #include "video_core/renderer_vulkan/vk_descriptor_pool.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
+#include "video_core/v2/commit.h"
 #include "video_core/v2/desc_cache.h"
 #include "video_core/v2/draw_cache.h"
+#include "video_core/v2/resolve/draw_record.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
 namespace VideoCore {
@@ -421,6 +423,16 @@ public:
     }
 
 private:
+    // Pipeline v2 P6 Step 0 (EDEN_NX2_V2_DRAWREC, vk_draw_resolve.cpp): the pure resolve of a
+    // draw record. Reads only the view, guest memory and const cache lookups.
+    /// The draw's texture handles, views and samplers into `out` (views, samplers, reads) and
+    /// their requests into `textures`: sampler requests first, then view requests (each with
+    /// its Rescale for blacklisted images), as CommitSamplerLookups and FillImageViewsCommit
+    /// apply them.
+    template <class View>
+    void ResolveTextures(const View& view, VideoCommon::V2::Resolve::ResolvedDraw& out,
+                         VideoCommon::V2::Commit::RequestList& textures) const;
+
     template <typename Spec, bool Capture = false>
     bool ConfigureImpl(bool is_indexed);
 
