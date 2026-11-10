@@ -17,8 +17,9 @@
 
 namespace Vulkan {
 
-InnerFence::InnerFence(Scheduler& scheduler_, bool is_stubbed_)
-    : FenceBase{is_stubbed_}, scheduler{scheduler_} {}
+InnerFence::InnerFence(Scheduler& scheduler_, bool is_stubbed_,
+                       const Tegra::Host1x::SyncpointManager* syncpoints_)
+    : FenceBase{is_stubbed_}, scheduler{scheduler_}, syncpoints{syncpoints_} {}
 
 InnerFence::~InnerFence() = default;
 
@@ -60,32 +61,24 @@ void InnerFence::Wait() {
     if (is_stubbed) {
         return;
     }
-    // Perf fix C (EDEN_NX2_V2_ADAPTSUBMIT's fast-flush input): the time spent here on a tick that
-    // isn't submitted while the guest waits on a sync. Fences pop in order, so a guest still
-    // waiting waits on this fence or a later one: it is the guest waiting on unsubmitted work.
-    const bool guest_waits = Core::g_nx2_guest_sync_waiters.load(std::memory_order_relaxed) != 0;
-    std::chrono::steady_clock::time_point unsubmitted_since{};
-    if (guest_waits && !scheduler.IsSubmitted(wait_tick)) [[unlikely]] {
-        unsubmitted_since = std::chrono::steady_clock::now();
-    }
-    const auto note_submitted = [&] {
-        if (unsubmitted_since != std::chrono::steady_clock::time_point{}) [[unlikely]] {
-            Core::g_nx2_guest_sync_wait_us.fetch_add(
-                static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
-                                     std::chrono::steady_clock::now() - unsubmitted_since)
-                                     .count()),
-                std::memory_order_relaxed);
-        }
+    // R2-F4-02 (MASTER_PLAN §6: urgency belongs to the sync waited on): a guest thread waiting on
+    // a host syncpoint value (nvhost_ctrl events, WaitHost) waits on what fence completions
+    // advance, so this fence is urgent then. vi2's present wait reads the guest syncpoint, which
+    // the back sets as it runs: it never needs a submit. Fast-flush mode's input is the time
+    // blocked threads waited for submissions (Scheduler::TakeBlockedWaitUs).
+    const auto host_waits = [this] {
+        return syncpoints != nullptr && syncpoints->HasHostWaiters();
     };
     // A deferred fence flush (Scheduler::DeferFlush) may not be submitted yet. Only the
     // split's back may submit; other threads (the fencing thread) ask it to and wait. If the back
     // has stopped, nothing else uses the scheduler and Wait below submits it.
     if (adaptive && !scheduler.IsSubmitted(wait_tick) && VideoCommon::GpuSplit::Get().Active() &&
         !VideoCommon::GpuSplit::OnBackThread()) [[unlikely]] {
-        // F4-02: the request is made at once while the guest waits, after LazyWindow otherwise;
-        // the back serves it at its next pass boundary, chunk (RequestGap after its last
-        // submission) or idle hook, so requests made close together share one submission. Past
-        // RequestGap (guest waiting) or EscalateWindow it is forced through the idle hook below.
+        // F4-02: the request is made at once while a host syncpoint wait is open, after
+        // LazyWindow otherwise; the back serves it at its next pass boundary or chunk (RequestGap
+        // after its last submission), an urgent one at its next idle hook, so requests made close
+        // together share one submission. Past RequestGap (host wait) or EscalateWindow it is
+        // forced through WaitSubmitted's urgent request below.
         constexpr auto LazyWindow = std::chrono::milliseconds{1};
         constexpr auto RequestGap = std::chrono::microseconds{500};
         constexpr auto EscalateWindow = std::chrono::milliseconds{4};
@@ -97,9 +90,7 @@ void InnerFence::Wait() {
             if (!VideoCommon::GpuSplit::Get().BackRunning() || now - queued_at >= EscalateWindow) {
                 break;
             }
-            const bool guest = Core::g_nx2_guest_sync_waiters.load(std::memory_order_relaxed) != 0;
-            // F4-X2: only a waiting guest makes the request urgent; the window's request may
-            // wait for the GPU's idle at the back's idle hook.
+            const bool guest = host_waits();
             if ((!requested && now - queued_at >= LazyWindow) || (guest && !urgent)) {
                 scheduler.RequestLazyFlush(wait_tick, guest);
                 requested = true;
@@ -124,12 +115,12 @@ void InnerFence::Wait() {
     } else if (lazy && !scheduler.IsSubmitted(wait_tick) && VideoCommon::GpuSplit::Get().Active() &&
         !VideoCommon::GpuSplit::OnBackThread()) {
         // A lazy fence (early downloads) goes with the next submission the back makes anyway
-        // (~1 per ms in heavy scenes). Only if none came within LazyWindow, or the guest is
-        // waiting, does it ask for one, so the fence operations behind it never wait long.
+        // (~1 per ms in heavy scenes). Only if none came within LazyWindow, or a guest thread
+        // waits on a host syncpoint, does it ask for one, so the operations behind it never wait
+        // long.
         constexpr auto LazyWindow = std::chrono::milliseconds{1};
         for (u32 spins = 0; !scheduler.IsSubmitted(wait_tick); ++spins) {
-            const bool guest =
-                Core::g_nx2_guest_sync_waiters.load(std::memory_order_relaxed) != 0;
+            const bool guest = host_waits();
             if (std::chrono::steady_clock::now() - queued_at >= LazyWindow || guest ||
                 !VideoCommon::GpuSplit::Get().BackRunning()) {
                 scheduler.RequestLazyFlush(wait_tick, guest);
@@ -144,11 +135,9 @@ void InnerFence::Wait() {
     }
     if (!scheduler.IsSubmitted(wait_tick) && VideoCommon::GpuSplit::Get().Active() &&
         !VideoCommon::GpuSplit::OnBackThread() && scheduler.WaitSubmitted(wait_tick)) {
-        note_submitted();
         scheduler.GetMasterSemaphore().Wait(wait_tick);
         return;
     }
-    note_submitted();
     scheduler.Wait(wait_tick);
 }
 
@@ -159,7 +148,7 @@ FenceManager::FenceManager(VideoCore::RasterizerInterface& rasterizer_, Tegra::G
       scheduler{scheduler_} {}
 
 Fence FenceManager::CreateFence(bool is_stubbed) {
-    return std::make_shared<InnerFence>(scheduler, is_stubbed);
+    return std::make_shared<InnerFence>(scheduler, is_stubbed, &syncpoint_manager);
 }
 
 void FenceManager::QueueFence(Fence& fence) {

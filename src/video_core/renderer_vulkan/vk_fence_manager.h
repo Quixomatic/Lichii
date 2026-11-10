@@ -26,7 +26,8 @@ class Scheduler;
 
 class InnerFence : public VideoCommon::FenceBase {
 public:
-    explicit InnerFence(Scheduler& scheduler_, bool is_stubbed_);
+    explicit InnerFence(Scheduler& scheduler_, bool is_stubbed_,
+                        const Tegra::Host1x::SyncpointManager* syncpoints_ = nullptr);
     ~InnerFence();
 
     /// `lazy`: only record the wait point; the next submission takes the fence's work.
@@ -38,6 +39,8 @@ public:
 
 private:
     Scheduler& scheduler;
+    /// R2-F4-02: a wait on a host syncpoint value makes this fence's submission urgent.
+    const Tegra::Host1x::SyncpointManager* syncpoints;
     u64 wait_tick = 0;
     bool lazy = false;
     bool adaptive = false; ///< F4-02: lazy because fences ride submissions (Scheduler::SetLazyFences)
