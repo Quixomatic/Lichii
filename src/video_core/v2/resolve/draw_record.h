@@ -150,9 +150,9 @@ struct DynamicValues {
     u32 cull_enable{};
     MaxwellRegs::CullFace cull_face{};
     MaxwellRegs::ComparisonOp depth_compare{};
-    MaxwellRegs::FrontFace front_face{}; ///< after the window origin's Y flip
+    MaxwellRegs::FrontFace front_face{}; ///< the register (encode flips it with front_face_flip)
     StencilFaceOp stencil_front{};
-    StencilFaceOp stencil_back{}; ///< the front op when two-sided stencil is off
+    StencilFaceOp stencil_back{}; ///< the register (used while two-sided stencil is on)
     u8 depth_bounds_test{};
     u8 depth_test{};
     u8 depth_write{};
@@ -168,7 +168,7 @@ struct DynamicValues {
     u8 line_smooth{};       ///< smooth line rasterization (requested and supported)
     u8 conservative{};
     u8 iterated_blend_squash{}; ///< the squashed iterated-blend workaround replaces equations
-    u8 pad0{};
+    u8 front_face_flip{};       ///< window_origin.flip_y
     u32 logic_op{}; ///< the register value (encode maps 0x1500..0x150f, else no-op)
     std::array<u8, MaxwellRegs::NumRenderTargets> color_masks{}; ///< RGBA bits, unmasked
     std::array<u8, MaxwellRegs::NumRenderTargets> blend_enables{};
@@ -428,6 +428,37 @@ struct RecordStats {
 /// Counts one relaxed increment (stats).
 inline void Count(std::atomic<u64>& counter, u64 value = 1) {
     counter.fetch_add(value, std::memory_order_relaxed);
+}
+
+/// The graphics descriptor tables a draw's view selects (SynchronizeDescriptors(false)'s inputs).
+/// Here, not in state_view.h, which this header includes.
+template <StateView View>
+[[nodiscard]] DescriptorTablesKey TablesOf(const View& view) {
+    const MaxwellRegs& regs = view.Regs();
+    const bool via_header = regs.sampler_binding == MaxwellRegs::SamplerBinding::ViaHeaderBinding;
+    const u32 tic_limit = regs.tex_header.limit;
+    return DescriptorTablesKey{
+        .tic_addr = regs.tex_header.Address(),
+        .tic_limit = tic_limit,
+        .tsc_addr = regs.tex_sampler.Address(),
+        .tsc_limit = via_header ? tic_limit : regs.tex_sampler.limit,
+        .via_header = via_header,
+    };
+}
+
+/// The render target registers the texture cache's render target update reads.
+template <StateView View>
+[[nodiscard]] RtKey RtKeyOf(const View& view) {
+    const MaxwellRegs& regs = view.Regs();
+    RtKey key{};
+    key.rt = regs.rt;
+    key.zeta = regs.zeta;
+    key.surface_clip = regs.surface_clip;
+    key.rt_control = regs.rt_control;
+    key.zeta_size = regs.zeta_size;
+    key.zeta_enable = regs.zeta_enable;
+    key.anti_alias_samples_mode = regs.anti_alias_samples_mode;
+    return key;
 }
 
 /// The P6 stats-line part of the record path ("drawrec ..."), counters taken; empty when
