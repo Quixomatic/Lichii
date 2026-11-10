@@ -357,8 +357,12 @@ bool NotedReleaseOnItsWay(DmaPusher& dma_pusher, GPUVAddr address, u32 value,
     if (!device) {
         return false;
     }
+    using Kind = VideoCommon::GpuSplit::ReleaseKind;
     const auto recent = VideoCommon::GpuSplit::Get().FindRecentRelease(*device);
-    return recent && V2::SemaphoreMet(op, recent->value, value);
+    // A reduction's or max release's value is its operand, not the word it leaves (those are
+    // untracked: UntrackedReleasePending covers them).
+    return recent && recent->kind != Kind::QmdReduction && recent->kind != Kind::QmdMax &&
+           V2::SemaphoreMet(op, recent->value, value);
 }
 
 } // Anonymous namespace
@@ -504,9 +508,9 @@ bool Puller::PollAcquireView(DmaPusher& dma_pusher) {
                          "V2 acquire progress poll resumed channel {} semaphore {:#x} (device "
                          "{:#x}) op {} value {:#x}: view reason {}, word {:#x} before the drain, "
                          "{:#x} after, gpu-written page {}, sem_execute {}, QMD release pending "
-                         "{}, waited {} us | newest noted release {} (value {:#x}, {} {:#x}), "
-                         "landed {:#x}, back issued {:#x}, front ticket {:#x}, consumed {:#x}, "
-                         "write {:#x}",
+                         "{}, waited {} us | newest noted release {} (kind {}, op {}, value "
+                         "{:#x}, {} {:#x}), landed {:#x}, back issued {:#x}, front ticket {:#x}, "
+                         "consumed {:#x}, write {:#x}, untracked issued {:#x}, landed {:#x}",
                          dma_pusher.channel_state.bind_id, address, device.value_or(0),
                          operation, value, static_cast<u32>(check.reason), view_word,
                          dma_pusher.memory_manager.Read<u32>(address),
@@ -515,12 +519,16 @@ bool Puller::PollAcquireView(DmaPusher& dma_pusher) {
                          std::chrono::duration_cast<std::chrono::microseconds>(
                              std::chrono::steady_clock::now() - acquire.since)
                              .count(),
-                         recent.has_value(), recent ? recent->value : 0,
+                         recent.has_value(),
+                         recent ? VideoCommon::GpuSplit::ReleaseKindName(recent->kind) : "none",
+                         recent ? recent->op : 0, recent ? recent->value : 0,
                          recent && recent->landing ? "ticket" : "position",
                          recent ? recent->position : 0,
                          V2::Landing::landed.load(std::memory_order_acquire),
                          V2::Landing::issued.load(std::memory_order_acquire),
-                         split.LastLandingTicket(), split.ConsumedNow(), split.WritePosition());
+                         split.LastLandingTicket(), split.ConsumedNow(), split.WritePosition(),
+                         V2::Landing::untracked_issued.load(std::memory_order_acquire),
+                         V2::Landing::untracked_landed.load(std::memory_order_acquire));
             }
         }
         if (verify && decided) {

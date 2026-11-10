@@ -247,7 +247,9 @@ public:
         FlushCbWrite();
         PrepareHazardNote();
         hazards.NoteKnown(device_address, bytes, size, write_position, producer);
-        RememberRelease(device_address, bytes, size, write_position, false);
+        RememberRelease(device_address, bytes, size, write_position, false,
+                        producer == V2::Producer::Report ? ReleaseKind::Report
+                                                         : ReleaseKind::Release);
     }
     void NoteRangeWrite(u64 device_address, u64 size, V2::Producer producer) {
         if (producer != V2::Producer::CbData) {
@@ -370,14 +372,30 @@ public:
             unlanded.Retire(V2::Landing::landed.load(std::memory_order_acquire));
         }
         unlanded.NoteKnown(device_address, bytes, size, ticket, V2::Producer::Release);
-        RememberRelease(device_address, bytes, size, ticket, true);
+        RememberRelease(device_address, bytes, size, ticket, true, ReleaseKind::Release);
     }
-    /// Front (Fix F3d, F3-X1): a QMD release's payload the front's QMD model read. The release
-    /// lands at its dispatch's fence without a landing ticket (Landing::Untracked), so it is
-    /// only remembered for the suspended-acquire poll and its resume line (no hazard entry: its
-    /// range note stays the one FindWrites orders against).
-    void RememberQmdRelease(u64 device_address, u32 payload) {
-        RememberRelease(device_address, &payload, sizeof(payload), write_position, false);
+    /// Fix F3e (F3-X1): who made a remembered release, for the resume line.
+    enum class ReleaseKind : u8 {
+        Release,      ///< A semaphore release (puller, copy engine) or a known write
+        Report,       ///< A report semaphore's payload
+        QmdPayload,   ///< A QMD release's payload
+        QmdReduction, ///< A QMD reduction release (`value`: its operand, `op`: its operation)
+        QmdMax,       ///< A QMD max release (`value`: its operand)
+    };
+    [[nodiscard]] static constexpr const char* ReleaseKindName(ReleaseKind kind) {
+        constexpr const char* names[] = {"release", "report", "qmd payload", "qmd reduction",
+                                         "qmd max"};
+        return names[static_cast<size_t>(kind)];
+    }
+    /// Front (Fix F3d, F3-X1): a QMD release the front's QMD model read (Fix F3e: reductions
+    /// and max releases too, by kind). The release lands at its dispatch's fence without a
+    /// landing ticket (Landing::Untracked), so it is only remembered for the suspended-acquire
+    /// poll and its resume line (no hazard entry: its range note stays the one FindWrites
+    /// orders against). `op`: the reduction's operation bits (QMD release flags 20-22, 24).
+    void RememberQmdRelease(u64 device_address, u32 payload,
+                            ReleaseKind kind = ReleaseKind::QmdPayload, u8 op = 0) {
+        RememberRelease(device_address, &payload, sizeof(payload), write_position, false, kind,
+                        op);
     }
     /// Front (F3-X1 diagnostics): the newest release of known bytes noted to the word at
     /// `device_address` among the last RecentReleases notes.
@@ -386,6 +404,8 @@ public:
         u64 position = 0; ///< Ring position, or the landing ticket when `landing`
         u32 value = 0;
         bool landing = false;
+        ReleaseKind kind = ReleaseKind::Release;
+        u8 op = 0;
     };
     [[nodiscard]] std::optional<RecentRelease> FindRecentRelease(u64 device_address) const {
         for (size_t i = 0; i < recent_releases.size(); ++i) {
@@ -783,13 +803,15 @@ private:
     V2::HazardResult FindWithLanding(u64 device_address, u64 size, u64 done,
                                      const V2::HazardFilter& filter, u8* out);
     void RememberRelease(u64 device_address, const void* bytes, u32 size, u64 position,
-                         bool landing) {
+                         bool landing, ReleaseKind kind, u8 op = 0) {
         RecentRelease& entry = recent_releases[recent_release_head++ % recent_releases.size()];
         entry.address = device_address;
         entry.position = position;
         entry.value = 0;
         std::memcpy(&entry.value, bytes, std::min<size_t>(size, sizeof(entry.value)));
         entry.landing = landing;
+        entry.kind = kind;
+        entry.op = op;
     }
     void PrepareHazardNote() {
         if (hazards.Size() == V2::HazardTable::Capacity) [[unlikely]] {

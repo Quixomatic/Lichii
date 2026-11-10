@@ -403,11 +403,19 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
             [&](u64 address, u32 payload, u32 flags) {
                 const bool four_words = (flags >> 30) == 0;
                 if (!memory_manager.IsFullyMappedRange(address, four_words ? 16 : sizeof(payload))) return false;
+                // Fix F3e (F3-X1, eac4735's 23 resume lines without a noted release, the word
+                // stepping by 0x13): reduction and max releases land at their fence too, so they
+                // report it like the Untracked queries (UntrackedReleasePending holds meanwhile).
+                const bool at_fence = (flags & ((1U << 26) | (1U << 19))) != 0 && !four_words;
+                const u64 untracked = at_fence ? VideoCommon::V2::Landing::CaptureUntracked() : 0;
                 if (flags & (1U << 26)) {
-                    rasterizer->SignalFence([this, address, payload, flags] {
+                    rasterizer->SignalFence([this, address, payload, flags, untracked] {
                         const u32 value = ReduceSemaphore((flags >> 20) & 7, (flags >> 24) & 1,
                                                           memory_manager.Read<u32>(address), payload);
                         memory_manager.Write<u32>(address, value);
+                        if (untracked != 0) {
+                            VideoCommon::V2::Landing::NoteUntracked(untracked);
+                        }
                         if (const auto device = memory_manager.GpuToCpuAddress(address)) {
                             Tegra::Nx2SemaphoreWaiters::Get().OnWrite(*device, value);
                         }
@@ -429,9 +437,12 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
                     // NVN2 tracks QMD completion with a max release (bit 19) into a word other
                     // releases also advance: a plain write would move it backwards and leave
                     // GEQ acquires waiting forever.
-                    rasterizer->SignalFence([this, address, payload] {
+                    rasterizer->SignalFence([this, address, payload, untracked] {
                         const u32 value = (std::max)(memory_manager.Read<u32>(address), payload);
                         memory_manager.Write<u32>(address, value);
+                        if (untracked != 0) {
+                            VideoCommon::V2::Landing::NoteUntracked(untracked);
+                        }
                         if (const auto device = memory_manager.GpuToCpuAddress(address)) {
                             Tegra::Nx2SemaphoreWaiters::Get().OnWrite(*device, value);
                         }
@@ -1737,8 +1748,14 @@ struct KeplerCompute::FrontState {
         bool unbounded{}; ///< a launched QMD writes where the front can't bound it
         std::vector<std::pair<GPUVAddr, u64>> writes;   ///< storage buffer ranges
         std::vector<std::pair<GPUVAddr, u64>> releases; ///< release words
-        /// Payload releases (not a reduction or max) and their payloads (Fix F3d, F3-X1).
-        std::vector<std::pair<GPUVAddr, u32>> payloads;
+        /// Releases with their payloads (Fix F3d, F3-X1) and flags (Fix F3e: reductions and max
+        /// releases are remembered too, by kind).
+        struct Payload {
+            GPUVAddr address;
+            u32 payload;
+            u32 flags;
+        };
+        std::vector<Payload> payloads;
     };
     std::deque<QmdSignal> qmd_signals; ///< this write's signals, consumed by the notes
     /// S1 single owner (GpuSplit::S1Exec, REGSEM=1, the native class): classified entries
@@ -2135,6 +2152,27 @@ void KeplerCompute::FrontDispatchRecord(VideoCommon::GpuSplit& split, FrontState
     split.Note(Ir::Kind::Dispatch, body);
 }
 
+namespace {
+/// F3-X1: a QMD release the front's model read, remembered by kind for the suspended-acquire
+/// poll and its resume line (Fix F3e: reductions and max releases too).
+void RememberQmdRelease(VideoCommon::GpuSplit& split, const Tegra::MemoryManager& memory,
+                        GPUVAddr address, u32 payload, u32 flags) {
+    using Kind = VideoCommon::GpuSplit::ReleaseKind;
+    const auto device = memory.GpuToCpuAddress(address);
+    if (!device) {
+        return;
+    }
+    if ((flags & (1U << 26)) != 0) {
+        const u8 op = static_cast<u8>(((flags >> 20) & 7) | (((flags >> 24) & 1) << 3));
+        split.RememberQmdRelease(*device, payload, Kind::QmdReduction, op);
+    } else if ((flags & (1U << 19)) != 0 && (flags >> 30) != 0) {
+        split.RememberQmdRelease(*device, payload, Kind::QmdMax);
+    } else {
+        split.RememberQmdRelease(*device, payload, Kind::QmdPayload);
+    }
+}
+} // Anonymous namespace
+
 void KeplerCompute::FrontNoteWrites(VideoCommon::GpuSplit& split, FrontState& fs, u32 method,
                                     u32 argument) {
     using VideoCommon::V2::Producer;
@@ -2175,11 +2213,10 @@ void KeplerCompute::FrontNoteWrites(VideoCommon::GpuSplit& split, FrontState& fs
                                                        Producer::QmdRelease);
                 }
                 // F3-X1 (971d resume lines: the satisfying release was in no front note): the
-                // payload releases' values, for the poll's deferral and its resume line.
-                for (const auto& [address, payload] : signal.payloads) {
-                    if (const auto device = memory_manager.GpuToCpuAddress(address)) {
-                        split.RememberQmdRelease(*device, payload);
-                    }
+                // releases' values, for the poll's deferral and its resume line.
+                for (const auto& release : signal.payloads) {
+                    RememberQmdRelease(split, memory_manager, release.address, release.payload,
+                                       release.flags);
                 }
                 VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::QmdBoundedWrites,
                                                signal.writes.size() + signal.releases.size());
@@ -2265,10 +2302,9 @@ void KeplerCompute::FrontModelQmd(VideoCommon::GpuSplit& split, FrontState& fs, 
         };
         const auto on_release = [&](u64 address, u32 payload, u32 flags) {
             signal.releases.emplace_back(address, (flags >> 30) == 0 ? 16U : 4U);
-            if ((flags & ((1U << 26) | (1U << 19))) == 0) {
-                // As the back's release: the payload (a four-word one at +0), not a reduction.
-                signal.payloads.emplace_back(address, payload);
-            }
+            // As the back's release: the payload (a four-word one at +0), or the operand of a
+            // reduction or max.
+            signal.payloads.push_back({address, payload, flags});
         };
         const auto result = model.Signal(qmd_address, argument, read, mapped, on_dispatch,
                                          on_release);
@@ -2361,11 +2397,7 @@ void KeplerCompute::FrontNoteInlineQmd(VideoCommon::GpuSplit& split, FrontState&
         const GPUVAddr address = (GPUVAddr{flags & 0xff} << 32) | qmd[base];
         V2::NoteRangeWriteGpu(split, memory_manager, address, (flags >> 30) == 0 ? 16U : 4U,
                               Producer::QmdRelease);
-        if ((flags & ((1U << 26) | (1U << 19))) == 0) {
-            if (const auto device = memory_manager.GpuToCpuAddress(address)) {
-                split.RememberQmdRelease(*device, qmd[base + 2]);
-            }
-        }
+        RememberQmdRelease(split, memory_manager, address, qmd[base + 2], flags);
     }
     if (!releases_bounded) {
         split.NoteUnboundedWrite(Producer::QmdRelease);

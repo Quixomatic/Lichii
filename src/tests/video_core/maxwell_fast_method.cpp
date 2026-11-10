@@ -8,6 +8,7 @@
 #include <functional>
 #include <memory>
 #include <random>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -2324,6 +2325,52 @@ TEST_CASE("V2 landing: the front remembers its releases, the back's captured ope
     V2::Landing::pending = saved_pending;
     V2::Landing::landed.store(0);
     V2::Landing::issued.store(0);
+}
+
+TEST_CASE("V2 landing: remembered releases name their producer kind (F3-X1)",
+          "[video_core][gpu_split_dispatch][v2_hazard]") {
+    // Fix F3e: the resume line names who made the newest release noted to the word; QMD
+    // reductions (eac4735: the word stepping by 0x13) and max releases are remembered too.
+    using Access = VideoCommon::GpuSplitTestAccess;
+    using Kind = VideoCommon::GpuSplit::ReleaseKind;
+    namespace V2 = VideoCommon::V2;
+    Fixture f;
+    f.system.Initialize();
+    VideoCommon::GpuSplit split;
+    Access::Initialize(split, f.system, 100);
+    constexpr u64 word = 0x21'13cd'1000;
+    const u32 payload = 0x690;
+    split.NoteKnownWrite(word, &payload, sizeof(payload), V2::Producer::Report);
+    REQUIRE(split.FindRecentRelease(word));
+    CHECK(split.FindRecentRelease(word)->kind == Kind::Report);
+    split.RememberQmdRelease(word, 0x13, Kind::QmdReduction, 0);
+    const auto reduction = split.FindRecentRelease(word);
+    REQUIRE(reduction);
+    CHECK(reduction->kind == Kind::QmdReduction);
+    CHECK(reduction->value == 0x13); // the operand, not the word's new value
+    CHECK(!reduction->landing);
+    split.RememberQmdRelease(word + 4, 0x6a3);
+    CHECK(split.FindRecentRelease(word + 4)->kind == Kind::QmdPayload);
+    CHECK(std::string_view{VideoCommon::GpuSplit::ReleaseKindName(Kind::QmdMax)} == "qmd max");
+    // The back reports a reduction's fence like an Untracked query: pending until it ran.
+    const u64 saved_tag = V2::Landing::tag;
+    const u64 issued = V2::Landing::untracked_issued.load();
+    const u64 landed = V2::Landing::untracked_landed.load();
+    V2::Landing::untracked_issued.store(0);
+    V2::Landing::untracked_landed.store(0);
+    V2::Landing::tag = 300;
+    u64 position = 0;
+    {
+        const V2::Landing::Untracked untracked;
+        position = V2::Landing::CaptureUntracked();
+    }
+    CHECK(position == 300);
+    CHECK(split.UntrackedReleasePending());
+    V2::Landing::NoteUntracked(position);
+    CHECK(!split.UntrackedReleasePending());
+    V2::Landing::tag = saved_tag;
+    V2::Landing::untracked_issued.store(issued);
+    V2::Landing::untracked_landed.store(landed);
 }
 
 TEST_CASE("V2 landing: one write table, tickets without IR cuts, ordered landing",
