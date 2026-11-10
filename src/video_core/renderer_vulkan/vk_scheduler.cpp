@@ -204,6 +204,9 @@ u64 Scheduler::Flush(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
     if (state.renderpass) {
         CountRenderPassEnd(location.file_name(), location.line());
     }
+    if (VideoCommon::V2::P5bStats::Enabled()) [[unlikely]] {
+        VideoCommon::V2::P5bStats::NoteSubmitSite(location.file_name(), location.line());
+    }
     if (VideoCommon::GpuSplit::check_owner) [[unlikely]] {
         VideoCommon::GpuSplit::CheckOwner("Scheduler::Flush");
     }
@@ -238,11 +241,13 @@ bool Scheduler::DeferFlush() {
 
 void Scheduler::FlushDeferred() {
     if (flush_pending) {
+        VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::FlushDeferred);
         Flush();
         return;
     }
     const u64 lazy = lazy_flush_tick.load(std::memory_order_relaxed);
     if (lazy != 0 && !IsSubmitted(lazy)) [[unlikely]] {
+        VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::FlushLazy);
         Flush();
     }
 }
@@ -281,6 +286,9 @@ void Scheduler::Finish(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
                        std::source_location location) {
     if (state.renderpass) {
         CountRenderPassEnd(location.file_name(), location.line());
+    }
+    if (VideoCommon::V2::P5bStats::Enabled()) [[unlikely]] {
+        VideoCommon::V2::P5bStats::NoteSubmitSite(location.file_name(), location.line());
     }
     if (VideoCommon::GpuSplit::check_owner) [[unlikely]] {
         VideoCommon::GpuSplit::CheckOwner("Scheduler::Finish");

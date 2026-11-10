@@ -2,6 +2,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <chrono>
+#include <string>
+
+#include <fmt/format.h>
 
 #include "common/logging.h"
 #include "video_core/v2/p5b_stats.h"
@@ -35,6 +38,17 @@ bool Enabled() {
     return On(Switch::Stats);
 }
 
+namespace {
+SubmitSites& Sites() {
+    static SubmitSites sites;
+    return sites;
+}
+} // Anonymous namespace
+
+void NoteSubmitSite(const char* file, u32 line) {
+    Sites().Note(file, line);
+}
+
 void Report(const char* thread_name, u64 window_ns) {
     if (!Enabled()) {
         return;
@@ -64,8 +78,9 @@ void Report(const char* thread_name, u64 window_ns) {
              "V2 stats {} P5b submission | frames {:.1f}/s, submits {:.1f}/frame ({:.0f}/s), "
              "draws per submit {:.1f} | flush reasons (per s): idle {:.0f}, pending {:.0f}, "
              "strong {:.0f}, weak {:.0f}, interval {:.0f}, fast {:.0f}, max draws {:.0f}, cost "
-             "{:.0f}, other {:.0f} | submit thread {:.0f}/s, hand-off {:.1f} us, finish {:.0f}/s "
-             "({:.1f} us after submit), recycled contexts {:.0f}/s",
+             "{:.0f}, other {:.0f}, pass {:.0f}, deferred {:.0f}, lazy/requested {:.0f} | submit "
+             "thread {:.0f}/s, hand-off {:.1f} us, finish {:.0f}/s ({:.1f} us after submit), "
+             "recycled contexts {:.0f}/s",
              thread_name, PerSecond(frames, seconds), per_frame(submits),
              PerSecond(submits, seconds), Ratio(at(Counter::SubmitDraws), submits),
              PerSecond(at(Counter::FlushIdle), seconds),
@@ -74,11 +89,26 @@ void Report(const char* thread_name, u64 window_ns) {
              PerSecond(at(Counter::FlushInterval), seconds),
              PerSecond(at(Counter::FlushFast), seconds), PerSecond(at(Counter::FlushMax), seconds),
              PerSecond(at(Counter::FlushCost), seconds), PerSecond(at(Counter::FlushOther), seconds),
+             PerSecond(at(Counter::FlushPass), seconds),
+             PerSecond(at(Counter::FlushDeferred), seconds),
+             PerSecond(at(Counter::FlushLazy), seconds),
              PerSecond(at(Counter::SubmitThreadSubmits), seconds),
              Ratio(at(Counter::SubmitLatencyUs), at(Counter::SubmitThreadSubmits)),
              PerSecond(at(Counter::FinishCompletions), seconds),
              Ratio(at(Counter::FinishLatencyUs), at(Counter::FinishCompletions)),
              PerSecond(at(Counter::RecycledContexts), seconds));
+    {
+        // F4-01: where the submissions came from (Scheduler::Flush/Finish call sites).
+        const auto sites = Sites().Take();
+        std::string list;
+        for (size_t i = 0; i < sites.size() && i < 16; ++i) {
+            list += fmt::format("{}{} {:.2f}", i == 0 ? "" : ", ",
+                                SubmitSites::Name(sites[i].file, sites[i].line),
+                                per_frame(sites[i].count));
+        }
+        LOG_INFO(HW_GPU, "V2 stats {} P5b submits by site (per frame) | {}", thread_name,
+                 list.empty() ? std::string{"none"} : list);
+    }
     LOG_INFO(HW_GPU,
              "V2 stats {} P5b passes | {:.1f}/frame ({:.0f}% dynamic), {:.1f} draws each | "
              "barriers per frame: pass-end {:.1f}, targeted {:.1f}, full {:.1f}; pass ends "

@@ -5,6 +5,7 @@
 #include <bit>
 #include <map>
 #include <random>
+#include <string>
 #include <vector>
 
 #include <catch2/catch_test_macros.hpp>
@@ -13,6 +14,7 @@
 #include "video_core/v2/barrier_tracker.h"
 #include "video_core/v2/flush_heuristic.h"
 #include "video_core/v2/frame_pacer.h"
+#include "video_core/v2/p5b_stats.h"
 #include "video_core/v2/gpu_unswizzle.h"
 #include "video_core/textures/decoders.h"
 #include "video_core/v2/qmd_front.h"
@@ -630,4 +632,28 @@ TEST_CASE("V2 P5b unused-region uploads join the transfer batch without a graphi
     // A blocked batch takes nothing.
     join.BlockHoisting();
     REQUIRE_FALSE(join.CanHoistUnordered());
+}
+TEST_CASE("V2 P5b submits are counted by call site", "[video_core][v2_p5b]") {
+    using VideoCommon::V2::P5bStats::SubmitSites;
+    SubmitSites sites;
+    static const char a[] = "src/video_core/renderer_vulkan/vk_fence_manager.cpp";
+    static const char b[] = "C:\lichii\src\video_core\renderer_vulkan\vk_rasterizer.cpp";
+    // The same file name from another literal (an inline function in two units) is one site.
+    std::string a_copy{a};
+    for (int i = 0; i < 5; ++i) {
+        sites.Note(a, 35);
+    }
+    sites.Note(a_copy.c_str(), 35);
+    sites.Note(a, 36);
+    sites.Note(b, 4800);
+    sites.Note(b, 4800);
+    const auto taken = sites.Take();
+    REQUIRE(taken.size() == 3);
+    REQUIRE(taken[0].count == 6);
+    REQUIRE(taken[0].line == 35);
+    REQUIRE(taken[1].count == 2);
+    REQUIRE(taken[2].count == 1);
+    REQUIRE(SubmitSites::Name(taken[0].file, taken[0].line) == "vk_fence_manager.cpp:35");
+    REQUIRE(SubmitSites::Name(b, 4800) == "vk_rasterizer.cpp:4800");
+    REQUIRE(sites.Take().empty());
 }

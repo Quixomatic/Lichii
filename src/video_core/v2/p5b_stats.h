@@ -3,8 +3,14 @@
 
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstring>
+#include <mutex>
+#include <string>
+#include <string_view>
+#include <vector>
 
 #include "common/common_types.h"
 
@@ -54,6 +60,9 @@ enum class Counter : u32 {
     FlushMax,
     FlushCost,
     FlushOther,
+    FlushDeferred,   ///< F4-01: a deferred fence/list flush (DeferFlush) served by the idle hook
+    FlushLazy,       ///< F4-01: a lazy fence's or a waiter's submit request served
+    FlushPass,       ///< F4-03: a heuristic flush decided at a pass boundary
     SubmitThreadSubmits,
     SubmitLatencyUs, ///< worker hand-off → vkQueueSubmit2 returned
     FinishCompletions,
@@ -87,6 +96,58 @@ inline void Add(Counter counter, u64 amount = 1) {
         Get().values[static_cast<size_t>(counter)].fetch_add(amount, std::memory_order_relaxed);
     }
 }
+
+/// F4-01: submissions counted by the call site Scheduler::Flush/Finish was given (its
+/// source_location). Sites are few (tens), so a short list under a lock is enough for STATS.
+class SubmitSites {
+public:
+    struct Site {
+        const char* file;
+        u32 line;
+        u64 count;
+    };
+
+    void Note(const char* file, u32 line) {
+        std::scoped_lock lock{mutex};
+        for (Site& site : sites) {
+            if (site.line == line &&
+                (site.file == file || std::strcmp(site.file, file) == 0)) {
+                ++site.count;
+                return;
+            }
+        }
+        sites.push_back({file, line, 1});
+    }
+
+    /// The counts so far, most frequent first; resets them.
+    [[nodiscard]] std::vector<Site> Take() {
+        std::vector<Site> taken;
+        {
+            std::scoped_lock lock{mutex};
+            taken.swap(sites);
+        }
+        std::ranges::stable_sort(taken, [](const Site& a, const Site& b) {
+            return a.count > b.count;
+        });
+        return taken;
+    }
+
+    /// "file.cpp:123" without the directories.
+    [[nodiscard]] static std::string Name(const char* file, u32 line) {
+        std::string_view name{file};
+        if (const auto slash = name.find_last_of("/\\"); slash != std::string_view::npos) {
+            name.remove_prefix(slash + 1);
+        }
+        return std::string{name} + ':' + std::to_string(line);
+    }
+
+private:
+    std::mutex mutex;
+    std::vector<Site> sites;
+};
+
+/// Counts one submission at file:line (callers check Enabled() first).
+void NoteSubmitSite(const char* file, u32 line);
 
 /// Logs and resets once per window (any thread; the first to arrive in a new window reports).
 void Report(const char* thread_name, u64 window_ns);
