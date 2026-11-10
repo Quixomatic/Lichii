@@ -1520,8 +1520,10 @@ void Scheduler::EndRenderPass()
                                           access | VK_ACCESS_SHADER_WRITE_BIT);
             }
             const bool dynamic = state.dynamic;
-            Record([dynamic, has_transform_feedback = device.IsExtTransformFeedbackSupported()](
-                       vk::CommandBuffer cmdbuf) {
+            // F4-07: the XFB barrier only after a pass that ran transform feedback.
+            const bool has_transform_feedback = device.IsExtTransformFeedbackSupported() &&
+                                                std::exchange(pass_transform_feedback, false);
+            Record([dynamic, has_transform_feedback](vk::CommandBuffer cmdbuf) {
                 if (dynamic) {
                     cmdbuf.EndRendering();
                 } else {

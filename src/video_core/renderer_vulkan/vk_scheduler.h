@@ -246,6 +246,11 @@ public:
         compute_writes_pending = true;
     }
 
+    /// F4-07: transform feedback began; the pass that ends next records the XFB barrier.
+    void NoteTransformFeedback() {
+        pass_transform_feedback = true;
+    }
+
     /// Returns true when a render pass is currently active in the scheduler state.
     bool IsRenderPassActive() const {
         return state.renderpass != VK_NULL_HANDLE;
@@ -514,6 +519,7 @@ private:
     std::atomic<u64> lazy_flush_tick{}; ///< RequestLazyFlush
     bool lazy_fences{};                 ///< F4-02: SetLazyFences
     bool finish_publishes_tick{};       ///< F4-12: FinishThreadPublishesTick
+    bool pass_transform_feedback{};     ///< F4-07: NoteTransformFeedback
     bool submit_wanted{};               ///< F4-02: work waits for the next idle hook or boundary
     u64 lazy_outstanding_tick{};        ///< F4-02: newest lazy fence's tick (recording thread)
 

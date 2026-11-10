@@ -984,6 +984,7 @@ private:
             return;
         }
         has_flushed_end_pending = true;
+        scheduler.NoteTransformFeedback(); // F4-07: this pass's end needs the XFB barrier
         // Refresh buffers state before beginning transform feedback so counters are up-to-date
         UpdateBuffers();
         if (!has_started || buffers_count == 0) {
