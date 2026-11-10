@@ -213,6 +213,11 @@ if (TARGET dynarmic::dynarmic)
 endif()
 
 add_test(NAME tests COMMAND tests)
+# Pipeline v2 P6 Step 0: the draw record resolve reads no engine state (step 20).
+add_test(NAME drawrec_resolve_no_engine
+         COMMAND ${CMAKE_COMMAND}
+                 -DSOURCE=${CMAKE_CURRENT_SOURCE_DIR}/../video_core/renderer_vulkan/vk_draw_resolve.cpp
+                 -P ${CMAKE_CURRENT_SOURCE_DIR}/video_core/drawrec_grep.cmake)
 
 if (TARGET SDL3::SDL3)
     add_executable(sdl_window_state_tests yuzu_cmd/sdl_window_state.cpp)
