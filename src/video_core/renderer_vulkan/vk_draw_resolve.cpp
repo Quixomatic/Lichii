@@ -413,24 +413,9 @@ R::ResolveStatus GraphicsPipeline::ResolveDraw(const View& view, const R::Resolv
     h.residency = texture_cache.CurrentResidency();
     h.stages = recipe_stages;
     // 2. What the record path does not take yet (D3).
-    if (IsMeshPipeline()) {
-        return CommitOnly(out, IsEmulatedMesh() ? R::CommitOnlyReason::EmulatedMesh
-                                                : R::CommitOnlyReason::Mesh);
-    }
-    if (ctx.frame_dump) {
-        return CommitOnly(out, R::CommitOnlyReason::FrameDump);
-    }
-    if (ctx.sampled_recording) {
-        return CommitOnly(out, R::CommitOnlyReason::SampledRecording);
-    }
-    if (view.Regs().transform_feedback_enabled != 0) {
-        return CommitOnly(out, R::CommitOnlyReason::TransformFeedback);
-    }
-    if (ctx.is_indexed && view.InlineIndexDraw()) {
-        return CommitOnly(out, R::CommitOnlyReason::InlineIndex);
-    }
-    if (ctx.is_indirect) {
-        return CommitOnly(out, R::CommitOnlyReason::Indirect);
+    if (const R::CommitOnlyReason reason = CommitOnlyOf(view, ctx);
+        reason != R::CommitOnlyReason::None) {
+        return CommitOnly(out, reason);
     }
     // 3. The descriptor tables this draw reads (SynchronizeDescriptors' inputs).
     h.tables = R::TablesOf(view);
@@ -445,17 +430,57 @@ R::ResolveStatus GraphicsPipeline::ResolveDraw(const View& view, const R::Resolv
         status != R::ResolveStatus::Ready) {
         return status;
     }
-    // 6. Render targets.
+    // 6-8. Render targets, dynamic state, render area.
+    ResolveTargetsAndDynamic(view, ctx, nullptr, out);
+    h.texture_requests = {0, static_cast<u32>(textures.Requests().size())};
+    h.buffer_requests = {0, static_cast<u32>(buffers.Requests().size())};
+    h.status = R::ResolveStatus::Ready;
+    return R::ResolveStatus::Ready;
+}
+
+template <class View>
+R::CommitOnlyReason GraphicsPipeline::CommitOnlyOf(const View& view,
+                                                   const R::ResolveContext& ctx) const {
+    if (IsMeshPipeline()) {
+        return IsEmulatedMesh() ? R::CommitOnlyReason::EmulatedMesh : R::CommitOnlyReason::Mesh;
+    }
+    if (ctx.frame_dump) {
+        return R::CommitOnlyReason::FrameDump;
+    }
+    if (ctx.sampled_recording) {
+        return R::CommitOnlyReason::SampledRecording;
+    }
+    if (view.Regs().transform_feedback_enabled != 0) {
+        return R::CommitOnlyReason::TransformFeedback;
+    }
+    if (ctx.is_indexed && view.InlineIndexDraw()) {
+        return R::CommitOnlyReason::InlineIndex;
+    }
+    if (ctx.is_indirect) {
+        return R::CommitOnlyReason::Indirect;
+    }
+    return R::CommitOnlyReason::None;
+}
+
+template <class View>
+void GraphicsPipeline::ResolveTargetsAndDynamic(const View& view, const R::ResolveContext& ctx,
+                                                const R::ResolvedDraw* base,
+                                                R::ResolvedDraw& out) const {
+    R::DrawHeader& h = out.h;
+    // 6. Render targets (a base with the same registers keeps its prediction).
     h.rt = R::RtKeyOf(view);
-    const auto prediction = texture_cache.PredictRenderTargets(h.rt);
-    h.rt_ids = prediction.ids;
-    h.rt_known = prediction.known;
-    h.rt_inputs_hold = prediction.inputs_hold;
+    if (base == nullptr || !(base->h.rt == h.rt)) {
+        const auto prediction = texture_cache.PredictRenderTargets(h.rt);
+        h.rt_ids = prediction.ids;
+        h.rt_known = prediction.known;
+        h.rt_inputs_hold = prediction.inputs_hold;
+    }
     // 7. Dynamic state (scale-independent).
     h.dynamic = R::ComputeDynamic(view, *ctx.features);
     // 8. Render area, as ConfigureImpl pushes it (Switch 2 titles may never program the
     // surface clip; colour target 0 then).
     const auto& regs = view.Regs();
+    h.render_area = {};
     for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
         if (recipe_stages[stage] && stage_infos[stage].uses_render_area) {
             const u32 clip_width = regs.surface_clip.width, clip_height = regs.surface_clip.height;
@@ -465,11 +490,63 @@ R::ResolveStatus GraphicsPipeline::ResolveDraw(const View& view, const R::Resolv
             h.render_area.h = static_cast<f32>(clip_set ? clip_height : u32{regs.rt[0].height});
         }
     }
-    h.texture_requests = {0, static_cast<u32>(textures.Requests().size())};
-    h.buffer_requests = {0, static_cast<u32>(buffers.Requests().size())};
+}
+
+template <class View>
+R::ResolveStatus GraphicsPipeline::ResolveFromBase(const View& view, const R::ResolveContext& ctx,
+                                                   const R::ResolvedDraw& base,
+                                                   R::ResolvedDraw& out,
+                                                   C::RequestList& buffers) const {
+    namespace Versions = VideoCommon::V2::Versions;
+    // The base's views, samplers and reads hold (a recipe validated its inputs; a continued
+    // draw changed no texture state); its buffer lists are resolved again and appended.
+    out.h = base.h;
+    out.arena.assign(base.arena.begin(), base.arena.end());
+    R::DrawHeader& h = out.h;
+    h.ordinal = ctx.ordinal;
+    h.fingerprint = view.Groups().Fingerprint(VideoCommon::V2::AllGroups);
+    h.draw = view.Draw();
+    h.topology = view.Topology();
+    h.indexed = ctx.is_indexed;
+    h.indirect = ctx.is_indirect;
+    h.pipeline = ctx.pipeline;
+    h.pipeline_epoch = ctx.pipeline_epoch;
+    h.map_serial = gpu_memory->MapSerial();
+    h.image_table_changes = texture_cache.GraphicsImageTableChanges();
+    h.sampler_table_changes = texture_cache.GraphicsSamplerTableChanges();
+    h.texture_bindings_serial = texture_cache.TextureBindingsSerial();
+    h.buffer_deletions = buffer_cache.BufferDeletions();
+    h.rescale_epoch = Versions::Gens().GetEpoch(Versions::Epoch::Rescale);
+    h.residency = texture_cache.CurrentResidency();
     h.status = R::ResolveStatus::Ready;
+    h.reason = R::CommitOnlyReason::None;
+    h.stale = R::StaleReason::None;
+    if (const R::CommitOnlyReason reason = CommitOnlyOf(view, ctx);
+        reason != R::CommitOnlyReason::None) {
+        return CommitOnly(out, reason);
+    }
+    h.tables = R::TablesOf(view);
+    if (!texture_cache.DescriptorTablesMatch(h.tables)) {
+        h.status = R::ResolveStatus::Stale;
+        h.stale = R::StaleReason::DescriptorTables;
+        return R::ResolveStatus::Stale;
+    }
+    if (const R::ResolveStatus status = ResolveBuffers(view, ctx, out, buffers);
+        status != R::ResolveStatus::Ready) {
+        return status;
+    }
+    ResolveTargetsAndDynamic(view, ctx, &base, out);
+    h.texture_requests = {0, 0};
+    h.buffer_requests = {0, static_cast<u32>(buffers.Requests().size())};
     return R::ResolveStatus::Ready;
 }
+
+template R::ResolveStatus GraphicsPipeline::ResolveFromBase<R::LiveView>(
+    const R::LiveView&, const R::ResolveContext&, const R::ResolvedDraw&, R::ResolvedDraw&,
+    C::RequestList&) const;
+template R::ResolveStatus GraphicsPipeline::ResolveFromBase<R::SnapshotView>(
+    const R::SnapshotView&, const R::ResolveContext&, const R::ResolvedDraw&, R::ResolvedDraw&,
+    C::RequestList&) const;
 
 template R::ResolveStatus GraphicsPipeline::ResolveDraw<R::LiveView>(
     const R::LiveView&, const R::ResolveContext&, R::ResolvedDraw&, C::RequestList&,
@@ -778,15 +855,45 @@ bool GraphicsPipeline::RefreshRecordTextureBuffers(R::ResolvedDraw& record) cons
     return true;
 }
 
-bool GraphicsPipeline::ApplyDraw(R::ResolvedDraw& record, C::RequestList& textures,
-                                 C::RequestList& buffers, DrawApplyOut& out, ApplyMode mode,
-                                 C::Stage& stage, VideoCommon::V2::DrawCache::Recipe* recipe) {
-    static_cast<void>(recipe);
+GraphicsPipeline::ApplyResult GraphicsPipeline::ApplyDraw(
+    R::ResolvedDraw& record, C::RequestList& textures, C::RequestList& buffers, DrawApplyOut& out,
+    ApplyMode mode, C::Stage& stage, VideoCommon::V2::DrawCache::Recipe* recipe) {
     R::RecordStats& stats = R::GetRecordStats();
     R::DrawHeader& h = record.h;
     const bool derive_only = mode == ApplyMode::DeriveOnly;
+    const bool from_template = mode == ApplyMode::Template && recipe != nullptr;
+    out.Clear();
     if (derive_only) {
         RelookupRecordProxies(record);
+    } else if (from_template) {
+        // 1. A hit's views are the template's: what FillImageViews does to the views it finds
+        // (uploads, alias copies, the LRU), once per residency stamp (F2-09).
+        for (const R::ResolvedView& entry : record.Span<const R::ResolvedView>(h.views)) {
+            out.views.push_back(VideoCommon::ImageViewInOut{
+                .index = entry.tic_index,
+                .blacklist = entry.blacklist != 0,
+                .id = VideoCommon::ImageViewId{entry.view.id},
+            });
+        }
+        if (!texture_cache.PrepareResidentViews(
+                std::span<const VideoCommon::ImageViewInOut>(out.views.data(), out.views.size()),
+                recipe->residency)) {
+            return ApplyResult::Rebuild;
+        }
+        // 2-3. Buffer creations (relocated bindings outside every buffer).
+        static_cast<void>(buffer_cache.TakeDeletedBuffers());
+        for (;;) {
+            stage.Apply(buffers, [&](const C::Request& request) {
+                return buffer_cache.ApplyDrawRequest(request);
+            });
+            PatchRecordBuffers(record, buffers);
+            if (!buffer_cache.TakeDeletedBuffers()) {
+                break;
+            }
+            R::CountRecordStat(stats.deleted_loops);
+            buffers.Reset(buffers.Segment());
+            RepeekRecordBuffers(record, buffers);
+        }
     } else {
         // 1. Samplers, then views (CommitSamplerLookups, FillImageViewsCommit's loop: a deletion,
         // or a blacklisted image scaled down, looks the views up again).
@@ -808,7 +915,7 @@ bool GraphicsPipeline::ApplyDraw(R::ResolvedDraw& record, C::RequestList& textur
             PushViewRequests(record.Span<R::ResolvedView>(h.views), blacklist, textures);
         }
         if (looped && h.tbo.count != 0 && !RefreshRecordTextureBuffers(record)) {
-            return false;
+            return ApplyResult::Failed;
         }
         // 2. Buffer creations (UpdateGraphicsBuffers' loop: a deletion looks every binding up
         // again).
@@ -829,28 +936,52 @@ bool GraphicsPipeline::ApplyDraw(R::ResolvedDraw& record, C::RequestList& textur
     }
     // 4. TraceTablePointer stays with the old bind (an env diagnostic of table pointers).
     // 5. The image descriptors (handles, heap slots, modification marks, rescaling bits).
-    out.Clear();
-    for (const R::ResolvedView& entry : record.Span<const R::ResolvedView>(h.views)) {
-        out.views.push_back(VideoCommon::ImageViewInOut{
-            .index = entry.tic_index,
-            .blacklist = entry.blacklist != 0,
-            .id = VideoCommon::ImageViewId{entry.view.id},
-        });
+    if (!from_template) {
+        out.views.clear();
+        for (const R::ResolvedView& entry : record.Span<const R::ResolvedView>(h.views)) {
+            out.views.push_back(VideoCommon::ImageViewInOut{
+                .index = entry.tic_index,
+                .blacklist = entry.blacklist != 0,
+                .id = VideoCommon::ImageViewId{entry.view.id},
+            });
+        }
     }
     for (const R::ResolvedSampler& entry : record.Span<const R::ResolvedSampler>(h.samplers)) {
         out.samplers.push_back(VideoCommon::SamplerId{entry.sampler.id});
     }
-    BindlessHeap* const heap = heap_pipeline ? heap_push.heap : nullptr;
-    const VideoCommon::SamplerId* samplers_it{out.samplers.data()};
-    const VideoCommon::ImageViewInOut* views_it{out.views.data()};
-    for (size_t index = 0; index < NUM_STAGES; ++index) {
-        if (!recipe_stages[index]) {
-            continue;
+    // F2-04 (§7 descriptor row): a hit replays the recipe's heap and rescaling words while no
+    // heap slot was recycled or freed since a hit found them equal; the slots are marked used
+    // once per submission.
+    const u64 heap_releases =
+        heap_pipeline && heap_push.heap != nullptr ? heap_push.heap->Releases() : 0;
+    if (from_template && HeapWordsReplayable(*recipe)) {
+        out.heap_words.assign(recipe->heap_words.begin(), recipe->heap_words.end());
+        out.rescaling.Assign(std::span<const u32>(recipe->push.data(), out.rescaling.Data().size()));
+        out.heap_replayed = true;
+        if (const u64 tick = scheduler.CurrentTick(); recipe->heap_tick != tick) {
+            recipe->heap_tick = tick;
+            TouchHeapWords(recipe->heap_words);
         }
-        const size_t words_before = out.heap_words.size();
-        DeriveImageDescriptors(texture_cache, stage_infos[index], samplers_it, views_it, heap,
-                               heap_push.verify, out, derive_only);
-        out.heap_stage_words[index] = static_cast<u32>(out.heap_words.size() - words_before);
+    } else {
+        BindlessHeap* const heap = heap_pipeline ? heap_push.heap : nullptr;
+        const VideoCommon::SamplerId* samplers_it{out.samplers.data()};
+        const VideoCommon::ImageViewInOut* views_it{out.views.data()};
+        for (size_t index = 0; index < NUM_STAGES; ++index) {
+            if (!recipe_stages[index]) {
+                continue;
+            }
+            const size_t words_before = out.heap_words.size();
+            DeriveImageDescriptors(texture_cache, stage_infos[index], samplers_it, views_it, heap,
+                                   heap_push.verify, out, derive_only);
+            out.heap_stage_words[index] = static_cast<u32>(out.heap_words.size() - words_before);
+        }
+        if (from_template && HeapWordsLearnable(*recipe) && out.heap_words == recipe->heap_words &&
+            std::equal(out.rescaling.Data().begin(), out.rescaling.Data().end(),
+                       recipe->push.begin())) {
+            // This hit found the recipe's words: later hits replay them while no slot moves.
+            recipe->heap_releases = heap_releases;
+            recipe->heap_tick = scheduler.CurrentTick();
+        }
     }
     if (!derive_only) {
         // 6. The heap slots reserved get their descriptors.
@@ -858,12 +989,40 @@ bool GraphicsPipeline::ApplyDraw(R::ResolvedDraw& record, C::RequestList& textur
             heap_push.heap->Commit();
         }
         // 7-8. Render targets (D4: the old update), the feedback-loop check.
-        texture_cache.UpdateRenderTargets(false);
+        if (from_template) {
+            // A hit (ConfigureRecipe's rule): with clean registers and the recipe's targets
+            // bound the update resolves nothing; other views mean the cache moved under them.
+            constexpr size_t NumColors = VideoCommon::V2::DrawCache::NumRecipeTargets - 1;
+            bool targets_unchanged = false;
+            if (texture_cache.CommitActive()) [[unlikely]] {
+                std::array<u32, NumColors> colors{};
+                for (size_t rt = 0; rt < NumColors; ++rt) {
+                    colors[rt] = recipe->targets[rt].id;
+                }
+                targets_unchanged =
+                    texture_cache.RenderTargetsUnchanged(colors, recipe->targets[NumColors].id);
+                texture_cache.NoteRecipeRenderTargets();
+            }
+            texture_cache.UpdateRenderTargets(false);
+            if (!targets_unchanged) {
+                const auto& targets = texture_cache.GetRenderTargets();
+                for (size_t rt = 0; rt < NumColors; ++rt) {
+                    if (targets.color_buffer_ids[rt].index != recipe->targets[rt].id) {
+                        return ApplyResult::Rebuild;
+                    }
+                }
+                if (targets.depth_buffer_id.index != recipe->targets[NumColors].id) {
+                    return ApplyResult::Rebuild;
+                }
+            }
+        } else {
+            texture_cache.UpdateRenderTargets(false);
+        }
         texture_cache.CheckFeedbackLoop(
             std::span<const VideoCommon::ImageViewInOut>(out.views.data(), out.views.size()));
     }
     // 9.
-    return !(IsBuilt() && (!pipeline || build->Failed()));
+    return IsBuilt() && (!pipeline || build->Failed()) ? ApplyResult::Failed : ApplyResult::Ok;
 }
 
 void GraphicsPipeline::VerifyDrawApply(R::ResolvedDraw& record, C::Stage& stage) {
@@ -873,7 +1032,7 @@ void GraphicsPipeline::VerifyDrawApply(R::ResolvedDraw& record, C::Stage& stage)
     }
     C::RequestList unused;
     DrawApplyOut& out = observer->derived;
-    if (!ApplyDraw(record, unused, unused, out, ApplyMode::DeriveOnly, stage)) {
+    if (ApplyDraw(record, unused, unused, out, ApplyMode::DeriveOnly, stage) != ApplyResult::Ok) {
         return;
     }
     observer->derived_ok = true;
@@ -955,23 +1114,54 @@ void GraphicsPipeline::FillRecipeCapture(const R::ResolvedDraw& record, const Dr
     NoteRecipePush(capture, out.rescaling, render_area, heap_push.words);
 }
 
+void GraphicsPipeline::NoteRecipeDelta(const VideoCommon::V2::DrawCache::Recipe& recipe,
+                                       const DrawApplyOut& out) {
+    // ConfigureRecipe's tail: a delta draw after this hit keeps what it bound (F2-14).
+    if (delta_recipe != &recipe || delta_recipe_stamp != recipe.inputs.stamp ||
+        !delta_views_valid) {
+        delta_views.assign(out.views.begin(), out.views.end());
+        delta_samplers.assign(out.samplers.begin(), out.samplers.end());
+        delta_recipe = &recipe;
+        delta_recipe_stamp = recipe.inputs.stamp;
+    }
+    configured_stages = recipe_stages;
+    delta_views_valid = true;
+    // The template is the next continued draw's base (its buffers are resolved again then).
+    if (last_record_recipe != &recipe || last_record_stamp != recipe.inputs.stamp) {
+        StoreLastRecord(recipe.record.Get());
+        last_record_recipe = &recipe;
+        last_record_stamp = recipe.inputs.stamp;
+    }
+}
+
 // ENCODE: the draw recorded from its record.
 
 bool GraphicsPipeline::EncodeDraw(const R::ResolvedDraw& record, const DrawApplyOut& out,
                                   const R::ResolvedDraw* previous, EncodeMode mode,
-                                  VideoCommon::V2::DrawCache::Recipe* recipe) {
+                                  VideoCommon::V2::DrawCache::Recipe* recipe,
+                                  VideoCommon::V2::Versions::EpochMemo* memo,
+                                  BufferReplay* replay) {
     static_cast<void>(previous);
-    static_cast<void>(recipe);
     namespace Profile = VideoCommon::Nx2Profile;
     const R::DrawHeader& h = record.h;
+    const bool try_replay = mode == EncodeMode::Replay && recipe != nullptr && memo != nullptr;
+    // A write after this stamp is newer than the buffers recorded again below.
+    const u64 buffer_stamp = try_replay ? VideoCommon::V2::Versions::Pages().Stamp() : 0;
+    bool buffers_replayed = false;
     // 1-2. The channel state as the update passes leave it, then the bind scope they open.
     buffer_cache.SetUniformBuffersState(enabled_uniform_buffer_masks, &uniform_buffer_sizes);
     {
         Profile::Scope scope{Profile::Zone::UpdateBuffers};
         buffer_cache.EncodeGraphicsBindings(record);
-        buffer_cache.BeginBindScope();
-        // 3.
-        buffer_cache.BindHostGeometryBuffers(h.indexed);
+        // 3. A hit binds from the recipe's buffers where they still hold (the channel state is
+        // the record's: the replay only decides which syncs it skips).
+        if (try_replay) {
+            buffers_replayed = buffer_cache.ReplayGraphicsBuffers(recipe->buffers, h.indexed, *memo);
+        }
+        if (!buffers_replayed) {
+            buffer_cache.BeginBindScope();
+            buffer_cache.BindHostGeometryBuffers(h.indexed);
+        }
     }
     // 4.
     {
@@ -988,7 +1178,13 @@ bool GraphicsPipeline::EncodeDraw(const R::ResolvedDraw& record, const DrawApply
         }
         {
             Profile::Scope scope{Profile::Zone::BindStageBuffers};
-            WithHeapTexels(stage, [&] { buffer_cache.BindHostStageBuffers(stage); });
+            if (buffers_replayed) {
+                WithHeapTexels(stage, [&] {
+                    buffer_cache.ReplayHostStageBuffers(stage, recipe->buffers, *memo);
+                });
+            } else {
+                WithHeapTexels(stage, [&] { buffer_cache.BindHostStageBuffers(stage); });
+            }
         }
         if (!out.heap_replayed) {
             const size_t words = out.heap_stage_words[stage];
@@ -1011,6 +1207,20 @@ bool GraphicsPipeline::EncodeDraw(const R::ResolvedDraw& record, const DrawApply
     if (buffer_cache.any_buffer_uploaded) {
         buffer_cache.runtime.PostCopyBarrier();
         buffer_cache.any_buffer_uploaded = false;
+    }
+    if (try_replay) {
+        const auto [replayed, synced] = buffer_cache.TakeReplayCounts();
+        if (replay != nullptr) {
+            *replay = BufferReplay{
+                .replayed = buffers_replayed,
+                .binds_replayed = replayed,
+                .binds_synced = synced,
+            };
+        }
+        if (!buffers_replayed || synced != 0) {
+            // Some binding took the sync path: the recipe holds what was bound now.
+            buffer_cache.RecordGraphicsBuffers(recipe->buffers, h.indexed, buffer_stamp);
+        }
     }
     if (mode == EncodeMode::PayloadOnly) {
         // Verify: the old configure's draw is already set up (its render pass included).

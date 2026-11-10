@@ -411,6 +411,9 @@ struct ResolveContext {
                                   u32 created_mask, std::string& reasons, u32* mismatched_groups,
                                   u32* dependent);
 
+/// Whether any handle of the record is still a commit proxy (not usable as a template).
+[[nodiscard]] bool HasProxies(const ResolvedDraw& record);
+
 struct RecordStats {
     std::atomic<u64> drawrec_draws{};
     std::array<std::atomic<u64>, 3> by_path{}; ///< full, delta, template

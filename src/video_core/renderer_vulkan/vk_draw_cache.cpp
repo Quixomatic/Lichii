@@ -19,6 +19,7 @@
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "common/settings.h"
 #include "video_core/v2/regsem.h"
+#include "video_core/v2/resolve/draw_record.h"
 #include "video_core/v2/resolve/split_resolve.h"
 #include "video_core/v2/resolve/state_view.h"
 #include "video_core/v2/v2_stats.h"
@@ -621,8 +622,20 @@ void DrawCacheGlue::BuildGraphicsRecipe(GraphicsPipeline& pipeline, const Decisi
     }
     // The shape learnt what its shaders use when DecideDraw met it.
     Store(graphics_table, pending_draw.key, recipe, decision, false);
+    pending_draw.stored = true;
     DC::ThreadStats().graphics_occupied = graphics_table.Occupied();
     DC::ThreadStats().graphics_capacity = graphics_table.Capacity();
+}
+
+void DrawCacheGlue::AttachRecordTemplate(const V2::Resolve::ResolvedDraw& record) {
+    if (!std::exchange(pending_draw.stored, false) ||
+        record.h.status != V2::Resolve::ResolveStatus::Ready || V2::Resolve::HasProxies(record)) {
+        return;
+    }
+    if (Recipe* const recipe = graphics_table.Find(pending_draw.key);
+        recipe != nullptr && !recipe->record.Valid()) {
+        recipe->record.Store(record);
+    }
 }
 
 void DrawCacheGlue::NoteReplayed(Recipe& recipe) {

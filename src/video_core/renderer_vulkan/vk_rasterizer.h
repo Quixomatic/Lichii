@@ -208,6 +208,22 @@ private:
     /// recipe capture is armed (a CommitOnly draw captures in the old configure, step 15).
     [[nodiscard]] bool PrepareDrawRecord(GraphicsPipeline& pipeline, bool is_indexed,
                                          bool is_indirect, bool& recorded, bool capture);
+    /// Steps 16-17: a record from `base` (a recipe template, the pipeline's last record) into
+    /// `out` (Stale: tables synchronized and resolved again once).
+    VideoCommon::V2::Resolve::ResolveStatus ResolveRecordFromBase(
+        GraphicsPipeline& pipeline, bool is_indexed,
+        const VideoCommon::V2::Resolve::ResolvedDraw& base,
+        VideoCommon::V2::Resolve::ResolvedDraw& out,
+        VideoCommon::V2::Commit::RequestList& buffers);
+    /// DRAWREC=1 (step 16): a recipe hit from its template in place of ConfigureRecipe.
+    [[nodiscard]] GraphicsPipeline::RecipeResult PrepareTemplateRecord(
+        GraphicsPipeline& pipeline, bool is_indexed, VideoCommon::V2::DrawCache::Recipe& recipe,
+        GraphicsPipeline::BufferReplay& buffers, bool& recorded);
+    /// DRAWREC=verify (step 16): the template path's record against the full resolve.
+    void VerifyTemplateRecord(GraphicsPipeline& pipeline, bool is_indexed,
+                              const VideoCommon::V2::DrawCache::Recipe& recipe);
+    VideoCommon::V2::Resolve::ResolvedDraw drawrec_scratch;
+    VideoCommon::V2::Commit::RequestList drawrec_scratch_buffers;
     /// DRAWREC=verify (step 10): what a cache mutation moves, around a pure resolve.
     struct DrawRecPurity {
         u64 flags{};

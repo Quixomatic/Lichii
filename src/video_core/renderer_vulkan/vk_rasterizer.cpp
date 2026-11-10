@@ -1790,6 +1790,9 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         // compares what it leaves behind with the record (DrawRecObserver).
         Profile::Scope scope{Profile::Zone::Configure};
         static_cast<void>(ResolveDrawRecord(*pipeline, is_indexed, is_indirect, true));
+        if (replay_pipeline != nullptr) {
+            VerifyTemplateRecord(*pipeline, is_indexed, *cache_decision.recipe);
+        }
         VideoCommon::V2::Resolve::CountRecordStat(
             VideoCommon::V2::Resolve::GetRecordStats().verify_draws);
         GraphicsPipeline::DrawRecObserver& observer = drawrec_observer_state;
@@ -1809,8 +1812,13 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     if (replay_pipeline != nullptr) [[unlikely]] {
         Profile::Scope scope{Profile::Zone::Configure};
         GraphicsPipeline::BufferReplay buffers{};
-        switch (pipeline->ConfigureRecipe(is_indexed, *cache_decision.recipe, nullptr,
-                                          &DrawCache().Memo(), &buffers)) {
+        const GraphicsPipeline::RecipeResult recipe_result =
+            drawrec == VideoCommon::V2::Mode::On && cache_decision.recipe->record.Valid()
+                ? PrepareTemplateRecord(*pipeline, is_indexed, *cache_decision.recipe, buffers,
+                                        drawrec_drawn)
+                : pipeline->ConfigureRecipe(is_indexed, *cache_decision.recipe, nullptr,
+                                            &DrawCache().Memo(), &buffers);
+        switch (recipe_result) {
         case GraphicsPipeline::RecipeResult::Recorded:
             replayed = true;
             DrawCache().NoteReplayed(*cache_decision.recipe);
@@ -1914,6 +1922,9 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         pipeline->VerifyDrawApply(drawrec_record, commit->stage);
         // Step 13: the encode's payload and push words against the configure's.
         pipeline->VerifyDrawEncode(drawrec_record);
+        // Step 16: a recipe this draw built keeps the record (proxies looked up again by the
+        // DeriveOnly apply) as its template.
+        DrawCache().AttachRecordTemplate(drawrec_record);
     }
 
 #ifdef EGLANTINE_STREAMLINE
@@ -5453,8 +5464,9 @@ bool RasterizerVulkan::PrepareDrawRecord(GraphicsPipeline& pipeline, bool is_ind
     R::RecordStats& stats = R::GetRecordStats();
     R::CountRecordStat(stats.drawrec_draws);
     R::CountRecordStat(stats.by_path[0]);
-    if (!pipeline.ApplyDraw(drawrec_record, drawrec_textures, drawrec_buffers, drawrec_apply,
-                            GraphicsPipeline::ApplyMode::Normal, commit->stage)) {
+    if (pipeline.ApplyDraw(drawrec_record, drawrec_textures, drawrec_buffers, drawrec_apply,
+                           GraphicsPipeline::ApplyMode::Normal, commit->stage) !=
+        GraphicsPipeline::ApplyResult::Ok) {
         return false;
     }
     pipeline.NoteRecordDelta(drawrec_apply);
@@ -5465,6 +5477,100 @@ bool RasterizerVulkan::PrepareDrawRecord(GraphicsPipeline& pipeline, bool is_ind
     pipeline.StoreLastRecord(drawrec_record);
     recorded = true;
     return true;
+}
+
+VideoCommon::V2::Resolve::ResolveStatus RasterizerVulkan::ResolveRecordFromBase(
+    GraphicsPipeline& pipeline, bool is_indexed, const VideoCommon::V2::Resolve::ResolvedDraw& base,
+    VideoCommon::V2::Resolve::ResolvedDraw& out, VideoCommon::V2::Commit::RequestList& buffers) {
+    namespace R = VideoCommon::V2::Resolve;
+    namespace Versions = VideoCommon::V2::Versions;
+    const R::ResolveContext ctx{
+        .pipeline = &pipeline,
+        .pipeline_epoch = Versions::Gens().GetEpoch(Versions::Epoch::Pipelines),
+        .is_indexed = is_indexed,
+        .is_indirect = false,
+        .frame_dump = frame_dump.Capturing(),
+        .sampled_recording = RecordingSampledTextures(),
+        .ordinal = drawrec_ordinal++,
+        .previous = &base,
+        .features = &DrawRecFeatures(),
+    };
+    buffers.Reset(commit->next_segment++);
+    R::ResolveStatus status = pipeline.ResolveFromBase(R::LiveView{*maxwell3d}, ctx, base, out,
+                                                       buffers);
+    if (status == R::ResolveStatus::Stale) {
+        R::CountRecordStat(R::GetRecordStats().stale);
+        texture_cache.SyncDescriptorTables(out.h.tables);
+        buffers.Reset(commit->next_segment++);
+        status = pipeline.ResolveFromBase(R::LiveView{*maxwell3d}, ctx, base, out, buffers);
+    }
+    return status;
+}
+
+GraphicsPipeline::RecipeResult RasterizerVulkan::PrepareTemplateRecord(
+    GraphicsPipeline& pipeline, bool is_indexed, VideoCommon::V2::DrawCache::Recipe& recipe,
+    GraphicsPipeline::BufferReplay& buffers, bool& recorded) {
+    namespace R = VideoCommon::V2::Resolve;
+    recorded = false;
+    // Step 16: a recipe hit copies the template; its buffers are resolved again (relocation),
+    // its dynamic state computed from the view.
+    if (ResolveRecordFromBase(pipeline, is_indexed, recipe.record.Get(), drawrec_record,
+                              drawrec_buffers) != R::ResolveStatus::Ready) {
+        return GraphicsPipeline::RecipeResult::Rebuild;
+    }
+    drawrec_textures.Reset(commit->next_segment++);
+    switch (pipeline.ApplyDraw(drawrec_record, drawrec_textures, drawrec_buffers, drawrec_apply,
+                               GraphicsPipeline::ApplyMode::Template, commit->stage, &recipe)) {
+    case GraphicsPipeline::ApplyResult::Ok:
+        break;
+    case GraphicsPipeline::ApplyResult::Rebuild:
+        return GraphicsPipeline::RecipeResult::Rebuild;
+    case GraphicsPipeline::ApplyResult::Failed:
+        return GraphicsPipeline::RecipeResult::Failed;
+    }
+    if (!pipeline.EncodeDraw(drawrec_record, drawrec_apply, nullptr,
+                             GraphicsPipeline::EncodeMode::Replay, &recipe, &DrawCache().Memo(),
+                             &buffers)) {
+        return GraphicsPipeline::RecipeResult::Failed;
+    }
+    pipeline.NoteRecipeDelta(recipe, drawrec_apply);
+    R::RecordStats& stats = R::GetRecordStats();
+    R::CountRecordStat(stats.drawrec_draws);
+    R::CountRecordStat(stats.by_path[2]);
+    recorded = true;
+    return GraphicsPipeline::RecipeResult::Recorded;
+}
+
+void RasterizerVulkan::VerifyTemplateRecord(GraphicsPipeline& pipeline, bool is_indexed,
+                                            const VideoCommon::V2::DrawCache::Recipe& recipe) {
+    namespace R = VideoCommon::V2::Resolve;
+    // Step 16 verify: the template path's record against the full resolve of the same draw
+    // (proxies in the full record are dependent, the template has none).
+    if (!recipe.record.Valid() || drawrec_record.h.status != R::ResolveStatus::Ready) {
+        return;
+    }
+    drawrec_scratch_buffers.Reset(commit->next_segment++);
+    if (ResolveRecordFromBase(pipeline, is_indexed, recipe.record.Get(), drawrec_scratch,
+                              drawrec_scratch_buffers) != R::ResolveStatus::Ready) {
+        return;
+    }
+    std::string reasons;
+    u32 groups = 0;
+    u32 dependent = 0;
+    R::RecordStats& stats = R::GetRecordStats();
+    if (!R::CompareRecords(drawrec_record, drawrec_scratch, ~0U, reasons, &groups, &dependent)) {
+        for (u32 bits = groups; bits != 0; bits &= bits - 1) {
+            R::CountRecordStat(stats.mismatches[std::countr_zero(bits)]);
+        }
+        static std::atomic<u32> logged{};
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+            LOG_WARNING(Render_Vulkan,
+                        "V2 draw record verify: the recipe template of draw {} differs from the "
+                        "full resolve: {}",
+                        drawrec_record.h.ordinal, reasons);
+        }
+    }
+    R::CountRecordStat(stats.dependent, dependent);
 }
 
 void RasterizerVulkan::HandleTransformFeedback() {

@@ -444,11 +444,26 @@ public:
     /// check. Template: a recipe hit (heap words replayed while valid). DeriveOnly (verify):
     /// nothing applied, proxies looked up again, slots peeked. False: the draw can't be recorded.
     enum class ApplyMode : u8 { Normal, Template, DeriveOnly };
-    [[nodiscard]] bool ApplyDraw(VideoCommon::V2::Resolve::ResolvedDraw& record,
-                                 VideoCommon::V2::Commit::RequestList& textures,
-                                 VideoCommon::V2::Commit::RequestList& buffers, DrawApplyOut& out,
-                                 ApplyMode mode, VideoCommon::V2::Commit::Stage& stage,
-                                 VideoCommon::V2::DrawCache::Recipe* recipe = nullptr);
+    /// Rebuild (Template only): the recipe no longer holds (views not resident, other render
+    /// targets); the draw resolves in full, as for ConfigureRecipe.
+    enum class ApplyResult : u8 { Ok, Rebuild, Failed };
+    [[nodiscard]] ApplyResult ApplyDraw(VideoCommon::V2::Resolve::ResolvedDraw& record,
+                                        VideoCommon::V2::Commit::RequestList& textures,
+                                        VideoCommon::V2::Commit::RequestList& buffers,
+                                        DrawApplyOut& out, ApplyMode mode,
+                                        VideoCommon::V2::Commit::Stage& stage,
+                                        VideoCommon::V2::DrawCache::Recipe* recipe = nullptr);
+
+    /// Steps 16-17: a record from a base record (a recipe's template, or the pipeline's last
+    /// record for a continued draw): its views, samplers and reads kept, the header, buffers
+    /// (with creations as requests), render targets and dynamic state resolved from the view.
+    /// Pure, as ResolveDraw.
+    template <class View>
+    [[nodiscard]] VideoCommon::V2::Resolve::ResolveStatus ResolveFromBase(
+        const View& view, const VideoCommon::V2::Resolve::ResolveContext& ctx,
+        const VideoCommon::V2::Resolve::ResolvedDraw& base,
+        VideoCommon::V2::Resolve::ResolvedDraw& out,
+        VideoCommon::V2::Commit::RequestList& buffers) const;
 
     /// DRAWREC=verify (step 11): the next configure (full, delta or recipe) builds the record it
     /// leaves behind and compares it with `resolved` before recording the draw. Null in v1.
@@ -477,11 +492,20 @@ public:
     /// commit, the fragment barrier decision, ConfigureDraw. PayloadOnly (verify) stops before
     /// ConfigureDraw and compares the payload with the observed configure's.
     enum class EncodeMode : u8 { Normal, Replay, PayloadOnly };
+    /// Replay (a recipe hit, `recipe` and `memo` set): the buffers bound from the recipe where it
+    /// still holds (ReplayGraphicsBuffers/ReplayHostStageBuffers), recorded again when a binding
+    /// took the sync path; `replay` (stats) receives what happened.
     [[nodiscard]] bool EncodeDraw(const VideoCommon::V2::Resolve::ResolvedDraw& record,
                                   const DrawApplyOut& out,
                                   const VideoCommon::V2::Resolve::ResolvedDraw* previous,
                                   EncodeMode mode,
-                                  VideoCommon::V2::DrawCache::Recipe* recipe = nullptr);
+                                  VideoCommon::V2::DrawCache::Recipe* recipe = nullptr,
+                                  VideoCommon::V2::Versions::EpochMemo* memo = nullptr,
+                                  BufferReplay* replay = nullptr);
+    /// Step 16: what ConfigureRecipe keeps for the delta draws after a hit (F2-14: not again
+    /// for the same recipe build), and the template as the pipeline's last record.
+    void NoteRecipeDelta(const VideoCommon::V2::DrawCache::Recipe& recipe,
+                         const DrawApplyOut& out);
     /// DRAWREC=verify (step 13): EncodeDraw(PayloadOnly) after the observed configure.
     void VerifyDrawEncode(const VideoCommon::V2::Resolve::ResolvedDraw& record);
     /// DRAWREC=1 (step 14): what ConfigureImpl keeps for delta draws after a resolve, from a
@@ -491,6 +515,7 @@ public:
     void StoreLastRecord(const VideoCommon::V2::Resolve::ResolvedDraw& record) {
         last_record.h = record.h;
         last_record.arena.assign(record.arena.begin(), record.arena.end());
+        last_record_recipe = nullptr;
     }
     [[nodiscard]] const VideoCommon::V2::Resolve::ResolvedDraw& LastRecord() const noexcept {
         return last_record;
@@ -519,6 +544,9 @@ private:
     DrawRecObserver* drawrec_observer{};
     /// DRAWREC: the record of the pipeline's last draw (the base of a continued draw, step 17).
     VideoCommon::V2::Resolve::ResolvedDraw last_record;
+    /// The recipe build (slot, stamp) last_record was copied from (null: a resolve).
+    const void* last_record_recipe{};
+    u64 last_record_stamp{};
     /// ApplyDraw's pieces: record proxies patched from a list (or looked up again), bindings
     /// peeked again after a deletion, texture buffers from the views again.
     void PatchRecordViews(VideoCommon::V2::Resolve::ResolvedDraw& record,
@@ -553,6 +581,18 @@ private:
         const View& view, const VideoCommon::V2::Resolve::ResolveContext& ctx,
         VideoCommon::V2::Resolve::ResolvedDraw& out,
         VideoCommon::V2::Commit::RequestList& buffers) const;
+
+    /// What the record path does not take yet (D3), None when it does.
+    template <class View>
+    [[nodiscard]] VideoCommon::V2::Resolve::CommitOnlyReason CommitOnlyOf(
+        const View& view, const VideoCommon::V2::Resolve::ResolveContext& ctx) const;
+    /// The render target key and prediction (kept from `base` when its registers are equal),
+    /// the dynamic state and the render area.
+    template <class View>
+    void ResolveTargetsAndDynamic(const View& view,
+                                  const VideoCommon::V2::Resolve::ResolveContext& ctx,
+                                  const VideoCommon::V2::Resolve::ResolvedDraw* base,
+                                  VideoCommon::V2::Resolve::ResolvedDraw& out) const;
 
     template <typename Spec, bool Capture = false>
     bool ConfigureImpl(bool is_indexed);

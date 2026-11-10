@@ -74,6 +74,10 @@ public:
                           const DrawApplyOut& out, const Tegra::Engines::Maxwell3D& maxwell3d,
                           Tegra::MemoryManager& memory, TextureCache& texture_cache,
                           BufferCache& buffer_cache);
+    /// DRAWREC=verify (step 16): the recipe this draw's capture built takes the draw's resolved
+    /// record (its proxies looked up again after the configure) as its template, so later hits
+    /// compare the template path with the full resolve. Once per stored recipe.
+    void AttachRecordTemplate(const VideoCommon::V2::Resolve::ResolvedDraw& record);
     /// The replay recorded the draw.
     void NoteReplayed(Recipe& recipe);
     /// The replay found a reason to resolve after all (Rebuild).
@@ -112,6 +116,7 @@ private:
         bool valid{};    ///< shape and key computed
         bool admit{};    ///< build a recipe (second sighting, invalidated entry or verify)
         bool capturing{};
+        bool stored{}; ///< this draw's capture stored a recipe under `key`
     };
 
     [[nodiscard]] static u64 GraphicsShape(const GraphicsPipeline& pipeline, bool is_indexed,

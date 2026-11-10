@@ -85,6 +85,30 @@ bool ListsEqual(const ResolvedDraw& lhs_record, Seg lhs_seg, const ResolvedDraw&
 
 } // Anonymous namespace
 
+bool HasProxies(const ResolvedDraw& record) {
+    const DrawHeader& h = record.h;
+    bool proxy = h.index.valid && Commit::IsProxy(h.index.buffer.id);
+    for (const ResolvedView& entry : record.Span<const ResolvedView>(h.views)) {
+        proxy |= Commit::IsProxy(entry.view.id);
+    }
+    for (const ResolvedSampler& entry : record.Span<const ResolvedSampler>(h.samplers)) {
+        proxy |= Commit::IsProxy(entry.sampler.id);
+    }
+    for (const ResolvedVertex& entry : record.Span<const ResolvedVertex>(h.vertex)) {
+        proxy |= Commit::IsProxy(entry.buffer.id);
+    }
+    for (const ResolvedUbo& entry : record.Span<const ResolvedUbo>(h.ubo)) {
+        proxy |= Commit::IsProxy(entry.buffer.id);
+    }
+    for (const ResolvedSsbo& entry : record.Span<const ResolvedSsbo>(h.ssbo)) {
+        proxy |= Commit::IsProxy(entry.buffer.id);
+    }
+    for (const ResolvedTbo& entry : record.Span<const ResolvedTbo>(h.tbo)) {
+        proxy |= Commit::IsProxy(entry.buffer.id);
+    }
+    return proxy;
+}
+
 bool CompareRecords(const ResolvedDraw& resolved, const ResolvedDraw& observed, u32 created_mask,
                     std::string& reasons, u32* mismatched_groups, u32* dependent) {
     u32 groups = 0;
