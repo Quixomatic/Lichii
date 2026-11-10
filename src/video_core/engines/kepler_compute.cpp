@@ -2225,11 +2225,9 @@ void KeplerCompute::FrontDispatchRecord(VideoCommon::GpuSplit& split, FrontState
 }
 
 namespace {
-/// F3-X1: a QMD release the front's model read, remembered by kind for the suspended-acquire
-/// poll and its resume line (Fix F3e: reductions and max releases too).
+/// A QMD release the front's model read (payload, reduction or max), into S1's semaphore view.
 void RememberQmdRelease(VideoCommon::GpuSplit& split, const Tegra::MemoryManager& memory,
                         GPUVAddr address, u32 payload, u32 flags) {
-    using Kind = VideoCommon::GpuSplit::ReleaseKind;
     const auto device = memory.GpuToCpuAddress(address);
     if (!device) {
         return;
@@ -2267,14 +2265,6 @@ void RememberQmdRelease(VideoCommon::GpuSplit& split, const Tegra::MemoryManager
             view.Note(*device + 12, 0, false, position, retire, position, SemKind::QmdUnknown,
                       progress);
         }
-    }
-    if (reduction) {
-        const u8 op = static_cast<u8>(((flags >> 20) & 7) | (((flags >> 24) & 1) << 3));
-        split.RememberQmdRelease(*device, payload, Kind::QmdReduction, op);
-    } else if ((flags & (1U << 19)) != 0 && (flags >> 30) != 0) {
-        split.RememberQmdRelease(*device, payload, Kind::QmdMax);
-    } else {
-        split.RememberQmdRelease(*device, payload, Kind::QmdPayload);
     }
 }
 } // Anonymous namespace
@@ -2329,8 +2319,6 @@ void KeplerCompute::FrontNoteWrites(VideoCommon::GpuSplit& split, FrontState& fs
                     // write, of unknown value (class A sums must not count on these words).
                     for (const auto& [address, size] : signal.releases) {
                         if (const auto device = memory_manager.GpuToCpuAddress(address)) {
-                            split.RememberQmdRelease(
-                                *device, 0, VideoCommon::GpuSplit::ReleaseKind::QmdUnknown);
                             // SYNC §2.1: written, value unknown (each word of the release).
                             const VideoCommon::V2::SemProgress progress = split.SemNow();
                             const u64 position = split.WritePosition();

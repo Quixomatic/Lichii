@@ -252,9 +252,6 @@ public:
         }
         PrepareHazardNote();
         hazards.NoteKnown(device_address, bytes, size, write_position, producer);
-        RememberRelease(device_address, bytes, size, write_position, false,
-                        producer == V2::Producer::Report ? ReleaseKind::Report
-                                                         : ReleaseKind::Release);
     }
     void NoteRangeWrite(u64 device_address, u64 size, V2::Producer producer) {
         if (producer != V2::Producer::CbData) {
@@ -449,110 +446,6 @@ public:
             unlanded.Retire(V2::Landing::landed.load(std::memory_order_acquire));
         }
         unlanded.NoteKnown(device_address, bytes, size, ticket, V2::Producer::Release);
-        RememberRelease(device_address, bytes, size, ticket, true, ReleaseKind::Release);
-    }
-    /// Fix F3e (F3-X1): who made a remembered release, for the resume line.
-    enum class ReleaseKind : u8 {
-        Release,      ///< A semaphore release (puller, copy engine) or a known write
-        Report,       ///< A report semaphore's payload
-        QmdPayload,   ///< A QMD release's payload
-        QmdReduction, ///< A QMD reduction release (`value`: its operand, `op`: its operation)
-        QmdMax,       ///< A QMD max release (`value`: its operand)
-        QmdUnknown,   ///< A QMD release whose payload the front can't tell (Fix F3h)
-    };
-    [[nodiscard]] static constexpr const char* ReleaseKindName(ReleaseKind kind) {
-        constexpr const char* names[] = {"release",       "report",  "qmd payload",
-                                         "qmd reduction", "qmd max", "qmd unknown"};
-        return names[static_cast<size_t>(kind)];
-    }
-    /// Front (Fix F3h, U-02 / R2-F3-05, MASTER_PLAN §6 class A): the QMD ADD reductions the
-    /// front's model saw to the word at `device_address` that memory may not hold yet. Known when
-    /// every remembered QMD release to the word not yet in memory for sure is still queued (the
-    /// back applies it after the acquire's position is passed, in order) and an ADD of less than
-    /// 2^31: memory plus `sum` is then a lower bound of the word once they ran. Not known when one
-    /// may already be in memory but isn't settled, or is another kind. Remembered releases that
-    /// fell out of the ring only make the bound lower.
-    struct QueuedAdds {
-        bool known = false;
-        u64 sum = 0;
-        u64 position = 0; ///< The newest one's ring position
-    };
-    [[nodiscard]] QueuedAdds QueuedQmdAdds(u64 device_address) const {
-        const u64 done = ConsumedNow();
-        const u64 settled = V2::Landing::UntrackedSettled(done);
-        QueuedAdds adds;
-        for (const RecentRelease& entry : recent_releases) {
-            if (entry.address != device_address || entry.position == 0 || entry.landing ||
-                entry.kind == ReleaseKind::Release || entry.kind == ReleaseKind::Report ||
-                entry.position <= settled) {
-                continue;
-            }
-            if (entry.position <= done || entry.kind != ReleaseKind::QmdReduction ||
-                (entry.op & 7) != 0 || entry.value >= 0x80000000U) {
-                return {};
-            }
-            adds.known = true;
-            adds.sum += entry.value;
-            adds.position = std::max(adds.position, entry.position);
-        }
-        return adds;
-    }
-    /// Front (Fix F3h, chunk C2: U-02 / R2-F3-05 for every acquire op, MASTER_PLAN §6 class A,
-    /// diagram 2.3 "value known at parse time"): the word at `device_address` as it will be once
-    /// the QMD reduction and max releases the front's exact model saw to it have landed, in
-    /// order. Memory holds exactly the landed ones (they land in capture order since d5e451eebf
-    /// tracks them); the pending ones are applied over it in ring order. Not known when any
-    /// pending writer of the word is another kind (a payload release, one whose payload depends
-    /// on a landing), an entry's operations may be partly landed, the memory read raced a
-    /// landing, or the ring may have dropped a pending one. `any`: at least one is pending.
-    struct ReductionView {
-        bool known = false;
-        bool any = false;
-        u32 value = 0;
-        u64 position = 0; ///< The newest pending one's ring position
-        /// Not known (SYNC Step 0): V2::Stats::ReductionReject + 1, 0 when known.
-        u8 reject = 0;
-    };
-    [[nodiscard]] ReductionView QmdReductionView(u64 device_address,
-                                                 const Tegra::MemoryManager& memory,
-                                                 u64 gpu_address) const;
-    /// Front (Fix F3h): an unknown QMD (an unbounded QmdRelease note) may write the range: still
-    /// queued, or run with an operation over the range still to land.
-    [[nodiscard]] bool UnknownQmdMayWrite(u64 device_address, u64 size) {
-        V2::HazardFilter filter;
-        filter.ranged = 0;
-        filter.unbounded = V2::ProducerBit(V2::Producer::QmdRelease);
-        return FindWrites(device_address, size, filter).kind != V2::HazardResult::Kind::Clear;
-    }
-    /// Front (Fix F3d, F3-X1): a QMD release the front's QMD model read (Fix F3e: reductions
-    /// and max releases too, by kind). The release lands at its dispatch's fence without a
-    /// landing ticket (Landing::Untracked), so it is only remembered for the suspended-acquire
-    /// poll and its resume line (no hazard entry: its range note stays the one FindWrites
-    /// orders against). `op`: the reduction's operation bits (QMD release flags 20-22, 24).
-    void RememberQmdRelease(u64 device_address, u32 payload,
-                            ReleaseKind kind = ReleaseKind::QmdPayload, u8 op = 0) {
-        RememberRelease(device_address, &payload, sizeof(payload), write_position, false, kind,
-                        op);
-    }
-    /// Front (F3-X1 diagnostics): the newest release of known bytes noted to the word at
-    /// `device_address` among the last RecentReleases notes.
-    struct RecentRelease {
-        u64 address = 0;
-        u64 position = 0; ///< Ring position, or the landing ticket when `landing`
-        u32 value = 0;
-        bool landing = false;
-        ReleaseKind kind = ReleaseKind::Release;
-        u8 op = 0;
-    };
-    [[nodiscard]] std::optional<RecentRelease> FindRecentRelease(u64 device_address) const {
-        for (size_t i = 0; i < recent_releases.size(); ++i) {
-            const RecentRelease& entry =
-                recent_releases[(recent_release_head - 1 - i) % recent_releases.size()];
-            if (entry.address == device_address && entry.position != 0) {
-                return entry;
-            }
-        }
-        return std::nullopt;
     }
     /// Any thread: whether an operation the back captured a landing ticket for hasn't run yet
     /// (V2::Landing::issued), whether or not the front still holds its note.
@@ -983,17 +876,6 @@ private:
                                    u64 floor = 0);
     /// Waits until untracked `ticket` landed, asking for the deferred submit (no drain).
     bool WaitUntrackedLanded(u64 ticket, DrainSite site, u64 timeout_us);
-    void RememberRelease(u64 device_address, const void* bytes, u32 size, u64 position,
-                         bool landing, ReleaseKind kind, u8 op = 0) {
-        RecentRelease& entry = recent_releases[recent_release_head++ % recent_releases.size()];
-        entry.address = device_address;
-        entry.position = position;
-        entry.value = 0;
-        std::memcpy(&entry.value, bytes, std::min<size_t>(size, sizeof(entry.value)));
-        entry.landing = landing;
-        entry.kind = kind;
-        entry.op = op;
-    }
     void PrepareHazardNote() {
         if (hazards.Size() == V2::HazardTable::Capacity) [[unlikely]] {
             hazards.Retire(consumed.load(std::memory_order_acquire));
@@ -1242,8 +1124,6 @@ private:
     /// operations ran (V2::Landing::UntrackedSettled), not only until the back consumed them.
     V2::HazardTable qmd_release_notes;
     V2::SemView sem_view; ///< Front: S1's semaphore view (SYNC_SUBMIT_SPEC §2.1)
-    std::array<RecentRelease, 256> recent_releases{};
-    size_t recent_release_head = 0;
     u64 back_entry_position{}; ///< Back: ring position of the entry it runs (TracksWrites)
 
     // Back side.

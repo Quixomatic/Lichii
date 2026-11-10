@@ -27,6 +27,7 @@
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/gpu.h"
 #include "video_core/gpu_split.h"
+#include "video_core/native_qmd.h"
 #include "video_core/gpu_thread.h"
 #include "video_core/memory_manager.h"
 #include "video_core/renderer_null/null_rasterizer.h"
@@ -2293,22 +2294,22 @@ TEST_CASE("V2 landing: the front remembers its releases, the back's captured ope
     V2::Landing::landed.store(0);
     V2::Landing::issued.store(0);
     constexpr u64 word = 0x5'0000'0040;
-    CHECK(!split.FindRecentRelease(word));
     const u32 first = 0x778;
     const u32 second = 0x779;
     split.NoteUnlandedWrite(word, &first, sizeof(first), split.NextLandingTicket());
     split.NoteKnownWrite(word + 4, &first, sizeof(first), V2::Producer::Release);
     const u64 ticket = split.NextLandingTicket();
     split.NoteUnlandedWrite(word, &second, sizeof(second), ticket);
-    const auto recent = split.FindRecentRelease(word);
-    REQUIRE(recent);
-    CHECK(recent->value == second); // the newest one
-    CHECK(recent->landing);
-    CHECK(recent->position == ticket);
     CHECK(split.LastLandingTicket() == ticket);
-    const auto other = split.FindRecentRelease(word + 4);
-    REQUIRE(other);
-    CHECK(!other->landing);
+    // The newest landing release is forwarded until it lands (SYNC Step 10: the release ring
+    // the resume line read is gone; the semaphore view and the write tables hold them).
+    u32 forwarded = 0;
+    V2::HazardFilter filter;
+    filter.ranged = V2::ProducerBit(V2::Producer::Release);
+    const auto found =
+        split.FindWrites(word, sizeof(u32), filter, reinterpret_cast<u8*>(&forwarded));
+    CHECK(found.kind == V2::HazardResult::Kind::Forward);
+    CHECK(forwarded == second);
     // The back's capture is what decides, not the front's note.
     CHECK(!VideoCommon::GpuSplit::CapturedLandingPending());
     const u64 saved_tag = V2::Landing::tag;
@@ -2327,31 +2328,15 @@ TEST_CASE("V2 landing: the front remembers its releases, the back's captured ope
     V2::Landing::issued.store(0);
 }
 
-TEST_CASE("V2 landing: remembered releases name their producer kind (F3-X1)",
+TEST_CASE("V2 landing: a QMD reduction deferred to its fence reports its landing (F3-X1)",
           "[video_core][gpu_split_dispatch][v2_hazard]") {
-    // Fix F3e: the resume line names who made the newest release noted to the word; QMD
-    // reductions (eac4735: the word stepping by 0x13) and max releases are remembered too.
     using Access = VideoCommon::GpuSplitTestAccess;
-    using Kind = VideoCommon::GpuSplit::ReleaseKind;
     namespace V2 = VideoCommon::V2;
     Fixture f;
     f.system.Initialize();
     VideoCommon::GpuSplit split;
     Access::Initialize(split, f.system, 100);
     constexpr u64 word = 0x21'13cd'1000;
-    const u32 payload = 0x690;
-    split.NoteKnownWrite(word, &payload, sizeof(payload), V2::Producer::Report);
-    REQUIRE(split.FindRecentRelease(word));
-    CHECK(split.FindRecentRelease(word)->kind == Kind::Report);
-    split.RememberQmdRelease(word, 0x13, Kind::QmdReduction, 0);
-    const auto reduction = split.FindRecentRelease(word);
-    REQUIRE(reduction);
-    CHECK(reduction->kind == Kind::QmdReduction);
-    CHECK(reduction->value == 0x13); // the operand, not the word's new value
-    CHECK(!reduction->landing);
-    split.RememberQmdRelease(word + 4, 0x6a3);
-    CHECK(split.FindRecentRelease(word + 4)->kind == Kind::QmdPayload);
-    CHECK(std::string_view{VideoCommon::GpuSplit::ReleaseKindName(Kind::QmdMax)} == "qmd max");
     // The back reports a reduction's fence like an Untracked query: pending until it ran.
     const u64 saved_tag = V2::Landing::tag;
     const u64 issued = V2::Landing::untracked_issued.load();
@@ -2755,75 +2740,47 @@ TEST_CASE("V2 landing: one write table, tickets without IR cuts, ordered landing
         Landing::ResetUntracked();
     }
 
-    SECTION("R2-F3-05: queued QMD ADD reductions answer a Gequal acquire (class A)") {
+    SECTION("SYNC: the split's semaphore view holds what pending QMD reductions leave") {
+        // Replaces the release ring's QueuedQmdAdds / QmdReductionView (SYNC Step 10): the view
+        // is retired by consumed + untracked settlement and cleared with the split.
         namespace Landing = V2::Landing;
-        using ReleaseKind = VideoCommon::GpuSplit::ReleaseKind;
+        using Retire = V2::SemView::Retire;
+        using SemKind = V2::SemView::Kind;
         Landing::ResetUntracked();
         Access::SetBack(split, 100, true);
+        const auto reduce = [](u32 op, u32 base, u32 operand) {
+            return Tegra::ReduceSemaphore(op, false, base, operand);
+        };
         Access::SetEnd(split, 200);
-        split.RememberQmdRelease(word_a, 3, ReleaseKind::QmdReduction, 0); // ADD 3
+        split.Sem().NoteReduction(word_a, false, 0, 3, 200, Retire::Untracked, 200,
+                                  SemKind::QmdReduction, split.SemNow(), true, reduce,
+                                  [] { return 0U; });
         Access::SetEnd(split, 210);
-        split.RememberQmdRelease(word_a, 2, ReleaseKind::QmdReduction, 0); // ADD 2
-        split.RememberQmdRelease(word_b, 7, ReleaseKind::QmdPayload);
-        auto adds = split.QueuedQmdAdds(word_a);
-        CHECK(adds.known);
-        CHECK(adds.sum == 5);
-        CHECK(adds.position == 210);
-        // The back ran entry 200 (applied at once, nothing to land): only 210's is queued.
-        Access::SetBack(split, 205, true);
-        adds = split.QueuedQmdAdds(word_a);
-        CHECK(adds.known);
-        CHECK(adds.sum == 2);
-        // A payload release may move the word back: not known.
-        CHECK(!split.QueuedQmdAdds(word_b).known);
-        // An operation of a consumed entry still to land: memory may or may not hold it.
-        Landing::tag = 210;
-        {
-            const Landing::Untracked untracked;
-            (void)Landing::CaptureUntracked(word_a, 4);
-        }
-        Landing::tag = 0;
-        Access::SetBack(split, 215, true);
-        CHECK(!split.QueuedQmdAdds(word_a).known);
-        Landing::ResetUntracked();
-        // A release whose payload the front can't tell: not known.
-        Access::SetEnd(split, 230);
-        split.RememberQmdRelease(word_a, 0, ReleaseKind::QmdUnknown);
-        CHECK(!split.QueuedQmdAdds(word_a).known);
-        // An unknown QMD that may write the word decides against it too.
-        CHECK(!split.UnknownQmdMayWrite(word_a, 4));
-        split.NoteUnboundedWrite(V2::Producer::QmdRelease);
-        CHECK(split.UnknownQmdMayWrite(word_a, 4));
-        Access::SetBack(split, 230, false);
+        split.Sem().NoteReduction(word_a, false, 0, 2, 210, Retire::Untracked, 210,
+                                  SemKind::QmdReduction, split.SemNow(), true, reduce,
+                                  [] { return 0U; });
+        auto answer = split.Sem().Find(word_a, split.SemNow());
+        REQUIRE(answer.pending);
+        CHECK(answer.writer.value == 5);
+        CHECK(answer.writer.position == 210);
+        CHECK(!split.Sem().Find(word_b, split.SemNow()).pending);
+        // The back ran both entries and nothing is left to land: in memory.
+        Access::SetBack(split, 210, false);
+        CHECK(!split.Sem().Find(word_a, split.SemNow()).pending);
     }
 
-    SECTION("chunk C2: the word pending QMD reductions leave decides any acquire (class A)") {
-        // 67e9: every reduction lands at its fence since d5e451eebf, so Equal acquires waited
-        // for fences b0da passed at once (~817/s). The view: memory (0 here: an unmapped GPU
-        // address) plus the pending reduction and max releases in order.
+    SECTION("SYNC: a QMD operation of a consumed entry still to land keeps its word pending") {
+        // Chunk C2's part-landed case, on the semaphore view: an entry the back ran whose
+        // untracked operations haven't all landed is not in memory yet.
         namespace Landing = V2::Landing;
-        using ReleaseKind = VideoCommon::GpuSplit::ReleaseKind;
-        constexpr u64 gpu_word = 0x7000'0000ULL; // not mapped: reads 0
+        using Retire = V2::SemView::Retire;
+        using SemKind = V2::SemView::Kind;
         Landing::ResetUntracked();
+        Landing::untracked_captured_tag = 0;
         Access::SetBack(split, 100, true);
         Access::SetEnd(split, 200);
-        split.RememberQmdRelease(word_a, 3, ReleaseKind::QmdReduction, 0); // ADD 3
-        Access::SetEnd(split, 210);
-        split.RememberQmdRelease(word_a, 2, ReleaseKind::QmdReduction, 0); // ADD 2
-        auto view = split.QmdReductionView(word_a, f.memory, gpu_word);
-        CHECK(view.known);
-        CHECK(view.any);
-        CHECK(view.value == 5);
-        CHECK(view.position == 210);
-        // A max release after them, in order: max(5, 9).
-        Access::SetEnd(split, 220);
-        split.RememberQmdRelease(word_a, 9, ReleaseKind::QmdMax);
-        CHECK(split.QmdReductionView(word_a, f.memory, gpu_word).value == 9);
-        // Another word: nothing pending.
-        view = split.QmdReductionView(word_b, f.memory, gpu_word);
-        CHECK(view.known);
-        CHECK(!view.any);
-        // An entry the back ran whose operations may be part landed: not known.
+        split.Sem().Note(word_a, 9, true, 200, Retire::Untracked, 200, SemKind::QmdMax,
+                         split.SemNow());
         Landing::tag = 200;
         u64 first = 0;
         {
@@ -2834,12 +2791,9 @@ TEST_CASE("V2 landing: one write table, tickets without IR cuts, ordered landing
         Landing::tag = 0;
         Access::SetBack(split, 205, true);
         Landing::NoteUntracked(first);
-        CHECK(!split.QmdReductionView(word_a, f.memory, gpu_word).known);
+        CHECK(split.Sem().Find(word_a, split.SemNow()).pending);
+        CHECK(split.Sem().Find(word_a, split.SemNow()).writer.value == 9);
         Landing::ResetUntracked();
-        // A payload release pending to the word: not known (it may move it anywhere).
-        Access::SetEnd(split, 230);
-        split.RememberQmdRelease(word_a, 1, ReleaseKind::QmdPayload);
-        CHECK(!split.QmdReductionView(word_a, f.memory, gpu_word).known);
         Access::SetBack(split, 230, false);
     }
 

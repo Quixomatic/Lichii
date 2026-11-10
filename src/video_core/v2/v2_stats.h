@@ -124,18 +124,6 @@ enum class WakeClass : u8 {
 };
 /// A suspended acquire resumed after `ns`, last waiting for `wake` (front thread).
 void NoteSuspended(WakeClass wake, u64 ns);
-/// Step 0: why GpuSplit::QmdReductionView (or its gate in the acquire) gave no answer.
-enum class ReductionReject : u8 {
-    UnknownQmdMayWrite, ///< The acquire's gate: an unknown QMD may write the word
-    Eviction,           ///< A pending reduction may have fallen out of the release ring
-    Kind,               ///< A pending writer of another kind (payload release, unknown QMD)
-    PartlyLanded,       ///< The newest landed entry's operations may be part landed
-    Raced,              ///< A landing between the reads
-    Count,
-};
-void NoteReductionReject(ReductionReject reason);
-/// Step 0: a forced landing (LandEverythingPending) blocked the back for `ns`.
-void NoteForcedLanding(u64 ns);
 /// SYNC Step 1+: an acquire decided by S1's semaphore view, by row (V2::SemRow), and slot
 /// evictions.
 void NoteSemRow(u8 row);
