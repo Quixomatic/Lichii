@@ -1518,7 +1518,8 @@ GraphicsPipeline::RecipeResult GraphicsPipeline::ConfigureRecipe(
         }
         if (!buffers_replayed || synced != 0) {
             // Some binding took the sync path: the recipe holds what was bound now.
-            buffer_cache.RecordGraphicsBuffers(recipe.buffers, is_indexed, buffer_stamp);
+            buffer_cache.RecordGraphicsBuffers(recipe.buffers, is_indexed, buffer_stamp,
+                                               RecipeStageMask());
         }
     }
     if (push_out != nullptr) {

@@ -352,8 +352,11 @@ public:
 
     /// EDEN_NX2_V2_DRAWCACHE buffer replay. Records the graphics buffer bindings the last
     /// UpdateGraphicsBuffers/BindHost* resolved and bound (with `stamp`, taken before them).
+    /// `stage_mask`: the stages the draw binds (bit per stage). The channel state keeps the
+    /// storage and texture buffer bits of stages the pipeline lacks from earlier draws; those were
+    /// neither bound nor synchronized by this draw, so they are not recorded (S0-G17).
     void RecordGraphicsBuffers(VideoCommon::V2::DrawCache::BufferRecipe& recipe, bool is_indexed,
-                               u64 stamp);
+                               u64 stamp, u32 stage_mask = ~0U);
     /// Replaces UpdateGraphicsBuffers + BindHostGeometryBuffers for a recipe replay. A binding
     /// whose buffer generation matches and whose guest range is unchanged since the recipe's stamp
     /// (and lies within the recorded one) is bound from the recipe: no FindBuffer, no

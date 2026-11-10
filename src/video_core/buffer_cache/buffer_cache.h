@@ -1083,7 +1083,7 @@ bool BufferCache<P>::BindGraphicsStorageBuffer(size_t stage, size_t ssbo_index, 
 
 template <class P>
 void BufferCache<P>::RecordGraphicsBuffers(VideoCommon::V2::DrawCache::BufferRecipe& recipe,
-                                           bool is_indexed, u64 stamp) {
+                                           bool is_indexed, u64 stamp, u32 stage_mask) {
     namespace DC = VideoCommon::V2::DrawCache;
     namespace Versions = VideoCommon::V2::Versions;
     recipe.Clear();
@@ -1120,6 +1120,9 @@ void BufferCache<P>::RecordGraphicsBuffers(VideoCommon::V2::DrawCache::BufferRec
         }
         const u64 tick = runtime.CurrentTick();
         for (u32 stage = 0; stage < NUM_STAGES; ++stage) {
+            if (((stage_mask >> stage) & 1U) == 0) {
+                continue;
+            }
             ForEachEnabledBit(channel_state->enabled_uniform_buffer_masks[stage], [&](u32 index) {
                 const Binding& binding = channel_state->uniform_buffers[stage][index];
                 DC::BufferBind bind = make(stage, index, binding);
@@ -1179,6 +1182,7 @@ void BufferCache<P>::RecordGraphicsBuffers(VideoCommon::V2::DrawCache::BufferRec
     } else {
         static_cast<void>(is_indexed);
         static_cast<void>(stamp);
+        static_cast<void>(stage_mask);
     }
 }
 

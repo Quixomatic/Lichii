@@ -1371,7 +1371,8 @@ bool GraphicsPipeline::EncodeDraw(const R::ResolvedDraw& record, const DrawApply
         }
         if (!buffers_replayed || synced != 0) {
             // Some binding took the sync path: the recipe holds what was bound now.
-            buffer_cache.RecordGraphicsBuffers(recipe->buffers, h.indexed, buffer_stamp);
+            buffer_cache.RecordGraphicsBuffers(recipe->buffers, h.indexed, buffer_stamp,
+                                               RecipeStageMask());
         }
     }
     if (mode == EncodeMode::PayloadOnly) {

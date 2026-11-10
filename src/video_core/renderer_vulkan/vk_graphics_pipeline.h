@@ -405,6 +405,14 @@ public:
     [[nodiscard]] const std::array<u32, NUM_STAGES>& StorageConstantBuffers() const noexcept {
         return storage_constant_buffers;
     }
+    /// The stages the pipeline binds, a bit per stage (BufferCache::RecordGraphicsBuffers).
+    [[nodiscard]] u32 RecipeStageMask() const noexcept {
+        u32 mask = 0;
+        for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
+            mask |= recipe_stages[stage] ? 1U << stage : 0U;
+        }
+        return mask;
+    }
 
     template <typename Spec>
     static auto MakeConfigureSpecFunc() {

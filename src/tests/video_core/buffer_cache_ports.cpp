@@ -776,6 +776,51 @@ TEST_CASE("Draw cache buffer replay binds unchanged cached uniforms without sync
     REQUIRE(f.cache->CountStaleRecipeRanges(moved, memo) == 0);
 }
 
+TEST_CASE("A recipe records only the stages its pipeline binds", "[buffer_ports][v2_p4]") {
+    // S0-G17 (DRAWREC=1 + DRAWCACHE=verify on eac4735c2b): the first stale binding was a storage
+    // buffer at stage 2 of a pipeline without that stage. The channel state keeps an unused
+    // stage's storage bits from an earlier draw; the draw neither binds nor syncs them, so a
+    // recipe that recorded them vouched for a range nobody uploaded.
+    namespace V2 = VideoCommon::V2;
+    const auto saved = V2::g_modes;
+    V2::g_modes[static_cast<size_t>(V2::Switch::DrawCache)] = V2::Mode::On;
+    SCOPE_EXIT {
+        V2::g_modes = saved;
+    };
+    Fixture f;
+    Tegra::Control::ChannelState state{0};
+    state.memory_manager = &*f.memory;
+    state.payload.emplace(f.system, *f.memory, state);
+    VideoCommon::BufferCacheChannelInfo channel{state};
+    VideoCommon::UniformBufferSizes sizes{};
+    sizes[0][0] = 0x2000;
+    channel.uniform_buffer_sizes = &sizes;
+    channel.enabled_uniform_buffer_masks[0] = 1;
+    const auto id = Access::Add(*f.cache, 0x20000, 0x10000);
+    Access::UseChannel(*f.cache, channel);
+    channel.uniform_buffers[0][0] = {.device_addr = 0x20000, .size = 0x2000, .buffer_id = id};
+    // Left behind by a draw whose pipeline had stage 2.
+    channel.enabled_storage_buffers[2] = 1U << 1;
+    channel.storage_buffers[2][1] = {.device_addr = 0x24000, .size = 0x4000, .buffer_id = id};
+    V2::Versions::EpochMemo memo{V2::Versions::Pages()};
+    const u64 stamp = V2::Versions::Pages().Stamp();
+
+    V2::DrawCache::BufferRecipe recipe;
+    f.cache->RecordGraphicsBuffers(recipe, false, stamp, 1U << 0 | 1U << 4);
+    REQUIRE(recipe.valid);
+    REQUIRE(recipe.uniform.size() == 1);
+    REQUIRE(recipe.storage.empty());
+    // Never uploaded by this draw: not a range the recipe vouches for.
+    Access::MarkCpuModifiedSilently(*f.cache, 0x24000, 0x1000);
+    REQUIRE(f.cache->CountStaleRecipeRanges(recipe, memo) == 0);
+
+    // The pipeline with stage 2 records it.
+    f.cache->RecordGraphicsBuffers(recipe, false, stamp, 1U << 0 | 1U << 2 | 1U << 4);
+    REQUIRE(recipe.storage.size() == 1);
+    REQUIRE(recipe.storage[0].stage == 2);
+    REQUIRE(recipe.storage[0].index == 1);
+}
+
 TEST_CASE("Index and vertex ranges are computed as the update passes compute them",
           "[buffer_ports][v2_drawrec]") {
     // P6 Step 0: UpdateIndexBuffer/UpdateVertexBuffer and the record resolve share these.

@@ -606,8 +606,10 @@ void DrawCacheGlue::BuildGraphicsRecipe(GraphicsPipeline& pipeline, const Decisi
                 recipe.inputs.content.push_back({binding.device_addr, binding.size, false});
             });
     }
-    // The buffers the resolve bound, against the stamp taken before it synchronized them.
-    buffer_cache.RecordGraphicsBuffers(recipe.buffers, is_indexed, recipe.inputs.stamp);
+    // The buffers the resolve bound, against the stamp taken before it synchronized them (only
+    // the pipeline's stages: the others hold earlier draws' bindings, never synced here).
+    buffer_cache.RecordGraphicsBuffers(recipe.buffers, is_indexed, recipe.inputs.stamp,
+                                       pipeline.RecipeStageMask());
     const auto& targets = texture_cache.GetRenderTargets();
     for (size_t rt = 0; rt < DC::NumRecipeTargets - 1; ++rt) {
         const u32 id = targets.color_buffer_ids[rt].index;

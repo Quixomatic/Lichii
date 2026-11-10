@@ -324,10 +324,14 @@ void Report(const char* thread, Versions::EpochMemo* memo) {
 }
 
 void LogMismatch(bool compute, u64 key, const std::string& reasons) {
+    // The first 32, then every 4096th: a burst at a load must not hide the later mismatches.
     static std::atomic<u32> logged{};
-    if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
-        LOG_WARNING(HW_GPU, "V2 draw cache verify: {} key {:016x}: the full resolve differs in {}",
-                    compute ? "dispatch" : "draw", key, reasons);
+    const u32 count = logged.fetch_add(1, std::memory_order_relaxed);
+    if (count < 32 || (count % 4096) == 0) {
+        LOG_WARNING(HW_GPU,
+                    "V2 draw cache verify: {} key {:016x}: the full resolve differs in {} "
+                    "(mismatch {})",
+                    compute ? "dispatch" : "draw", key, reasons, count + 1);
     }
 }
 
