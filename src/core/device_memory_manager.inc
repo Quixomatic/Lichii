@@ -28,6 +28,7 @@
 #include "core/device_memory_manager.h"
 #include "core/memory.h"
 #include "video_core/nx2_perf.h"
+#include "video_core/v2/cbuf_watch.h"
 
 namespace Core {
 
@@ -280,6 +281,7 @@ void DeviceMemoryManager<Traits>::Map(DAddr address, VAddr virtual_address, size
     Core::Memory::Memory* process_memory = registered_processes[asid.id];
     size_t start_page_d = address >> Memory::YUZU_PAGEBITS;
     size_t num_pages = Common::AlignUp(size, Memory::YUZU_PAGESIZE) >> Memory::YUZU_PAGEBITS;
+    ReleaseWatchedPages(address, size);
     std::scoped_lock lk(mapping_guard);
 
     tracked_entries.CommitRegion(start_page_d, start_page_d + num_pages);
@@ -320,6 +322,7 @@ template <typename Traits>
 void DeviceMemoryManager<Traits>::Unmap(DAddr address, size_t size) {
     size_t start_page_d = address >> Memory::YUZU_PAGEBITS;
     size_t num_pages = Common::AlignUp(size, Memory::YUZU_PAGESIZE) >> Memory::YUZU_PAGEBITS;
+    ReleaseWatchedPages(address, size);
     device_inter->InvalidateRegion(address, size);
     std::scoped_lock lk(mapping_guard);
 
@@ -735,6 +738,33 @@ template <typename Traits>
 void DeviceMemoryManager<Traits>::UpdatePagesCachedCount(DAddr addr, size_t size, s32 delta) {
     Common::ScopedRangeLock lk(counter_guard, addr, size);
     UpdatePagesCachedCountNoLock(addr, size, delta);
+}
+
+template <typename Traits>
+void DeviceMemoryManager<Traits>::ReleaseWatchedPages(DAddr addr, size_t size) {
+    // F2-03: a count of the constant buffer write watch goes back while the old CPU backing
+    // still exists; left on the device page it would not protect the next mapping.
+    if (VideoCommon::V2::On(VideoCommon::V2::Switch::CbufRing)) [[unlikely]] {
+        VideoCommon::V2::CbufWatch::Get().ReleaseRange(addr, size, [this](u64 page) {
+            UpdatePagesCachedCount(page, Memory::YUZU_PAGESIZE, -1);
+        });
+    }
+}
+
+template <typename Traits>
+bool DeviceMemoryManager<Traits>::HoldPageIfCached(DAddr addr) {
+    Common::ScopedRangeLock lk(counter_guard, addr, Memory::YUZU_PAGESIZE);
+    const size_t page = addr >> Memory::YUZU_PAGEBITS;
+    if ((ExtractCPUBacking(page).second >> Memory::YUZU_PAGEBITS) == 0) {
+        return false; // no CPU backing: the count would not protect anything
+    }
+    CounterAtomicType& count = cached_pages->at(page >> subentries_shift).Count(page);
+    const CounterType value = count.load(std::memory_order_relaxed);
+    if (value == 0 || value == std::numeric_limits<CounterType>::max()) {
+        return false;
+    }
+    count.fetch_add(1, std::memory_order_release);
+    return true;
 }
 
 template <typename Traits>

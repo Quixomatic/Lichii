@@ -47,6 +47,7 @@
 #include "video_core/nx2_download_trace.h"
 #include "video_core/surface.h"
 #include "video_core/texture_cache/types.h"
+#include "video_core/v2/cbuf_watch.h"
 #include "video_core/v2/commit.h"
 #include "video_core/v2/draw_cache.h"
 #include "video_core/v2/resolve/draw_record.h"
@@ -741,6 +742,8 @@ private:
     /// EDEN_NX2_V2_CBUFVER: what guest memory holds at [device_addr, device_addr + size) now
     /// (a direct span, or a copy in version_scratch).
     const u8* V2GuestBytes(DAddr device_addr, u32 size);
+    /// F2-03: once per frame, the write watch's arming (v2/cbuf_watch.h).
+    void V2TickCbufWatch();
 
     void BindHostGraphicsStorageBuffers(size_t stage);
 
@@ -1104,6 +1107,8 @@ private:
     /// EDEN_NX2_V2_CBUFRING: ReplayHostStageBuffers missed the ring for the binding it now hands
     /// to BindHostGraphicsUniformBuffer, which then skips its own ring lookup.
     bool v2_ring_missed = false;
+    /// F2-03: the constant buffer write watch's arming (v2/cbuf_watch.h), made on first use.
+    std::unique_ptr<VideoCommon::V2::CbufWatch::Arming> v2_cbuf_arming;
 
     /// A command list page (Nx2CopyListPages): the GPU writes noted to it and the last copy.
     using Nx2Staging = decltype(std::declval<Runtime&>().DownloadStagingBuffer(size_t{}, true));

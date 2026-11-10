@@ -488,4 +488,22 @@ private:
     std::vector<u32> release;
 };
 
+/// Arming's Ops over a Core::DeviceMemoryManager.
+template <typename Memory>
+struct DeviceOps {
+    Memory& memory;
+
+    void Hold(std::span<const std::pair<u64, u64>> ranges, s32 delta) {
+        std::vector<std::pair<DAddr, size_t>> copy;
+        copy.reserve(ranges.size());
+        for (const auto& [addr, size] : ranges) {
+            copy.emplace_back(addr, static_cast<size_t>(size));
+        }
+        memory.UpdatePagesCachedBatch(copy, delta);
+    }
+    bool TryHold(u64 page_address) {
+        return memory.HoldPageIfCached(page_address);
+    }
+};
+
 } // namespace VideoCommon::V2::CbufWatch

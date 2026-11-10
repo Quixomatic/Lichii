@@ -81,6 +81,13 @@ BufferCache<P>::~BufferCache() {
     if constexpr (VideoCommon::StreamUniformReusable<Runtime>) {
         VideoCommon::V2::CbufVer::Table<typename Runtime::StreamUniformRef>().Reset();
     }
+    if (v2_cbuf_arming) {
+        // F2-03: every count the write watch holds goes back; no page stays armed.
+        VideoCommon::V2::CbufWatch::DeviceOps<Tegra::MaxwellDeviceMemoryManager> ops{
+            device_memory};
+        v2_cbuf_arming->ReleaseAll(ops);
+        VideoCommon::V2::CbufWatch::Get().Reset();
+    }
 }
 
 template <class P>
@@ -127,6 +134,9 @@ void BufferCache<P>::TickFrame() {
     }
     runtime.TickFrame(slot_buffers);
     ++learned_frame;
+    if (VideoCommon::V2::On(VideoCommon::V2::Switch::CbufRing)) [[unlikely]] {
+        V2TickCbufWatch();
+    }
     if (!readbacks_in_flight.empty()) [[unlikely]] {
         FreeLandedReadbacks();
     }
@@ -3027,6 +3037,29 @@ const u8* BufferCache<P>::V2GuestBytes(DAddr device_addr, u32 size) {
     version_scratch.resize(size);
     device_memory.ReadBlockUnsafe(device_addr, version_scratch.data(), size);
     return version_scratch.data();
+}
+
+template <class P>
+void BufferCache<P>::V2TickCbufWatch() {
+    namespace W = VideoCommon::V2::CbufWatch;
+    if constexpr (requires { runtime.CbufRingRef(u64{}); }) {
+        if (!W::Enabled() || !VideoCommon::V2::CbufRing::Get().Ready()) {
+            return;
+        }
+        if (!v2_cbuf_arming) {
+            v2_cbuf_arming = std::make_unique<W::Arming>(W::Get());
+        }
+        // Reactive flushing takes read permission from every cached page: with it on, only
+        // pages others already hold are armed, so the watch changes no protection (Phase 1).
+        static const bool no_reactive = [] {
+            const char* const value = std::getenv("EDEN_NX2_NO_REACTIVE");
+            return value != nullptr && value[0] == '1';
+        }();
+        const bool only_held = Settings::values.use_reactive_flushing.GetValue() &&
+                               !(no_reactive && Settings::CurrentProgramIsSwitch2());
+        W::DeviceOps<Tegra::MaxwellDeviceMemoryManager> ops{device_memory};
+        v2_cbuf_arming->Tick(frame_tick, only_held, ops);
+    }
 }
 
 template <class P>

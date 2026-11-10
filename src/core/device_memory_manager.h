@@ -145,6 +145,12 @@ public:
     // New batch API to update multiple ranges with a single lock acquisition.
     void UpdatePagesCachedBatch(std::span<const std::pair<DAddr, size_t>> ranges, s32 delta);
 
+    /// Adds 1 to the page's cached count only if it is already held (no protection change);
+    /// true if it did (F2-03's write watch with reactive flushing on).
+    bool HoldPageIfCached(DAddr addr);
+    /// Gives back the write watch's counts on device pages about to be (re)mapped.
+    void ReleaseWatchedPages(DAddr addr, size_t size);
+
     /// Traps the next guest CPU read of these pages, to learn which GPU writes the CPU reads.
     void ArmReadTraps(DAddr addr, size_t size);
 
