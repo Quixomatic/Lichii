@@ -8,9 +8,14 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <exception>
+
 #include "shader_recompiler/shader_info.h"
+#include "video_core/rasterizer_interface.h"
 #include "video_core/v2/front_writes.h"
 #include "video_core/v2/hazard.h"
+#include "video_core/v2/ir_exec.h"
+#include "video_core/v2/landing.h"
 #include "video_core/v2/macro_hle.h"
 #include "video_core/v2/shader_writes.h"
 
@@ -18,6 +23,61 @@ namespace {
 
 using namespace VideoCommon::V2;
 using Kind = HazardResult::Kind;
+
+/// Counts the fences and flushes LandCaptured makes.
+class FenceRasterizer final : public VideoCore::RasterizerInterface {
+public:
+    int delayed_fences = 0;
+    int other_fences = 0;
+    int flushes = 0;
+
+    void Draw(bool, u32) override {}
+    void DrawTexture() override {}
+    void Clear(u32) override {}
+    void DispatchCompute() override {}
+    void ResetCounter(VideoCommon::QueryType) override {}
+    void Query(GPUVAddr, VideoCommon::QueryType, VideoCommon::QueryPropertiesFlags, u32,
+               u32) override {}
+    void BindGraphicsUniformBuffer(size_t, u32, GPUVAddr, u32) override {}
+    void DisableGraphicsUniformBuffer(size_t, u32) override {}
+    void SignalFence(std::function<void()>&&) override {
+        // Delayed (never skipped as empty, so its operations wait for the GPU) only when the
+        // report flag is set, as FenceManager::SignalFence decides.
+        (VideoCore::g_signaling_query_report_fence ? delayed_fences : other_fences)++;
+    }
+    void SyncOperation(std::function<void()>&&) override {}
+    void SignalSyncPoint(u32) override {}
+    void SignalReference() override {}
+    void ReleaseFences(bool) override {}
+    void FlushAll() override {}
+    void FlushRegion(DAddr, u64, VideoCommon::CacheType) override {}
+    bool MustFlushRegion(DAddr, u64, VideoCommon::CacheType) override {
+        return false;
+    }
+    VideoCore::RasterizerDownloadArea GetFlushArea(DAddr addr, u64 size) override {
+        return {addr, addr + size, false};
+    }
+    void InvalidateRegion(DAddr, u64, VideoCommon::CacheType) override {}
+    void OnCacheInvalidation(DAddr, u64) override {}
+    bool OnCPUWrite(DAddr, u64) override {
+        return false;
+    }
+    void InvalidateGPUCache() override {}
+    void UnmapMemory(DAddr, u64) override {}
+    void ModifyGPUMemory(size_t, GPUVAddr, u64) override {}
+    void FlushAndInvalidateRegion(DAddr, u64, VideoCommon::CacheType) override {}
+    void WaitForIdle() override {}
+    void FragmentBarrier() override {}
+    void TiledCacheBarrier() override {}
+    void FlushCommands() override {
+        ++flushes;
+    }
+    void TickFrame() override {}
+    Tegra::Engines::AccelerateDMAInterface& AccessAccelerateDMA() override {
+        std::terminate();
+    }
+    void AccelerateInlineToMemory(GPUVAddr, size_t, std::span<const u8>) override {}
+};
 
 u32 Word(const u8* bytes) {
     u32 value;
@@ -460,6 +520,36 @@ TEST_CASE("V2 acquire: a suspended acquire whose release the view never records 
         CHECK(PlanSuspendedPoll(false, 0) == SuspendedPoll::Wait);
         CHECK(PlanSuspendedPoll(true, 0) == SuspendedPoll::ReadBack);
     }
+}
+
+// F3F5b-1/-2: a wait that must see what a report's operation writes (its timestamp, or a release
+// the back deferred behind an earlier one) makes the fence behind the back's captured operations,
+// and waits for the back's own newest ticket, not the front's numbering.
+TEST_CASE("V2 landing: the back lands its captured operations for a waiting front",
+          "[video_core][v2_hazard]") {
+    FenceRasterizer rasterizer;
+    const u64 saved_pending = Landing::pending;
+    const u64 saved_landed = Landing::landed.load();
+    SECTION("nothing captured above landed: no fence, nothing to wait for") {
+        Landing::landed.store(Landing::Ticket(50, 0));
+        Landing::pending = Landing::Ticket(50, 0);
+        CHECK(IrExec::LandCaptured(rasterizer) == 0);
+        CHECK(rasterizer.delayed_fences + rasterizer.other_fences == 0);
+        CHECK(rasterizer.flushes == 0);
+    }
+    SECTION("captured operations still to land: one delayed fence, submitted, their ticket") {
+        Landing::landed.store(Landing::Ticket(50, 0));
+        // The front's ticket for the report may be (60, 1): the back numbered the write it made
+        // at once in that entry not at all, so its own ticket is (60, 0).
+        Landing::pending = Landing::Ticket(60, 0);
+        CHECK(IrExec::LandCaptured(rasterizer) == Landing::Ticket(60, 0));
+        CHECK(rasterizer.delayed_fences == 1);
+        CHECK(rasterizer.other_fences == 0);
+        CHECK(rasterizer.flushes == 1);
+        CHECK(!VideoCore::g_signaling_query_report_fence); // restored
+    }
+    Landing::pending = saved_pending;
+    Landing::landed.store(saved_landed);
 }
 
 TEST_CASE("V2 hazard table: wide writes and draw targets", "[video_core][v2_hazard]") {

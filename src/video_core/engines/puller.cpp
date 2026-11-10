@@ -31,6 +31,8 @@
 #include "video_core/rasterizer_interface.h"
 #include "video_core/v2/front_writes.h"
 #include "video_core/v2/hazard.h"
+#include "video_core/v2/ir_exec.h"
+#include "video_core/v2/landing.h"
 #include "video_core/v2/v2_stats.h"
 #include "video_core/v2/versions.h"
 #include "video_core/v2/word_readback.h"
@@ -289,18 +291,32 @@ void NoteViewDecision(const ViewCheck& check) {
 // The serious case is a pass the old path doesn't make. A poll the view keeps waiting that the
 // old path resumes only costs time (the latch or the valve resumes it); it is counted too.
 // `landing`: the view passed on a release still to land (class B). The drained path reads memory,
-// which gets the release only when its operation runs: the comparison waits for that landing and
-// asks memory again, so only a pass the landed release doesn't confirm counts (Fix F3-04).
+// which gets the release only when its operation runs: the comparison makes every operation the
+// back gave a landing ticket land and asks memory again, so only a pass the landed releases
+// don't confirm counts (Fix F3-04). F3F5b-2: not only the view's ticket (the front may number a
+// write the back made at once, so `landed` can stay below it), and not only for landing
+// passes: a release the front noted as made at once is deferred by the back behind an earlier
+// one still to land (Landing::MustDefer), and the drain alone doesn't land it.
+bool LandForVerify(DmaPusher& dma_pusher) {
+    auto& split = VideoCommon::GpuSplit::Get();
+    return split.CompleteLanding(
+        V2::Landing::Ticket(split.WritePosition(), V2::Landing::SubMask),
+        VideoCommon::DrainSite::Acquire,
+        [](void* rasterizer) -> u64 {
+            return VideoCommon::V2::IrExec::LandCaptured(
+                *static_cast<VideoCore::RasterizerInterface*>(rasterizer));
+        },
+        dma_pusher.rasterizer);
+}
+
 void ReportViewMismatch(DmaPusher& dma_pusher, GPUVAddr address, u32 value, u32 operation,
                         bool view_passes, bool old_passed, const char* where, u64 landing = 0,
                         V2::SemaphoreOp op = V2::SemaphoreOp::Gequal) {
     if (view_passes == old_passed) {
         return;
     }
-    if (view_passes && landing != 0 &&
-        VideoCommon::GpuSplit::Get().WaitLanded(landing, VideoCommon::DrainSite::Acquire,
-                                                200'000) &&
-        V2::SemaphoreMet(op, dma_pusher.memory_manager.Read<u32>(address), value)) {
+    const bool landed = view_passes && LandForVerify(dma_pusher);
+    if (landed && V2::SemaphoreMet(op, dma_pusher.memory_manager.Read<u32>(address), value)) {
         return;
     }
     // The view waiting where the drained path goes on is benign: a release landed between the two
@@ -312,10 +328,12 @@ void ReportViewMismatch(DmaPusher& dma_pusher, GPUVAddr address, u32 value, u32 
     if ((benign ? logged_benign : logged).fetch_add(1) < (benign ? 4U : 32U)) {
         LOG_WARNING(HW_GPU,
                     "V2 acquire verify ({}): channel {} semaphore {:#x} op {} value {:#x}: the "
-                    "view {}, the drained path {} (word now {:#x})",
+                    "view {}, the drained path {} (word now {:#x}; view ticket {:#x}, landed "
+                    "{:#x}, captured operations landed {})",
                     where, dma_pusher.channel_state.bind_id, address, operation, value,
                     view_passes ? "passes" : "waits", old_passed ? "passes" : "waits",
-                    dma_pusher.memory_manager.Read<u32>(address));
+                    dma_pusher.memory_manager.Read<u32>(address), landing,
+                    V2::Landing::landed.load(std::memory_order_acquire), landed);
     }
 }
 
