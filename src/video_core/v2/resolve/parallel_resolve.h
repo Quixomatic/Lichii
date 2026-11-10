@@ -403,6 +403,7 @@ public:
                         // now waits on no early segment until FinishStream, when the segment's
                         // end is published.) The result belongs to the shard until then.
                         streaming_id = id;
+                        streaming = true;
                         Count(GetStats().early_streamed);
                         return result;
                     }
@@ -461,7 +462,7 @@ public:
     Result& Merge(u64 id, Fallback&& fallback, Apply&& apply) {
         Result& result = Take(id);
         NoteOrder(id);
-        if (streaming_id == id) {
+        if (Streaming(id)) {
             // The shard still writes the result: the caller reads its records through the
             // segment's progress until FinishStream (they carry no requests before R4).
             return result;
@@ -479,7 +480,7 @@ public:
 
     /// Commit thread: whether Take streams segment `id` (its shard still running).
     [[nodiscard]] bool Streaming(u64 id) const {
-        return streaming_id == id;
+        return streaming && streaming_id == id;
     }
 
     /// Commit thread, before a streamed segment's result is read or released: stops its shard
@@ -487,10 +488,10 @@ public:
     /// shard waits for no front). Verify compares what the shard resolved with a serial resolve.
     /// Returns the time waited (0 when `id` is not streamed).
     u64 FinishStream(u64 id) {
-        if (streaming_id != id) {
+        if (!Streaming(id)) {
             return 0;
         }
-        streaming_id = 0;
+        streaming = false;
         Slot& slot = slots[id & mask];
         const u64 start = NowNs();
         if constexpr (requires { slot.input.progress->abandon; }) {
@@ -810,7 +811,8 @@ private:
     Commit::Stage stage;
     u64 next_commit = 0;
     bool committed_any = false; ///< The first commit starts the order (segment ids start at 1)
-    u64 streaming_id = 0;       ///< F1-36: the segment Take streams (0: none; ids start at 1)
+    u64 streaming_id = 0;       ///< F1-36: the segment Take streams, while `streaming`
+    bool streaming = false;     ///< (ids may start at 0: no id is reserved for "none")
     std::vector<Record> verify_records;
     Commit::RequestList verify_requests;
     Arena verify_arena;

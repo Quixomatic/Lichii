@@ -1222,7 +1222,8 @@ TEST_CASE("V2 P6 R3: shared lookups find inserted pipelines and refuse cleared o
     }
     lookup.Clear();
     CHECK(lookup.Generation() != generation);
-    CHECK(domain.PendingRetired() == 1); // the reader is inside: not freed
+    // The reader is inside: neither the shader sets nor the published table (F6-X1) is freed.
+    CHECK(domain.PendingRetired() == 2);
     phase.store(2);
     reader.join();
     CHECK(held == &value);
@@ -1482,7 +1483,8 @@ void FakeShardPipeline(const Resolve::SnapshotView&, uintptr_t memory, Resolve::
     pre.pipeline = reinterpret_cast<const void*>(static_cast<uintptr_t>(pre.pipeline_key->hash << 4));
     pre.has_pipeline = true;
     pre.lookup_generation = 1;
-    pre.lookup_serial = 5;
+    pre.lookup_serial = 6;      // stable reads (F6-X1: 0 marks an overlapped, unstable read)
+    pre.program_generation = 2;
 }
 
 } // Anonymous namespace
@@ -1551,7 +1553,7 @@ TEST_CASE("V2 P6 R3: shards look up each draw's pipeline; verify compares the ob
     serial.pipeline = nullptr;
     serial.has_pipeline = false;
     CHECK(Resolve::SplitTraits::Compare(records[0], serial) != nullptr);
-    serial.lookup_serial = 6;
+    serial.lookup_serial = 8;
     CHECK(Resolve::SplitTraits::Compare(records[0], serial) == nullptr);
     serial = records[0];
     serial.hashes[5] = 2;
