@@ -3323,6 +3323,10 @@ public:
     void FinishFrontMacro(Core::System& system);
     /// EDEN_NX2_V2_MACROHLE (back): a host indirect draw replacing an identified NVN2 macro.
     void RunMacroHleDraw(Core::System& system, const VideoCommon::V2::MacroHle::Draw& draw);
+    /// EDEN_NX2_V2_MACROHLE (back): the render enable mode a conditional render macro computes
+    /// from the report pair at `source` (its MME DMA read), written as the macro writes it.
+    void RunMacroHleRenderEnable(Core::System& system, GPUVAddr source, u32 bytes, bool invert,
+                                 bool s1);
 
     /// EDEN_NX2_V2_REGSEM=verify: register file mismatches the table-driven copy found.
     [[nodiscard]] u64 V2BackMismatches() const {
@@ -3507,6 +3511,14 @@ private:
     /// Sends a macro HLE host indirect draw (a HostIndirect Draw record).
     void FrontEmitHostIndirect(Core::System& system, VideoCommon::GpuSplit& split,
                                FrontState& state, const VideoCommon::V2::MacroHle::Draw& draw);
+    /// Macro HLE of a conditional render macro (Kind::RenderEnableCompare): the macro's
+    /// register writes, then a record the back evaluates the render enable mode from.
+    void FrontHleRenderEnable(Core::System& system, VideoCommon::GpuSplit& split,
+                              FrontState& state, const VideoCommon::V2::MacroHle::Entry& entry);
+    /// MACROHLE=verify: what the macro did against what its entry would have done.
+    void FrontCheckHle(const VideoCommon::V2::MacroHle::Entry& entry, u64 hash,
+                       std::span<const u32> parameters,
+                       const VideoCommon::V2::MacroHle::Observation& observation);
     // EDEN_NX2_V2_REGSEM on the executing engine: the register update through the semantics
     // table (=1), or the engine's own path compared with it on a register copy (verify).
     void CallMethodV2(u32 method, u32 method_argument, bool is_last_call, bool fast);

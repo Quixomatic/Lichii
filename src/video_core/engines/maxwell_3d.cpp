@@ -41,6 +41,7 @@
 #include "video_core/v2/draw_model.h"
 #include "video_core/v2/front_writes.h"
 #include "video_core/v2/ir_exec.h"
+#include "video_core/v2/macro_memo.h"
 #include "video_core/v2/regsem_3d.h"
 #include "video_core/v2/resolve/split_resolve.h"
 #include "video_core/v2/s1_deltas.h"
@@ -1650,7 +1651,12 @@ struct Maxwell3D::FrontState {
     };
     std::array<MacroSlot, 64> v2_macro_slots{};
     u64 v2_macro_generation{~u64{0}};
+    /// What the macro being dumped or checked (MACROHLE=verify) does.
     std::unique_ptr<VideoCommon::V2::MacroHle::Observation> v2_observation;
+    /// EDEN_NX2_V2_MACROMEMO: replayed macro calls (Fix F5-02).
+    std::unique_ptr<VideoCommon::V2::MacroMemo::Memo> v2_memo;
+    /// EDEN_NX2_V2_STATS: calls per macro and exact repeats (Fix F5-01).
+    std::unique_ptr<VideoCommon::V2::MacroMemo::CallStats> v2_call_stats;
     // FrontNoteDraw's verdict on the bound programs' stores, kept until a Shaders-group register,
     // a register it reads, a summary (ShaderWrites::Generation) or a mapping (MapEpoch) changes.
     bool v2_programs_dirty{true};
@@ -2595,7 +2601,17 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
     const bool dump = VideoCommon::V2::On(VideoCommon::V2::Switch::MacroDump);
     const VideoCommon::V2::Mode hle = VideoCommon::V2::Get(VideoCommon::V2::Switch::MacroHle);
     std::vector<u32> dump_parameters;
+    bool dumping = false;
+    const MacroHle::Entry* check_entry = nullptr; // MACROHLE=verify: compared after the run
     MacroHle::Identity identity{};
+    if (VideoCommon::V2::Stats::Enabled() && engine.native_turing) [[unlikely]] {
+        if (!fs.v2_call_stats) {
+            fs.v2_call_stats = std::make_unique<VideoCommon::V2::MacroMemo::CallStats>();
+        }
+        fs.v2_call_stats->Note("3D", start, fs.parameters, engine.native_code,
+                               engine.native_code_generation,
+                               fs.v2_memo ? &fs.v2_memo->statistics : nullptr);
+    }
     if ((dump || hle != VideoCommon::V2::Mode::Off) && engine.native_turing) [[unlikely]] {
         if (fs.v2_macro_generation != engine.native_code_generation) {
             fs.v2_macro_generation = engine.native_code_generation;
@@ -2619,8 +2635,20 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
             };
         }
         identity = slot.identity;
-        if (const MacroHle::Entry* entry =
-                hle != VideoCommon::V2::Mode::Off ? slot.entry : nullptr) {
+        const MacroHle::Entry* const entry =
+            hle != VideoCommon::V2::Mode::Off ? slot.entry : nullptr;
+        if (entry != nullptr && entry->kind == MacroHle::Kind::RenderEnableCompare) {
+            // Only without shadow RAM tracking or replay: the shadow copy of the render enable
+            // mode would need the value the back evaluates.
+            if (fs.control == Regs::ShadowRamControl::Passthrough &&
+                MacroHle::Applies(*entry, fs.parameters)) {
+                if (hle == VideoCommon::V2::Mode::On) {
+                    FrontHleRenderEnable(system, split, fs, *entry);
+                    return;
+                }
+                check_entry = entry;
+            }
+        } else if (entry != nullptr) {
             const MacroHle::Draw draw = MacroHle::Resolve(*entry, fs.parameters);
             if (hle == VideoCommon::V2::Mode::On) {
                 // The back draws from the GPU buffer; the front reads nothing.
@@ -2641,7 +2669,13 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
         if (dump && !slot.dump_checked) {
             slot.dump_checked = true;
             if (MacroHle::ShouldDump("3d", identity.hash)) {
-                fs.v2_observation = std::make_unique<MacroHle::Observation>();
+                dumping = true;
+                dump_parameters = fs.parameters;
+            }
+        }
+        if (dumping || check_entry != nullptr) {
+            fs.v2_observation = std::make_unique<MacroHle::Observation>();
+            if (!dumping) {
                 dump_parameters = fs.parameters;
             }
         }
@@ -2653,7 +2687,7 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
         const auto read = [&fs](u32 address) {
             return address < Regs::NUM_REGS ? fs.regs[address] : 0U;
         };
-        const auto emit = [&](u32 address, u32 value) {
+        const auto write = [&](u32 address, u32 value) {
             if (address >= MacroRegistersStart) {
                 return false;
             }
@@ -2661,35 +2695,88 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
                 fs.v2_observation->writes.emplace_back(address, value);
             }
             FrontWrite(split, fs, address, value, true, true);
-            // MME_DMA_READ (into data RAM) and MME_DMA_READ_FIFOED (into the load FIFO).
+            return true;
+        };
+        // MME_DMA_READ (into data RAM) and MME_DMA_READ_FIFOED (into the load FIFO).
+        const auto dma = [&](u32 address, u32 value) {
+            const size_t before = fs.parameters.size();
+            FrontDmaRead(split, fs, method, address, value);
+            if (fs.v2_observation) [[unlikely]] {
+                auto& words = fs.v2_observation->read_words;
+                words.insert(words.end(), fs.parameters.begin() + before, fs.parameters.end());
+            }
+        };
+        const auto emit = [&](u32 address, u32 value) {
+            if (!write(address, value)) {
+                return false;
+            }
             if (address == 0x157 || address == 0x158) {
-                FrontDmaRead(split, fs, method, address, value);
+                dma(address, value);
             }
             return true;
         };
+        const auto live = [&](auto& live_emit) {
 #ifdef ARCHITECTURE_x86_64
-        if (!engine.native_jit) {
-            engine.native_jit = std::make_shared<TuringMacroJit>();
-        }
-        engine.native_jit->Prepare(engine.native_code, engine.native_code_generation);
-        const auto result = engine.native_jit->Execute(
-            start, fs.parameters, std::span<u32>{native_data_ram}, read, emit);
+            if (!engine.native_jit) {
+                engine.native_jit = std::make_shared<TuringMacroJit>();
+            }
+            engine.native_jit->Prepare(engine.native_code, engine.native_code_generation);
+            return engine.native_jit->Execute(start, fs.parameters,
+                                              std::span<u32>{native_data_ram}, read, live_emit);
 #else
-        const auto result =
-            engine.native_interpreter.Execute(engine.native_code, start, fs.parameters, read, emit);
+            return engine.native_interpreter.Execute(engine.native_code, start, fs.parameters,
+                                                     read, live_emit);
 #endif
+        };
+        const VideoCommon::V2::Mode memo = VideoCommon::V2::Get(VideoCommon::V2::Switch::MacroMemo);
+        Tegra::TuringMacroInterpreter::Result result;
+        if (memo != VideoCommon::V2::Mode::Off && engine.native_turing) [[unlikely]] {
+            namespace MacroMemo = VideoCommon::V2::MacroMemo;
+            if (!fs.v2_memo) {
+                fs.v2_memo = std::make_unique<MacroMemo::Memo>();
+            }
+            fs.v2_memo->Synchronize(engine.native_code_generation);
+            // Registers a write changes besides its own (RegSem::Write3D's effects).
+            static constexpr std::array<u32, 3> side_effects{
+                MAXWELL3D_REG_INDEX(const_buffer.offset),
+                MAXWELL3D_REG_INDEX(load_mme.start_address_ptr),
+                MAXWELL3D_REG_INDEX(shadow_scratch),
+            };
+            const MacroMemo::CallInfo call{
+                .start = start,
+                .fifo = &fs.parameters,
+                .dram = native_data_ram,
+                .code = engine.native_code,
+                .generation = &engine.native_code_generation,
+                .regs = fs.regs.data(),
+                .num_regs = Regs::NUM_REGS,
+                .side_effects = side_effects,
+                .dma_fifoed = 0x158,
+                .dma_ram = 0x157,
+                .verify = memo == VideoCommon::V2::Mode::Verify,
+            };
+            result = MacroMemo::Call(*fs.v2_memo, engine.native_interpreter, call, live, read,
+                                     write, dma);
+        } else {
+            result = live(emit);
+        }
         if (!result.success) {
             engine.native_execution_failed = true;
             LOG_ERROR(HW_GPU, "Native MME (split front) failed: start={:#x}, consumed={}/{}, error={}",
                       start, result.consumed, parameter_count, result.error);
         }
     }
-    fs.parameters.clear();
     if (fs.v2_observation) [[unlikely]] {
-        MacroHle::Dump("3d", method, start, identity, engine.native_code, dump_parameters,
-                       *fs.v2_observation);
+        if (check_entry != nullptr) {
+            FrontCheckHle(*check_entry, identity.hash, dump_parameters, *fs.v2_observation);
+        }
+        if (dumping) {
+            MacroHle::Dump("3d", method, start, identity, engine.native_code, dump_parameters,
+                           *fs.v2_observation);
+        }
         fs.v2_observation.reset();
     }
+    fs.parameters.clear();
     FrontEndMacro(system, split, fs);
     if (FrontVerifyEnabled() && (++fs.calls & 4095) == 0) [[unlikely]] {
         FrontVerify(split, fs);
@@ -3043,6 +3130,79 @@ void Maxwell3D::FrontEmitHostIndirect(Core::System& system, VideoCommon::GpuSpli
     });
 }
 
+void Maxwell3D::FrontHleRenderEnable(Core::System& system, VideoCommon::GpuSplit& split,
+                                     FrontState& fs, const VideoCommon::V2::MacroHle::Entry& entry) {
+    // Fix F5-03/04: the macro's writes to the MME DMA source registers (and the DMA count),
+    // without the read: the back reads the report pair where its writers are done (class C/D
+    // read moved off the front) and writes the render enable mode the macro would have.
+    for (u32 i = 0; i < entry.num_writes; ++i) {
+        FrontWrite(split, fs, entry.writes[i].method, entry.writes[i].value.Get(fs.parameters),
+                   true, true);
+    }
+    const GPUVAddr source = (GPUVAddr{fs.regs[0x154] & 0x1ffffff} << 32) | fs.regs[0x155];
+    const bool invert = entry.invert.Get(fs.parameters) != 0;
+    const u32 bytes = entry.words * sizeof(u32);
+    const bool s1 = fs.s1_exec;
+    fs.parameters.clear();
+    const VideoCommon::V2::Ir::ReadbackBody body{
+        .op = VideoCommon::V2::Ir::ReadbackOp::MacroRenderEnable,
+        .object = split.Ref(this),
+        .object2 = VideoCommon::V2::Ir::NoObject,
+        .cache = (invert ? 1U : 0U) | (s1 ? 2U : 0U),
+        .address = source,
+        .bytes = bytes,
+    };
+    split.Emit(VideoCommon::V2::Ir::Kind::Readback, body,
+               [this, system_ptr = &system, source, bytes, invert, s1] {
+                   RunMacroHleRenderEnable(*system_ptr, source, bytes, invert, s1);
+               });
+    FrontEndMacro(system, split, fs);
+    if (FrontVerifyEnabled() && (++fs.calls & 4095) == 0) [[unlikely]] {
+        FrontVerify(split, fs);
+    }
+}
+
+void Maxwell3D::RunMacroHleRenderEnable(Core::System& system, GPUVAddr source, u32 bytes,
+                                        bool invert, bool s1) {
+    // The macro's DMA read with the flushes the v1 macro made, here where everything before it
+    // in command order ran on the back.
+    VideoCommon::V2::IrExec::MacroDmaFlush(memory_manager, *rasterizer, source, bytes);
+    std::array<u32, 6> words{};
+    memory_manager.ReadBlockUnsafe(source, words.data(),
+                                   std::min<size_t>(bytes, sizeof(words)));
+    const u32 mode = VideoCommon::V2::MacroHle::RenderEnableValue(invert, words);
+    constexpr u32 method = MAXWELL3D_REG_INDEX(render_enable.mode);
+    if (s1) {
+        // As an S1 Exec entry of the macro's write.
+        namespace S1 = VideoCommon::V2::S1;
+        const u64 entry = S1::MakeRegister(S1::Tag::Exec, method, mode, S1::IsLast);
+        ExecuteS1Run(&entry, &entry + 1);
+        return;
+    }
+    // As the macro's write on the word stream (GpuSplit::ExecuteMethod3D, Direct).
+    ConsumeSink(system);
+    CallMethod(system, method, mode, true);
+}
+
+void Maxwell3D::FrontCheckHle(const VideoCommon::V2::MacroHle::Entry& entry, u64 hash,
+                              std::span<const u32> parameters,
+                              const VideoCommon::V2::MacroHle::Observation& observation) {
+    static std::atomic<u64> checks{};
+    static std::atomic<u64> mismatches{};
+    const auto mismatch = VideoCommon::V2::MacroHle::CheckRenderEnable(
+        entry, parameters, observation.writes, observation.read_words);
+    const u64 checked = checks.fetch_add(1) + 1;
+    if (mismatch) {
+        if (mismatches.fetch_add(1) < 32) {
+            LOG_WARNING(HW_GPU, "V2 macro HLE verify: macro {:016x}: {}", hash, *mismatch);
+        }
+    }
+    if ((checked & 0xffff) == 1) {
+        LOG_INFO(HW_GPU, "V2 macro HLE verify: {} calls checked, {} mismatches", checked,
+                 mismatches.load());
+    }
+}
+
 void Maxwell3D::FrontTrackInstanceLoop(FrontState& fs, u32 method, u32 value) {
     switch (method) {
     case MAXWELL3D_REG_INDEX(draw.begin):
@@ -3358,9 +3518,14 @@ void Maxwell3D::FrontVerify(VideoCommon::GpuSplit& split, FrontState& fs) {
                         f.argument, f.before, f.path, b.argument, b.before, b.path);
         }
     }
+    // MACROHLE: the back evaluates the render enable mode of conditional render macros.
+    const u32 hle_register =
+        VideoCommon::V2::Get(VideoCommon::V2::Switch::MacroHle) == VideoCommon::V2::Mode::On
+            ? MAXWELL3D_REG_INDEX(render_enable.mode)
+            : ~0U;
     for (u32 i = 0; i < Regs::NUM_REGS; ++i) {
         if (fs.regs[i] != expected[i]) {
-            if (differences++ < 64) {
+            if (i != hle_register && differences++ < 64) {
                 LOG_WARNING(HW_GPU, "Split front register {:#x}: front {:#x}, back {:#x}", i,
                             fs.regs[i], expected[i]);
             }

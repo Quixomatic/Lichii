@@ -23,9 +23,25 @@ namespace {
 
 constexpr u32 MaxInstructions = 4096;
 
-// Built in: none yet. No NVN2 macro has been identified from captured code; entries come from
-// nx2_macro_hle.txt until dumps (EDEN_NX2_V2_MACRO_DUMP) identify them (IMPLEMENTATION_LOG P2).
-constexpr std::array<Entry, 0> built_in{};
+// Built in, from EDEN_NX2_V2_MACRO_DUMP captures (IMPLEMENTATION_LOG Fix F5).
+constexpr std::array<Entry, 1> built_in{
+    // 3D 966aeb0e43e7a13c (Ocarina of Time, ~600 calls a frame): p1/p2 into the MME DMA source
+    // registers, a 6-word MME_DMA_READ_FIFOED of a ReportSemaphore::Compare there, then
+    // render_enable.mode = p0 ^ ((w0 ^ w4) | (w1 ^ w5) != 0): IfNotEqual (p0 = 0) or IfEqual
+    // (p0 = 1) evaluated by the macro.
+    Entry{
+        .hash = 0x966aeb0e43e7a13cULL,
+        .kind = Kind::RenderEnableCompare,
+        .writes = {{
+            {0x154, {true, 1}},
+            {0x155, {true, 2}},
+            {0x158, {false, 6}},
+        }},
+        .num_writes = 3,
+        .invert = {true, 0},
+        .words = 6,
+    },
+};
 
 std::optional<Operand> ParseOperand(const std::string& text) {
     if (text.empty()) {
@@ -108,10 +124,12 @@ std::optional<Entry> ParseLine(const std::string& line) {
         entry.kind = Kind::DrawIndexedIndirect;
     } else if (kind_text == "multi_draw_indexed_indirect_count") {
         entry.kind = Kind::MultiDrawIndexedIndirectCount;
+    } else if (kind_text == "render_enable_compare") {
+        entry.kind = Kind::RenderEnableCompare;
     } else {
         return std::nullopt;
     }
-    bool has_topology = false, has_address = false;
+    bool has_topology = false, has_address = false, has_invert = false;
     std::string field;
     while (stream >> field) {
         if (field == "base_vertex_attribute") {
@@ -155,9 +173,42 @@ std::optional<Entry> ParseLine(const std::string& line) {
             entry.count = *operand;
         } else if (key == "stride") {
             entry.stride = static_cast<u32>(std::strtoul(value.c_str(), nullptr, 0));
+        } else if (key == "invert") {
+            const auto operand = ParseOperand(value);
+            if (!operand) {
+                return std::nullopt;
+            }
+            entry.invert = *operand;
+            has_invert = true;
+        } else if (key == "words") {
+            entry.words = static_cast<u32>(std::strtoul(value.c_str(), nullptr, 0));
+        } else if (key == "writes") {
+            // <method>:<operand>,...
+            std::istringstream list{value};
+            std::string item;
+            while (std::getline(list, item, ',')) {
+                const auto colon = item.find(':');
+                if (colon == std::string::npos || entry.num_writes == entry.writes.size()) {
+                    return std::nullopt;
+                }
+                const auto operand = ParseOperand(item.substr(colon + 1));
+                if (!operand) {
+                    return std::nullopt;
+                }
+                entry.writes[entry.num_writes++] = WriteOp{
+                    static_cast<u32>(std::strtoul(item.substr(0, colon).c_str(), nullptr, 0)),
+                    *operand};
+            }
         } else {
             return std::nullopt;
         }
+    }
+    if (entry.kind == Kind::RenderEnableCompare) {
+        // The report pair's six words, read where the writes put the DMA source.
+        if (!has_invert || entry.words != 6 || entry.num_writes == 0) {
+            return std::nullopt;
+        }
+        return entry;
     }
     if (!has_topology || !has_address ||
         (entry.kind == Kind::MultiDrawIndexedIndirectCount && !entry.has_count_address)) {
@@ -186,6 +237,57 @@ Draw Resolve(const Entry& entry, std::span<const u32> parameters) {
     draw.stride = entry.stride;
     draw.base_vertex_attribute = entry.base_vertex_attribute;
     return draw;
+}
+
+bool Applies(const Entry& entry, std::span<const u32> parameters) {
+    if (entry.kind != Kind::RenderEnableCompare) {
+        return true;
+    }
+    const auto covered = [&](const Operand& operand) {
+        return !operand.parameter || operand.value < parameters.size();
+    };
+    for (u32 i = 0; i < entry.num_writes; ++i) {
+        if (!covered(entry.writes[i].value)) {
+            return false;
+        }
+    }
+    // The macro XORs the parameter into the mode: only 0 and 1 give IfNotEqual / IfEqual.
+    return covered(entry.invert) && entry.invert.Get(parameters) <= 1;
+}
+
+u32 RenderEnableValue(bool invert, std::span<const u32> words) {
+    const auto word = [&](size_t i) { return i < words.size() ? words[i] : 0U; };
+    // ReportSemaphore::Compare: initial sequence and mode, two words, current sequence and mode.
+    const bool differ = ((word(0) ^ word(4)) | (word(1) ^ word(5))) != 0;
+    return (differ ? 1U : 0U) ^ (invert ? 1U : 0U);
+}
+
+std::optional<std::string> CheckRenderEnable(const Entry& entry, std::span<const u32> parameters,
+                                             std::span<const std::pair<u32, u32>> writes,
+                                             std::span<const u32> words) {
+    std::vector<std::pair<u32, u32>> expected;
+    for (u32 i = 0; i < entry.num_writes; ++i) {
+        expected.emplace_back(entry.writes[i].method, entry.writes[i].value.Get(parameters));
+    }
+    expected.emplace_back(0x556, RenderEnableValue(entry.invert.Get(parameters) != 0, words));
+    const bool same = words.size() == entry.words && writes.size() == expected.size() &&
+                      std::equal(writes.begin(), writes.end(), expected.begin());
+    if (same) {
+        return std::nullopt;
+    }
+    std::string text = "macro wrote ";
+    for (const auto& [method, value] : writes) {
+        text += fmt::format("{:x}={:x},", method, value);
+    }
+    text += " after reading ";
+    for (const u32 word : words) {
+        text += fmt::format("{:x},", word);
+    }
+    text += " the entry writes ";
+    for (const auto& [method, value] : expected) {
+        text += fmt::format("{:x}={:x},", method, value);
+    }
+    return text;
 }
 
 bool ShouldDump(const char* engine, u64 hash) {
