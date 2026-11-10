@@ -1944,51 +1944,8 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     }
     drawrec_last_drawn = drawrec_drawn;
 
-#ifdef EGLANTINE_STREAMLINE
-    TrackOcarinaCamera();
-    TrackOcarinaActor(pipeline->ShaderHashes()[1], is_indexed, is_indirect);
-#endif
-    if (!lean || DebugHooks().pending_writes) {
-        TracePendingCpuWrites(false, pipeline->ShaderHashes());
-    }
-    if (!lean || VideoCommon::RenderTrace::Enabled()) {
-        TraceRenderState(is_indexed, "configured", texture_cache.GetFramebuffer());
-    }
-    if (frame_dump.Capturing()) {
-        FrameDumpPass(texture_cache.GetFramebuffer());
-        frame_dump.NoteDraw(pipeline->ShaderHashes());
-        bool recorded = false;
-        if (frame_dump.CapturingSampled()) {
-            boost::container::small_vector<FrameDump::Sampled, 16> sampled;
-            for (const auto& image : pipeline->SampledImages()) {
-                sampled.push_back({image.stage, image.tic, &texture_cache.GetImageView(image.id),
-                                   &texture_cache.GetSampler(image.sampler)});
-            }
-            recorded = frame_dump.NoteSampled(sampled);
-        }
-        if (frame_dump.CapturingBuffers()) {
-            recorded |= FrameDumpBuffers(false, pipeline->ShaderHashes());
-        }
-        if (recorded) {
-            scheduler.RequestRendering(texture_cache.GetFramebuffer());
-        }
-    }
-    if (VideoCommon::RenderTrace::SampleFrame(render_trace_frame) && render_trace_draws <= 2048) {
-        LOG_DEBUG(Render_Vulkan,
-                  "Render trace pipeline: frame={} draw={} hashes={:016x} dynamic_vertex_input={}",
-                  render_trace_frame, render_trace_draws, fmt::join(pipeline->ShaderHashes(), ","),
-                  pipeline->HasDynamicVertexInput());
-    }
-
-    if (is_indirect && !mesh_draw && Common::DkbFrameTrace::Enabled()) {
-        static const bool readback = [] {
-            const char* value = std::getenv("EDEN_DKB_INDIRECT_READBACK");
-            return value && std::string_view{value} == "1";
-        }();
-        if (readback) {
-            CaptureIndirectTrace();
-        }
-    }
+    // Step 19 (G15): the debug and title hooks after the draw's encode, outside every resolve.
+    DrawHooks(*pipeline, is_indexed, is_indirect, lean);
 
     {
         Profile::Scope scope{Profile::Zone::DynamicState};
@@ -5585,6 +5542,55 @@ GraphicsPipeline::RecipeResult RasterizerVulkan::PrepareTemplateRecord(
     R::CountRecordStat(stats.by_path[2]);
     recorded = true;
     return GraphicsPipeline::RecipeResult::Recorded;
+}
+
+void RasterizerVulkan::DrawHooks(GraphicsPipeline& pipeline, bool is_indexed, bool is_indirect,
+                                 bool lean) {
+#ifdef EGLANTINE_STREAMLINE
+    TrackOcarinaCamera();
+    TrackOcarinaActor(pipeline.ShaderHashes()[1], is_indexed, is_indirect);
+#endif
+    if (!lean || DebugHooks().pending_writes) {
+        TracePendingCpuWrites(false, pipeline.ShaderHashes());
+    }
+    if (!lean || VideoCommon::RenderTrace::Enabled()) {
+        TraceRenderState(is_indexed, "configured", texture_cache.GetFramebuffer());
+    }
+    if (frame_dump.Capturing()) {
+        FrameDumpPass(texture_cache.GetFramebuffer());
+        frame_dump.NoteDraw(pipeline.ShaderHashes());
+        bool recorded = false;
+        if (frame_dump.CapturingSampled()) {
+            boost::container::small_vector<FrameDump::Sampled, 16> sampled;
+            for (const auto& image : pipeline.SampledImages()) {
+                sampled.push_back({image.stage, image.tic, &texture_cache.GetImageView(image.id),
+                                   &texture_cache.GetSampler(image.sampler)});
+            }
+            recorded = frame_dump.NoteSampled(sampled);
+        }
+        if (frame_dump.CapturingBuffers()) {
+            recorded |= FrameDumpBuffers(false, pipeline.ShaderHashes());
+        }
+        if (recorded) {
+            scheduler.RequestRendering(texture_cache.GetFramebuffer());
+        }
+    }
+    if (VideoCommon::RenderTrace::SampleFrame(render_trace_frame) && render_trace_draws <= 2048) {
+        LOG_DEBUG(Render_Vulkan,
+                  "Render trace pipeline: frame={} draw={} hashes={:016x} dynamic_vertex_input={}",
+                  render_trace_frame, render_trace_draws, fmt::join(pipeline.ShaderHashes(), ","),
+                  pipeline.HasDynamicVertexInput());
+    }
+
+    if (is_indirect && !mesh_draw && Common::DkbFrameTrace::Enabled()) {
+        static const bool readback = [] {
+            const char* value = std::getenv("EDEN_DKB_INDIRECT_READBACK");
+            return value && std::string_view{value} == "1";
+        }();
+        if (readback) {
+            CaptureIndirectTrace();
+        }
+    }
 }
 
 bool RasterizerVulkan::PrepareDeltaRecord(GraphicsPipeline& pipeline, bool is_indexed,

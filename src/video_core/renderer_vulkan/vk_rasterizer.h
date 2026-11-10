@@ -225,6 +225,11 @@ private:
     VideoCommon::V2::Resolve::ResolvedDraw drawrec_scratch;
     VideoCommon::V2::Commit::RequestList drawrec_scratch_buffers;
     VideoCommon::V2::Commit::RequestList drawrec_scratch_textures;
+    /// Step 19 (G15): the per-draw debug and title hooks (OoT tracking, pending CPU writes,
+    /// render trace, frame dump pass, Dkb indirect readback), run after the draw's encode on
+    /// every path; the mesh survey and emulation stay with the mesh (commit-only) draws, the
+    /// native capture after the draw it reads.
+    void DrawHooks(GraphicsPipeline& pipeline, bool is_indexed, bool is_indirect, bool lean);
     /// The last draw went through the record path (its pipeline's last record is its base).
     bool drawrec_last_drawn{};
     /// DRAWREC=1 (step 17): a continued draw from the pipeline's last record in place of
