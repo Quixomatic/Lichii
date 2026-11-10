@@ -151,6 +151,7 @@ add_library(video_core STATIC
     v2/ir_exec.h
     v2/landing.h
     v2/landing_fence.h
+    v2/sem_view.h
     v2/macro_hle.cpp
     v2/macro_hle.h
     v2/macro_memo.cpp

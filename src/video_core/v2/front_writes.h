@@ -33,9 +33,15 @@ namespace VideoCommon::V2 {
 /// A write that lands at an operation (fenced, a counter, High accuracy, or a write the back
 /// defers behind an earlier one still to land: v2/landing.h) is noted once, by landing ticket,
 /// in the table of writes still to land; any other in the queued table only.
+/// SYNC_SUBMIT_SPEC §2.1: each word also goes to S1's semaphore view (GpuSplit::Sem), a
+/// reduction (`reduction_op`, ReduceSemaphore) with the value it leaves when S1 can tell it.
 void NoteReleaseWrite(GpuSplit& split, const Tegra::MemoryManager& memory, GPUVAddr address,
                       u32 payload, u32 bytes, bool known, Producer producer, bool fenced,
-                      bool reduction = false);
+                      bool reduction = false, u32 reduction_op = 0);
+
+/// SYNC_SUBMIT_SPEC §2.1: the newest unbounded unknown writer still queued or a GPU-written page
+/// makes memory an incomplete base for a reduction S1 computes.
+[[nodiscard]] bool SemMemoryComplete(GpuSplit& split, u64 device_address);
 
 /// Whether fence operations wait for the host GPU (as FenceManager::SignalFence's delay_fence
 /// without a report): accurate GPU, or Balanced/Accurate fences.

@@ -134,6 +134,19 @@ enum class ReductionReject : u8 {
 void NoteReductionReject(ReductionReject reason);
 /// Step 0: a forced landing (LandEverythingPending) blocked the back for `ns`.
 void NoteForcedLanding(u64 ns);
+/// SYNC Step 1+: an acquire decided by S1's semaphore view, by row (V2::SemRow), and slot
+/// evictions.
+void NoteSemRow(u8 row);
+void NoteSemEvictions(u64 count);
+/// SYNC Step 1 (ACQUIRE=verify shadow): where the view's decision differs.
+enum class SemShadow : u8 {
+    PassesTodayWaits,   ///< The view passes, today's decision waits
+    WaitsTodayPasses,   ///< The view waits, today's decision passes
+    PassesDrainedFails, ///< The view passes, the drained path (after landing) doesn't: serious
+    WaitsDrainedPasses, ///< The view waits, the drained path passes (benign)
+    Count,
+};
+void NoteSemShadow(SemShadow kind);
 
 /// Attributes the waits for the back made while it lives (acquire sites) to `sync_class`.
 class AcquireContext {

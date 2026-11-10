@@ -11,6 +11,8 @@
 #include "video_core/engines/maxwell_dma.h"
 #include "video_core/gpu_split.h"
 #include "video_core/memory_manager.h"
+#include "video_core/native_qmd.h"
+#include "video_core/nx2.h"
 #include "video_core/surface.h"
 #include "video_core/textures/decoders.h"
 #include "video_core/v2/front_writes.h"
@@ -32,9 +34,52 @@ bool FencesDelayed() {
                : Settings::IsGPUFenceBehaviorBalanced() || Settings::IsGPUFenceBehaviorAccurate();
 }
 
+bool SemMemoryComplete(GpuSplit& split, u64 device_address) {
+    return split.Sem().UnboundedUnknown(split.ConsumedNow()) == 0 &&
+           !Tegra::Nx2MayBeGpuWritten(device_address, sizeof(u32));
+}
+
+namespace {
+
+/// SYNC_SUBMIT_SPEC §2.1: the words a release writes, into S1's semaphore view. `ticket` 0: made
+/// when the back runs it, else at its operation by landing ticket.
+void NoteSemRelease(GpuSplit& split, const Tegra::MemoryManager& memory, GPUVAddr address,
+                    u64 device, u32 payload, u32 bytes, bool known, Producer producer,
+                    bool reduction, u32 reduction_op, u64 ticket) {
+    SemView& view = split.Sem();
+    const SemProgress progress = split.SemNow();
+    const u64 position = split.WritePosition();
+    const auto retire = ticket != 0 ? SemView::Retire::Landing : SemView::Retire::Consumed;
+    using Kind = SemView::Kind;
+    const Kind kind = !known && !reduction        ? Kind::Counter
+                      : producer == Producer::Report ? Kind::Report
+                                                     : Kind::Release;
+    if (reduction) {
+        view.NoteReduction(
+            device, false, reduction_op, payload, position, retire, ticket, kind, progress,
+            SemMemoryComplete(split, device),
+            [](u32 op, u32 base, u32 operand) {
+                return Tegra::ReduceSemaphore(op, false, base, operand);
+            },
+            [&memory, address] { return memory.Read<u32>(address); });
+        return;
+    }
+    view.Note(device, payload, known, position, retire, ticket, kind, progress);
+    if (bytes > 4) {
+        // The payload as 64 bits, then a timestamp only the operation knows.
+        view.Note(device + 4, 0, known, position, retire, ticket, kind, progress);
+        for (u64 offset = 8; offset < bytes; offset += 4) {
+            view.Note(device + offset, 0, false, position, retire, ticket, Kind::Counter,
+                      progress);
+        }
+    }
+}
+
+} // Anonymous namespace
+
 void NoteReleaseWrite(GpuSplit& split, const Tegra::MemoryManager& memory, GPUVAddr address,
                       u32 payload, u32 bytes, bool known, Producer producer, bool fenced,
-                      bool reduction) {
+                      bool reduction, u32 reduction_op) {
     const auto device = memory.GpuToCpuAddress(address);
     if (!device) {
         return; // The back drops it too (the query cache skips unmapped reports)
@@ -50,6 +95,8 @@ void NoteReleaseWrite(GpuSplit& split, const Tegra::MemoryManager& memory, GPUVA
         Landing::PushVerdict(split.WritePosition(), at_once);
     }
     if (at_once) {
+        NoteSemRelease(split, memory, address, *device, payload, bytes, known, producer,
+                       reduction, reduction_op, 0);
         if (!known) {
             split.NoteRangeWrite(*device, bytes, producer);
         } else if (bytes <= 4) {
@@ -62,6 +109,8 @@ void NoteReleaseWrite(GpuSplit& split, const Tegra::MemoryManager& memory, GPUVA
         return;
     }
     const u64 ticket = split.NextLandingTicket();
+    NoteSemRelease(split, memory, address, *device, payload, bytes, known, producer, reduction,
+                   reduction_op, ticket);
     if (!known) {
         split.NoteUnlandedRange(*device, bytes, ticket);
     } else if (bytes <= 4) {
@@ -206,7 +255,7 @@ void NoteReportCompute(GpuSplit& split, const Tegra::MemoryManager& memory, cons
     const bool reduction = ((control >> 3) & 1) != 0;
     const bool one_word = ((control >> 28) & 1) != 0;
     NoteReleaseWrite(split, memory, address, registers[0x6c2], reduction || one_word ? 4 : 16,
-                     !reduction, Producer::Report, one_word, reduction);
+                     !reduction, Producer::Report, one_word, reduction, (control >> 9) & 7);
 }
 
 void DmaWriteTracker::Note(GpuSplit& split, const Tegra::MemoryManager& memory, u32 method,

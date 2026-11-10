@@ -102,6 +102,18 @@ struct FrontData {
     std::array<u64, static_cast<size_t>(ReductionReject::Count)> reduction_rejects{};
     u64 forced_landings{};
     u64 forced_landing_ns{};
+    std::array<u64, 8> sem_rows{};
+    u64 sem_evictions{};
+    std::array<u64, static_cast<size_t>(SemShadow::Count)> sem_shadow{};
+};
+
+constexpr std::array<const char*, 7> sem_row_names{
+    "map queued", "unmapped", "gpu-written", "no writer", "pending known", "unknown at execute",
+    "unknown at fence",
+};
+constexpr std::array<const char*, static_cast<size_t>(SemShadow::Count)> sem_shadow_names{
+    "passes where today waits", "waits where today passes",
+    "passes where the drained path fails (must be 0)", "waits where the drained path passes",
 };
 
 constexpr std::array<const char*, static_cast<size_t>(WakeClass::Count)> wake_names{
@@ -374,6 +386,25 @@ void ReportFront(const FrontData& data, const char* thread_name, u64 window_ns,
 // SYNC_SUBMIT_SPEC Step 0: suspended acquire time by wake class, reduction view rejects,
 // forced landings.
 void ReportSync(const FrontData& data, const char* thread_name, u64 window_ns) {
+    u64 sem_any = data.sem_evictions;
+    std::string rows;
+    for (size_t r = 0; r < sem_row_names.size(); ++r) {
+        sem_any += data.sem_rows[r];
+        rows += fmt::format(" {} {:.0f},", sem_row_names[r], PerSecond(data.sem_rows[r], window_ns));
+    }
+    std::string shadow;
+    for (size_t s = 0; s < data.sem_shadow.size(); ++s) {
+        sem_any += data.sem_shadow[s];
+        shadow += fmt::format(" {} {},", sem_shadow_names[s], data.sem_shadow[s]);
+    }
+    if (sem_any != 0) {
+        rows.pop_back();
+        shadow.pop_back();
+        LOG_INFO(HW_GPU,
+                 "V2 stats {} SYNC semaphore view decisions (per s):{} | slot evictions {:.0f}/s "
+                 "| verify shadow (counts):{}",
+                 thread_name, rows, PerSecond(data.sem_evictions, window_ns), shadow);
+    }
     u64 any = data.forced_landings;
     std::string wakes;
     for (size_t w = 0; w < data.suspended.size(); ++w) {
@@ -651,6 +682,27 @@ void NoteForcedLanding(u64 ns) {
     auto& data = Front().data;
     ++data.forced_landings;
     data.forced_landing_ns += ns;
+}
+
+void NoteSemRow(u8 row) {
+    if (!Enabled()) [[likely]] {
+        return;
+    }
+    ++Front().data.sem_rows[std::min<size_t>(row, 7)];
+}
+
+void NoteSemEvictions(u64 count) {
+    if (!Enabled()) [[likely]] {
+        return;
+    }
+    Front().data.sem_evictions += count;
+}
+
+void NoteSemShadow(SemShadow kind) {
+    if (!Enabled()) [[likely]] {
+        return;
+    }
+    ++Front().data.sem_shadow[static_cast<size_t>(kind)];
 }
 
 AcquireContext::AcquireContext(SyncClass sync_class) : enabled{Enabled()} {

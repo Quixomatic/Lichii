@@ -22,6 +22,7 @@
 #include "video_core/v2/ir_arena.h"
 #include "video_core/v2/ir_trace.h"
 #include "video_core/v2/landing.h"
+#include "video_core/v2/sem_view.h"
 #include "video_core/v2/v2_switches.h"
 
 // Fix F3d: the per-write S1 ring appends, which MSVC kept out of line (F3d breakdown).
@@ -273,6 +274,7 @@ public:
         if (producer == V2::Producer::QmdRelease) {
             last_qmd_release = write_position;
             qmd_release_notes.NoteUnbounded(producer, write_position);
+            sem_view.NoteUnboundedUnknown(write_position);
         }
         hazards.NoteUnbounded(producer, write_position);
     }
@@ -313,6 +315,18 @@ public:
             return result;
         }
         return FindUntracked(device_address, size, done, filter, result);
+    }
+    /// Front (SYNC_SUBMIT_SPEC §2.1): S1's semaphore view, and the back's progress it retires by.
+    [[nodiscard]] V2::SemView& Sem() {
+        return sem_view;
+    }
+    [[nodiscard]] V2::SemProgress SemNow() const {
+        const u64 done = ConsumedNow();
+        return {
+            .consumed = done,
+            .landed = V2::Landing::landed.load(std::memory_order_acquire),
+            .untracked_settled = V2::Landing::UntrackedSettled(done),
+        };
     }
     [[nodiscard]] u64 PendingUnboundedWrite(V2::Producer producer) const {
         return hazards.PendingUnbounded(producer, ConsumedNow());
@@ -1221,6 +1235,7 @@ private:
     /// Front (Fix F3f): QmdRelease notes by ring position, live until their entry's untracked
     /// operations ran (V2::Landing::UntrackedSettled), not only until the back consumed them.
     V2::HazardTable qmd_release_notes;
+    V2::SemView sem_view; ///< Front: S1's semaphore view (SYNC_SUBMIT_SPEC §2.1)
     std::array<RecentRelease, 256> recent_releases{};
     size_t recent_release_head = 0;
     u64 back_entry_position{}; ///< Back: ring position of the entry it runs (TracksWrites)

@@ -2228,7 +2228,41 @@ void RememberQmdRelease(VideoCommon::GpuSplit& split, const Tegra::MemoryManager
     if (!device) {
         return;
     }
-    if ((flags & (1U << 26)) != 0) {
+    // SYNC_SUBMIT_SPEC §2.1 (MASTER_PLAN §6 class A "QMD release counters"): the word each one
+    // leaves, into S1's semaphore view; a QMD's writes are in memory once its entry's untracked
+    // operations ran (Retire::Untracked).
+    namespace V2 = VideoCommon::V2;
+    using SemKind = V2::SemView::Kind;
+    V2::SemView& view = split.Sem();
+    const V2::SemProgress progress = split.SemNow();
+    const u64 position = split.WritePosition();
+    constexpr auto retire = V2::SemView::Retire::Untracked;
+    const bool reduction = (flags & (1U << 26)) != 0;
+    const bool max = !reduction && (flags & (1U << 19)) != 0 && (flags >> 30) != 0;
+    if (reduction || max) {
+        const bool is_signed = ((flags >> 24) & 1) != 0;
+        view.NoteReduction(
+            *device, max, (flags >> 20) & 7, payload, position, retire, position,
+            max ? SemKind::QmdMax : SemKind::QmdReduction, progress,
+            V2::SemMemoryComplete(split, *device),
+            [is_signed](u32 op, u32 base, u32 operand) {
+                return Tegra::ReduceSemaphore(op, is_signed, base, operand);
+            },
+            [&memory, address] { return memory.Read<u32>(address); });
+    } else {
+        view.Note(*device, payload, true, position, retire, position, SemKind::QmdPayload,
+                  progress);
+        if ((flags >> 30) == 0) {
+            // Four words: the payload as 64 bits, then the timestamp.
+            view.Note(*device + 4, 0, true, position, retire, position, SemKind::QmdPayload,
+                      progress);
+            view.Note(*device + 8, 0, false, position, retire, position, SemKind::QmdUnknown,
+                      progress);
+            view.Note(*device + 12, 0, false, position, retire, position, SemKind::QmdUnknown,
+                      progress);
+        }
+    }
+    if (reduction) {
         const u8 op = static_cast<u8>(((flags >> 20) & 7) | (((flags >> 24) & 1) << 3));
         split.RememberQmdRelease(*device, payload, Kind::QmdReduction, op);
     } else if ((flags & (1U << 19)) != 0 && (flags >> 30) != 0) {
@@ -2291,6 +2325,16 @@ void KeplerCompute::FrontNoteWrites(VideoCommon::GpuSplit& split, FrontState& fs
                         if (const auto device = memory_manager.GpuToCpuAddress(address)) {
                             split.RememberQmdRelease(
                                 *device, 0, VideoCommon::GpuSplit::ReleaseKind::QmdUnknown);
+                            // SYNC §2.1: written, value unknown (each word of the release).
+                            const VideoCommon::V2::SemProgress progress = split.SemNow();
+                            const u64 position = split.WritePosition();
+                            for (u64 offset = 0; offset < size; offset += 4) {
+                                split.Sem().Note(*device + offset, 0, false, position,
+                                                 VideoCommon::V2::SemView::Retire::Untracked,
+                                                 position,
+                                                 VideoCommon::V2::SemView::Kind::QmdUnknown,
+                                                 progress);
+                            }
                         }
                     }
                 }

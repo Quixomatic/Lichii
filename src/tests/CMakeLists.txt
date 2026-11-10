@@ -88,6 +88,7 @@ add_executable(tests
     video_core/pending_maps.cpp
     video_core/maxwell_fast_method.cpp
     video_core/v2_hazard.cpp
+    video_core/v2_sem_view.cpp
     video_core/v2_ir.cpp
     video_core/v2_macro.cpp
     video_core/v2_p3.cpp

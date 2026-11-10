@@ -10,6 +10,7 @@
 #include <optional>
 #include <string>
 #include <thread>
+#include <utility>
 
 #include "common/assert.h"
 #include "common/logging.h"
@@ -255,9 +256,8 @@ constexpr u64 SnapshotQmdTarget = ~u64{0};
 // `qmd_target` (Fix F3h, F3-X1): the QMD release an Equal/Mask acquire orders behind, recorded
 // when it was parsed (SnapshotQmdTarget there); its polls wait for that one producer, not for
 // the newest QMD release the front noted since (a moving target only the net used to end).
-ViewCheck CheckWithView(DmaPusher& dma_pusher, GPUVAddr address, u32 value, V2::SemaphoreOp op,
-                        bool wait = true, bool word_landed = false,
-                        u64 qmd_target = SnapshotQmdTarget) {
+ViewCheck CheckWithViewToday(DmaPusher& dma_pusher, GPUVAddr address, u32 value,
+                             V2::SemaphoreOp op, bool wait, bool word_landed, u64 qmd_target) {
     auto& split = VideoCommon::GpuSplit::Get();
     // Macros on the back send 3D reports the front doesn't see.
     if (!split.Active() || !split.FrontMacros() || !ReleasesLandAtOnce()) {
@@ -363,6 +363,80 @@ bool Passes(const ViewCheck& check) {
            check.verdict == V2::AcquireVerdict::MetByQueued;
 }
 
+V2::SemDecision DecideSem(DmaPusher& dma_pusher, GPUVAddr address, u32 value, V2::SemaphoreOp op,
+                          bool word_landed);
+void ShadowCompare(const V2::SemDecision& decision, bool today_passes);
+
+ViewCheck CheckWithView(DmaPusher& dma_pusher, GPUVAddr address, u32 value, V2::SemaphoreOp op,
+                        bool wait = true, bool word_landed = false,
+                        u64 qmd_target = SnapshotQmdTarget) {
+    auto& split = VideoCommon::GpuSplit::Get();
+    // SYNC Step 1: in ACQUIRE=verify the semaphore view decides alongside (shadow), first: a
+    // verify check may wait for a producer below.
+    const bool shadow = split.AcquireMode() == V2::Mode::Verify && split.Active() &&
+                        split.FrontMacros() && ReleasesLandAtOnce();
+    V2::SemDecision sem{};
+    if (shadow) [[unlikely]] {
+        sem = DecideSem(dma_pusher, address, value, op, word_landed);
+    }
+    const ViewCheck check =
+        CheckWithViewToday(dma_pusher, address, value, op, wait, word_landed, qmd_target);
+    if (shadow) [[unlikely]] {
+        ShadowCompare(sem, Passes(check));
+    }
+    return check;
+}
+
+// SYNC_SUBMIT_SPEC §2.1: the acquire decided from S1's semaphore view (DecideFromView). The word
+// is read after the view's lookup, so a writer that retired in between is in what it reads.
+V2::SemDecision DecideSem(DmaPusher& dma_pusher, GPUVAddr address, u32 value, V2::SemaphoreOp op,
+                          bool word_landed) {
+    auto& split = VideoCommon::GpuSplit::Get();
+    auto& memory = dma_pusher.memory_manager;
+    V2::SemInputs in;
+    const auto device = memory.GpuToCpuAddress(address);
+    V2::SemView::Answer answer{};
+    if (!device) {
+        in.mapped = false;
+        in.map_queued = split.MapQueued();
+    } else {
+        in.gpu_written = !word_landed && Nx2MayBeGpuWritten(*device, sizeof(u32));
+        const V2::SemProgress progress = split.SemNow();
+        in.unbounded_unknown = split.Sem().UnboundedUnknown(progress.consumed);
+        answer = split.Sem().Find(*device, progress);
+    }
+    in.memory_word = memory.Read<u32>(address);
+    const V2::SemDecision decision = V2::DecideFromView(op, value, answer, in);
+    if (V2Stats::Enabled()) [[unlikely]] {
+        V2Stats::NoteSemRow(static_cast<u8>(decision.row));
+        V2Stats::NoteSemEvictions(split.Sem().TakeEvictions());
+    }
+    return decision;
+}
+
+bool SemPasses(const V2::SemDecision& decision) {
+    return decision.verdict == V2::AcquireVerdict::Met ||
+           decision.verdict == V2::AcquireVerdict::MetByQueued;
+}
+
+/// SYNC Step 1 (ACQUIRE=verify): the shadow decision of the last acquire check, compared with
+/// the drained path once it ran (front thread only).
+struct SemShadowState {
+    bool valid = false;
+    bool passes = false;
+    V2::SemRow row{};
+    u64 position = 0;
+};
+SemShadowState g_sem_shadow;
+
+void ShadowCompare(const V2::SemDecision& decision, bool today_passes) {
+    g_sem_shadow = {true, SemPasses(decision), decision.row, decision.position};
+    if (g_sem_shadow.passes != today_passes) {
+        V2Stats::NoteSemShadow(g_sem_shadow.passes ? V2Stats::SemShadow::PassesTodayWaits
+                                                   : V2Stats::SemShadow::WaitsTodayPasses);
+    }
+}
+
 // EDEN_NX2_V2_ACQUIRE=1 (MASTER_PLAN §6, Fix F3-05): an acquire the view doesn't pass suspends
 // the channel; no drain, no forced fence. Settings the view doesn't model (accurate GPU, delayed
 // fences, macros on the back) take the old path; unmapped words suspend too (Fix F3h, R2-F3-03:
@@ -434,6 +508,35 @@ void ReportViewMismatch(DmaPusher& dma_pusher, GPUVAddr address, u32 value, u32 
                     view_passes ? "passes" : "waits", old_passed ? "passes" : "waits",
                     dma_pusher.memory_manager.Read<u32>(address), landing,
                     V2::Landing::landed.load(std::memory_order_acquire), landed);
+    }
+}
+
+// SYNC Step 1 (ACQUIRE=verify): the drained path decided `drained_passes` on the acquire whose
+// shadow decision is pending. A view pass the drained path doesn't make counts only when the
+// captured operations' landing doesn't confirm it either (as ReportViewMismatch).
+void ShadowDrained(DmaPusher& dma_pusher, GPUVAddr address, u32 value, u32 operation,
+                   V2::SemaphoreOp op, bool drained_passes) {
+    if (!std::exchange(g_sem_shadow.valid, false) || g_sem_shadow.passes == drained_passes) {
+        return;
+    }
+    if (!g_sem_shadow.passes) {
+        V2Stats::NoteSemShadow(V2Stats::SemShadow::WaitsDrainedPasses);
+        return;
+    }
+    if (LandForVerify(dma_pusher) &&
+        V2::SemaphoreMet(op, dma_pusher.memory_manager.Read<u32>(address), value)) {
+        return;
+    }
+    V2Stats::NoteSemShadow(V2Stats::SemShadow::PassesDrainedFails);
+    static std::atomic<u32> logged{};
+    if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+        LOG_WARNING(HW_GPU,
+                    "V2 semaphore view verify: channel {} semaphore {:#x} op {} value {:#x}: the "
+                    "view passes (row {}, writer at {:#x}), the drained path waits (word now "
+                    "{:#x})",
+                    dma_pusher.channel_state.bind_id, address, operation, value,
+                    static_cast<u32>(g_sem_shadow.row), g_sem_shadow.position,
+                    dma_pusher.memory_manager.Read<u32>(address));
     }
 }
 
@@ -699,6 +802,9 @@ bool Puller::PollAcquireView(DmaPusher& dma_pusher) {
                          recent ? VideoCommon::GpuSplit::ReleaseKindName(recent->kind) : "none",
                          recent ? recent->value : 0);
             }
+        }
+        if (verify) {
+            ShadowDrained(dma_pusher, address, value, operation, op, old_passed);
         }
         if (verify && decided) {
             ReportViewMismatch(dma_pusher, address, value, operation, passes, old_passed,
@@ -1030,6 +1136,10 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
         NoteAcquireRecord(dma_pusher, acquire.address, acquire.value, acquire.operation, ~0U);
         // Verify: a pass of the view must be one of the old path too (no suspension).
         const auto verify_result = [&](bool old_passed) {
+            if (view_mode == V2::Mode::Verify) [[unlikely]] {
+                ShadowDrained(dma_pusher, acquire.address, acquire.value, acquire.operation,
+                              ViewOp(acquire.operation), old_passed);
+            }
             if (view_passes) [[unlikely]] {
                 ReportViewMismatch(dma_pusher, acquire.address, acquire.value,
                                    acquire.operation, true, old_passed, "acquire", view_landing,
@@ -1234,6 +1344,10 @@ void Puller::ProcessSemaphoreExecute(DmaPusher& dma_pusher, u32 argument) {
                                         : true;
     if (sync_class != V2Stats::SyncClass::Count) [[unlikely]] {
         V2Stats::NoteAcquire(sync_class, false, ready);
+    }
+    if (operation < 6 && VideoCommon::GpuSplit::Get().AcquireMode() == V2::Mode::Verify)
+        [[unlikely]] {
+        ShadowDrained(dma_pusher, address, payload, operation, view_ops[operation], ready);
     }
     if (view_passes) [[unlikely]] {
         ReportViewMismatch(dma_pusher, address, payload, operation, true, ready, "SEM_EXECUTE",

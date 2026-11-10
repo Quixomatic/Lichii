@@ -211,6 +211,7 @@ void GpuSplit::MaybeStart(Core::System& system_) {
     cb_translations.fill({});
     unlanded.Clear();
     recent_releases.fill({});
+    sem_view.Clear();
     ticket_position = 0;
     ticket_sub = 0;
     last_ticket = 0;
@@ -301,6 +302,7 @@ void GpuSplit::Stop() {
     hazards.Clear();
     pending_cb = {};
     unlanded.Clear();
+    sem_view.Clear();
     ticket_position = 0;
     ticket_sub = 0;
     last_ticket = 0;
