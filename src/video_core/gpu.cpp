@@ -282,11 +282,27 @@ struct GPU::Impl {
             lane_requests.push_back(std::move(request));
             lane_pending.store(true, std::memory_order_release);
         }
-        VideoCommon::GpuSplit::Get().RequestCpuLane();
-        // Also through the ordered path: TickWork serves the lane too, should the back not.
-        gpu_thread.TickGPU(is_async);
+        auto& split = VideoCommon::GpuSplit::Get();
+        split.RequestCpuLane();
+        // The back serves the lane after its entry (or at once if it waits for work). Only a
+        // back that isn't running needs the ordered path, where TickWork serves the lane
+        // (MASTER_PLAN §6 lane: no TickGPU per request).
+        bool ticked = false;
+        if (!split.BackRunning()) {
+            gpu_thread.TickGPU(is_async);
+            ticked = true;
+        }
         std::unique_lock lck{lane_mutex};
-        lane_cv.wait(lck, [this, fence] { return lane_done >= fence || lane_dropped; });
+        while (!lane_cv.wait_for(lck, std::chrono::milliseconds{2},
+                                 [this, fence] { return lane_done >= fence || lane_dropped; })) {
+            if (!ticked && !split.BackRunning()) {
+                // The back stopped before serving it.
+                lck.unlock();
+                gpu_thread.TickGPU(is_async);
+                ticked = true;
+                lck.lock();
+            }
+        }
     }
 
     void TickCpuLane() {
