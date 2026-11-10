@@ -363,6 +363,34 @@ void ReportViewMismatch(DmaPusher& dma_pusher, GPUVAddr address, u32 value, u32 
 }
 
 
+/// SYNC (20c0 boot hang, ACQUIRE=verify): the view waits where the drained path passes. Names
+/// the word, the view's row and what the drained path had that the view didn't: the latch, the
+/// buffer cache holding the word (ReadSemaphoreWord flushes it), or memory changing during the
+/// drain (work still queued, or fences ReleaseFences ran). First 64.
+void LogViewWaitsOldPasses(DmaPusher& dma_pusher, const char* where, GPUVAddr address,
+                           u32 operation, u32 value, const ViewCheck& check, u32 word_at_view,
+                           bool latched_at_view, bool latched_after, bool cache_holds,
+                           bool gpu_written_page) {
+    static std::atomic<u32> logged{};
+    if (logged.fetch_add(1, std::memory_order_relaxed) >= 64) {
+        return;
+    }
+    auto& split = VideoCommon::GpuSplit::Get();
+    LOG_WARNING(HW_GPU,
+                "V2 view waits, drained path passes ({}): channel {} semaphore {:#x} op {} value "
+                "{:#x}: view row {} reason {}, word {:#x} at the view, {:#x} after the drain; "
+                "latched {} then {}; buffer cache holds the word {}, GPU-written page {}; back "
+                "consumed {:#x} of {:#x}, landed {:#x}, untracked landed {:#x} of {:#x}",
+                where, dma_pusher.channel_state.bind_id, address, operation, value,
+                static_cast<u32>(check.decision.row), static_cast<u32>(check.reason),
+                word_at_view, dma_pusher.memory_manager.Read<u32>(address), latched_at_view,
+                latched_after, cache_holds,
+                gpu_written_page, split.ConsumedNow(), split.WritePosition(),
+                V2::Landing::landed.load(std::memory_order_relaxed),
+                V2::Landing::untracked_landed.load(std::memory_order_relaxed),
+                V2::Landing::untracked_issued.load(std::memory_order_relaxed));
+}
+
 /// Landings of either kind (the "landing" wake class).
 u64 Landings() {
     return V2::Landing::landed.load(std::memory_order_acquire) +
@@ -586,7 +614,22 @@ bool Puller::PollAcquireView(DmaPusher& dma_pusher) {
     if (!decided || verify) {
         // The old poll reads memory each pass: keep the front's sleep at one tick.
         V2::FrontWake::NoteTickWaiter();
+        // SYNC (20c0 boot hang): what the drained path sees that the view doesn't, logged.
+        const u32 word_at_view = verify ? dma_pusher.memory_manager.Read<u32>(address) : 0;
+        const bool latched_at_view = verify && Nx2SemaphoreWaiters::Get().Latched(this);
+        const auto view_device = verify ? dma_pusher.memory_manager.GpuToCpuAddress(address)
+                                        : std::nullopt;
+        const bool cache_holds =
+            view_device &&
+            dma_pusher.rasterizer->MustFlushRegion(*view_device, sizeof(u32),
+                                                   VideoCommon::CacheType::BufferCache);
         const bool old_passed = PollAcquire(dma_pusher);
+        if (verify && !passes && old_passed) [[unlikely]] {
+            LogViewWaitsOldPasses(dma_pusher, "poll", address, operation, value, check,
+                                  word_at_view, latched_at_view,
+                                  Nx2SemaphoreWaiters::Get().Latched(this), cache_holds,
+                                  view_device && Nx2MayBeGpuWritten(*view_device, sizeof(u32)));
+        }
         if (verify && decided) {
             ReportViewMismatch(dma_pusher, address, value, operation, passes, old_passed,
                                "poll", check.landing, op);

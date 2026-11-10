@@ -51,6 +51,10 @@ struct GpuSplitTestAccess {
     static u64 End(const GpuSplit& split) {
         return split.write_position;
     }
+    /// What the back may run (GpuSplit::Publish).
+    static u64 Published(const GpuSplit& split) {
+        return split.published.load();
+    }
     /// As if entries up to `position` were sent.
     static void SetEnd(GpuSplit& split, u64 position) {
         split.write_position = position;
@@ -2328,6 +2332,34 @@ TEST_CASE("V2 landing: the front remembers its releases, the back's captured ope
     V2::Landing::pending = saved_pending;
     V2::Landing::landed.store(0);
     V2::Landing::issued.store(0);
+}
+
+TEST_CASE("SYNC 20c0 boot hang: words a suspending channel sent reach the back before the "
+          "suspended channels are polled",
+          "[video_core][gpu_split_dispatch][v2_hazard]") {
+    // 20c0746b9e: ch1 left 9 words written but unpublished while the front looped in
+    // ResumePending (a channel resuming and suspending every pass); the back never ran them.
+    // Control::Scheduler::ResumePending now publishes before the poll loop and after every
+    // resumed channel's commands; this checks what that Publish guarantees.
+    using Access = VideoCommon::GpuSplitTestAccess;
+    Fixture f;
+    f.system.Initialize();
+    VideoCommon::GpuSplit split;
+    Access::Initialize(split, f.system, 100);
+    struct Noop {
+        void operator()() const {}
+    };
+    split.Defer(Noop{});
+    split.Defer(Noop{});
+    // Below publish_every: nothing is visible to the back yet.
+    REQUIRE(Access::End(split) > 100);
+    REQUIRE(Access::Published(split) < Access::End(split));
+    split.Publish(); // what ResumePending does before polling suspended channels
+    REQUIRE(Access::Published(split) == Access::End(split));
+    // Publishing again with nothing new changes nothing (the per-pass cost is one compare).
+    const u64 published = Access::Published(split);
+    split.Publish();
+    REQUIRE(Access::Published(split) == published);
 }
 
 TEST_CASE("V2 landing: a QMD reduction deferred to its fence reports its landing (F3-X1)",

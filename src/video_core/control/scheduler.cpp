@@ -70,6 +70,12 @@ void Scheduler::Push(GPU& gpu, s32 channel, CommandList&& entries) {
 
 bool Scheduler::ResumePending(GPU& gpu) {
     bool any_progress = false;
+    // SYNC (20c0 boot hang): what the channel that just suspended sent goes to the back before
+    // the suspended channels are polled (the poll loop may not return for a long time).
+    if (auto& split = VideoCommon::GpuSplit::Get();
+        split.Active() && split.AcquireMode() != VideoCommon::V2::Mode::Off) [[unlikely]] {
+        split.Publish();
+    }
     // Running one channel can release the semaphore another waits for: retry until none moves.
     for (bool progress = true; progress;) {
         progress = false;
@@ -86,6 +92,15 @@ bool Scheduler::ResumePending(GPU& gpu) {
             }
             BindChannel(gpu, state->bind_id);
             dma_pusher.DispatchCalls();
+            // SYNC (20c0 boot hang): a channel that resumes and suspends again every pass keeps
+            // this loop going without returning to the GPU thread's publish, so the back never
+            // saw the other channels' last records (9 words written, not published) and their
+            // producers never ran. MP §5.1 "the engine runs other channels": what this channel
+            // sent is handed to the back now (nothing happens when nothing new was written).
+            if (auto& split = VideoCommon::GpuSplit::Get();
+                split.Active() && split.AcquireMode() != VideoCommon::V2::Mode::Off) [[unlikely]] {
+                split.Publish();
+            }
             progress = true;
             any_progress = true;
         }
