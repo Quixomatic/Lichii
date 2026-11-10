@@ -702,6 +702,73 @@ void Scheduler::BeginRenderingImpl(const Framebuffer* framebuffer, u32 color_cou
     next_pass_dynamic = false;
     VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::DynamicPasses);
     ++pass_draws;
+    if (color_clear_mask == 0 && !depth_clear) {
+        // U-13: a pass without clear load ops (nearly all of them) records only the views; the
+        // worker builds the attachment infos (no ~700-byte struct built and copied here).
+        struct Views {
+            std::array<VkImageView, 8> colors{};
+            VkImageView depth{};
+            VkExtent2D render_area{};
+            u32 layers{};
+            u32 num_colors{};
+            bool has_depth{};
+            bool has_stencil{};
+        } compact;
+        const auto& color_views = framebuffer->ColorViews();
+        const RenderPassKey& base_key = framebuffer->RenderPassKeyBase();
+        for (u32 slot = 0; slot < 8; ++slot) {
+            if (base_key.color_formats[slot] != VideoCore::Surface::PixelFormat::Invalid) {
+                compact.colors[slot] = color_views[slot];
+                compact.num_colors = slot + 1;
+            }
+        }
+        if (color_count != 0) {
+            compact.num_colors = (std::min)(color_count, 8U);
+        }
+        dynamic_color_count = compact.num_colors;
+        if (base_key.depth_format != VideoCore::Surface::PixelFormat::Invalid) {
+            compact.depth = framebuffer->DepthView();
+            compact.has_depth = framebuffer->HasAspectDepthBit();
+            compact.has_stencil = framebuffer->HasAspectStencilBit();
+        }
+        compact.render_area = framebuffer->RenderArea();
+        compact.layers = framebuffer->Layers();
+        Record([compact](vk::CommandBuffer cmdbuf) {
+            const auto info = [](VkImageView view) {
+                return VkRenderingAttachmentInfo{
+                    .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+                    .pNext = nullptr,
+                    .imageView = view,
+                    .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+                    .resolveMode = VK_RESOLVE_MODE_NONE,
+                    .resolveImageView = VK_NULL_HANDLE,
+                    .resolveImageLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+                    .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD,
+                    .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+                    .clearValue = {},
+                };
+            };
+            std::array<VkRenderingAttachmentInfo, 8> colors;
+            for (u32 slot = 0; slot < compact.num_colors; ++slot) {
+                colors[slot] = info(compact.colors[slot]);
+            }
+            const VkRenderingAttachmentInfo depth = info(compact.depth);
+            const VkRenderingInfo rendering_info{
+                .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
+                .pNext = nullptr,
+                .flags = 0,
+                .renderArea = {.offset = {0, 0}, .extent = compact.render_area},
+                .layerCount = compact.layers,
+                .viewMask = 0,
+                .colorAttachmentCount = compact.num_colors,
+                .pColorAttachments = colors.data(),
+                .pDepthAttachment = compact.has_depth ? &depth : nullptr,
+                .pStencilAttachment = compact.has_stencil ? &depth : nullptr,
+            };
+            cmdbuf.BeginRendering(rendering_info);
+        });
+        return;
+    }
     struct Attachments {
         std::array<VkRenderingAttachmentInfo, 8> colors{};
         u32 num_colors = 0;
