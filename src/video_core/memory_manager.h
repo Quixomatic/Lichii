@@ -231,7 +231,10 @@ private:
 
     void ReadBlockImpl(GPUVAddr gpu_src_addr, void* dest_buffer, std::size_t size, VideoCommon::CacheType which, bool unsafe,
                        std::source_location caller) const;
-    void WriteBlockImpl(GPUVAddr gpu_dest_addr, const void* src_buffer, std::size_t size, VideoCommon::CacheType which, bool unsafe);
+    /// `cached`: constant buffer data (the decode-time versions patch themselves), not a foreign
+    /// write for F2-03's write watch.
+    void WriteBlockImpl(GPUVAddr gpu_dest_addr, const void* src_buffer, std::size_t size, VideoCommon::CacheType which, bool unsafe,
+                        bool cached = false);
 
     [[nodiscard]] std::size_t PageEntryIndex(GPUVAddr gpu_addr, bool is_big_page) const {
         if (is_big_page) {

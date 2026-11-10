@@ -29,6 +29,7 @@
 #include "video_core/dirty_flags.h"
 #include "video_core/nx2_fast_draw.h"
 #include "video_core/v2/v2_stats.h"
+#include "video_core/v2/cbuf_watch.h"
 #include "video_core/v2/versions.h"
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/guest_memory.h"
@@ -183,6 +184,7 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
             runtime.Finish();
             V2::Versions::HookWrite(image.cpu_addr, image.guest_size_bytes,
                                     V2::Versions::Source::Gpu);
+            V2::CbufWatch::HookForeign(image.cpu_addr, image.guest_size_bytes);
             SwizzleImage(*gpu_memory, image.gpu_addr, image.info, copies, map.mapped_span, swizzle_data_buffer);
             ++gc_download_deletes;
             ClearStaleImage(image);
@@ -1636,6 +1638,7 @@ void TextureCache<P>::DownloadMemory(DAddr cpu_addr, size_t size) {
             Image& image = slot_images[entry.image_id];
             V2::Versions::HookWrite(image.cpu_addr, image.guest_size_bytes,
                                     V2::Versions::Source::Gpu);
+            V2::CbufWatch::HookForeign(image.cpu_addr, image.guest_size_bytes);
             SwizzleImage(*gpu_memory, image.gpu_addr, image.info, entry.copies,
                          entry.map.mapped_span, swizzle_data_buffer);
             ClearStaleImage(image);
@@ -2207,6 +2210,7 @@ void TextureCache<P>::PopAsyncFlushes() {
                     download_buffer.mapped_span.subspan(download_buffer.offset);
                 V2::Versions::HookWrite(image.cpu_addr, image.guest_size_bytes,
                                         V2::Versions::Source::Gpu);
+                V2::CbufWatch::HookForeign(image.cpu_addr, image.guest_size_bytes);
                 SwizzleImage(*gpu_memory, image.gpu_addr, image.info, copies, download_span, swizzle_data_buffer);
                 ClearStaleImage(image);
             } else {
@@ -2259,6 +2263,7 @@ void TextureCache<P>::PopAsyncFlushes() {
             const auto copies = FullDownloadCopies(image.info);
             V2::Versions::HookWrite(image.cpu_addr, image.guest_size_bytes,
                                     V2::Versions::Source::Gpu);
+            V2::CbufWatch::HookForeign(image.cpu_addr, image.guest_size_bytes);
             SwizzleImage(*gpu_memory, image.gpu_addr, image.info, copies, download_span, swizzle_data_buffer);
             ClearStaleImage(image);
             download_map.offset += image.unswizzled_size_bytes;

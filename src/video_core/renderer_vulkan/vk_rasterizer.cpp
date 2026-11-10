@@ -62,6 +62,7 @@
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/renderer_vulkan/vk_bindless_heap.h"
 #include "video_core/v2/cbuf_version.h"
+#include "video_core/v2/cbuf_watch.h"
 #include "video_core/v2/continued_draw.h"
 #include "core/core.h"
 #include "video_core/v2/p3_stats.h"
@@ -3555,6 +3556,7 @@ void RasterizerVulkan::InvalidateRegion(DAddr addr, u64 size, VideoCommon::Cache
         return;
     }
     VideoCommon::V2::Versions::HookWrite(addr, size, VideoCommon::V2::Versions::Source::Host);
+    VideoCommon::V2::CbufWatch::HookForeign(addr, size);
     if (VideoCommon::V2::On(VideoCommon::V2::Switch::CbufVer)) [[unlikely]] {
         VideoCommon::V2::CbufVer::Log().NoteHost(addr, size);
     }
@@ -3712,6 +3714,7 @@ void RasterizerVulkan::OnCacheInvalidations(std::span<const std::pair<DAddr, u64
             }
             VideoCommon::V2::Versions::HookWrite(addr, size,
                                                  VideoCommon::V2::Versions::Source::Host);
+            VideoCommon::V2::CbufWatch::HookForeign(addr, size);
             if (VideoCommon::V2::On(VideoCommon::V2::Switch::CbufVer)) [[unlikely]] {
                 VideoCommon::V2::CbufVer::Log().NoteHost(addr, size);
             }
@@ -3748,6 +3751,7 @@ void RasterizerVulkan::OnCacheInvalidation(DAddr addr, u64 size) {
         return;
     }
     VideoCommon::V2::Versions::HookWrite(addr, size, VideoCommon::V2::Versions::Source::Host);
+    VideoCommon::V2::CbufWatch::HookForeign(addr, size);
     if (VideoCommon::V2::On(VideoCommon::V2::Switch::CbufVer)) [[unlikely]] {
         VideoCommon::V2::CbufVer::Log().NoteHost(addr, size);
     }
@@ -3780,6 +3784,7 @@ void RasterizerVulkan::OnCacheInvalidation(DAddr addr, u64 size) {
 bool RasterizerVulkan::TryCacheInvalidation(DAddr addr, u64 size) {
     if (addr == 0 || size == 0) return true;
     VideoCommon::V2::Versions::HookWrite(addr, size, VideoCommon::V2::Versions::Source::Host);
+    VideoCommon::V2::CbufWatch::HookForeign(addr, size);
     if (VideoCommon::V2::On(VideoCommon::V2::Switch::CbufVer)) [[unlikely]] {
         VideoCommon::V2::CbufVer::Log().NoteHost(addr, size);
     }
@@ -3838,6 +3843,7 @@ void RasterizerVulkan::InvalidateGPUCache() {
 
 void RasterizerVulkan::UnmapMemory(DAddr addr, u64 size) {
     VideoCommon::V2::Versions::HookWrite(addr, size, VideoCommon::V2::Versions::Source::Host);
+    VideoCommon::V2::CbufWatch::HookForeign(addr, size);
     if (commit_lock_free) [[unlikely]] {
         // Synchronous: the memory is reused once this returns.
         WithCaches([&] {

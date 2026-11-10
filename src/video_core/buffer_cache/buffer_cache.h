@@ -563,6 +563,7 @@ bool BufferCache<P>::DownloadMemoryAsync(DAddr device_addr, u64 size,
                 }
                 // As WriteDownloadedMemory: CPU writes since the download keep their bytes.
                 V2::Versions::HookWrite(copy.device_addr, copy.size, V2::Versions::Source::Gpu);
+                V2::CbufWatch::HookForeign(copy.device_addr, copy.size);
                 if (!state->cpu_written.Intersects(copy.device_addr, copy.size)) {
                     memory->WriteBlockUnsafe(copy.device_addr, data, copy.size);
                     continue;
@@ -752,6 +753,7 @@ bool BufferCache<P>::DMACopy(GPUVAddr src_address, GPUVAddr dest_address, u64 am
     ClearDownload(*cpu_dest_address, amount);
     MarkVertexBuffersStale(*cpu_dest_address, amount);
     V2::Versions::HookWrite(*cpu_dest_address, amount, V2::Versions::Source::Dma);
+    V2::CbufWatch::HookForeign(*cpu_dest_address, amount);
 
     BufferId buffer_a;
     BufferId buffer_b;
@@ -823,6 +825,7 @@ bool BufferCache<P>::DMAClear(GPUVAddr dst_address, u64 amount, u32 value) {
     const size_t size = amount * sizeof(u32);
     ClearDownload(*cpu_dst_address, size);
     V2::Versions::HookWrite(*cpu_dst_address, size, V2::Versions::Source::Dma);
+    V2::CbufWatch::HookForeign(*cpu_dst_address, size);
     gpu_modified_ranges.Subtract(*cpu_dst_address, size);
 
     const BufferId buffer = FindBuffer(*cpu_dst_address, static_cast<u32>(size), false);
@@ -2525,6 +2528,7 @@ void BufferCache<P>::WriteDownloadedMemory(const Common::RangeSet<DAddr>& cpu_wr
                                            DAddr device_addr, const u8* data, u64 size) {
     // A download changes guest memory (handle words, stream-copied uniforms read it).
     V2::Versions::HookWrite(device_addr, size, V2::Versions::Source::Gpu);
+    V2::CbufWatch::HookForeign(device_addr, size);
     if (!cpu_written.Intersects(device_addr, size)) {
         device_memory.WriteBlockUnsafe(device_addr, data, size);
         return;
