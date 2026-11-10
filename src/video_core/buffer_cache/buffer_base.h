@@ -135,6 +135,9 @@ public:
     /// Pipeline v2 R2-F4-07 (EDEN_NX2_V2_ADAPTSUBMIT): the submission (scheduler tick) of the
     /// newest GPU write, the producer a host read waits for.
     u64 v2_gpu_write_tick = 0;
+    /// R2-F4-07: the recording thread read this mapped buffer back once: its later GPU writes end
+    /// their submission with a host-read barrier (learned, as early downloads are), no others.
+    bool v2_host_read = false;
 
 private:
     VAddr cpu_addr = 0;

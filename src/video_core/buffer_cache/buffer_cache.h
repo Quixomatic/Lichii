@@ -719,11 +719,14 @@ void BufferCache<P>::DownloadRangesMemory(std::span<const std::pair<DAddr, u64>>
             if constexpr (has_mapped) {
                 if (v2_producer_reads) [[unlikely]] {
                     u64 producer = 0;
+                    bool known = true;
                     for (const Download& download : mapped) {
-                        producer = (std::max)(producer,
-                                              slot_buffers[download.buffer_id].v2_gpu_write_tick);
+                        Buffer& read = slot_buffers[download.buffer_id];
+                        known &= read.v2_gpu_write_tick != 0;
+                        producer = (std::max)(producer, read.v2_gpu_write_tick);
+                        read.v2_host_read = true;
                     }
-                    WaitMappedHostRead(producer);
+                    WaitMappedHostRead(known ? producer : 0);
                 } else {
                     runtime.FinishForHostRead();
                 }
@@ -838,7 +841,11 @@ bool BufferCache<P>::DMACopy(GPUVAddr src_address, GPUVAddr dest_address, u64 am
                 dest_buffer.v2_gpu_write_tick = runtime.CurrentTick();
                 if constexpr (requires { dest_buffer.Mapped(); runtime.NoteMappedGpuWrite(); }) {
                     if (!dest_buffer.Mapped().empty()) {
-                        runtime.NoteMappedGpuWrite();
+                        if (dest_buffer.v2_host_read) {
+                            runtime.NoteMappedGpuWrite();
+                        } else {
+                            dest_buffer.v2_gpu_write_tick = 0;
+                        }
                     }
                 }
             }
@@ -4163,7 +4170,13 @@ void BufferCache<P>::MarkWrittenBuffer(BufferId buffer_id, DAddr device_addr, u3
             buffer.v2_gpu_write_tick = runtime.CurrentTick();
             if constexpr (requires { buffer.Mapped(); runtime.NoteMappedGpuWrite(); }) {
                 if (!buffer.Mapped().empty()) {
-                    runtime.NoteMappedGpuWrite();
+                    // Only buffers the host read before pay the barrier; for the others the
+                    // producer stays unknown (a read takes FinishForHostRead and learns it).
+                    if (buffer.v2_host_read) {
+                        runtime.NoteMappedGpuWrite();
+                    } else {
+                        buffer.v2_gpu_write_tick = 0;
+                    }
                 }
             }
         }
@@ -5141,6 +5154,7 @@ void BufferCache<P>::DownloadBufferMemory(Buffer& buffer, DAddr device_addr, u64
     if constexpr (requires { buffer.Mapped(); }) {
         if (const auto mapped = buffer.Mapped(); !mapped.empty()) {
             if (v2_producer_reads) [[unlikely]] {
+                buffer.v2_host_read = true;
                 WaitMappedHostRead(buffer.v2_gpu_write_tick);
             } else {
                 runtime.FinishForHostRead();
