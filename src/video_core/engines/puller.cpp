@@ -588,8 +588,15 @@ bool Puller::PollAcquireView(DmaPusher& dma_pusher) {
                 // often does not exist yet at the first ask). Only the producer's position: the
                 // known QMD producer, else what was sent when the channel suspended (019d asked
                 // for everything sent so far every millisecond: 69 submits/f).
+                const auto word_device = dma_pusher.memory_manager.GpuToCpuAddress(address);
+                const u64 untracked_ticket =
+                    word_device ? V2::Landing::UntrackedTargetFor(*word_device, sizeof(u32)) : 0;
                 if (acquire.qmd_target != 0) {
                     V2::LandingFence::Want(acquire.qmd_target);
+                } else if (untracked_ticket != 0) {
+                    // F3h: the tracked QMD reduction/max release to this word (d5e4: reductions
+                    // waited up to 91 ms for their fence): its entry's fence is urgent.
+                    V2::LandingFence::Want(V2::Landing::UntrackedPosition(untracked_ticket));
                 } else if (first_ask) {
                     V2::LandingFence::Want(split.WritePosition());
                 }
