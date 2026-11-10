@@ -2,8 +2,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cstring>
 #include <random>
+#include <thread>
 #include <vector>
 
 #include <catch2/catch_test_macros.hpp>
@@ -12,6 +15,7 @@
 
 #include "shader_recompiler/shader_info.h"
 #include "video_core/rasterizer_interface.h"
+#include "video_core/v2/front_wake.h"
 #include "video_core/v2/front_writes.h"
 #include "video_core/v2/hazard.h"
 #include "video_core/v2/ir_exec.h"
@@ -829,4 +833,29 @@ TEST_CASE("V2 front writes: block linear copies and 2D blits are bounded by thei
         tracker.macros = true; // registers a 2D macro set are not tracked
         CHECK(!tracker.DestinationRange());
     }
+}
+
+// Fix F3f (W-01b): the front's sleep while every channel is suspended ends at a ring (a release
+// latching a waiter, the back's progress, a readback, a command), and without one after a tick.
+TEST_CASE("V2 front wake: a ring ends the suspended front's sleep", "[video_core][v2_hazard]") {
+    namespace FrontWake = VideoCommon::V2::FrontWake;
+    FrontWake::RegisterFrontThread();
+    // No ring: the sleep still ends (the guest CPU's releases are polled).
+    FrontWake::Sleep();
+    // A ring while nothing sleeps does nothing (and leaves no wake for later).
+    FrontWake::Ring();
+    // An idle back ringing: every sleep ends, the front makes progress at the ring's pace.
+    std::atomic<bool> stop{false};
+    std::jthread ringer([&] {
+        while (!stop.load()) {
+            FrontWake::Ring();
+            std::this_thread::yield();
+        }
+    });
+    const auto begin = std::chrono::steady_clock::now();
+    for (int i = 0; i < 200; ++i) {
+        FrontWake::Sleep();
+    }
+    CHECK(std::chrono::steady_clock::now() - begin < std::chrono::seconds{2});
+    stop.store(true);
 }

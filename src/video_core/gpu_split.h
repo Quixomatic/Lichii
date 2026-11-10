@@ -16,6 +16,7 @@
 #include <utility>
 
 #include "common/common_types.h"
+#include "video_core/v2/front_wake.h"
 #include "video_core/v2/hazard.h"
 #include "video_core/v2/ir.h"
 #include "video_core/v2/ir_arena.h"
@@ -990,6 +991,8 @@ private:
             front_wake.fetch_add(1, std::memory_order_seq_cst);
             front_wake.notify_one();
         }
+        // W-01b: a suspended channel's poll may wait for this position (the view's WaitFor).
+        V2::FrontWake::Ring();
     }
 
     void BackLoop(std::stop_token stop_token);

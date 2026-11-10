@@ -9,6 +9,7 @@
 #include "common/common_types.h"
 #include "video_core/cache_types.h"
 #include "video_core/rasterizer_interface.h"
+#include "video_core/v2/front_wake.h"
 
 // Pipeline v2 (MASTER_PLAN §6 class C, Fix F3-06/F3-08): the split front reads a few words of
 // GPU-written guest memory without draining the back. The front sends a Readback record
@@ -27,6 +28,7 @@ struct WordReadback {
             rasterizer.FlushRegionForRead(address, size, land);
         }
         ready.store(true, std::memory_order_release);
+        FrontWake::Ring(); // W-01b: the suspended poll that sent it may land it now
     }
 
     /// Front: whether the back ran the record.

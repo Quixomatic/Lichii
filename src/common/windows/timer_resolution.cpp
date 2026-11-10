@@ -110,4 +110,11 @@ void SleepForOneTick() {
     NtDelayExecution(FALSE, &DelayInterval);
 }
 
+void SleepForOneTickAlertable() {
+    LARGE_INTEGER DelayInterval{
+        .QuadPart{-1},
+    };
+    NtDelayExecution(TRUE, &DelayInterval);
+}
+
 } // namespace Common::Windows

@@ -29,6 +29,7 @@
 #include "video_core/host1x/host1x.h"
 #include "video_core/renderer_base.h"
 #include "video_core/v2/commit.h"
+#include "video_core/v2/front_wake.h"
 #include "video_core/v2/v2_stats.h"
 
 namespace VideoCommon::GPUThread {
@@ -66,6 +67,7 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
             Common::PinCurrentThread(Common::PinnedRole::GpuFront);
         }
         system.RegisterHostThread();
+        V2::FrontWake::RegisterFrontThread();
 
         auto current_context = context.Acquire();
         CpuRecord next;
@@ -97,7 +99,8 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                     // present waited ~17 ms a frame in Kokiri village, with 50 us ~1 ms. A channel
                     // still waiting after 2 s (menus, loading) goes back to 1 ms sleeps.
                     Profile::Scope scope{Profile::Zone::PendingSleep};
-                    if (split.AcquireMode() != V2::Mode::Off) [[unlikely]] {
+                    const bool view = split.AcquireMode() != V2::Mode::Off;
+                    if (view) [[unlikely]] {
                         // Polls no longer drain: hand the back what the front holds before
                         // sleeping (0758309bcc), or it waits out the sleep without work.
                         split.Publish();
@@ -105,6 +108,10 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                     const auto waited = std::chrono::steady_clock::now() - last_progress;
                     if (waited < std::chrono::microseconds{500}) {
                         std::this_thread::yield();
+                    } else if (view && waited < std::chrono::seconds{2}) [[unlikely]] {
+                        // W-01b: a release latching a waiter, the back's progress, a readback
+                        // or a new command ends the tick at once (v2/front_wake.h).
+                        V2::FrontWake::Sleep();
                     } else if (waited < std::chrono::seconds{2}) {
 #ifdef _WIN32
                         // sleep_for(50us) rounds up to Sleep(1) (>= 1 ms) on Windows;
@@ -317,6 +324,7 @@ u64 ThreadManager::PushCommand(CpuRecord&& record, bool block, bool is_async) {
     if (!state.queue.EmplaceWaitUnlessStopped(stop, std::move(record))) [[unlikely]] {
         return fence;
     }
+    V2::FrontWake::Ring(); // W-01b: a front sleeping on suspended channels takes it at once
 
     if (block) {
         state.cv.wait(lk, stop, [this, fence] {

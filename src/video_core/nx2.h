@@ -14,6 +14,7 @@
 
 #include "common/bit_util.h"
 #include "common/common_types.h"
+#include "video_core/v2/front_wake.h"
 
 namespace Tegra {
 
@@ -408,11 +409,19 @@ public:
         if (count.load(std::memory_order_acquire) == 0) {
             return;
         }
-        std::scoped_lock lk{mutex};
-        for (auto& w : waiters) {
-            if (w.address == device_address && !w.latched && Matches(w, value)) {
-                w.latched = true;
+        bool latched = false;
+        {
+            std::scoped_lock lk{mutex};
+            for (auto& w : waiters) {
+                if (w.address == device_address && !w.latched && Matches(w, value)) {
+                    w.latched = true;
+                    latched = true;
+                }
             }
+        }
+        if (latched) {
+            // W-01b: the front may sleep with every channel suspended; this one can go on.
+            VideoCommon::V2::FrontWake::Ring();
         }
     }
 
