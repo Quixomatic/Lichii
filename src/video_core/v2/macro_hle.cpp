@@ -24,7 +24,13 @@ namespace {
 constexpr u32 MaxInstructions = 4096;
 
 // Built in, from EDEN_NX2_V2_MACRO_DUMP captures (IMPLEMENTATION_LOG Fix F5).
-constexpr std::array<Entry, 1> built_in{
+constexpr std::array<Entry, 3> built_in{
+    // Fix F3h (R2-F5-03, notes/conformance-r2-p1-s1.md d3): the two hot 3D macros the memo
+    // can't help (Ocarina of Time, 4488 dump; RE with lichii-refs/tools/mme_symbolic.py).
+    // 96d36d962a7ff692 (start 0x21, ~207k calls/s): see Evaluate.
+    Entry{.hash = 0x96d36d962a7ff692ULL, .kind = Kind::ConstantBufferBind},
+    // 5b6e8dc0f6ab7d8e (start 0x8, ~56k calls/s): see Evaluate.
+    Entry{.hash = 0x5b6e8dc0f6ab7d8eULL, .kind = Kind::SurfaceBind},
     // 3D 966aeb0e43e7a13c (Ocarina of Time, ~600 calls a frame): p1/p2 into the MME DMA source
     // registers, a 6-word MME_DMA_READ_FIFOED of a ReportSemaphore::Compare there, then
     // render_enable.mode = p0 ^ ((w0 ^ w4) | (w1 ^ w5) != 0): IfNotEqual (p0 = 0) or IfEqual
@@ -237,6 +243,147 @@ Draw Resolve(const Entry& entry, std::span<const u32> parameters) {
     draw.stride = entry.stride;
     draw.base_vertex_attribute = entry.base_vertex_attribute;
     return draw;
+}
+
+namespace {
+
+// TuringMacroInterpreter's data RAM bounds (a read or write past it fails the macro).
+constexpr u32 DataRamWords = 0xc00;
+
+// The MERGE operation: `count` bits of y from bit `source` into x at bit `dest`.
+constexpr u32 Merge(u32 x, u32 y, u32 dest, u32 count, u32 source) {
+    const u32 mask = (1U << count) - 1;
+    return (x & ~(mask << dest)) | (((y >> source) & mask) << dest);
+}
+
+void AddWrite(Effects& out, u32 method, u32 value) {
+    out.writes[out.num_writes++] = {method, value};
+}
+
+void AddDramWrite(Effects& out, u32 index, u32 value) {
+    out.dram_writes[out.num_dram_writes++] = {index, value};
+}
+
+// 3D 96d36d962a7ff692 (15 instructions at 0x21), p0 stage or binding index, p1 slot, p2
+// address low, p3 size << 12 | address high:
+//   if !(s32(p0) < 8): r1 = merge(merge(0x480, p0 bits 0-1 at 5), p1 bits 0-3 at 1)
+//                      stage = dram[0x520 + p0]; dram[r1] = p2; dram[r1 + 1] = p3
+//   else stage = p0
+//   if !(s32(stage) < 15): end (nothing written)
+//   0x8e0 = p3 >> 12 & 0xfffff; 0x8e1 = p3 & 0xff; 0x8e2 = p2
+//   [0x904 + (stage & 7) * 8] = 1 | ((p1 + 3) & 0xfffffff) << 4
+bool EvaluateConstantBufferBind(std::span<const u32> p, std::span<const u32> dram,
+                                Effects& out) {
+    if (p.size() != 4) {
+        return false;
+    }
+    u32 stage = p[0];
+    if (!(static_cast<s32>(p[0]) < 8)) {
+        const u32 index = Merge(Merge(0x480, p[0], 5, 2, 0), p[1], 1, 4, 0);
+        const u32 stage_index = 0x520 + p[0];
+        if (stage_index >= DataRamWords || index + 1 >= DataRamWords ||
+            stage_index >= dram.size()) {
+            return false;
+        }
+        stage = dram[stage_index]; // read before the writes (same instruction order)
+        AddDramWrite(out, index, p[2]);
+        AddDramWrite(out, index + 1, p[3]);
+    }
+    if (!(static_cast<s32>(stage) < 15)) {
+        return true;
+    }
+    AddWrite(out, 0x8e0, Merge(0, p[3], 0, 20, 12));
+    AddWrite(out, 0x8e1, p[3] & 0xff);
+    AddWrite(out, 0x8e2, p[2]);
+    AddWrite(out, Merge(0x904, stage, 3, 3, 0) & 0xfff, Merge(1, p[1] + 3, 4, 28, 0));
+    return true;
+}
+
+// 3D 5b6e8dc0f6ab7d8e (23 instructions at 0x8), p0 index, p1..p4 the binding (p4: slot in
+// bits 24-26, cb_bind stage in bits 28-30):
+//   base = 0x500 + p0 * 4 (signed multiply); if p1 == dram[base]: end
+//   mask = dram[0x52c] (read before the writes); dram[base..base+3] = p1, p2, p3, p4
+//   if (mask & 1 << p0) == 0: end
+//   s = p4 >> 24 & 7: [0x805 + 16s] = p2 >> 24; [0x806 + 16s] = p2 << 8; [0x807 + 16s] =
+//   p4 >> 9 & 0x7f; 0x8e0 = 0x10000; 0x8e1 = p3 >> 24; 0x8e2 = p3 << 8;
+//   [0x904 + (p4 >> 28 & 7) * 8] = 0x11; [0x803 + 16s] = p4 & 0x1ff; [0x800 + 16s] = 1 | s << 4
+bool EvaluateSurfaceBind(std::span<const u32> p, std::span<const u32> dram, Effects& out) {
+    if (p.size() != 5) {
+        return false;
+    }
+    const u32 base = static_cast<u32>(static_cast<s64>(static_cast<s32>(p[0])) * 4) + 0x500;
+    if (base >= DataRamWords || base >= dram.size()) {
+        return false;
+    }
+    if (p[1] == dram[base]) {
+        return true;
+    }
+    if (0x52c >= dram.size() || base + 3 >= DataRamWords) {
+        return false;
+    }
+    const u32 mask = dram[0x52c];
+    AddDramWrite(out, base, p[1]);
+    AddDramWrite(out, base + 1, p[2]);
+    AddDramWrite(out, base + 2, p[3]);
+    AddDramWrite(out, base + 3, p[4]);
+    if ((mask & (1U << (p[0] & 31))) == 0) {
+        return true;
+    }
+    const u32 slot = (p[4] >> 24) & 7;
+    const u32 rt = Merge(0x805, p[4], 4, 3, 24); // 0x805 + 16s
+    AddWrite(out, rt, (p[2] >> 24) & 0xff);
+    AddWrite(out, rt + 1, (p[2] & 0xffffff) << 8);
+    AddWrite(out, rt + 2, (p[4] >> 9) & 0x7f);
+    AddWrite(out, 0x8e0, 0x10000);
+    AddWrite(out, 0x8e1, (p[3] >> 24) & 0xff);
+    AddWrite(out, 0x8e2, (p[3] & 0xffffff) << 8);
+    AddWrite(out, Merge(0x904, p[4], 3, 3, 28), 0x11);
+    AddWrite(out, Merge(0x803, p[4], 4, 3, 24), p[4] & 0x1ff);
+    AddWrite(out, Merge(0x800, p[4], 4, 3, 24), Merge(1, slot, 4, 3, 0));
+    return true;
+}
+
+} // Anonymous namespace
+
+bool Evaluate(const Entry& entry, std::span<const u32> parameters, std::span<const u32> dram,
+              Effects& out) {
+    out = {};
+    switch (entry.kind) {
+    case Kind::ConstantBufferBind:
+        return EvaluateConstantBufferBind(parameters, dram, out);
+    case Kind::SurfaceBind:
+        return EvaluateSurfaceBind(parameters, dram, out);
+    default:
+        return false;
+    }
+}
+
+std::optional<std::string> CheckEffects(const Effects& predicted,
+                                        std::span<const std::pair<u32, u32>> writes,
+                                        std::span<const u32> dram) {
+    std::string differences;
+    if (writes.size() != predicted.num_writes) {
+        differences += fmt::format("{} writes, predicted {}; ", writes.size(),
+                                   predicted.num_writes);
+    }
+    for (u32 i = 0; i < std::min<size_t>(writes.size(), predicted.num_writes); ++i) {
+        if (writes[i] != predicted.writes[i]) {
+            differences += fmt::format("write {} {:#x}={:#x}, predicted {:#x}={:#x}; ", i,
+                                       writes[i].first, writes[i].second,
+                                       predicted.writes[i].first, predicted.writes[i].second);
+        }
+    }
+    for (u32 i = 0; i < predicted.num_dram_writes; ++i) {
+        const auto [index, value] = predicted.dram_writes[i];
+        if (index < dram.size() && dram[index] != value) {
+            differences += fmt::format("data RAM {:#x}={:#x}, predicted {:#x}; ", index,
+                                       dram[index], value);
+        }
+    }
+    if (differences.empty()) {
+        return std::nullopt;
+    }
+    return differences;
 }
 
 bool Applies(const Entry& entry, std::span<const u32> parameters) {

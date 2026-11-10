@@ -3520,6 +3520,12 @@ private:
     void FrontCheckHle(const VideoCommon::V2::MacroHle::Entry& entry, u64 hash,
                        std::span<const u32> parameters,
                        const VideoCommon::V2::MacroHle::Observation& observation);
+    /// Fix F3h (R2-F5-03): macro HLE of a pure macro (ConstantBufferBind, SurfaceBind): its
+    /// data RAM writes and register writes as the macro makes them; and its verify check.
+    void FrontHlePure(Core::System& system, VideoCommon::GpuSplit& split, FrontState& state,
+                      const VideoCommon::V2::MacroHle::Effects& effects);
+    void FrontCheckHlePure(u64 hash, const VideoCommon::V2::MacroHle::Effects& predicted,
+                           const VideoCommon::V2::MacroHle::Observation& observation);
     /// MACROHLE: the back's render_enable.mode into the front's registers (drains; before an
     /// MME read of it while FrontState::v2_render_enable_unknown).
     void FrontSyncRenderEnable(VideoCommon::GpuSplit& split, FrontState& state);

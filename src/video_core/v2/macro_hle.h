@@ -7,6 +7,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "common/common_types.h"
@@ -58,6 +59,15 @@ enum class Kind : u8 {
     /// render_enable.mode = invert ^ (report pair's two (sequence, mode) words differ): the
     /// macro's MME_DMA_READ_FIFOED of a ReportSemaphore::Compare at the DMA source registers.
     RenderEnableCompare,
+    /// Fix F3h (R2-F5-03): NVN2 macros that are a pure function of their parameters and data
+    /// RAM (no register read, no DMA): the front makes their writes and data RAM writes itself
+    /// (Evaluate), without running or memoising them. 3D 96d36d962a7ff692: a constant buffer
+    /// bind to a stage (const_buffer size/address, cb_bind), the stage from data RAM for an
+    /// indexed binding, which it also records in data RAM.
+    ConstantBufferBind,
+    /// 3D 5b6e8dc0f6ab7d8e: a render target address/layer and its constant buffer binding,
+    /// recorded in data RAM; skipped when unchanged there or disabled by a data RAM mask.
+    SurfaceBind,
 };
 
 /// A value from a macro parameter or a literal.
@@ -120,6 +130,25 @@ struct Draw {
     std::span<const std::pair<u32, u32>> writes, std::span<const u32> words);
 /// Parses one line of nx2_macro_hle.txt (also for tests).
 [[nodiscard]] std::optional<Entry> ParseLine(const std::string& line);
+
+/// What a ConstantBufferBind or SurfaceBind call does: its method writes and data RAM writes,
+/// each in order.
+struct Effects {
+    std::array<std::pair<u32, u32>, 8> writes{};
+    u32 num_writes = 0;
+    std::array<std::pair<u32, u32>, 4> dram_writes{};
+    u32 num_dram_writes = 0;
+};
+/// Evaluates the call as the macro computes it (TuringMacroInterpreter's semantics). False when
+/// the entry doesn't model it (another parameter count, a data RAM access out of range: the
+/// macro would fail) and the macro must run.
+[[nodiscard]] bool Evaluate(const Entry& entry, std::span<const u32> parameters,
+                            std::span<const u32> dram, Effects& out);
+/// MACROHLE=verify for Evaluate's kinds: what differs between the macro's run (its writes, the
+/// data RAM after it) and `predicted`; nothing when they agree.
+[[nodiscard]] std::optional<std::string> CheckEffects(
+    const Effects& predicted, std::span<const std::pair<u32, u32>> writes,
+    std::span<const u32> dram);
 
 /// What a macro did on the run that is dumped.
 struct Observation {

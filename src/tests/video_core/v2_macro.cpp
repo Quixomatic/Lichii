@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <array>
+#include <random>
 #include <span>
 #include <sstream>
 #include <string>
@@ -568,6 +569,122 @@ TEST_CASE("V2 macro HLE: the conditional render macro", "[video_core][v2_macro]"
     // Only parameter values the macro turns into a render enable mode.
     CHECK(!MacroHle::Applies(*entry, std::vector<u32>{2, 0x21, 0x13760dc0}));
     CHECK(!MacroHle::Applies(*entry, std::vector<u32>{0, 0x21}));
+}
+
+// Fix F3h (R2-F5-03): the two hot 3D macros the memo can't help (4488 MACRO_DUMP), built in as
+// pure functions of their parameters and data RAM. Evaluate must match the interpreter exactly:
+// writes, data RAM, and which calls it leaves to the macro (those that would fail).
+const std::string cbuf_bind_code = // 96d36d962a7ff692
+    "00000003:1d200000:31c28300 00000003:1d100000:31c18300 00000023:18c02001:f45c6700 "
+    "00000003:18c00148:0b900300 00001203:18c00510:0ba0c300 00000003:18c00120:0810c300 "
+    "00000003:002f8000:72100300 00000003:18c00000:061c7f00 00000003:18c00000:040c7f00 "
+    "0000003f:18c00400:345c6700 00386383:18c000a3:058c4300 20200003:03c00040:058c4300 "
+    "00000003:18c00000:f2400300 00042413:18c00318:0bac4301 00200007:18c004e0:01ac4300";
+const std::string surface_bind_code = // 5b6e8dc0f6ab7d8e
+    "00000003:5c110001:31c00300 00000003:1c400140:32228300 00000000:1a0a4000:70507b00 "
+    "00000003:18c02400:008c7700 00001407:2220014b:31907b00 0000140f:22100140:b2218300 "
+    "00000003:1d300000:31c38300 00000001:05c7c000:31c28300 00000003:18c00000:0e4c7f00 "
+    "00000003:18c00000:0c3c7f00 00000000:20030000:0a2c7f00 00000003:18c02400:300c7700 "
+    "00046017:18c0041e:0bac4300 20208c00:f8c40046:0f8c4300 0c206383:18c0003a:4b8c4300 "
+    "01400003:18c00000:718c0300 20208c00:d8c40046:0d8c4300 00042413:18c0031f:0bac4300 "
+    "00a00003:18c00004:718c0300 0004200f:18c0041e:0bac4300 00200003:18c00048:0b8c4300 "
+    "00042003:18c0041e:0bac4301 00200007:18c0041e:0bac4300";
+
+TEST_CASE("V2 macro HLE: the constant buffer and surface binds match the macros",
+          "[video_core][v2_macro]") {
+    struct Case {
+        const std::string* code;
+        u64 hash;
+        MacroHle::Kind kind;
+        u32 parameters;
+    };
+    const std::array<Case, 2> cases{{
+        {&cbuf_bind_code, 0x96d36d962a7ff692ULL, MacroHle::Kind::ConstantBufferBind, 4},
+        {&surface_bind_code, 0x5b6e8dc0f6ab7d8eULL, MacroHle::Kind::SurfaceBind, 5},
+    }};
+    std::mt19937 rng{0xf3a};
+    for (const Case& test : cases) {
+        const std::vector<u32> code = Code(*test.code);
+        CHECK(MacroHle::Identify(code, 0).hash == test.hash);
+        const MacroHle::Entry* const entry = MacroHle::Find(test.hash);
+        REQUIRE(entry != nullptr);
+        REQUIRE(entry->kind == test.kind);
+        u32 evaluated = 0;
+        u32 with_writes = 0;
+        for (int round = 0; round < 4000; ++round) {
+            // Values that reach every branch: small indices, equal words, mask bits, the
+            // dumped calls' shapes, and out-of-range indices (the macro fails: not modelled).
+            const auto pick = [&](u32 index) -> u32 {
+                switch (rng() % 6) {
+                case 0:
+                    return rng() % 16;
+                case 1:
+                    return index == 0 ? 0x6e0 + rng() % 0x400 : rng();
+                case 2:
+                    return 0x100000 | (rng() % 0x100);
+                case 3:
+                    return (rng() % 8) << 24 | (rng() % 8) << 28 | (rng() & 0xfffff);
+                default:
+                    return rng();
+                }
+            };
+            std::vector<u32> parameters(test.parameters);
+            for (u32 i = 0; i < test.parameters; ++i) {
+                parameters[i] = pick(i);
+            }
+            Tegra::TuringMacroInterpreter::DataRam dram{};
+            for (u32& word : dram) {
+                word = rng() % 4 == 0 ? rng() : rng() % 16;
+            }
+            if (rng() % 3 == 0 && parameters[0] < 0x100) {
+                dram[(0x500 + parameters[0] * 4) % dram.size()] = parameters[1]; // unchanged
+            }
+            dram[0x52c] = rng() % 2 == 0 ? ~0U : rng();
+            const auto before = dram;
+            MacroHle::Effects predicted;
+            const bool modelled = MacroHle::Evaluate(*entry, parameters, before, predicted);
+            Tegra::TuringMacroInterpreter interpreter;
+            interpreter.active_dram = &dram;
+            Pairs writes;
+            std::vector<u32> fifo = parameters;
+            const auto result = interpreter.Execute(
+                code, 0, fifo, [](u32) { return 0U; },
+                [&](u32 method, u32 value) {
+                    writes.emplace_back(method, value);
+                    return true;
+                });
+            if (!result.success) {
+                CHECK(!modelled); // the macro fails: it runs, the HLE doesn't stand for it
+                continue;
+            }
+            REQUIRE(modelled);
+            ++evaluated;
+            with_writes += predicted.num_writes != 0 ? 1 : 0;
+            const auto mismatch = MacroHle::CheckEffects(predicted, writes, dram);
+            CHECK(!mismatch.has_value());
+            if (mismatch) {
+                FAIL(*mismatch);
+            }
+            // Data RAM: exactly the predicted words changed.
+            auto expected = before;
+            for (u32 i = 0; i < predicted.num_dram_writes; ++i) {
+                expected[predicted.dram_writes[i].first] = predicted.dram_writes[i].second;
+            }
+            CHECK(dram == expected);
+        }
+        CHECK(evaluated > 1000);
+        CHECK(with_writes > 200);
+        // Another parameter count: the macro runs.
+        MacroHle::Effects effects;
+        Tegra::TuringMacroInterpreter::DataRam dram{};
+        CHECK(!MacroHle::Evaluate(*entry, std::vector<u32>(test.parameters + 1), dram, effects));
+    }
+    // A wrong prediction is reported.
+    MacroHle::Effects predicted;
+    predicted.writes[0] = {0x8e0, 1};
+    predicted.num_writes = 1;
+    const Pairs made{{0x8e0, 2}};
+    CHECK(MacroHle::CheckEffects(predicted, made, {}).has_value());
 }
 
 TEST_CASE("V2 macro HLE: nx2_macro_hle.txt lines", "[video_core][v2_macro]") {

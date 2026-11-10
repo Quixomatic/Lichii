@@ -2823,6 +2823,7 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
     std::vector<u32> dump_parameters;
     bool dumping = false;
     const MacroHle::Entry* check_entry = nullptr; // MACROHLE=verify: compared after the run
+    MacroHle::Effects hle_effects; // ConstantBufferBind / SurfaceBind: what the entry predicts
     MacroHle::Identity identity{};
     u64 call_key = 0; // MacroMemo::Hash of the call, made once for the stats and the memo
     if (VideoCommon::V2::Stats::Enabled() && engine.native_turing) [[unlikely]] {
@@ -2880,6 +2881,18 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
                              fs.parameters.size(),
                              fs.parameters.empty() ? 0U : fs.parameters[0]);
                 }
+            }
+        } else if (entry != nullptr && (entry->kind == MacroHle::Kind::ConstantBufferBind ||
+                                        entry->kind == MacroHle::Kind::SurfaceBind)) {
+            // Fix F3h (R2-F5-03): a pure function of its parameters and data RAM (no register
+            // read, no DMA): its writes are made here, the macro doesn't run. Under shadow RAM
+            // replay Write3D applies the shadow to them as to the macro's own.
+            if (MacroHle::Evaluate(*entry, fs.parameters, native_data_ram, hle_effects)) {
+                if (hle == VideoCommon::V2::Mode::On) {
+                    FrontHlePure(system, split, fs, hle_effects);
+                    return;
+                }
+                check_entry = entry; // verify: compared with the macro's run below
             }
         } else if (entry != nullptr) {
             const MacroHle::Draw draw = MacroHle::Resolve(*entry, fs.parameters);
@@ -3081,7 +3094,10 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
         }
     }
     if (fs.v2_observation) [[unlikely]] {
-        if (check_entry != nullptr) {
+        if (check_entry != nullptr && (check_entry->kind == MacroHle::Kind::ConstantBufferBind ||
+                                       check_entry->kind == MacroHle::Kind::SurfaceBind)) {
+            FrontCheckHlePure(identity.hash, hle_effects, *fs.v2_observation);
+        } else if (check_entry != nullptr) {
             FrontCheckHle(*check_entry, identity.hash, dump_parameters, *fs.v2_observation);
         }
         if (dumping) {
@@ -3528,6 +3544,44 @@ void Maxwell3D::FrontCheckHle(const VideoCommon::V2::MacroHle::Entry& entry, u64
     }
     if ((checked & 0xffff) == 1) {
         LOG_INFO(HW_GPU, "V2 macro HLE verify: {} calls checked, {} mismatches", checked,
+                 mismatches.load());
+    }
+}
+
+void Maxwell3D::FrontHlePure(Core::System& system, VideoCommon::GpuSplit& split,
+                             FrontState& fs, const VideoCommon::V2::MacroHle::Effects& effects) {
+    // The macro's data RAM writes, then its method writes in order through the front's write
+    // path, as its run would make them (FrontRunMacro's `write`).
+    for (u32 i = 0; i < effects.num_dram_writes; ++i) {
+        native_data_ram[effects.dram_writes[i].first] = effects.dram_writes[i].second;
+    }
+    for (u32 i = 0; i < effects.num_writes; ++i) {
+        const auto [method, value] = effects.writes[i];
+        if (fs.s1_exec) [[likely]] {
+            FrontWriteS1(split, fs, method, value, true, true);
+        } else {
+            FrontWrite(split, fs, method, value, true, true);
+        }
+    }
+    fs.parameters.clear();
+    FrontEndMacro(system, split, fs);
+    if (FrontVerifyEnabled() && (++fs.calls & 4095) == 0) [[unlikely]] {
+        FrontVerify(split, fs);
+    }
+}
+
+void Maxwell3D::FrontCheckHlePure(u64 hash, const VideoCommon::V2::MacroHle::Effects& predicted,
+                                  const VideoCommon::V2::MacroHle::Observation& observation) {
+    static std::atomic<u64> checks{};
+    static std::atomic<u64> mismatches{};
+    const auto mismatch =
+        VideoCommon::V2::MacroHle::CheckEffects(predicted, observation.writes, native_data_ram);
+    const u64 checked = checks.fetch_add(1) + 1;
+    if (mismatch && mismatches.fetch_add(1) < 32) {
+        LOG_WARNING(HW_GPU, "V2 macro HLE verify: macro {:016x}: {}", hash, *mismatch);
+    }
+    if ((checked & 0xffff) == 1) {
+        LOG_INFO(HW_GPU, "V2 macro HLE verify: {} pure calls checked, {} mismatches", checked,
                  mismatches.load());
     }
 }
