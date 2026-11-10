@@ -1714,9 +1714,22 @@ namespace {
 
 // EDEN_NX2_SPLIT_VERIFY=1: every 4096 front macro calls, wait for the back and compare the
 // front's registers with the back's (logs and resynchronizes differences).
-bool FrontVerifyEnabled() {
-    static const bool verify = std::getenv("EDEN_NX2_SPLIT_VERIFY") != nullptr;
+// F1-X3: read once, then one relaxed load and a predictable branch per call (a function-local
+// static paid its thread-safe initialization check, a TLS load, out of line on every macro call).
+std::atomic<s8> g_front_verify{-1};
+
+bool ReadFrontVerify() {
+    const bool verify = std::getenv("EDEN_NX2_SPLIT_VERIFY") != nullptr;
+    g_front_verify.store(verify ? 1 : 0, std::memory_order_relaxed);
     return verify;
+}
+
+inline bool FrontVerifyEnabled() {
+    const s8 verify = g_front_verify.load(std::memory_order_relaxed);
+    if (verify >= 0) [[likely]] {
+        return verify != 0;
+    }
+    return ReadFrontVerify();
 }
 
 // Executable methods ProcessMethodCall handles itself; the rest go to the draw manager.
