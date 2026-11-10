@@ -130,6 +130,19 @@ void BackgroundReadback::AddImageCopy(VkImage image, VkImageAspectFlags aspect, 
     image_copies.push_back({image, aspect, dst, {copies.begin(), copies.end()}});
 }
 
+bool BackgroundReadback::DirectRoute(u64 producer) {
+    const u64 open_tick = scheduler.CurrentTick();
+    const SubmitEngine* const engine = scheduler.GetSubmitEngine();
+    const u64 queued_tick = engine != nullptr ? engine->QueuedTick() : 0;
+    if (ThreadResources().last_post_tick > queued_tick) {
+        return false;
+    }
+    return VideoCommon::V2::ChooseReadbackRoute(false, (std::min)(producer, open_tick), open_tick,
+                                                queued_tick,
+                                                scheduler.GetMasterSemaphore().KnownGpuTick()) ==
+           VideoCommon::V2::ReadbackRoute::Direct;
+}
+
 BackgroundReadback::Job BackgroundReadback::Submit(u64 producer, u64* ride_tick) {
     if (Empty()) {
         return {};

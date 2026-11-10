@@ -186,6 +186,8 @@ public:
     /// R2-F4-07, recording thread: waits for `producer` (a scheduler tick) when it is submitted
     /// and its writes are host-visible. False: the caller takes FinishForHostRead.
     [[nodiscard]] bool WaitForProducerHostRead(u64 producer);
+    /// R2-F4-11: whether a transfer-queue readback for `producer` needs no flush (Direct).
+    [[nodiscard]] bool TransferReadbackDirect(u64 producer);
     /// As FinishForHostRead without waiting: submits and returns the tick to wait for.
     [[nodiscard]] u64 SubmitForHostRead();
     /// Any thread: waits until the GPU passed `tick` (SubmitForHostRead).

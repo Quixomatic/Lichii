@@ -67,6 +67,10 @@ public:
     /// `ride_tick` (if given) is set to 0: no job is left riding an unsubmitted tick.
     Job Submit(u64 producer = (std::numeric_limits<u64>::max)(), u64* ride_tick = nullptr);
 
+    /// R2-F4-11: whether a buffer-only job for `producer` would go Direct (no flush). When not,
+    /// the caller copies on the graphics queue in order instead, riding the open submission.
+    [[nodiscard]] bool DirectRoute(u64 producer);
+
     /// Any thread: waits for the job (and counts its latency). `ride_tick`: the open submission
     /// the job rode (Submit), asked for first if still unsubmitted.
     void Wait(const Job& job, u64 ride_tick = 0);

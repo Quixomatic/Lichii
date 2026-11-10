@@ -499,6 +499,16 @@ bool BufferCache<P>::DownloadMemoryAsync(DAddr device_addr, u64 size,
                     (std::max)(producer_tick, slot_buffers[download.buffer_id].LastUsageTick());
             }
         }
+        if constexpr (requires { runtime.TransferReadbackDirect(producer_tick); }) {
+            if (transfer && v2_producer_reads) [[unlikely]] {
+                // R2-F4-11 (MASTER_PLAN §6: submit only if the sync is unsubmitted): a producer
+                // still in the open submission made the transfer job flush at once. The copies
+                // go in order on the graphics queue instead and ride the open submission (no
+                // later write of that submission can reach the buffer first); the reader's
+                // urgent EnsureSubmitted (WaitForHostRead) submits it, waking an idle back.
+                transfer = runtime.TransferReadbackDirect(producer_tick);
+            }
+        }
         for (Download& download : staged) {
             Buffer& buffer = slot_buffers[download.buffer_id];
             state->copies.push_back({buffer.CpuAddr() + download.copy.src_offset,

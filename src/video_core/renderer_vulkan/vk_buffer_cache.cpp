@@ -743,6 +743,15 @@ void BufferCacheRuntime::NoteMappedGpuWrite() {
     scheduler.WantHostReadBarrier();
 }
 
+bool BufferCacheRuntime::TransferReadbackDirect(u64 producer) {
+    if (scheduler.GetBackgroundReadback()->DirectRoute(producer)) {
+        return true;
+    }
+    // STATS: riding the open submission in order (R2-F4-11), no flush of its own.
+    VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::ReadbacksRiding);
+    return false;
+}
+
 bool BufferCacheRuntime::WaitForProducerHostRead(u64 producer) {
     if (!scheduler.IsSubmitted(producer) || !scheduler.HostVisibleThrough(producer)) {
         return false;
