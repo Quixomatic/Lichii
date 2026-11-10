@@ -44,6 +44,8 @@ enum class Counter : u32 {
     ReadbackFallbacks,
     TextureReadbacks,
     MappedReadbacks,
+    ReadbacksDirect, ///< F4-04: producer already on the queue: no flush
+    ReadbacksRiding, ///< F4-04: rode the open submission without a submit of its own
     EarlyDownloads,  ///< learned downloads recorded right after their writer
     GpuDecodes,
     GpuDecodeBytes,

@@ -658,6 +658,26 @@ TEST_CASE("V2 P5b submits are counted by call site", "[video_core][v2_p5b]") {
     REQUIRE(sites.Take().empty());
 }
 
+TEST_CASE("V2 P5b readbacks submit only if their producer is still open",
+          "[video_core][v2_p5b]") {
+    using VideoCommon::V2::ChooseReadbackRoute;
+    using VideoCommon::V2::ReadbackRoute;
+    // open tick 10, the graphics queue has up to 8, the GPU finished 5.
+    REQUIRE(ChooseReadbackRoute(false, true, 7, 10, 8, 5) == ReadbackRoute::Direct);
+    REQUIRE(ChooseReadbackRoute(false, false, 8, 10, 8, 5) == ReadbackRoute::Direct);
+    REQUIRE(ChooseReadbackRoute(false, true, 0, 10, 0, 0) == ReadbackRoute::Direct);
+    // Handed to the worker but not on the queue yet (B1: the job must not get ahead of it).
+    REQUIRE(ChooseReadbackRoute(false, true, 9, 10, 8, 5) == ReadbackRoute::Ride);
+    REQUIRE(ChooseReadbackRoute(false, false, 9, 10, 8, 5) == ReadbackRoute::FlushNow);
+    // ... unless the GPU already finished it.
+    REQUIRE(ChooseReadbackRoute(false, true, 9, 10, 8, 9) == ReadbackRoute::Direct);
+    // The open tick: ride it, or flush without lazy submissions.
+    REQUIRE(ChooseReadbackRoute(false, true, 10, 10, 9, 9) == ReadbackRoute::Ride);
+    REQUIRE(ChooseReadbackRoute(false, false, 10, 10, 9, 9) == ReadbackRoute::FlushNow);
+    // Image copies carry a release recorded in the open submission.
+    REQUIRE(ChooseReadbackRoute(true, true, 1, 10, 9, 9) == ReadbackRoute::FlushNow);
+}
+
 TEST_CASE("V2 P5b flush decisions at pass boundaries", "[video_core][v2_p5b]") {
     FlushParams params;
     params.pass_boundaries = true;

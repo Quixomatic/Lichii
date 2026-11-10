@@ -5,6 +5,7 @@
 
 #include "common/logging.h"
 #include "video_core/renderer_vulkan/vk_background_readback.h"
+#include "video_core/renderer_vulkan/vk_master_semaphore.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_submit_engine.h"
 #include "video_core/v2/p5b_stats.h"
@@ -129,12 +130,19 @@ void BackgroundReadback::AddImageCopy(VkImage image, VkImageAspectFlags aspect, 
     image_copies.push_back({image, aspect, dst, {copies.begin(), copies.end()}});
 }
 
-BackgroundReadback::Job BackgroundReadback::Submit() {
+BackgroundReadback::Job BackgroundReadback::Submit(u64 producer, u64* ride_tick) {
     if (Empty()) {
         return {};
     }
+    const u64 open_tick = scheduler.CurrentTick();
+    const SubmitEngine* const engine = scheduler.GetSubmitEngine();
+    const auto route = VideoCommon::V2::ChooseReadbackRoute(
+        !image_copies.empty(), ride_tick != nullptr && scheduler.LazyFencesHere(),
+        (std::min)(producer, open_tick), open_tick, engine != nullptr ? engine->QueuedTick() : 0,
+        scheduler.GetMasterSemaphore().KnownGpuTick());
     // The producers (and the releases) go to the GPU; the job waits for that tick.
-    const u64 producer_tick = scheduler.CurrentTick();
+    const u64 producer_tick =
+        route == VideoCommon::V2::ReadbackRoute::Direct ? producer : open_tick;
     Resources& r = ThreadResources();
     const vk::CommandBuffer cmdbuf{TakeCommandBuffer(r), device.GetDispatchLoader()};
     cmdbuf.Begin({
@@ -162,11 +170,30 @@ BackgroundReadback::Job BackgroundReadback::Submit() {
     }
     cmdbuf.End();
     const u64 value = r.values.Next();
-    // Perf fix C (MASTER_PLAN §6 class C): the job rides the producing submission: the submit
-    // path queues it on the transfer queue right behind that tick's own transfer batch, so the
-    // recorder never waits for the worker. Fix pass 1's B1 order (job after the batch graphics
-    // `producer_tick` waits for) holds by construction.
-    if (scheduler.AddTransferJob(*cmdbuf, *r.timeline, value)) {
+    if (route == VideoCommon::V2::ReadbackRoute::Direct) {
+        // F4-04: the producer and its transfer batch are already on their queues (QueuedTick),
+        // so B1's cycle can't form: no flush, no worker wait. A producer of 0 needs no wait.
+        const VkResult result =
+            transfer->Submit(*cmdbuf, scheduler.GetMasterSemaphore().TimelineHandle(),
+                             producer_tick, *r.timeline, value);
+        if (result == VK_ERROR_DEVICE_LOST) {
+            device.ReportLoss();
+        }
+        vk::Check(result);
+        P5bStats::Add(Counter::ReadbacksDirect);
+    } else if (route == VideoCommon::V2::ReadbackRoute::Ride &&
+               scheduler.AddTransferJob(*cmdbuf, *r.timeline, value)) {
+        // F4-04: the producer is open: the job rides it with no submit of its own. The open
+        // submission goes out at the next heuristic submit, the idle hook, or when the reader
+        // asks for it (Wait with ride_tick).
+        scheduler.WantSubmit();
+        *ride_tick = open_tick;
+        P5bStats::Add(Counter::ReadbacksRiding);
+    } else if (scheduler.AddTransferJob(*cmdbuf, *r.timeline, value)) {
+        // Perf fix C (MASTER_PLAN §6 class C): the job rides the producing submission: the submit
+        // path queues it on the transfer queue right behind that tick's own transfer batch, so
+        // the recorder never waits for the worker. Fix pass 1's B1 order (job after the batch
+        // graphics `producer_tick` waits for) holds by construction.
         scheduler.Flush();
     } else {
         scheduler.Flush();
@@ -212,14 +239,19 @@ BackgroundReadback::Job BackgroundReadback::Submit() {
     image_copies.clear();
     if (!joined) {
         // Every wait slot of the next submission holds another thread's job: wait here instead.
-        Wait(job);
+        Wait(job, ride_tick != nullptr ? *ride_tick : 0);
     }
     return job;
 }
 
-void BackgroundReadback::Wait(const Job& job) {
+void BackgroundReadback::Wait(const Job& job, u64 ride_tick) {
     if (!job.Valid()) {
         return;
+    }
+    if (ride_tick != 0) [[unlikely]] {
+        // F4-04: the job rides an open submission: a reader waiting on it is the "interrupt" that
+        // forces the submit (MASTER_PLAN §6).
+        scheduler.EnsureSubmitted(ride_tick);
     }
     const VkSemaphoreWaitInfo wait_info{
         .sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO,

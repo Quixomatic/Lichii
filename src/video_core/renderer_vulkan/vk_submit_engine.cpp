@@ -256,6 +256,7 @@ void SubmitEngine::DoSubmit(SubmitWork& work) {
         }
         vk::Check(job_result);
     }
+    queued_tick.store(work.tick, std::memory_order_release);
     context.submitted = std::chrono::steady_clock::now();
     if (P5bStats::Enabled()) {
         P5bStats::Add(Counter::SubmitThreadSubmits, threaded ? 1 : 0);

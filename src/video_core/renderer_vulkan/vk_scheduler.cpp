@@ -270,6 +270,21 @@ void Scheduler::FlushDeferred() {
     }
 }
 
+void Scheduler::EnsureSubmitted(u64 tick) {
+    if (IsSubmitted(tick)) {
+        return;
+    }
+    auto& split = VideoCommon::GpuSplit::Get();
+    if (!split.Active() || VideoCommon::GpuSplit::OnBackThread()) {
+        Flush();
+        return;
+    }
+    RequestLazyFlush(tick);
+    if (!WaitSubmitted(tick) && !IsSubmitted(tick)) {
+        Flush(); // The back stopped: nothing else uses the scheduler
+    }
+}
+
 bool Scheduler::WaitSubmitted(u64 tick) {
     if (IsSubmitted(tick)) {
         return true;

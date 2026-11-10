@@ -4,6 +4,7 @@
 #pragma once
 
 #include <chrono>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <span>
@@ -58,12 +59,17 @@ public:
         return buffer_copies.empty() && image_copies.empty();
     }
 
-    /// Flushes the open graphics submission and submits the job on this thread's background
-    /// resources. An invalid job means the caller must take the graphics path (nothing queued).
-    Job Submit();
+    /// Submits the job on this thread's background resources. An invalid job means the caller
+    /// must take the graphics path (nothing queued). F4-04: `producer` is the newest graphics
+    /// tick that used the buffers read (UINT64_MAX: unknown, treated as the open one). Already on
+    /// the graphics queue: the job goes to the transfer queue now, waiting on it, without
+    /// flushing. Still open: it rides the open submission (F4-02 lazy mode; `ride_tick` gets that
+    /// tick, which a waiter must ask for), else the open submission is flushed as before.
+    Job Submit(u64 producer = (std::numeric_limits<u64>::max)(), u64* ride_tick = nullptr);
 
-    /// Any thread: waits for the job (and counts its latency).
-    void Wait(const Job& job);
+    /// Any thread: waits for the job (and counts its latency). `ride_tick`: the open submission
+    /// the job rode (Submit), asked for first if still unsubmitted.
+    void Wait(const Job& job, u64 ride_tick = 0);
 
 private:
     struct BufferCopy {

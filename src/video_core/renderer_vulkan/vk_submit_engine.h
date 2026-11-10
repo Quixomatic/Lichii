@@ -130,6 +130,11 @@ public:
     /// waiting on a binary semaphore a handed submission signals (present).
     void WaitSubmitted();
 
+    /// Any thread: the newest tick whose submission (and transfer batch) reached its queue.
+    [[nodiscard]] u64 QueuedTick() const noexcept {
+        return queued_tick.load(std::memory_order_acquire);
+    }
+
     /// Any thread: runs `func` on the finish thread (or the worker without one) once the GPU
     /// finished `tick`.
     void RetireAfter(u64 tick, std::function<void()>&& func);
@@ -166,6 +171,7 @@ private:
     bool submit_waiting{};   ///< under submit_queue_mutex: the submit thread sleeps
     std::atomic<u64> handed{};
     std::atomic<u64> submitted{};
+    std::atomic<u64> queued_tick{};
     std::condition_variable submitted_cv;
     std::mutex submitted_mutex;
     u32 submitted_waiters{}; ///< under submitted_mutex

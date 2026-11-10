@@ -135,9 +135,11 @@ public:
     [[nodiscard]] bool TransferReadbacks() const noexcept;
     void TransferReadbackCopy(VkBuffer staging, Buffer& src, const VideoCommon::BufferCopy& copy,
                               bool mapped);
-    /// Flushes and submits the job: {semaphore, value}.
-    std::pair<u64, u64> SubmitTransferReadback();
-    void WaitTransferReadback(u64 semaphore, u64 value);
+    /// Submits the job: {semaphore, value}. F4-04: `producer_tick` is the newest tick that used
+    /// the buffers read; `ride_tick` gets the open tick the job rode (0: none), which the reader
+    /// passes back to WaitTransferReadback.
+    std::pair<u64, u64> SubmitTransferReadback(u64 producer_tick, u64& ride_tick);
+    void WaitTransferReadback(u64 semaphore, u64 value, u64 ride_tick);
 
 private:
 

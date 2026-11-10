@@ -157,6 +157,30 @@ private:
     std::array<PostJob, MaxPostJobs> post_jobs{};
 };
 
+/// F4-04 (MASTER_PLAN §6: "a submit is forced only if the covering sync is not yet submitted",
+/// Ryujinx): how a readback job reaches the transfer queue.
+enum class ReadbackRoute : u8 {
+    Direct,   ///< its producer is already on the graphics queue: submit now, waiting on it
+    Ride,     ///< the producer is still open: a post job of the open submission, no submit
+    FlushNow, ///< as before: a post job, and the open submission goes out at once
+};
+
+/// `producer`: newest graphics tick that used the job's sources (0: none). `open_tick`: the
+/// recording tick. `queued_tick`: newest tick on the graphics queue. `lazy`: submissions follow
+/// requests (F4-02), so a reader waiting on a riding job asks for it. Image copies carry a
+/// release recorded in the open submission and are waited for at once: always FlushNow.
+[[nodiscard]] constexpr ReadbackRoute ChooseReadbackRoute(bool images, bool lazy, u64 producer,
+                                                          u64 open_tick, u64 queued_tick,
+                                                          u64 gpu_tick) noexcept {
+    if (images) {
+        return ReadbackRoute::FlushNow;
+    }
+    if (producer < open_tick && (producer <= queued_tick || producer <= gpu_tick)) {
+        return ReadbackRoute::Direct;
+    }
+    return lazy ? ReadbackRoute::Ride : ReadbackRoute::FlushNow;
+}
+
 /// A per-thread timeline's values for readback jobs (BackgroundResources): monotonic, and
 /// completion seen without asking the driver when a known value already passed.
 class JobTimeline {

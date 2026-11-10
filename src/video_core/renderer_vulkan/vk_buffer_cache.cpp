@@ -593,11 +593,17 @@ u64 BufferCacheRuntime::SubmitForHostRead() {
     scheduler.RequestOutsideRenderPassOperationContext();
     scheduler.Record(HostReadBarrier);
     const u64 tick = scheduler.CurrentTick();
+    if (scheduler.LazyFencesHere()) [[unlikely]] {
+        // F4-04: no submit of its own; the reader asks for it only if still open (WaitForHostRead).
+        scheduler.WantSubmit();
+        return tick;
+    }
     scheduler.Flush();
     return tick;
 }
 
 void BufferCacheRuntime::WaitForHostRead(u64 tick) {
+    scheduler.EnsureSubmitted(tick);
     scheduler.GetMasterSemaphore().Wait(tick);
 }
 
@@ -615,14 +621,17 @@ void BufferCacheRuntime::TransferReadbackCopy(VkBuffer staging, Buffer& src,
     }
 }
 
-std::pair<u64, u64> BufferCacheRuntime::SubmitTransferReadback() {
-    const auto job = scheduler.GetBackgroundReadback()->Submit();
+std::pair<u64, u64> BufferCacheRuntime::SubmitTransferReadback(u64 producer_tick,
+                                                                u64& ride_tick) {
+    ride_tick = 0;
+    const auto job = scheduler.GetBackgroundReadback()->Submit(producer_tick, &ride_tick);
     return {reinterpret_cast<u64>(job.semaphore), job.value};
 }
 
-void BufferCacheRuntime::WaitTransferReadback(u64 semaphore, u64 value) {
+void BufferCacheRuntime::WaitTransferReadback(u64 semaphore, u64 value, u64 ride_tick) {
     scheduler.GetBackgroundReadback()->Wait(
-        {reinterpret_cast<VkSemaphore>(semaphore), value, std::chrono::steady_clock::now()});
+        {reinterpret_cast<VkSemaphore>(semaphore), value, std::chrono::steady_clock::now()},
+        ride_tick);
 }
 
 bool BufferCacheRuntime::CanReorderUpload(const Buffer& buffer,

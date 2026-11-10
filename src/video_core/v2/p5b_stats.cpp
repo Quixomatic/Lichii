@@ -122,7 +122,8 @@ void Report(const char* thread_name, u64 window_ns) {
     LOG_INFO(HW_GPU,
              "V2 stats {} P5b transfer queue | batches {:.0f}/s, buffer copies {:.0f}/s ({:.0f} "
              "KiB/s), image uploads {:.0f}/s, kept in order {:.0f}/s, acquire joins {:.0f}/s | "
-             "readbacks {:.0f}/s (textures {:.0f}, mapped buffers {:.0f}), latency {:.1f} us, "
+             "readbacks {:.0f}/s (textures {:.0f}, mapped buffers {:.0f}; direct {:.0f}, riding "
+             "{:.0f}), latency {:.1f} us, "
              "fallbacks {:.0f}/s, early downloads in the writer's submission {:.0f}/s",
              thread_name, PerSecond(at(Counter::TransferBatches), seconds),
              PerSecond(at(Counter::TransferCopies), seconds),
@@ -133,6 +134,8 @@ void Report(const char* thread_name, u64 window_ns) {
              PerSecond(at(Counter::Readbacks), seconds),
              PerSecond(at(Counter::TextureReadbacks), seconds),
              PerSecond(at(Counter::MappedReadbacks), seconds),
+             PerSecond(at(Counter::ReadbacksDirect), seconds),
+             PerSecond(at(Counter::ReadbacksRiding), seconds),
              Ratio(at(Counter::ReadbackLatencyUs), at(Counter::ReadbackLanded)),
              PerSecond(at(Counter::ReadbackFallbacks), seconds),
              PerSecond(at(Counter::EarlyDownloads), seconds));

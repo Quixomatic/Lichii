@@ -468,6 +468,14 @@ bool BufferCache<P>::DownloadMemoryAsync(DAddr device_addr, u64 size,
         }
         auto state = std::make_shared<ReadbackState>();
         state->staging = runtime.DownloadStagingBuffer(total_size_bytes, true);
+        // F4-04: the newest tick that used the buffers read, before this readback marks them.
+        u64 producer_tick = 0;
+        if constexpr (requires(Buffer& buffer) { buffer.LastUsageTick(); }) {
+            for (const Download& download : staged) {
+                producer_tick =
+                    (std::max)(producer_tick, slot_buffers[download.buffer_id].LastUsageTick());
+            }
+        }
         for (Download& download : staged) {
             Buffer& buffer = slot_buffers[download.buffer_id];
             state->copies.push_back({buffer.CpuAddr() + download.copy.src_offset,
@@ -495,7 +503,8 @@ bool BufferCache<P>::DownloadMemoryAsync(DAddr device_addr, u64 size,
             }
         } else if (transfer) {
             if constexpr (requires { runtime.TransferReadbacks(); }) {
-                const auto job = runtime.SubmitTransferReadback();
+                // state->tick: the open submission the job rode (F4-04), asked for by the reader.
+                const auto job = runtime.SubmitTransferReadback(producer_tick, state->tick);
                 state->job_semaphore = job.first;
                 state->job_value = job.second;
             }
@@ -506,7 +515,8 @@ bool BufferCache<P>::DownloadMemoryAsync(DAddr device_addr, u64 size,
         land = [state, runtime_ptr = &runtime, memory = &device_memory] {
             if (state->job_value != 0) {
                 if constexpr (requires { runtime_ptr->TransferReadbacks(); }) {
-                    runtime_ptr->WaitTransferReadback(state->job_semaphore, state->job_value);
+                    runtime_ptr->WaitTransferReadback(state->job_semaphore, state->job_value,
+                                                      state->tick);
                 }
             } else if (!state->verify) {
                 runtime_ptr->WaitForHostRead(state->tick);

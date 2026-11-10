@@ -105,6 +105,10 @@ public:
     /// The idle hook (the back goes idle, or another thread asked with RequestIdleHook): what
     /// FlushDeferred submits, plus with lazy fences any work they or WantSubmit wait for.
     void ServeIdleHook();
+    /// Any thread, F4-02/F4-04: `tick` is submitted when this returns. On the split's back it
+    /// submits; other threads ask the back (RequestLazyFlush + WaitSubmitted), or submit
+    /// themselves once the back stopped.
+    void EnsureSubmitted(u64 tick);
     /// Recording thread, F4-02: a thread asked for a tick that is still open.
     [[nodiscard]] bool SubmitRequested() const noexcept {
         const u64 lazy = lazy_flush_tick.load(std::memory_order_relaxed);
