@@ -375,8 +375,10 @@ public:
     }
     /// Verify: recipe bindings the versions vouch for whose ranges the tracker still holds
     /// CPU-modified (a skipped upload would have been needed).
+    /// `detail` (optional) names the first stale binding (S0-G17 diagnostics).
     [[nodiscard]] u32 CountStaleRecipeRanges(const VideoCommon::V2::DrawCache::BufferRecipe& recipe,
-                                             VideoCommon::V2::Versions::EpochMemo& memo);
+                                             VideoCommon::V2::Versions::EpochMemo& memo,
+                                             std::string* detail = nullptr);
     /// F2-X1: the path BindHostGraphicsUniformBuffer takes for this uniform binding now, as a
     /// recipe kind: Normal (root-table bank, native bank, no host buffer), Version (the stream
     /// path; a recipe holds Version only when a version was found) or Cached (the host buffer).

@@ -1576,13 +1576,15 @@ void BufferCache<P>::ReplayHostStageBuffers(size_t stage,
 
 template <class P>
 u32 BufferCache<P>::CountStaleRecipeRanges(const VideoCommon::V2::DrawCache::BufferRecipe& recipe,
-                                           VideoCommon::V2::Versions::EpochMemo& memo) {
+                                           VideoCommon::V2::Versions::EpochMemo& memo,
+                                           std::string* detail) {
     if (!recipe.valid) {
         return 0;
     }
     u32 stale = 0;
     using BindKind = VideoCommon::V2::DrawCache::BufferBind::Kind;
     const auto& gens = VideoCommon::V2::Versions::Gens();
+    const char* list_name = "index";
     const auto check = [&](const VideoCommon::V2::DrawCache::BufferBind& bind) {
         // Only bindings the replay takes from the host buffer: stream copies (Normal) and
         // constant buffer versions (Version) read guest memory, never sync the buffer, and keep
@@ -1595,13 +1597,25 @@ u32 BufferCache<P>::CountStaleRecipeRanges(const VideoCommon::V2::DrawCache::Buf
         }
         if (memo.Unchanged(bind.device_addr, bind.size, recipe.stamp) &&
             memory_tracker.IsRegionCpuModified(bind.device_addr, bind.size)) {
+            if (detail != nullptr && stale == 0) {
+                const Buffer& buffer = slot_buffers[BufferId{bind.buffer_id}];
+                *detail = fmt::format(
+                    "first {} stage {} index {} kind {} range {:#x}+{:#x} buffer {} [{:#x}+{:#x}) "
+                    "gpu-modified {}",
+                    list_name, bind.stage, bind.index, static_cast<u32>(bind.kind),
+                    bind.device_addr, bind.size, bind.buffer_id, buffer.CpuAddr(),
+                    buffer.SizeBytes(), IsRegionGpuModified(bind.device_addr, bind.size));
+            }
             ++stale;
         }
     };
     if (recipe.has_index) {
         check(recipe.index);
     }
+    constexpr std::array<const char*, 4> names{"vertex", "uniform", "storage", "texture"};
+    size_t list = 0;
     for (const auto* binds : {&recipe.vertex, &recipe.uniform, &recipe.storage, &recipe.texture}) {
+        list_name = names[list++];
         for (const auto& bind : *binds) {
             check(bind);
         }

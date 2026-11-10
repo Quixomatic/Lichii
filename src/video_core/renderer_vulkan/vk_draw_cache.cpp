@@ -689,16 +689,20 @@ void DrawCacheGlue::VerifyBufferBytes(const Decision& decision, BufferCache& buf
     if (decision.recipe == nullptr) {
         return;
     }
-    const u32 stale = buffer_cache.CountStaleRecipeRanges(decision.recipe->buffers, memo);
+    std::string detail;
+    const u32 stale = buffer_cache.CountStaleRecipeRanges(decision.recipe->buffers, memo, &detail);
     if (stale == 0) {
         return;
     }
     DC::Counters& counters = GraphicsCounters();
     counters.buffer_stale += stale;
     ++counters.verify_mismatches;
+    // S0-G17: which binding, and whether the record path built the recipe.
     DC::LogMismatch(false, decision.recipe->key,
-                    fmt::format("buffer bytes: {} ranges CPU-modified behind unchanged versions",
-                                stale));
+                    fmt::format("buffer bytes: {} ranges CPU-modified behind unchanged versions "
+                                "({}, recipe from {})",
+                                stale, detail,
+                                decision.recipe->record.Valid() ? "a record" : "a capture"));
 }
 
 void DrawCacheGlue::NoteDrawTime(bool replay, u64 ns) {
