@@ -72,6 +72,13 @@ public:
         return semaphore.Wait(tick, timeout_ns);
     }
 
+    /// F4-10 (MASTER_PLAN §5.5: one thread waits on the timeline): while the finish thread runs
+    /// (EDEN_NX2_V2_SUBMITTHREAD), Wait sleeps on the ticks it publishes instead of waiting on the
+    /// driver itself. Off again when the finish thread stops.
+    void SetFinishPublisher(bool on);
+    /// Finish thread: refreshes the known tick and wakes Wait's sleepers.
+    void PublishFromFinish();
+
 private:
     VkResult SubmitQueueTimeline(vk::CommandBuffer& cmdbuf, vk::CommandBuffer& upload_cmdbuf,
                                  VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
@@ -94,6 +101,10 @@ private:
     std::condition_variable_any wait_cv;
     std::queue<Waitable> wait_queue;  ///< Queue for the fences to be waited on by the wait thread.
     std::deque<vk::Fence> free_queue; ///< Holds available fences for submission.
+    std::atomic<bool> finish_publisher{}; ///< F4-10: SetFinishPublisher
+    std::atomic<u32> publish_waiters{};
+    std::mutex publish_mutex;
+    std::condition_variable publish_cv;
     std::jthread debug_thread;        ///< Debug thread to workaround validation layer bugs.
     std::jthread wait_thread;         ///< Helper thread that waits for submitted fences.
 };

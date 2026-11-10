@@ -4,6 +4,7 @@
 // SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <chrono>
 #include <thread>
 
 #include <ranges>
@@ -76,6 +77,22 @@ void MasterSemaphore::Refresh() {
                                              std::memory_order_relaxed));
 }
 
+void MasterSemaphore::SetFinishPublisher(bool on) {
+    {
+        std::scoped_lock lock{publish_mutex};
+        finish_publisher.store(on, std::memory_order_release);
+    }
+    publish_cv.notify_all();
+}
+
+void MasterSemaphore::PublishFromFinish() {
+    Refresh();
+    if (publish_waiters.load(std::memory_order_seq_cst) != 0) {
+        { std::scoped_lock lock{publish_mutex}; }
+        publish_cv.notify_all();
+    }
+}
+
 void MasterSemaphore::Wait(u64 tick) {
     if (!semaphore) {
         // Fast check: already reached the requested tick?
@@ -101,6 +118,28 @@ void MasterSemaphore::Wait(u64 tick) {
 
     if (IsFree(tick)) {
         return;
+    }
+
+    if (finish_publisher.load(std::memory_order_acquire)) [[unlikely]] {
+        // F4-10: the finish thread is the timeline's one waiter; sleep on what it publishes. The
+        // timed wakeups re-read the counter, so a missed notify or a stopped finish thread only
+        // costs a few milliseconds.
+        publish_waiters.fetch_add(1, std::memory_order_seq_cst);
+        {
+            std::unique_lock lock{publish_mutex};
+            while (!IsFree(tick) && finish_publisher.load(std::memory_order_acquire)) {
+                if (!publish_cv.wait_for(lock, std::chrono::milliseconds{4},
+                                         [&] { return IsFree(tick); })) {
+                    lock.unlock();
+                    Refresh();
+                    lock.lock();
+                }
+            }
+        }
+        publish_waiters.fetch_sub(1, std::memory_order_seq_cst);
+        if (IsFree(tick)) {
+            return;
+        }
     }
 
     // If none of the above is hit, fallback to a regular wait

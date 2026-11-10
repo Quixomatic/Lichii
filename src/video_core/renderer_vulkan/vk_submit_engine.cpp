@@ -5,6 +5,7 @@
 #include <utility>
 
 #include "common/logging.h"
+#include "common/scope_exit.h"
 #include "common/thread.h"
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
 #include "video_core/renderer_vulkan/vk_submit_engine.h"
@@ -389,6 +390,11 @@ void SubmitEngine::SubmitThread(std::stop_token token) {
 
 void SubmitEngine::FinishThread(std::stop_token token) {
     Common::SetCurrentThreadName("VulkanFinish");
+    // F4-10: this thread is the timeline's one waiter; others sleep on what it publishes.
+    master.SetFinishPublisher(true);
+    SCOPE_EXIT {
+        master.SetFinishPublisher(false);
+    };
     while (true) {
         SubmitContext* context = nullptr;
         {
@@ -414,7 +420,7 @@ void SubmitEngine::FinishThread(std::stop_token token) {
                 return;
             }
         }
-        master.Refresh();
+        master.PublishFromFinish();
         {
             std::scoped_lock lock{finish_mutex};
             finish_queue.pop_front();
