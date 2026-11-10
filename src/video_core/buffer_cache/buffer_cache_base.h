@@ -15,6 +15,7 @@
 #include <mutex>
 #include <numeric>
 #include <optional>
+#include <source_location>
 #include <span>
 #include <unordered_map>
 #include <unordered_set>
@@ -886,7 +887,9 @@ private:
     /// Downloads the GPU-written data of several buffers with one wait for the GPU.
     void DownloadBuffersMemory(std::span<const BufferId> buffer_ids);
 
-    void DownloadRangesMemory(std::span<const std::pair<DAddr, u64>> ranges);
+    /// `location` (SYNC Step 8): the caller, named in the STATS "finishes by site".
+    void DownloadRangesMemory(std::span<const std::pair<DAddr, u64>> ranges,
+                              std::source_location location = std::source_location::current());
 
     void DeleteBuffer(BufferId buffer_id, bool do_not_mark = false);
 

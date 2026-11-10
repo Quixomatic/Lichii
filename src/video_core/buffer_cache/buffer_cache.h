@@ -664,7 +664,8 @@ void BufferCache<P>::WaitMappedHostRead(u64 producer) {
 }
 
 template <class P>
-void BufferCache<P>::DownloadRangesMemory(std::span<const std::pair<DAddr, u64>> ranges) {
+void BufferCache<P>::DownloadRangesMemory(std::span<const std::pair<DAddr, u64>> ranges,
+                                          std::source_location location) {
     constexpr bool has_mapped = requires(Buffer& buffer) { buffer.Mapped(); };
     if constexpr (!USE_MEMORY_MAPS) {
         for (const auto& [device_addr, size] : ranges) {
@@ -727,6 +728,8 @@ void BufferCache<P>::DownloadRangesMemory(std::span<const std::pair<DAddr, u64>>
                         read.v2_host_read = true;
                     }
                     WaitMappedHostRead(known ? producer : 0);
+                } else if constexpr (requires { runtime.FinishForHostRead(location); }) {
+                    runtime.FinishForHostRead(location);
                 } else {
                     runtime.FinishForHostRead();
                 }
@@ -739,7 +742,9 @@ void BufferCache<P>::DownloadRangesMemory(std::span<const std::pair<DAddr, u64>>
                 buffer.MarkUsage(download.copy.src_offset, download.copy.size);
                 runtime.CopyBuffer(staging.buffer, buffer, std::span{&download.copy, 1}, true);
             }
-            if constexpr (has_mapped) {
+            if constexpr (requires { runtime.FinishForHostRead(location); }) {
+                runtime.FinishForHostRead(location); // SYNC Step 8: named by the caller
+            } else if constexpr (has_mapped) {
                 runtime.FinishForHostRead();
             } else {
                 runtime.Finish();
