@@ -556,8 +556,31 @@ void GraphicsPipeline::ResolveTargetsAndDynamic(const View& view, const R::Resol
         h.rt_known = prediction.known;
         h.rt_inputs_hold = prediction.inputs_hold;
     }
-    // 7. Dynamic state (scale-independent).
-    h.dynamic = R::ComputeDynamic(view, *ctx.features);
+    // 7. Dynamic state (scale-independent): ComputeDynamic reads the registers and the
+    // topology; a base whose register groups that hold them hash equal has the same values.
+    const R::ResolvedDraw* const dynamic_base = base != nullptr ? base : ctx.previous;
+    const auto same_dynamic = [&] {
+        using VideoCommon::V2::RegGroup;
+        if (dynamic_base == nullptr || dynamic_base->h.status != R::ResolveStatus::Ready ||
+            !dynamic_base->h.groups_valid || !h.groups_valid ||
+            dynamic_base->h.topology != h.topology) {
+            return false;
+        }
+        for (const RegGroup group : {RegGroup::Pipeline, RegGroup::Viewport,
+                                     RegGroup::VertexStreams, RegGroup::IndexBuffer,
+                                     RegGroup::RenderTargets}) {
+            const size_t index = static_cast<size_t>(group);
+            if (dynamic_base->h.group_hashes[index] != h.group_hashes[index]) {
+                return false;
+            }
+        }
+        return true;
+    };
+    if (same_dynamic()) {
+        h.dynamic = dynamic_base->h.dynamic;
+    } else {
+        h.dynamic = R::ComputeDynamic(view, *ctx.features);
+    }
     // 8. Render area, as ConfigureImpl pushes it (Switch 2 titles may never program the
     // surface clip; colour target 0 then).
     const auto& regs = view.Regs();
