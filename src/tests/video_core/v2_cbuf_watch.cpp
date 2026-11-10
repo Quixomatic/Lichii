@@ -455,6 +455,9 @@ TEST_CASE("V2 F2-03: a version on armed pages is trusted until its pages see a w
     arming.Tick(10, false, counts);
     REQUIRE(watch->Take(page, 0x100).armed);
     decode->Bind(0x2000, 0x100, cbuf_bit, env); // trusted again (one compare)
+    // The upgrade is published with the next draw (until then the window is dirty and binds
+    // return before any check).
+    REQUIRE(PublishAll(*decode).size() == 1);
     const u32 before_foreign = env.same_calls;
     decode->Bind(0x2000, 0x100, cbuf_bit, env);
     REQUIRE(env.same_calls == before_foreign);
