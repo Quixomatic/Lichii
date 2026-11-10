@@ -2136,7 +2136,9 @@ TEST_CASE("V2 S1 deltas applied on the back match the method executor on random 
             REQUIRE(s1.root_tables.tables == ref.root_tables.tables);
             REQUIRE(s1.root_tables.offset == ref.root_tables.offset);
         };
-        for (u32 step = 0; step < 6000; ++step) {
+        // 600 steps per seed (was 6000, ~110 s and 18M assertions): every method class still
+        // appears many times per seed.
+        for (u32 step = 0; step < 600; ++step) {
             CAPTURE(step);
             const u32 kind = rng() % 100;
             const bool from_macro = rng() % 2 == 0;
