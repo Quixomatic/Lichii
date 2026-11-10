@@ -29,6 +29,7 @@
 #include "video_core/nx2_perf.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/texture_cache/util.h"
+#include "video_core/v2/cbuf_ring.h"
 #include "video_core/v2/cbuf_version.h"
 #include "video_core/v2/p3_stats.h"
 #include "video_core/v2/v2_stats.h"
@@ -2897,6 +2898,11 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
         // Stream buffer path to avoid stalling on non-Nvidia drivers or Vulkan
         bool streamed = false;
         if constexpr (!IS_OPENGL && VideoCommon::StreamUniformReusable<Runtime>) {
+            if (VideoCommon::V2::On(VideoCommon::V2::Switch::CbufRing)) [[unlikely]] {
+                if (BindRingVersion(stage, index, device_addr, size)) {
+                    return;
+                }
+            }
             // EDEN_NX2_V2_CBUFVER: a version of this range copied earlier in this command buffer
             // (by any stage or slot) that still holds what guest memory holds is referenced
             // again, without a stream allocation or copy (v2/cbuf_version.h).
@@ -2958,6 +2964,59 @@ const u8* BufferCache<P>::V2GuestBytes(DAddr device_addr, u32 size) {
     version_scratch.resize(size);
     device_memory.ReadBlockUnsafe(device_addr, version_scratch.data(), size);
     return version_scratch.data();
+}
+
+template <class P>
+bool BufferCache<P>::BindRingVersion(size_t stage, u32 index, DAddr device_addr, u32 size) {
+    if constexpr (requires { runtime.CbufRingRef(u64{}); }) {
+        namespace V2 = VideoCommon::V2;
+        auto& shared = V2::CbufRing::Get();
+        if (!shared.Ready()) {
+            return false;
+        }
+        auto& ring = shared.ring;
+        const u64 tick = runtime.CurrentTick();
+        ring.Roll(tick, [this](u64 done) { return runtime.IsFree(done); });
+        const bool stats = V2::P3Stats::Enabled();
+        auto& data = V2::P3Stats::Get();
+        if (stats) {
+            ++data.ring_binds;
+        }
+        const V2::CbufRing::BackTable::Entry* const entry = shared.table.Find(device_addr, size);
+        if (entry == nullptr || !ring.Usable(entry->position)) {
+            if (stats) {
+                ++(entry == nullptr ? data.ring_none : data.ring_old);
+            }
+            return false;
+        }
+        // The version is what the shader reads only while its bytes equal guest memory now:
+        // a write the front could not see (guest CPU) ends it here (F2-03 replaces this
+        // compare with write tracking).
+        const u64 offset = ring.Offset(entry->position);
+        if (std::memcmp(shared.shadow.get() + offset, V2GuestBytes(device_addr, size), size) !=
+            0) {
+            if (stats) {
+                ++data.ring_mismatches;
+            }
+            if (V2::Verify(V2::Switch::CbufRing)) {
+                static std::atomic<u32> logged{};
+                if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+                    LOG_WARNING(HW_GPU,
+                                "V2 cbuf ring verify: stage {} cbuf {} at {:#x}+{:#x}: the "
+                                "decode-time version at {:#x} differs from guest memory",
+                                stage, index, device_addr, size, entry->position);
+                }
+            }
+            return false;
+        }
+        ring.Use(tick, entry->position);
+        runtime.RebindStreamUniform(runtime.CbufRingRef(offset), size);
+        if (stats) {
+            ++data.ring_hits;
+        }
+        return true;
+    }
+    return false;
 }
 
 template <class P>

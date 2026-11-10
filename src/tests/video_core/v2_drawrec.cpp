@@ -16,6 +16,7 @@
 
 #include "video_core/v2/cbuf_ring.h"
 #include "video_core/v2/commit.h"
+#include "video_core/v2/hazard.h"
 #include "video_core/v2/resolve/draw_record.h"
 #include "video_core/v2/resolve/dynamic_state.h"
 #include "video_core/v2/v2_switches.h"
@@ -278,21 +279,131 @@ TEST_CASE("V2 F2-02: the version ring retires by timeline value", "[video_core][
     REQUIRE(ring.Head() == 0xf00);
     REQUIRE_FALSE(ring.Allocate(0x200, 0x100).has_value()); // would wrap over unretired bytes
     REQUIRE(ring.Refusals() == 1);
-    // Back: two submits; the first one's completion frees only what it referenced.
-    ring.NoteSubmit(5, 0x110);
-    ring.NoteSubmit(6, 0x110); // nothing new
-    ring.NoteSubmit(7, 0xf00);
-    ring.Collect(4);
-    REQUIRE(ring.Retired() == 0);
-    ring.Collect(6);
-    REQUIRE(ring.Retired() == 0x110);
-    // 0x200 bytes at the next lap need positions up to 0x1200: 0x1200 - 0x110 > capacity.
-    REQUIRE_FALSE(ring.Allocate(0x200, 0x100).has_value());
-    ring.Collect(7);
-    REQUIRE(ring.Retired() == 0xf00);
+    // Back: the bind floor is head - capacity / 2; nothing below it is bound again, so it is
+    // free once no running tick references it.
+    u64 completed = 0;
+    const auto is_free = [&](u64 tick) { return tick <= completed; };
+    ring.Roll(5, is_free);
+    REQUIRE(ring.Floor() == 0x700);
+    REQUIRE_FALSE(ring.Usable(0x200));
+    REQUIRE(ring.Usable(0x700));
+    ring.Use(5, 0x700);
+    REQUIRE(ring.Retired() == 0x700);
     const auto wrapped = ring.Allocate(0x200, 0x100);
-    REQUIRE(wrapped == 0x1000);
+    REQUIRE(wrapped == 0x1000); // the tail is skipped
     REQUIRE(ring.Offset(*wrapped) == 0);
+    ring.Roll(6, is_free);
+    REQUIRE(ring.Floor() == 0xa00);
+    REQUIRE_FALSE(ring.Usable(0x700));
+    REQUIRE(ring.Retired() == 0x700); // tick 5 still runs and holds 0x700
+    REQUIRE_FALSE(ring.Allocate(0x700, 0x100).has_value());
+    REQUIRE(ring.Refusals() == 2);
+    completed = 5;
+    ring.Roll(7, is_free);
+    REQUIRE(ring.Retired() == 0xa00);
+    REQUIRE(ring.Allocate(0x700, 0x100) == 0x1200);
+}
+
+namespace {
+
+/// A guest memory of 0x10000 bytes at GPU address 0 and a hazard answer for the decode tests.
+struct DecodeEnv {
+    std::vector<u8> memory = std::vector<u8>(0x10000);
+    u32 writers = 0;
+    u32 reads = 0;
+    u32 Writers(u64, u32) {
+        return writers;
+    }
+    bool Read(u64 va, u32 size, u8* dst) {
+        ++reads;
+        std::memcpy(dst, memory.data() + va, size);
+        return true;
+    }
+};
+
+struct Published {
+    u64 va;
+    u32 size;
+    u64 position;
+};
+
+std::vector<Published> PublishAll(V2::CbufRing::Decode& decode) {
+    std::vector<Published> out;
+    decode.Publish([&](u64 va, u32 size, u64 position) { out.push_back({va, size, position}); });
+    return out;
+}
+
+} // Anonymous namespace
+
+TEST_CASE("V2 F2-02: constant buffer versions are made at decode", "[video_core][v2_drawrec]") {
+    static V2::CbufRing::Shared shared;
+    std::vector<u8> mapped(V2::CbufRing::Shared::Capacity);
+    shared.Init(mapped.data(), 256);
+    V2::CbufRing::Decode decode{shared};
+    DecodeEnv env;
+    constexpr u32 cbuf_bit = V2::ProducerBit(V2::Producer::CbData);
+    for (u32 i = 0; i < 0x100; ++i) {
+        env.memory[0x1000 + i] = static_cast<u8>(i);
+    }
+    // First write to a window with nothing in flight: guest memory is the base.
+    const u32 a = 0xaabbccdd;
+    decode.Write(0x1000, 0x100, 0x10, &a, 1, cbuf_bit, env);
+    const u32 b = 0x11223344;
+    decode.Write(0x1000, 0x100, 0x14, &b, 1, cbuf_bit, env); // patched in place
+    REQUIRE(env.reads == 1);
+    auto published = PublishAll(decode);
+    REQUIRE(published.size() == 1);
+    REQUIRE(published[0].va == 0x1000);
+    REQUIRE(published[0].size == 0x100);
+    const u64 first = published[0].position;
+    const u8* const ring = mapped.data() + shared.ring.Offset(first);
+    REQUIRE(ring[0x20] == 0x20);
+    u32 word = 0;
+    std::memcpy(&word, ring + 0x10, 4);
+    REQUIRE(word == a);
+    std::memcpy(&word, ring + 0x14, 4);
+    REQUIRE(word == b);
+    REQUIRE(PublishAll(decode).empty()); // nothing changed since the draw
+    // A write after the draw: a new version. Only this data in flight: the previous version.
+    env.writers = cbuf_bit;
+    const u32 c = 0x55667788;
+    decode.Write(0x1000, 0x100, 0x10, &c, 1, cbuf_bit, env);
+    REQUIRE(env.reads == 1);
+    published = PublishAll(decode);
+    REQUIRE(published.size() == 1);
+    REQUIRE(published[0].position != first);
+    const u8* const second = mapped.data() + shared.ring.Offset(published[0].position);
+    std::memcpy(&word, second + 0x10, 4);
+    REQUIRE(word == c);
+    std::memcpy(&word, second + 0x14, 4);
+    REQUIRE(word == b);
+    std::memcpy(&word, ring + 0x10, 4);
+    REQUIRE(word == a); // published versions never change
+    // Another producer in flight over the window: no version, the back drops its own.
+    env.writers = cbuf_bit | V2::ProducerBit(V2::Producer::Copy);
+    decode.Write(0x1000, 0x100, 0x10, &a, 1, cbuf_bit, env);
+    published = PublishAll(decode);
+    REQUIRE(published.size() == 1);
+    REQUIRE(published[0].position == V2::CbufRing::NoPosition);
+    // Writes outside the window or windows too large for the stream path make none either.
+    env.writers = 0;
+    decode.Write(0x2000, 0x10, 0x10, &a, 1, cbuf_bit, env);
+    decode.Write(0x3000, 0x10000, 0, &a, 1, cbuf_bit, env);
+    published = PublishAll(decode);
+    REQUIRE(published.size() == 2);
+    REQUIRE(published[0].position == V2::CbufRing::NoPosition);
+    REQUIRE(published[1].position == V2::CbufRing::NoPosition);
+}
+
+TEST_CASE("V2 F2-02: the back table maps versions by device address", "[video_core][v2_drawrec]") {
+    V2::CbufRing::BackTable table;
+    table.Set(0x8000, 0x100, 0x400);
+    REQUIRE(table.Find(0x8000, 0x80) != nullptr);
+    REQUIRE(table.Find(0x8000, 0x80)->position == 0x400);
+    REQUIRE(table.Find(0x8000, 0x200) == nullptr); // the bind reads more than the version
+    REQUIRE(table.Find(0x8040, 0x40) == nullptr);
+    table.Drop(0x8000);
+    REQUIRE(table.Find(0x8000, 0x80) == nullptr);
 }
 
 namespace {

@@ -729,6 +729,9 @@ private:
     /// True when an unchanged version was referenced; false when it bound a new copy.
     bool BindUniformVersion(size_t stage, u32 index, u32 binding_index, DAddr device_addr,
                             u32 size);
+    /// EDEN_NX2_V2_CBUFRING: binds the decode-time version of the range (v2/cbuf_ring.h) while
+    /// its bytes equal guest memory. False when there is none or it differs.
+    bool BindRingVersion(size_t stage, u32 index, DAddr device_addr, u32 size);
     /// EDEN_NX2_V2_CBUFVER: what guest memory holds at [device_addr, device_addr + size) now
     /// (a direct span, or a copy in version_scratch).
     const u8* V2GuestBytes(DAddr device_addr, u32 size);

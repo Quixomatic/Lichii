@@ -38,6 +38,7 @@
 #include "video_core/textures/texture.h"
 #include "video_core/texture_cache/image_info.h"
 #include "video_core/texture_cache/util.h"
+#include "video_core/v2/cbuf_ring.h"
 #include "video_core/v2/draw_model.h"
 #include "video_core/v2/front_writes.h"
 #include "video_core/v2/ir_exec.h"
@@ -997,6 +998,19 @@ void Maxwell3D::ExecuteS1Run(const u64* it, const u64* const end) {
             draw_manager.DrawPredicted(*this, S1::DrawOf(it), static_cast<u8>(word >> 8));
             it += S1::DrawWords;
             break;
+        case S1::Tag::CbufVersion: {
+            // The window's decode-time version, by device address for the uniform binds.
+            auto& table = VideoCommon::V2::CbufRing::Get().table;
+            if (const auto device = memory_manager.GpuToCpuAddress(it[1])) {
+                if (it[2] == VideoCommon::V2::CbufRing::NoPosition) {
+                    table.Drop(*device);
+                } else {
+                    table.Set(*device, S1::ValueOf(word), it[2]);
+                }
+            }
+            it += S1::CbufVersionWords;
+            break;
+        }
         case S1::Tag::Inline: {
             const u32 count = S1::ValueOf(word);
             draw_manager.SetInlineIndexBuffer(*this, S1::IndexOf(word),
@@ -1698,6 +1712,8 @@ struct Maxwell3D::FrontState {
     /// kept only with EDEN_NX2_V2_PARALLEL (v2_cbufs_wanted).
     VideoCommon::V2::Resolve::CbufTable v2_cbufs;
     bool v2_cbufs_wanted{};
+    /// EDEN_NX2_V2_CBUFRING (S1 with the hazard table only): decode-time cbuf versions.
+    std::unique_ptr<VideoCommon::V2::CbufRing::Decode> v2_cbuf_ring;
     /// Register blocks of 64 changed since the last P6 snapshot (all after a copy or resync).
     u64 v2_dirty_blocks{~u64{0}};
     std::unique_ptr<VideoCommon::V2::RegSem::Front3D> v2;
@@ -1883,6 +1899,12 @@ Maxwell3D::FrontState& Maxwell3D::Front(Core::System& system, VideoCommon::GpuSp
                     front->s1_hooks[method] = hooks;
                 }
             }
+            if (front->s1_exec && split.TracksWrites() &&
+                VideoCommon::V2::On(VideoCommon::V2::Switch::CbufRing) &&
+                VideoCommon::V2::CbufRing::Get().Ready()) [[unlikely]] {
+                front->v2_cbuf_ring = std::make_unique<VideoCommon::V2::CbufRing::Decode>(
+                    VideoCommon::V2::CbufRing::Get());
+            }
             if (front->s1_exec) {
                 // The front's DrawModel decides every draw from now on (it took the state above);
                 // the back's state machine stays idle so that nothing on it issues a draw.
@@ -1982,6 +2004,7 @@ M3D_FORCE_INLINE void Maxwell3D::FrontWriteRegSemOn(VideoCommon::GpuSplit& split
 struct Maxwell3D::S1Sink {
     VideoCommon::GpuSplit& split;
     Maxwell3D* engine;
+    FrontState* fs{}; ///< Set where EDEN_NX2_V2_CBUFRING versions the data words
 
     void Delta(u32 index, u32 value) {
         namespace S1 = VideoCommon::V2::S1;
@@ -1999,6 +2022,9 @@ struct Maxwell3D::S1Sink {
     void Cbuf(bool store, u32 method, u64 buffer, u32 offset, u32 word) {
         split.S1Cbuf(engine, store, method - MAXWELL3D_REG_INDEX(const_buffer.buffer), buffer,
                      offset, word);
+        if (fs != nullptr && fs->v2_cbuf_ring) [[unlikely]] {
+            engine->FrontCbufVersion(split, *fs, buffer, offset, &word, 1);
+        }
     }
     void Inline(u32 method, const u32* words, u32 count) {
         split.S1Inline(engine, method, words, count);
@@ -2031,7 +2057,7 @@ M3D_FORCE_INLINE void Maxwell3D::FrontWriteS1(VideoCommon::GpuSplit& split, Fron
         ++fs.s1_same_writes; // the hooks only follow sent writes
         return;
     }
-    S1Sink sink{split, this};
+    S1Sink sink{split, this, &fs};
     VideoCommon::V2::S1::Classify3D(fs.regs.data(), table, fs.s1_touch.data(), fs.back_skip_same,
                                     method, old_value, old_offset, is_last_call, sink);
     if ((flags & RegSem::DrawManager) != 0) [[unlikely]] {
@@ -2083,6 +2109,9 @@ void Maxwell3D::FrontMultiS1(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
                            fs.regs[MAXWELL3D_REG_INDEX(const_buffer.address_low)];
         RegSem::WriteMulti3D(fs, table, method, base_start, amount, effects);
         split.S1CbufBlock(this, buffer, offset, base_start, amount);
+        if (fs.v2_cbuf_ring) [[unlikely]] {
+            FrontCbufVersion(split, fs, buffer, offset, base_start, amount);
+        }
     } else if ((flags & RegSem::InlineData) != 0) {
         // Upload data only: the back's CallMultiMethod reads no register for it.
         RegSem::WriteMulti3D(fs, table, method, base_start, amount, effects);
@@ -2148,6 +2177,9 @@ void Maxwell3D::FrontS1Draws(VideoCommon::GpuSplit& split, FrontState& fs,
     if (out.count == 0) {
         return;
     }
+    if (fs.v2_cbuf_ring && fs.v2_cbuf_ring->Pending()) [[unlikely]] {
+        FrontPublishCbufVersions(split, fs);
+    }
     FrontS1Groups(split, fs);
     for (u32 i = 0; i < out.count; ++i) {
         u64* const entry = split.S1Begin(this, S1::DrawWords);
@@ -2156,6 +2188,51 @@ void Maxwell3D::FrontS1Draws(VideoCommon::GpuSplit& split, FrontState& fs,
         split.S1Commit(S1::DrawWords);
     }
     split.S1PaceDraws(out.count);
+}
+
+void Maxwell3D::FrontCbufVersion(VideoCommon::GpuSplit& split, FrontState& fs, u64 buffer,
+                                 u32 offset, const u32* words, u32 count) {
+    namespace V2 = VideoCommon::V2;
+    struct Env {
+        VideoCommon::GpuSplit& split;
+        const Tegra::MemoryManager& memory;
+        u32 Writers(u64 va, u32 size) {
+            const auto first = memory.GpuToCpuAddress(va);
+            const auto last = memory.GpuToCpuAddress(va + size - 1);
+            if (!first || !last || *last != *first + size - 1) {
+                return V2::CbufRing::Decode::UnknownWriters;
+            }
+            // (a): in-flight writes of any producer over the window, this front's constant
+            // buffer data included, by the hazard table. Unbounded writers (shader stores the
+            // front can't place) are left to the back's compare at the bind.
+            V2::HazardFilter filter{};
+            filter.ranged = V2::AllProducers;
+            const V2::HazardResult result = split.FindWrites(*first, size, filter);
+            if (result.kind == V2::HazardResult::Kind::Clear) {
+                return 0;
+            }
+            return result.producers != 0 ? result.producers
+                                         : V2::CbufRing::Decode::UnknownWriters;
+        }
+        bool Read(u64 va, u32 size, u8* dst) {
+            memory.ReadBlockUnsafe(va, dst, size);
+            return true;
+        }
+    } env{split, memory_manager};
+    const u32 size = fs.regs[MAXWELL3D_REG_INDEX(const_buffer.size)];
+    fs.v2_cbuf_ring->Write(buffer, size, offset, words, count,
+                           V2::ProducerBit(V2::Producer::CbData), env);
+}
+
+void Maxwell3D::FrontPublishCbufVersions(VideoCommon::GpuSplit& split, FrontState& fs) {
+    namespace S1 = VideoCommon::V2::S1;
+    fs.v2_cbuf_ring->Publish([&](u64 va, u32 size, u64 position) {
+        u64* const entry = split.S1Begin(this, S1::CbufVersionWords);
+        entry[0] = static_cast<u64>(S1::Tag::CbufVersion) | (u64{size} << 32);
+        entry[1] = va;
+        entry[2] = position;
+        split.S1Commit(S1::CbufVersionWords);
+    });
 }
 
 void Maxwell3D::FrontS1Groups(VideoCommon::GpuSplit& split, FrontState& fs) {

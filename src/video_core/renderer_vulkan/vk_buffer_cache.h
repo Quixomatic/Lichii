@@ -150,6 +150,7 @@ public:
                                 GuestDescriptorQueue& guest_descriptor_queue,
                                 ComputePassDescriptorQueue& compute_pass_descriptor_queue,
                                 DescriptorPool& descriptor_pool);
+    ~BufferCacheRuntime();
 
     void TickFrame(Common::SlotVector<Buffer>& slot_buffers) noexcept;
 
@@ -250,6 +251,27 @@ public:
         };
         RebindStreamUniform(last_stream_uniform, size);
         return ref.mapped_span;
+    }
+
+    /// Verify (Step 0 R-8): the bytes of `size` at `offset` of `buffer` when it is the stream
+    /// buffer, else an empty span.
+    [[nodiscard]] std::span<const u8> StreamBytes(VkBuffer buffer, u64 offset,
+                                                  u64 size) const noexcept {
+        const std::span<const u8> mapped = staging_pool.StreamMapped();
+        if (buffer != staging_pool.StreamBuf() || offset + size > mapped.size()) {
+            return {};
+        }
+        return mapped.subspan(offset, size);
+    }
+
+    /// EDEN_NX2_V2_CBUFRING: the ring range at `offset` as a stream reference (BufferCache's
+    /// BindRingVersion; the ring retires a version only after the ticks that bound it).
+    [[nodiscard]] StreamUniformRef CbufRingRef(u64 offset) const noexcept {
+        return StreamUniformRef{
+            .buffer = *cbuf_ring_buffer,
+            .device_address = cbuf_ring_address,
+            .offset = static_cast<u32>(offset),
+        };
     }
 
     /// The allocation of the latest BindMappedUniformBuffer call.
@@ -404,6 +426,10 @@ private:
     VkDeviceSize multi_range_total{};
 
     StreamUniformRef last_stream_uniform{};
+
+    /// EDEN_NX2_V2_CBUFRING: the decode-time constant buffer version ring (v2/cbuf_ring.h).
+    vk::Buffer cbuf_ring_buffer;
+    VkDeviceAddress cbuf_ring_address{};
 
     bool limit_dynamic_storage_buffers = false;
     u32 max_dynamic_storage_buffers = (std::numeric_limits<u32>::max)();

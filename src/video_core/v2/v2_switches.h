@@ -59,6 +59,7 @@ enum class Switch : u32 {
     MultiFront,   ///< EDEN_NX2_V2_MULTIFRONT: front engines over channel groups (P6b)
     MacroMemo,    ///< EDEN_NX2_V2_MACROMEMO: front macro calls replayed (v2/macro_memo.h, F5)
     DrawRec,      ///< EDEN_NX2_V2_DRAWREC: ResolveDraw / ApplyDraw / EncodeDraw (P6 Step 0)
+    CbufRing,     ///< EDEN_NX2_V2_CBUFRING: decode-time constant buffer versions (F2-02)
     Count,
 };
 
@@ -98,6 +99,7 @@ inline constexpr std::array<const char*, static_cast<size_t>(Switch::Count)> swi
     "MULTIFRONT",
     "MACROMEMO",
     "DRAWREC",
+    "CBUFRING",
 };
 
 namespace Detail {

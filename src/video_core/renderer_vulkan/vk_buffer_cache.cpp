@@ -21,7 +21,9 @@
 
 #include "video_core/renderer_vulkan/maxwell_to_vk.h"
 #include "video_core/renderer_vulkan/vk_bindless_heap.h"
+#include "video_core/v2/cbuf_ring.h"
 #include "video_core/v2/p3_stats.h"
+#include "video_core/v2/v2_switches.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
@@ -450,6 +452,38 @@ BufferCacheRuntime::BufferCacheRuntime(const Device& device_, MemoryAllocator& m
                                                                      scheduler_, staging_pool_);
     quad_strip_index_buffer = std::make_shared<QuadStripIndexBuffer>(device_, memory_allocator_,
                                                                      scheduler_, staging_pool_);
+    if (VideoCommon::V2::On(VideoCommon::V2::Switch::CbufRing)) [[unlikely]] {
+        VkBufferCreateInfo ring_ci{
+            .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .size = VideoCommon::V2::CbufRing::Shared::Capacity,
+            .usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+            .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+            .queueFamilyIndexCount = 0,
+            .pQueueFamilyIndices = nullptr,
+        };
+        if (device.IsBufferDeviceAddressSupported()) {
+            ring_ci.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+        }
+        cbuf_ring_buffer = memory_allocator.CreateBuffer(ring_ci, MemoryUsage::Stream);
+        if (device.IsBufferDeviceAddressSupported()) {
+            cbuf_ring_address = device.GetLogical().GetBufferDeviceAddress(*cbuf_ring_buffer);
+        }
+        const std::span<u8> mapped = cbuf_ring_buffer.Mapped();
+        if (!mapped.empty()) {
+            VideoCommon::V2::CbufRing::Get().Init(mapped.data(), GetUniformBufferAlignment());
+        }
+        LOG_INFO(Render_Vulkan, "V2 F2-02 constant buffer version ring: {} MiB, {}",
+                 VideoCommon::V2::CbufRing::Shared::Capacity >> 20,
+                 mapped.empty() ? "not host visible, off" : "mapped");
+    }
+}
+
+BufferCacheRuntime::~BufferCacheRuntime() {
+    if (cbuf_ring_buffer) {
+        VideoCommon::V2::CbufRing::Get().Shutdown();
+    }
 }
 
 u32 BufferCacheRuntime::SetVertexRepackLayout(const Tegra::Engines::Maxwell3D::Regs& regs,

@@ -3560,6 +3560,11 @@ private:
                       const VideoCommon::V2::DrawOutput& out);
     /// The dirty groups, hashes and fast draw breaks the next draw sees (an S1 Groups entry).
     void FrontS1Groups(VideoCommon::GpuSplit& split, FrontState& state);
+    /// EDEN_NX2_V2_CBUFRING: constant buffer data written to the selected window at decode
+    /// (v2/cbuf_ring.h), and the changed windows' versions sent before a draw.
+    void FrontCbufVersion(VideoCommon::GpuSplit& split, FrontState& state, u64 buffer,
+                          u32 offset, const u32* words, u32 count);
+    void FrontPublishCbufVersions(VideoCommon::GpuSplit& split, FrontState& state);
     /// The end of a front macro: sends what the back does there (a deferred instanced batch the
     /// macro left) when it can do anything. Returns whether it did.
     bool FrontEndMacro(Core::System& system, VideoCommon::GpuSplit& split, FrontState& state);

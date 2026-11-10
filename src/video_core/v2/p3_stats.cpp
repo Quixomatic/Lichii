@@ -7,6 +7,7 @@
 #include <fmt/format.h>
 
 #include "common/logging.h"
+#include "video_core/v2/cbuf_ring.h"
 #include "video_core/v2/p3_stats.h"
 
 namespace VideoCommon::V2::P3Stats {
@@ -97,6 +98,31 @@ void Report(const char* thread_name, u64 window_ns) {
                  Percent(d.cbuf_hits, d.cbuf_binds), PerSecond(d.cbuf_copies, window_ns),
                  PerSecond(d.cbuf_bytes_saved, window_ns) / 1024.0, d.cbuf_verify,
                  d.cbuf_mismatches);
+    }
+    if (d.ring_binds != 0) {
+        // The front's counters since the last line (one back thread reports them).
+        auto& shared = CbufRing::Get();
+        static u64 last_versions, last_guest, last_kept, last_none;
+        const u64 versions = shared.versions.load(std::memory_order_relaxed);
+        const u64 guest = shared.guest_bases.load(std::memory_order_relaxed);
+        const u64 kept = shared.kept_bases.load(std::memory_order_relaxed);
+        const u64 none = shared.no_version.load(std::memory_order_relaxed);
+        LOG_INFO(HW_GPU,
+                 "V2 stats {} F2-02 cbuf ring: {:.0f} small binds/s, ring hits {:.1f}% (no "
+                 "version {:.1f}%, below floor {:.1f}%, bytes differ {:.1f}%) | front: versions "
+                 "{:.0f}/s (from guest memory {:.0f}/s, kept {:.0f}/s), none {:.0f}/s, ring "
+                 "retired {:#x} of head {:#x}",
+                 thread_name, PerSecond(d.ring_binds, window_ns),
+                 Percent(d.ring_hits, d.ring_binds), Percent(d.ring_none, d.ring_binds),
+                 Percent(d.ring_old, d.ring_binds), Percent(d.ring_mismatches, d.ring_binds),
+                 PerSecond(versions - last_versions, window_ns),
+                 PerSecond(guest - last_guest, window_ns), PerSecond(kept - last_kept, window_ns),
+                 PerSecond(none - last_none, window_ns), shared.ring.Retired(),
+                 shared.ring.Head());
+        last_versions = versions;
+        last_guest = guest;
+        last_kept = kept;
+        last_none = none;
     }
     const u64 heap_work = d.heap_draws + d.heap_partial_draws + d.heap_fallback_draws +
                           d.heap_dispatches + d.heap_partial_dispatches +

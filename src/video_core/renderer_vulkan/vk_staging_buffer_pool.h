@@ -43,6 +43,10 @@ public:
     [[nodiscard]] VkBuffer StreamBuf() const noexcept {
         return *stream_buffer;
     }
+    /// The stream buffer's mapping (verify reads what an allocation holds).
+    [[nodiscard]] std::span<const u8> StreamMapped() const noexcept {
+        return stream_pointer;
+    }
 
     void TickFrame();
 

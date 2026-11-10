@@ -49,7 +49,11 @@ enum class Tag : u8 {
     /// KeplerCompute (native class): [tag][dirty 8-23], then one hash per hashed compute group
     /// in dirty; the front's compute groups before a write that may launch QMDs.
     ComputeGroups = 14,
+    /// EDEN_NX2_V2_CBUFRING (v2/cbuf_ring.h): [tag][size 32-63], [window GPU address], [ring
+    /// position, ~0 for none]; the window's decode-time version, sent before the next draw.
+    CbufVersion = 15,
 };
+inline constexpr size_t CbufVersionWords = 3;
 
 inline constexpr u64 TagMask = 0xf;
 inline constexpr u64 IsLast = 1 << 4;
@@ -131,6 +135,8 @@ inline constexpr u32 LightGroups = GroupBit(RegGroup::DrawParams) |
         return 1 + static_cast<size_t>(std::popcount(GroupsDirty(word) & HashedGroups));
     case Tag::ComputeGroups:
         return 1 + static_cast<size_t>(std::popcount(GroupsDirty(word) & HashedComputeGroups));
+    case Tag::CbufVersion:
+        return CbufVersionWords;
     default:
         return 1;
     }

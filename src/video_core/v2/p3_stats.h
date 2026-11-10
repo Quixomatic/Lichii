@@ -58,6 +58,12 @@ struct Data {
     u64 cbuf_bytes_saved{};
     u64 cbuf_verify{};
     u64 cbuf_mismatches{};
+    // EDEN_NX2_V2_CBUFRING (the back's binds; the front's counters are in CbufRing::Shared)
+    u64 ring_binds{};
+    u64 ring_hits{};
+    u64 ring_none{};       ///< no version of the range
+    u64 ring_old{};        ///< below the bind floor
+    u64 ring_mismatches{}; ///< the version's bytes differ from guest memory
     // EDEN_NX2_V2_BINDLESS
     u64 heap_draws{};          ///< every image descriptor in the heap
     u64 heap_partial_draws{};  ///< some left out (heap_reasons)
