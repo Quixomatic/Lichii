@@ -5,6 +5,8 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#include "common/cpu_features.h"
+#include "common/uint128.h"
 #elif defined(__linux__)
 #include <pthread.h>
 #include <time.h>
@@ -13,8 +15,27 @@
 namespace Common {
 namespace {
 
+#ifdef _WIN32
+/// M-02: QueryThreadCycleTime counts TSC ticks charged to the thread at every context switch, so
+/// short bursts are charged exactly; GetThreadTimes counts whole 15.625 ms scheduler ticks and
+/// over-charges threads that wake briefly. 0 when the TSC rate is unknown or not invariant.
+u64 CycleFrequency() {
+#ifdef ARCHITECTURE_x86_64
+    return g_cpu_caps.invariant_tsc ? g_cpu_caps.tsc_frequency : 0;
+#else
+    return 0;
+#endif
+}
+#endif
+
 std::optional<u64> ReadNativeClock(std::intptr_t native_clock) {
 #ifdef _WIN32
+    if (const u64 frequency = CycleFrequency(); frequency != 0) {
+        ULONG64 cycles{};
+        if (QueryThreadCycleTime(reinterpret_cast<HANDLE>(native_clock), &cycles)) {
+            return MultiplyAndDivide64(cycles, 1'000'000'000ULL, frequency);
+        }
+    }
     FILETIME creation{}, exit{}, kernel{}, user{};
     if (!GetThreadTimes(reinterpret_cast<HANDLE>(native_clock), &creation, &exit, &kernel, &user)) {
         return std::nullopt;
