@@ -173,7 +173,8 @@ bool DmaPusher::Step() {
 
     if (header.size > 0) {
         if (header.sync && g_nx2_ampere.load(std::memory_order_relaxed)) {
-            VideoCommon::GpuSplit::Get().NoteSync();
+            // The fetch waits for this channel's earlier work only (W-01a).
+            VideoCommon::GpuSplit::Get().NoteChannelSync();
         }
         // EDEN_NX2_FETCH_DRAIN=1: wait for the back before every entry, as before the split
         // overlapped the two halves again.

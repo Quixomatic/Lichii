@@ -745,9 +745,20 @@ public:
     void NoteSync() {
         NoteSyncAt(write_position);
     }
+    /// Fix F3f (W-01a): a host-level wait that orders the current channel's own earlier work
+    /// only (a GP entry's sync bit, the puller's wait for idle): the hazard table's later
+    /// lookups for this channel wait for its unbounded writes, not other channels' (those are
+    /// ordered against it only through semaphores and syncpoints, NoteSync/NoteSyncAt).
+    void NoteChannelSync() {
+        NoteSyncAt(write_position, true);
+    }
+    /// Front: the channel whose commands follow (Scheduler::BindChannel).
+    void SetFrontChannel(u32 channel) {
+        hazards.SetChannel(channel);
+    }
     /// A sync that orders only the work sent up to `position` (F3-X5: an acquire met by a
     /// queued release orders what came before that release, not what the front sent since).
-    void NoteSyncAt(u64 position) {
+    void NoteSyncAt(u64 position, bool channel_only = false) {
         const u64 at = std::min(position, write_position);
         last_sync_position = std::max(last_sync_position, at);
         if (transfer_join_hook != nullptr) [[unlikely]] {
@@ -764,7 +775,11 @@ public:
             Defer(Join{transfer_join_hook, transfer_join_argument});
         }
         if (tracks_writes) [[unlikely]] {
-            hazards.NoteSync(at);
+            if (channel_only) {
+                hazards.NoteChannelSync(at);
+            } else {
+                hazards.NoteSync(at);
+            }
         }
     }
     /// Waits until the back executed the work sent before the last NoteSync. Returns whether any

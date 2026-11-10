@@ -24,6 +24,7 @@ void Scheduler::BindChannel(GPU& gpu, s32 bind_id) {
     // With the GPU thread split the rasterizer's channel switches with the methods around it, on
     // the back thread (deferred outside the lock: the back takes it to bind).
     if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
+        split.SetFrontChannel(static_cast<u32>(bind_id));
         const VideoCommon::V2::Ir::ChannelBody body{
             .scheduler = split.Ref(this),
             .gpu = split.Ref(&gpu),

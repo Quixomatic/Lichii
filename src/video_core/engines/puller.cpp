@@ -1100,7 +1100,8 @@ void Puller::CallPullerMethod(DmaPusher& dma_pusher, const MethodCall& method_ca
     case BufferMethods::WaitForIdle:
         OnBackBarrier(dma_pusher, VideoCommon::V2::Ir::BarrierOp::WaitForIdle,
                       [rasterizer = dma_pusher.rasterizer] { rasterizer->WaitForIdle(); });
-        VideoCommon::GpuSplit::Get().NoteSync();
+        // The channel's own engines go idle (W-01a: other channels' work isn't ordered by it).
+        VideoCommon::GpuSplit::Get().NoteChannelSync();
         break;
     case BufferMethods::SemaphoreOperation: {
         ProcessSemaphoreTriggerMethod(dma_pusher);

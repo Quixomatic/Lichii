@@ -33,7 +33,17 @@ void HazardTable::Clear() {
     for (auto& history : unbounded_history) {
         history.fill(0);
     }
+    for (auto& history : unbounded_history_channel) {
+        history.fill(0);
+    }
     unbounded_noted.fill(0);
+    for (auto& synced : channel_synced) {
+        synced.fill(0);
+    }
+    for (auto& own : channel_unbounded) {
+        own.fill(0);
+    }
+    current_channel = 0;
     overflow_position = 0;
     overflows = 0;
 }
@@ -148,31 +158,52 @@ void HazardTable::NoteUnbounded(Producer producer, u64 position) {
         return;
     }
     unbounded[p] = position;
-    unbounded_history[p][unbounded_noted[p]++ % UnboundedHistory] = position;
+    const size_t slot = unbounded_noted[p]++ % UnboundedHistory;
+    unbounded_history[p][slot] = position;
+    unbounded_history_channel[p][slot] = current_channel;
+    channel_unbounded[current_channel % ChannelSlots][p] = position;
+}
+
+u64 HazardTable::SyncedUnbounded(size_t p, u64 position, u32 channel) const {
+    constexpr u32 any = ~0U;
+    if (channel == any && unbounded[p] <= position) {
+        return unbounded[p];
+    }
+    u64 oldest = ~u64{0};
+    u64 synced = 0;
+    bool found = false;
+    for (size_t i = 0; i < UnboundedHistory; ++i) {
+        const u64 noted = unbounded_history[p][i];
+        if (noted == 0) {
+            continue;
+        }
+        oldest = std::min(oldest, noted);
+        if (noted <= position && (channel == any || unbounded_history_channel[p][i] == channel)) {
+            synced = std::max(synced, noted);
+            found = true;
+        }
+    }
+    if (!found && unbounded_noted[p] > UnboundedHistory) {
+        synced = oldest; // An older one fell out of the history
+    }
+    return synced;
 }
 
 void HazardTable::NoteSync(u64 position) {
     for (size_t p = 0; p < NumProducers; ++p) {
-        u64 synced = unbounded[p];
-        if (synced > position) {
-            u64 oldest = ~u64{0};
-            synced = 0;
-            bool found = false;
-            for (const u64 noted : unbounded_history[p]) {
-                if (noted == 0) {
-                    continue;
-                }
-                oldest = std::min(oldest, noted);
-                if (noted <= position) {
-                    synced = std::max(synced, noted);
-                    found = true;
-                }
-            }
-            if (!found && unbounded_noted[p] > UnboundedHistory) {
-                synced = oldest; // An older one fell out of the history
-            }
-        }
-        unbounded_synced[p] = std::max(unbounded_synced[p], synced);
+        unbounded_synced[p] = std::max(unbounded_synced[p], SyncedUnbounded(p, position, ~0U));
+    }
+}
+
+void HazardTable::NoteChannelSync(u64 position) {
+    const size_t slot = current_channel % ChannelSlots;
+    auto& synced = channel_synced[slot];
+    for (size_t p = 0; p < NumProducers; ++p) {
+        // Syncs are noted as they are sent: the channel's newest unbounded write precedes it.
+        const u64 own = channel_unbounded[slot][p];
+        synced[p] = std::max(synced[p], own <= position
+                                            ? own
+                                            : SyncedUnbounded(p, position, current_channel));
     }
 }
 
@@ -241,7 +272,8 @@ HazardResult HazardTable::Find(u64 address, u64 size, u64 consumed, const Hazard
         if ((filter.unbounded & bit) != 0) {
             position = unbounded[p];
         } else if ((filter.unbounded_synced & bit) != 0) {
-            position = unbounded_synced[p];
+            position = std::max(unbounded_synced[p],
+                                channel_synced[current_channel % ChannelSlots][p]);
         }
         if (position > consumed) {
             wait = std::max(wait, position);

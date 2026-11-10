@@ -110,7 +110,7 @@ public:
     /// A write of [address, address + size) whose bytes the front doesn't know. A CbData write
     /// that continues the previous one extends it.
     void NoteRange(u64 address, u64 size, u64 position, Producer producer);
-    /// A write the front can't bound.
+    /// A write the front can't bound, sent by the current channel (SetChannel).
     void NoteUnbounded(Producer producer, u64 position);
     /// A host-level wait was sent at `position`: the unbounded writes before it are complete
     /// before what the front fetches after it (HazardFilter::unbounded_synced). `position` may
@@ -118,7 +118,19 @@ public:
     /// work before that release): the newest unbounded write at or before it counts, or, past
     /// what UnboundedHistory keeps, the oldest one kept (later, so the wait covers it).
     void NoteSync(u64 position);
+    /// Fix F3f (W-01a): a wait that orders only the current channel's own work (a GP entry's
+    /// sync bit, the puller's wait for idle): the unbounded writes that channel sent before
+    /// `position` count for its later lookups; other channels' don't (they are ordered against
+    /// it only through a semaphore, NoteSync). Lookups take the current channel's.
+    void NoteChannelSync(u64 position);
+    /// The channel the front runs (Scheduler::BindChannel).
+    void SetChannel(u32 channel) {
+        current_channel = channel;
+    }
     static constexpr size_t UnboundedHistory = 8;
+    /// Channels' own syncs, by bind id modulo this (channels sharing a slot share their syncs,
+    /// which only makes their waits longer).
+    static constexpr size_t ChannelSlots = 16;
     /// Drops entries the back consumed.
     void Retire(u64 consumed);
 
@@ -188,7 +200,18 @@ private:
     /// Per producer: the last UnboundedHistory distinct positions of its unbounded writes.
     std::array<std::array<u64, UnboundedHistory>, static_cast<size_t>(Producer::Count)>
         unbounded_history{};
+    /// The channel of each unbounded_history entry.
+    std::array<std::array<u32, UnboundedHistory>, static_cast<size_t>(Producer::Count)>
+        unbounded_history_channel{};
     std::array<u64, static_cast<size_t>(Producer::Count)> unbounded_noted{};
+    /// NoteChannelSync, per channel slot and producer; and each slot's newest unbounded write.
+    std::array<std::array<u64, static_cast<size_t>(Producer::Count)>, ChannelSlots>
+        channel_synced{};
+    std::array<std::array<u64, static_cast<size_t>(Producer::Count)>, ChannelSlots>
+        channel_unbounded{};
+    u32 current_channel = 0;
+    /// The newest unbounded write at or before `position` (of `channel` only, unless ~0U).
+    [[nodiscard]] u64 SyncedUnbounded(size_t producer, u64 position, u32 channel) const;
     u64 overflow_position = 0; ///< Pending entries that no longer fit
     u64 overflows = 0;
 };

@@ -207,6 +207,37 @@ TEST_CASE("V2 hazard table: overlap, forwarding and retirement", "[video_core][v
         CHECK(table.Find(0x9000, 4, 0, synced).position == 110);
     }
 
+    SECTION("W-01a: a channel's own sync orders its unbounded writes, not other channels'") {
+        HazardFilter synced;
+        synced.ranged = 0;
+        synced.unbounded_synced = ProducerBit(Producer::Dispatch);
+        table.SetChannel(2);
+        table.NoteUnbounded(Producer::Dispatch, 100); // channel 2's dispatch
+        table.SetChannel(1);
+        table.NoteUnbounded(Producer::Dispatch, 120); // channel 1's
+        table.SetChannel(3);
+        table.NoteUnbounded(Producer::Dispatch, 125); // channel 3's, after channel 1's
+        table.SetChannel(1);
+        table.NoteChannelSync(130); // channel 1's GP entry sync bit (or its WFI)
+        const HazardResult own = table.Find(0x9000, 4, 0, synced);
+        CHECK(own.kind == Kind::Wait);
+        CHECK(own.position == 120); // its own dispatch, not channel 3's at 125
+        CHECK(table.Find(0x9000, 4, 120, synced).kind == Kind::Clear);
+        // Channel 2 sent no sync: its fetches are not ordered after anything.
+        table.SetChannel(2);
+        CHECK(table.Find(0x9000, 4, 0, synced).kind == Kind::Clear);
+        // An acquire met by a release at 110 orders every channel's work before it.
+        table.NoteSync(110);
+        CHECK(table.Find(0x9000, 4, 0, synced).position == 100);
+        table.SetChannel(1);
+        CHECK(table.Find(0x9000, 4, 0, synced).position == 120); // the later of both
+        CHECK(table.Find(0x9000, 4, 110, synced).position == 120);
+        // A channel with no unbounded write of its own: its sync waits for nothing new.
+        table.SetChannel(4);
+        table.NoteChannelSync(140);
+        CHECK(table.Find(0x9000, 4, 100, synced).kind == Kind::Clear);
+    }
+
     SECTION("constant buffer words grow one write within a page") {
         for (u32 i = 0; i < 64; ++i) {
             table.NoteRange(0x8000 + i * 4, 4, 100 + i, Producer::CbData);
