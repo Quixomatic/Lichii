@@ -319,6 +319,25 @@ TEST_CASE("V2 DRAWREC: the verify encode needs the configure's buffer ids, not a
     REQUIRE(R::SameBufferIds(regen, with_buffers(900, 7)));
 }
 
+TEST_CASE("V2 DRAWREC: a uniform over the draw's own written storage is told apart",
+          "[video_core][v2_drawrec]") {
+    // eac4735c2b DRAWREC=verify payload 1,373 on 8068c8d6daee9d81: the same 0x1b0 bytes from
+    // another buffer and offset. The second encode sees the configure's written marks applied.
+    const auto with = [](DAddr ubo_addr, u8 written) {
+        R::ResolvedDraw record = SampleRecord();
+        record.h.ubo = record.Push(std::span<const R::ResolvedUbo>(std::array{
+            R::ResolvedUbo{.stage = 0, .slot = 1, .daddr = ubo_addr, .size = 0x1b0}}));
+        record.h.ssbo = record.Push(std::span<const R::ResolvedSsbo>(std::array{
+            R::ResolvedSsbo{.stage = 4, .index = 0, .written = written, .daddr = 0x30000,
+                            .size = 0x1000}}));
+        return record;
+    };
+    REQUIRE(R::ReadsOwnWrites(with(0x30100, 1)));
+    // Read-only storage, or a uniform elsewhere: not the case.
+    REQUIRE_FALSE(R::ReadsOwnWrites(with(0x30100, 0)));
+    REQUIRE_FALSE(R::ReadsOwnWrites(with(0x31000, 1)));
+}
+
 TEST_CASE("V2 DRAWREC: a table update to a known view compares as that view",
           "[video_core][v2_drawrec]") {
     // F2e (c236: views differ on 13% of draws): a ViewBind proxy (the TIC entry changed, its

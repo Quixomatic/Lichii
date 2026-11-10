@@ -1447,6 +1447,26 @@ void GraphicsPipeline::VerifyDrawEncode(const R::ResolvedDraw& record) {
          (observer->render_area[0] == record.h.render_area.w &&
           observer->render_area[1] == record.h.render_area.h)) &&
         heap_push.words == observer->heap_words;
+    const auto only_sources_differ = [&] {
+        // Every differing entry binds the same number of bytes (another source of a range).
+        const DescriptorUpdateEntry* const encoded = guest_descriptor_queue.UpdateData();
+        for (size_t i = 0; i < count; ++i) {
+            if (!same_entry(encoded[i], observer->payload[i]) &&
+                encoded[i].buffer.range != observer->payload[i].buffer.range) {
+                return false;
+            }
+        }
+        return true;
+    };
+    if (!payload_equal && count == observer->payload.size() && R::ReadsOwnWrites(record) &&
+        only_sources_differ()) {
+        // A uniform over this draw's written storage: the second encode sees the configure's
+        // written marks applied (GPU-modified), so its bind path may differ (8068c8d6daee9d81:
+        // the same 0x1b0 bytes from another buffer and offset). Dependent, as other effects of
+        // the configure on the compare.
+        R::CountRecordStat(stats.dependent);
+        payload_equal = true;
+    }
     if (!payload_equal) {
         R::CountRecordStat(stats.mismatches[static_cast<size_t>(R::RecordGroup::Payload)]);
     }

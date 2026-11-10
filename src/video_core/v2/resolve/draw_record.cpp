@@ -152,6 +152,26 @@ bool SameBufferIds(const ResolvedDraw& lhs, const ResolvedDraw& rhs) {
            same(static_cast<ResolvedTbo*>(nullptr), l.tbo, r.tbo);
 }
 
+bool ReadsOwnWrites(const ResolvedDraw& record) {
+    const DrawHeader& h = record.h;
+    const auto overlaps = [](DAddr a, u64 a_size, DAddr b, u64 b_size) {
+        return a_size != 0 && b_size != 0 && a < b + b_size && b < a + a_size;
+    };
+    for (const ResolvedUbo& ubo : record.Span<const ResolvedUbo>(h.ubo)) {
+        for (const ResolvedSsbo& ssbo : record.Span<const ResolvedSsbo>(h.ssbo)) {
+            if (ssbo.written != 0 && overlaps(ubo.daddr, ubo.size, ssbo.daddr, ssbo.size)) {
+                return true;
+            }
+        }
+        for (const ResolvedTbo& tbo : record.Span<const ResolvedTbo>(h.tbo)) {
+            if (tbo.written != 0 && overlaps(ubo.daddr, ubo.size, tbo.daddr, tbo.size)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 std::string DescribeRecordGroup(const ResolvedDraw& resolved, const ResolvedDraw& observed,
                                 RecordGroup group) {
     const DrawHeader& r = resolved.h;

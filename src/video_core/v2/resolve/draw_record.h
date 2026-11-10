@@ -433,6 +433,12 @@ struct ResolveContext {
 /// channel state's bindings from its record, so it runs only on this (S0-G18).
 [[nodiscard]] bool SameBufferIds(const ResolvedDraw& lhs, const ResolvedDraw& rhs);
 
+/// DRAWREC=verify: whether a uniform buffer of the record overlaps a storage or texture buffer
+/// the same draw writes. The verify's second encode runs after the configure's commit applied
+/// those written marks, so the uniform's bind path (stream copy while not GPU-modified, else the
+/// host buffer) can differ from the configure's: a payload difference there is dependent.
+[[nodiscard]] bool ReadsOwnWrites(const ResolvedDraw& record);
+
 /// DRAWREC=verify: replaces the view proxies of table updates whose view the lookup already
 /// knows (ViewBind requests: a cached view or the null view) with that view, so the compare
 /// with the old configure is exact for them. Creations keep their proxies (dependent).
