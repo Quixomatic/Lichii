@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstring>
 #include <map>
 #include <memory>
 #include <span>
@@ -13,8 +14,11 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include "video_core/v2/cbuf_ring.h"
 #include "video_core/v2/cbuf_watch.h"
+#include "video_core/v2/hazard.h"
 
+namespace V2 = VideoCommon::V2;
 namespace W = VideoCommon::V2::CbufWatch;
 
 namespace {
@@ -264,5 +268,122 @@ TEST_CASE("V2 F2-03: the armed list releases its oldest pages over the cap",
     arming.ReleaseAll(counts);
     for (const auto& [page, count] : counts.counts) {
         REQUIRE(count == 0);
+    }
+}
+
+namespace {
+
+constexpr u64 DeviceBase = 0x100000;
+
+/// Guest memory of 0x10000 bytes; GPU address va maps to device DeviceBase + (va & 0xffff), so
+/// 0x11000 aliases 0x1000.
+struct WatchEnv {
+    std::vector<u8> memory = std::vector<u8>(0x10000);
+    u32 writers = 0;
+    u64 maps = 0;
+    u32 same_calls = 0;
+    u32 Writers(u64, u32) {
+        return writers;
+    }
+    bool Read(u64 va, u32 size, u8* dst) {
+        std::memcpy(dst, memory.data() + (va & 0xffff), size);
+        return true;
+    }
+    bool Same(u64 va, u32 size, const u8* bytes) {
+        ++same_calls;
+        return std::memcmp(memory.data() + (va & 0xffff), bytes, size) == 0;
+    }
+    u64 shift = 0; ///< a remap moves every window
+    u64 Device(u64 va, u32) {
+        return DeviceBase + shift + (va & 0xffff);
+    }
+    u64 Maps() {
+        return maps;
+    }
+};
+
+struct Version {
+    u64 va;
+    u32 size;
+    u64 position;
+};
+
+std::vector<Version> PublishAll(V2::CbufRing::Decode& decode) {
+    std::vector<Version> out;
+    decode.Publish([&](u64 va, u32 size, u64 position) { out.push_back({va, size, position}); });
+    return out;
+}
+
+const Version* Find(const std::vector<Version>& versions, u64 va) {
+    for (const Version& version : versions) {
+        if (version.va == va) {
+            return &version;
+        }
+    }
+    return nullptr;
+}
+
+u32 WordAt(const std::vector<u8>& mapped, const V2::CbufRing::Shared& shared, u64 position,
+           u32 offset) {
+    u32 word = 0;
+    std::memcpy(&word, mapped.data() + shared.ring.Offset(position) + offset, 4);
+    return word;
+}
+
+} // Anonymous namespace
+
+TEST_CASE("V2 F2-03: constant buffer data through one window reaches every window over it",
+          "[video_core][v2_cbufwatch]") {
+    static V2::CbufRing::Shared shared;
+    std::vector<u8> mapped(V2::CbufRing::Shared::Capacity);
+    shared.Init(mapped.data(), 256);
+    auto decode = std::make_unique<V2::CbufRing::Decode>(shared, true);
+    WatchEnv env;
+    constexpr u32 cbuf_bit = V2::ProducerBit(V2::Producer::CbData);
+    // B = [0x1080, 0x1180) overlaps A = [0x1000, 0x1100); C aliases A's device bytes.
+    decode->Bind(0x1080, 0x100, cbuf_bit, env);
+    decode->Bind(0x11000, 0x100, cbuf_bit, env);
+    auto versions = PublishAll(*decode);
+    REQUIRE(versions.size() == 2);
+    const u64 first_b = Find(versions, 0x1080)->position;
+    const u64 cows = shared.cow_versions.load();
+    // Data through A over B's first bytes: B was published, so it is copied, then patched.
+    const u32 x = 0x11111111;
+    decode->Write(0x1000, 0x100, 0x80, &x, 1, cbuf_bit, env);
+    REQUIRE(shared.cow_versions.load() == cows + 2); // B and C
+    env.writers = cbuf_bit; // the data is in flight from now on: kept bases
+    const u32 y = 0x22222222;
+    decode->Write(0x1000, 0x100, 0x84, &y, 1, cbuf_bit, env);
+    REQUIRE(shared.cow_versions.load() == cows + 2); // unpublished now: patched in place
+    // The alias C gets A's bytes too (its first word lies outside B).
+    const u32 z = 0x33333333;
+    decode->Write(0x1000, 0x100, 0x00, &z, 1, cbuf_bit, env);
+    versions = PublishAll(*decode);
+    REQUIRE(versions.size() == 3);
+    const Version* const b = Find(versions, 0x1080);
+    const Version* const c = Find(versions, 0x11000);
+    REQUIRE(b != nullptr);
+    REQUIRE(c != nullptr);
+    REQUIRE(b->position != first_b);
+    REQUIRE(WordAt(mapped, shared, b->position, 0) == x);
+    REQUIRE(WordAt(mapped, shared, b->position, 4) == y);
+    REQUIRE(WordAt(mapped, shared, first_b, 0) == 0); // published versions never change
+    REQUIRE(WordAt(mapped, shared, c->position, 0) == z);
+    REQUIRE(WordAt(mapped, shared, c->position, 0x80) == x);
+    // Another producer's ranged write over B's tail (not A's bytes) drops B only.
+    decode->NoteWrite(DeviceBase + 0x1150, 4);
+    versions = PublishAll(*decode);
+    REQUIRE(versions.size() == 1);
+    REQUIRE(versions[0].va == 0x1080);
+    REQUIRE(versions[0].position == V2::CbufRing::NoPosition);
+    // A window whose mapping moved loses its version (the back drops the old device's entry).
+    env.maps = 1;
+    env.shift = 0x10000;
+    env.writers = 0;
+    decode->Bind(0x1000, 0x100, cbuf_bit, env);
+    versions = PublishAll(*decode);
+    REQUIRE(Find(versions, 0x1000) != nullptr);
+    for (const Version& version : versions) {
+        REQUIRE(version.position == V2::CbufRing::NoPosition);
     }
 }

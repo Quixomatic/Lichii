@@ -245,6 +245,9 @@ public:
     /// landing ticket.
     void NoteKnownWrite(u64 device_address, const void* bytes, u32 size, V2::Producer producer) {
         FlushCbWrite();
+        if (range_write_listener != nullptr) [[unlikely]] {
+            range_write_listener(range_write_context, device_address, size);
+        }
         PrepareHazardNote();
         hazards.NoteKnown(device_address, bytes, size, write_position, producer);
         RememberRelease(device_address, bytes, size, write_position, false,
@@ -256,6 +259,9 @@ public:
             FlushCbWrite();
             if (producer == V2::Producer::QmdRelease) {
                 last_qmd_release = write_position;
+            }
+            if (range_write_listener != nullptr) [[unlikely]] {
+                range_write_listener(range_write_context, device_address, size);
             }
         }
         PrepareHazardNote();
@@ -317,6 +323,19 @@ public:
     /// translations (FlushCbWriteSlow) are checked against it, maps without a drain included.
     static void NoteMapExecuted() {
         maps_executed.fetch_add(1, std::memory_order_release);
+    }
+    [[nodiscard]] static u64 MapsExecuted() {
+        return maps_executed.load(std::memory_order_acquire);
+    }
+    /// Front, EDEN_NX2_V2_CBUFRING (F2-03): the decode-time versions hear of every ranged write
+    /// but constant buffer data (theirs), to drop the windows it overlaps.
+    using RangeWriteListener = void (*)(void* context, u64 device_address, u64 size);
+    void SetRangeWriteListener(RangeWriteListener listener, void* context) {
+        range_write_listener = listener;
+        range_write_context = context;
+    }
+    [[nodiscard]] void* RangeWriteContext() const {
+        return range_write_context;
     }
     /// Front: the newest compute/copy work sent before the last host-level sync (NoteSync).
     [[nodiscard]] u64 SyncedWriterPosition() const {
@@ -1031,6 +1050,8 @@ private:
         u64 device; ///< ~0: unmapped
     };
     static inline std::atomic<u64> maps_executed{0};
+    RangeWriteListener range_write_listener{}; ///< SetRangeWriteListener
+    void* range_write_context{};
     std::array<CbTranslation, 64> cb_translations{}; ///< FlushCbWriteSlow
     u32 map_epoch{};        ///< MapEpoch
     u64 front_spin_start{};

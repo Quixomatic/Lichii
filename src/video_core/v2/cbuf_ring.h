@@ -11,6 +11,7 @@
 #include <limits>
 #include <memory>
 #include <optional>
+#include <unordered_map>
 #include <vector>
 
 #include "common/common_types.h"
@@ -230,6 +231,14 @@ struct Shared {
     std::atomic<u64> bind_versions{};   ///< made at a bind (no constant buffer data written)
     std::atomic<u64> in_flight_bases{}; ///< guest bytes taken while writers were in flight
     std::atomic<u64> refused{};         ///< no ring space
+    std::atomic<u64> overlap_patches{}; ///< F2-03: data through one window patched another
+    std::atomic<u64> cow_versions{};    ///< ... a published one, copied first
+    std::atomic<u64> write_drops{};     ///< windows dropped by another producer's ranged write
+    /// F2-03: the live decoders (one per 3D front). Versions are trusted only while there is
+    /// exactly one: a decoder patches the windows it knows, not another channel's.
+    std::atomic<u32> decoders{};
+    /// Moves with every decoder made: back entries of an earlier decoder are not trusted.
+    std::atomic<u32> decode_epoch{};
 };
 
 [[nodiscard]] inline Shared& Get() {
@@ -246,8 +255,16 @@ struct Shared {
 /// flight and the window has no version to copy (its earlier words may be rewritten before the
 /// draw); otherwise there is no version. A bind of a window with no current version (one the
 /// guest CPU fills) makes one from guest memory, and takes it again when guest memory no longer
-/// holds its bytes. Either way the back binds a version only while its bytes equal guest memory
-/// at the bind, so a write neither saw (a guest CPU write) costs a fallback, never a wrong bind.
+/// holds its bytes. Without the write watch the back binds a version only while its bytes equal
+/// guest memory at the bind, so a write neither saw (a guest CPU write) costs a fallback, never a
+/// wrong bind.
+///
+/// F2-03 (`watch`): versions are exact for every write the front decodes. Windows are indexed by
+/// device page, so constant buffer data through one window patches every other window over the
+/// same bytes (an unpublished version in place, a published one copied first), aliases
+/// included; another producer's ranged write drops the windows it overlaps (NoteWrite); an
+/// evicted window drops its back entry. Writes the front never decodes reach the back's trust
+/// check through the watch's page words (v2/cbuf_watch.h).
 class Decode {
 public:
     static constexpr u32 MaxWindow = 4096; ///< DEFAULT_SKIP_CACHE_SIZE: larger ones bind cached
@@ -257,31 +274,65 @@ public:
     /// Env::Writers result when the range's in-flight writers are unknown.
     static constexpr u32 UnknownWriters = ~0U;
 
-    explicit Decode(Shared& shared_) : shared{&shared_} {}
+    explicit Decode(Shared& shared_, bool watch_ = false) : shared{&shared_}, watch{watch_} {
+        shared->decoders.fetch_add(1, std::memory_order_acq_rel);
+        epoch = shared->decode_epoch.fetch_add(1, std::memory_order_acq_rel) + 1;
+    }
+    ~Decode() {
+        shared->decoders.fetch_sub(1, std::memory_order_acq_rel);
+    }
+    Decode(const Decode&) = delete;
+    Decode& operator=(const Decode&) = delete;
 
     /// A constant buffer data write of `count` words at byte `offset` of the window {va, size}.
     /// Env: `u32 Writers(u64 va, u32 size)` (the producer bits of in-flight writes over the
-    /// range, UnknownWriters when untranslatable) and `bool Read(u64 va, u32 size, u8* dst)`
-    /// (guest memory).
+    /// range, UnknownWriters when untranslatable), `bool Read(u64 va, u32 size, u8* dst)`
+    /// (guest memory); with the watch also `u64 Device(u64 va, u32 size)` (the device address
+    /// of a range that translates contiguously, else NoPosition) and `u64 Maps()` (moves at
+    /// every GPU map).
     template <typename Env>
     void Write(u64 va, u32 size, u32 offset, const u32* words, u32 count, u32 cbuf_bit,
                Env& env) {
-        Window& window = Lookup(va, size);
-        if (size == 0 || size > MaxWindow || u64{offset} + u64{count} * 4 > size) {
-            Invalidate(window);
-            return;
-        }
+        Window& window = Lookup(va, size, env);
+        const bool fits = size != 0 && size <= MaxWindow && u64{offset} + u64{count} * 4 <= size;
         Ring& ring = shared->ring;
-        if (!window.valid || window.published || window.position < ring.Retired()) {
-            if (!NewVersion(window, cbuf_bit, env)) {
-                Invalidate(window);
-                return;
+        bool made = fits;
+        if (fits && (!window.valid || window.published || window.position < ring.Retired())) {
+            made = NewVersion(window, cbuf_bit, env);
+        }
+        if (made) {
+            std::memcpy(shared->shadow.get() + ring.Offset(window.position) + offset, words,
+                        size_t{count} * 4);
+            window.written = true;
+            MarkDirty(window);
+        } else {
+            Invalidate(window);
+        }
+        if constexpr (requires { env.Maps(); }) {
+            if (watch && count != 0) {
+                const u64 written = fits && window.device != NoPosition
+                                        ? window.device + offset
+                                        : env.Device(va + offset, count * 4);
+                PatchOverlaps(window, written, reinterpret_cast<const u8*>(words), count * 4,
+                              env);
             }
         }
-        std::memcpy(shared->shadow.get() + ring.Offset(window.position) + offset, words,
-                    size_t{count} * 4);
-        window.written = true;
-        MarkDirty(window);
+    }
+
+    /// F2-03: another producer's ranged write over device bytes [device, device + size) (front,
+    /// GpuSplit's range write notes): the windows over it lose their versions.
+    void NoteWrite(u64 device, u64 size) {
+        if (!watch || size == 0) {
+            return;
+        }
+        Collect(device, size, nullptr);
+        for (const u32 index : overlaps) {
+            Window& other = windows[index];
+            if (other.valid) {
+                Invalidate(other);
+                shared->write_drops.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
     }
 
     /// A bind of the window {va, size} (the const_buffer registers at a bind_groups write).
@@ -294,7 +345,7 @@ public:
         if (size == 0 || size > MaxWindow) {
             return;
         }
-        Window& window = Lookup(va, size);
+        Window& window = Lookup(va, size, env);
         if (window.dirty) {
             return; // written since the last draw: its version is published with the draw
         }
@@ -350,6 +401,8 @@ public:
         windows.fill(Window{});
         dirty.clear();
         drops.clear();
+        page_windows.clear();
+        UntrustAll();
     }
 
 private:
@@ -357,6 +410,9 @@ private:
         u64 va{NoPosition};
         u32 size{};
         u64 position{};
+        u64 device{NoPosition}; ///< F2-03: where the window was located (Locate), indexed there
+        u64 maps{};             ///< ... the env's Maps() then
+        bool located{};
         bool valid{};
         bool published{};
         bool dirty{};
@@ -365,9 +421,11 @@ private:
     struct Dropped {
         u64 va;
         u32 size;
+        u64 device; ///< F2-03: the device address the back entry has (NoPosition: translate)
     };
 
-    Window& Lookup(u64 va, u32 size) {
+    template <typename Env>
+    Window& Lookup(u64 va, u32 size, Env& env) {
         u64 key = (va >> 4) ^ (u64{size} << 44);
         key ^= key >> 29;
         key *= 0xbf58476d1ce4e5b9ULL;
@@ -378,11 +436,164 @@ private:
                 // Its writes since the last draw have no version: the back drops the old one.
                 dirty.erase(std::find(dirty.begin(), dirty.end(),
                                       static_cast<u32>(&window - windows.data())));
-                drops.push_back({window.va, window.size});
+                drops.push_back({window.va, window.size, window.device});
+            } else if (watch && window.valid) {
+                // F2-03: no overlap patches it once it leaves the index.
+                drops.push_back({window.va, window.size, window.device});
             }
+            Unindex(window);
             window = Window{va, size};
         }
+        if constexpr (requires { env.Maps(); }) {
+            if (watch) {
+                Locate(window, env);
+            }
+        }
         return window;
+    }
+
+    /// F2-03: the window's device address for the current mappings, indexed by device page. A
+    /// window whose bytes moved to another device address loses its version.
+    template <typename Env>
+    void Locate(Window& window, Env& env) {
+        const u64 maps = env.Maps();
+        if (window.located && window.maps == maps) {
+            return;
+        }
+        const u64 device = window.size != 0 && window.size <= MaxWindow
+                               ? env.Device(window.va, window.size)
+                               : NoPosition;
+        if (window.located && device != window.device) {
+            if (window.valid) {
+                drops.push_back({window.va, window.size, window.device});
+                Invalidate(window);
+            }
+            Unindex(window);
+        }
+        if (!window.located || device != window.device) {
+            window.device = device;
+            Index(window);
+        }
+        window.located = true;
+        window.maps = maps;
+    }
+
+    void Index(const Window& window) {
+        if (window.device == NoPosition) {
+            return;
+        }
+        const u32 index = static_cast<u32>(&window - windows.data());
+        const u64 last = (window.device + window.size - 1) >> 12;
+        for (u64 page = window.device >> 12; page <= last; ++page) {
+            page_windows[page].push_back(index);
+        }
+    }
+    void Unindex(const Window& window) {
+        if (!window.located || window.device == NoPosition) {
+            return;
+        }
+        const u32 index = static_cast<u32>(&window - windows.data());
+        const u64 last = (window.device + window.size - 1) >> 12;
+        for (u64 page = window.device >> 12; page <= last; ++page) {
+            const auto it = page_windows.find(page);
+            if (it == page_windows.end()) {
+                continue;
+            }
+            std::vector<u32>& list = it->second;
+            const auto found = std::find(list.begin(), list.end(), index);
+            if (found != list.end()) {
+                *found = list.back();
+                list.pop_back();
+            }
+            if (list.empty()) {
+                page_windows.erase(it);
+            }
+        }
+    }
+
+    /// The located windows (but `self`) over device bytes [device, device + size), in overlaps.
+    void Collect(u64 device, u64 size, const Window* self) {
+        overlaps.clear();
+        const u64 end = device + size;
+        const auto take = [&](const std::vector<u32>& list) {
+            for (const u32 index : list) {
+                const Window& other = windows[index];
+                if (&other == self || other.device >= end ||
+                    other.device + other.size <= device) {
+                    continue;
+                }
+                if (std::find(overlaps.begin(), overlaps.end(), index) == overlaps.end()) {
+                    overlaps.push_back(index);
+                }
+            }
+        };
+        const u64 first = device >> 12;
+        const u64 last = (end - 1) >> 12;
+        if (last - first + 1 > page_windows.size()) {
+            // A large write: walk the index instead of the pages.
+            for (const auto& [page, list] : page_windows) {
+                if (page >= first && page <= last) {
+                    take(list);
+                }
+            }
+            return;
+        }
+        for (u64 page = first; page <= last; ++page) {
+            if (const auto it = page_windows.find(page); it != page_windows.end()) {
+                take(it->second);
+            }
+        }
+    }
+
+    /// F2-03 (G1): constant buffer data `src` written to device bytes [device, device + size)
+    /// through `self` reaches every other window over them: an unpublished version is patched in
+    /// place, a published one is copied into a new version first; a window with no ring space
+    /// loses its version. Untranslatable data untrusts every version.
+    template <typename Env>
+    void PatchOverlaps(Window& self, u64 device, const u8* src, u32 size, Env& env) {
+        if (device == NoPosition) {
+            UntrustAll();
+            return;
+        }
+        Collect(device, size, &self);
+        Ring& ring = shared->ring;
+        const u64 maps = env.Maps();
+        for (const u32 index : overlaps) {
+            Window& other = windows[index];
+            if (!other.valid || other.position < ring.Retired()) {
+                continue;
+            }
+            if (other.maps != maps) {
+                Invalidate(other); // located under older mappings: its next use locates it
+                continue;
+            }
+            if (other.published) {
+                const std::optional<u64> position = ring.Allocate(other.size, shared->align);
+                if (!position) {
+                    shared->refused.fetch_add(1, std::memory_order_relaxed);
+                    Invalidate(other);
+                    continue;
+                }
+                std::memcpy(shared->shadow.get() + ring.Offset(*position),
+                            shared->shadow.get() + ring.Offset(other.position), other.size);
+                other.position = *position;
+                other.published = false;
+                shared->cow_versions.fetch_add(1, std::memory_order_relaxed);
+            }
+            const u64 begin = (std::max)(device, other.device);
+            const u64 end = (std::min)(device + size, other.device + other.size);
+            std::memcpy(shared->shadow.get() + ring.Offset(other.position) +
+                            (begin - other.device),
+                        src + (begin - device), static_cast<size_t>(end - begin));
+            other.written = true;
+            MarkDirty(other);
+            shared->overlap_patches.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+
+    /// Every version made so far stops being trusted (front and back: the epoch moves).
+    void UntrustAll() {
+        epoch = shared->decode_epoch.fetch_add(1, std::memory_order_acq_rel) + 1;
     }
 
     /// `may_keep`: the previous version may be the base (constant buffer data); a bind takes
@@ -442,9 +653,13 @@ private:
     }
 
     Shared* shared;
+    bool watch; ///< F2-03 (CbufWatch::Enabled() when made)
+    u32 epoch{};
     std::array<Window, NumWindows> windows{};
     std::vector<u32> dirty;
     std::vector<Dropped> drops;
+    std::unordered_map<u64, std::vector<u32>> page_windows; ///< device page → window indices
+    std::vector<u32> overlaps;                              ///< Collect
 };
 
 } // namespace VideoCommon::V2::CbufRing

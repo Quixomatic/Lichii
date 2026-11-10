@@ -39,6 +39,7 @@
 #include "video_core/texture_cache/image_info.h"
 #include "video_core/texture_cache/util.h"
 #include "video_core/v2/cbuf_ring.h"
+#include "video_core/v2/cbuf_watch.h"
 #include "video_core/v2/draw_model.h"
 #include "video_core/v2/front_writes.h"
 #include "video_core/v2/ir_exec.h"
@@ -1714,6 +1715,8 @@ struct Maxwell3D::FrontState {
     bool v2_cbufs_wanted{};
     /// EDEN_NX2_V2_CBUFRING (S1 with the hazard table only): decode-time cbuf versions.
     std::unique_ptr<VideoCommon::V2::CbufRing::Decode> v2_cbuf_ring;
+    /// F2-03: the split whose range write notes reach v2_cbuf_ring (cleared on release).
+    VideoCommon::GpuSplit* v2_listener_split{};
     /// Register blocks of 64 changed since the last P6 snapshot (all after a copy or resync).
     u64 v2_dirty_blocks{~u64{0}};
     std::unique_ptr<VideoCommon::V2::RegSem::Front3D> v2;
@@ -1909,8 +1912,19 @@ Maxwell3D::FrontState& Maxwell3D::Front(Core::System& system, VideoCommon::GpuSp
                 VideoCommon::V2::On(VideoCommon::V2::Switch::CbufRing) &&
                 VideoCommon::V2::CbufRing::Get().Ready()) [[unlikely]] {
                 front->v2_cbuf_ring = std::make_unique<VideoCommon::V2::CbufRing::Decode>(
-                    VideoCommon::V2::CbufRing::Get());
+                    VideoCommon::V2::CbufRing::Get(), VideoCommon::V2::CbufWatch::Enabled());
                 front->v2_cbufs_wanted = true; // the binds make versions (FrontCbufBindVersions)
+                if (VideoCommon::V2::CbufWatch::Enabled() &&
+                    split.RangeWriteContext() == nullptr) {
+                    // F2-03: other producers' ranged writes drop the windows they overlap.
+                    split.SetRangeWriteListener(
+                        [](void* context, u64 device_address, u64 size) {
+                            static_cast<VideoCommon::V2::CbufRing::Decode*>(context)->NoteWrite(
+                                device_address, size);
+                        },
+                        front->v2_cbuf_ring.get());
+                    front->v2_listener_split = &split;
+                }
             }
             if (front->s1_exec) {
                 // The front's DrawModel decides every draw from now on (it took the state above);
@@ -1948,6 +1962,10 @@ void Maxwell3D::ReleaseFront() {
     }
     std::memcpy(shadow_state.reg_array.data(), front->shadow.data(), sizeof(front->shadow));
     shadow_state.shadow_ram_control = front->control;
+    if (front->v2_listener_split != nullptr &&
+        front->v2_listener_split->RangeWriteContext() == front->v2_cbuf_ring.get()) {
+        front->v2_listener_split->SetRangeWriteListener(nullptr, nullptr);
+    }
     front.reset();
     front_macros = false;
     LOG_INFO(HW_GPU, "GPU thread split stopped: 3D macros back on the engine");
@@ -2241,6 +2259,18 @@ struct CbufRingEnv {
         thread_local std::array<u8, VideoCommon::V2::CbufRing::Decode::MaxWindow> scratch;
         memory.ReadBlockUnsafe(va, scratch.data(), size);
         return std::memcmp(scratch.data(), bytes, size) == 0;
+    }
+    // F2-03: where the window lives in device memory (the overlap index and the watch).
+    u64 Device(u64 va, u32 size) {
+        const auto first = memory.GpuToCpuAddress(va);
+        const auto last = memory.GpuToCpuAddress(va + size - 1);
+        if (!first || !last || *last != *first + size - 1) {
+            return VideoCommon::V2::CbufRing::NoPosition;
+        }
+        return *first;
+    }
+    u64 Maps() {
+        return VideoCommon::GpuSplit::MapsExecuted();
     }
 };
 
