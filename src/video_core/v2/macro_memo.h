@@ -102,7 +102,7 @@ public:
     /// `num_regs`, as the engines' MME STATE reads; `dram` words).
     [[nodiscard]] bool Find(u32 start, std::span<const u32> parameters, const u32* regs,
                             size_t num_regs, std::span<const u32> dram, Record& record);
-    void Store(u32 start, std::span<const u32> parameters, const Trace& trace,
+    void Store(u32 start, std::span<const u32> parameters, const Trace& recorded,
                std::span<const std::pair<u32, u32>> dram_reads,
                std::span<const std::pair<u32, u32>> dram_writes);
     /// After each call through the memo: decides Wanted.

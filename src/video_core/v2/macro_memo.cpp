@@ -101,7 +101,7 @@ bool Memo::Find(u32 start, std::span<const u32> parameters, const u32* regs, siz
     return true;
 }
 
-void Memo::Store(u32 start, std::span<const u32> parameters, const Trace& trace,
+void Memo::Store(u32 start, std::span<const u32> parameters, const Trace& recorded,
                  std::span<const std::pair<u32, u32>> dram_reads,
                  std::span<const std::pair<u32, u32>> dram_writes) {
     ++statistics.stores;
@@ -109,12 +109,12 @@ void Memo::Store(u32 start, std::span<const u32> parameters, const Trace& trace,
     const std::array<u32, HeaderWords> header{
         start,
         static_cast<u32>(parameters.size()),
-        static_cast<u32>(trace.reads.size()),
+        static_cast<u32>(recorded.reads.size()),
         static_cast<u32>(dram_reads.size()),
         static_cast<u32>(dram_writes.size()),
-        static_cast<u32>(trace.writes.size()),
-        static_cast<u32>(trace.dma.size()),
-        static_cast<u32>(trace.dma_words.size()),
+        static_cast<u32>(recorded.writes.size()),
+        static_cast<u32>(recorded.dma.size()),
+        static_cast<u32>(recorded.dma_words.size()),
     };
     const size_t words = RecordWords(header.data());
     u32 offset;
@@ -134,7 +134,7 @@ void Memo::Store(u32 start, std::span<const u32> parameters, const Trace& trace,
     }
     u32* out = std::copy(header.begin(), header.end(), arena.data() + offset);
     out = std::copy(parameters.begin(), parameters.end(), out);
-    for (const Trace::Read& read : trace.reads) {
+    for (const Trace::Read& read : recorded.reads) {
         *out++ = read.address;
         *out++ = read.value;
         *out++ = read.writes_before;
@@ -145,15 +145,15 @@ void Memo::Store(u32 start, std::span<const u32> parameters, const Trace& trace,
             *out++ = value;
         }
     }
-    for (const auto& [method, value] : trace.writes) {
+    for (const auto& [method, value] : recorded.writes) {
         *out++ = method;
         *out++ = value;
     }
-    for (const Trace::Dma& dma : trace.dma) {
+    for (const Trace::Dma& dma : recorded.dma) {
         *out++ = dma.write_index;
         *out++ = dma.words;
     }
-    std::copy(trace.dma_words.begin(), trace.dma_words.end(), out);
+    std::copy(recorded.dma_words.begin(), recorded.dma_words.end(), out);
     StartInfo& info = starts[start % starts.size()];
     if (info.start != start) {
         info = StartInfo{.start = start};

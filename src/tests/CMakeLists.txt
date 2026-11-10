@@ -89,6 +89,7 @@ add_executable(tests
     video_core/maxwell_fast_method.cpp
     video_core/v2_hazard.cpp
     video_core/v2_ir.cpp
+    video_core/v2_macro.cpp
     video_core/v2_p3.cpp
     video_core/v2_p4.cpp
     video_core/v2_p5.cpp
