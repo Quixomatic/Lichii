@@ -584,14 +584,13 @@ void BufferCacheRuntime::Finish() {
 }
 
 void BufferCacheRuntime::FinishForHostRead() {
-    scheduler.RequestOutsideRenderPassOperationContext();
-    scheduler.Record(HostReadBarrier);
+    // F4-06: the host reads buffers only; pending attachment writes stay pending for graphics.
+    scheduler.RecordBufferOperation(HostReadBarrier);
     scheduler.Finish();
 }
 
 u64 BufferCacheRuntime::SubmitForHostRead() {
-    scheduler.RequestOutsideRenderPassOperationContext();
-    scheduler.Record(HostReadBarrier);
+    scheduler.RecordBufferOperation(HostReadBarrier);
     const u64 tick = scheduler.CurrentTick();
     if (scheduler.LazyFencesHere()) [[unlikely]] {
         // F4-04: no submit of its own; the reader asks for it only if still open (WaitForHostRead).

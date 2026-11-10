@@ -925,8 +925,8 @@ public:
             .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
             .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
         };
-        scheduler.RequestOutsideRenderPassOperationContext();
-        scheduler.Record([](vk::CommandBuffer cmdbuf) {
+        // F4-06: a buffer-only barrier flushes no pending attachment write.
+        scheduler.RecordBufferOperation([](vk::CommandBuffer cmdbuf) {
             cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
                                    vk::PIPELINE_STAGE_HOST, 0, WRITE_BARRIER);
         });
@@ -1100,11 +1100,11 @@ private:
             .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
             .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT,
         };
-        scheduler.RequestOutsideRenderPassOperationContext();
-        scheduler.Record([dst_buffer = current_bank->GetBuffer(),
-                          src_buffer = counter_buffers[slot_index],
-                          src_offset = offsets[slot_index],
-                          slot](vk::CommandBuffer cmdbuf) {
+        // F4-06: buffers only; pending attachment writes stay pending.
+        scheduler.RecordBufferOperation([dst_buffer = current_bank->GetBuffer(),
+                                         src_buffer = counter_buffers[slot_index],
+                                         src_offset = offsets[slot_index],
+                                         slot](vk::CommandBuffer cmdbuf) {
             cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFORM_FEEDBACK_BIT_EXT,
                                    VK_PIPELINE_STAGE_TRANSFER_BIT, 0, READ_BARRIER);
             std::array<VkBufferCopy, 1> copy{VkBufferCopy{
@@ -1677,14 +1677,15 @@ void QueryCacheRuntime::Barriers(bool is_prebarrier) {
         .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
         .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
     };
-    impl->scheduler.RequestOutsideRenderPassOperationContext();
+    // F4-06: barriers around buffer copies of query values; pending attachment writes stay
+    // pending.
     if (is_prebarrier) {
-        impl->scheduler.Record([](vk::CommandBuffer cmdbuf) {
+        impl->scheduler.RecordBufferOperation([](vk::CommandBuffer cmdbuf) {
             cmdbuf.PipelineBarrier(vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER,
                                    VK_PIPELINE_STAGE_TRANSFER_BIT, 0, READ_BARRIER);
         });
     } else {
-        impl->scheduler.Record([](vk::CommandBuffer cmdbuf) {
+        impl->scheduler.RecordBufferOperation([](vk::CommandBuffer cmdbuf) {
             cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
                                    vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER_HOST, 0, WRITE_BARRIER);
         });
