@@ -3656,6 +3656,7 @@ void BufferCache<P>::V2BeginBindScope() {
     v2_binds.Reset(v2_segment++);
     v2_written_marks.clear();
     v2_scope_uploads.clear();
+    v2_scope_deletions = buffer_deletions;
     v2_defer = true;
 }
 
@@ -3809,9 +3810,12 @@ void BufferCache<P>::CommitBinds() {
     }
     namespace C = V2::Commit;
     const u64 start = commit->stats ? VideoCommon::Nx2Profile::Now() : 0;
+    // F2-19: no buffer was deleted since the scope began: every request's buffer still serves it.
+    const bool ids_hold = buffer_deletions == v2_scope_deletions;
     commit->stage.Apply(v2_binds, [&](const C::Request& request) {
-        const BufferId id =
-            V2CurrentBuffer(BufferId{request.slot}, request.address, request.size);
+        const BufferId id = ids_hold ? BufferId{request.slot}
+                                     : V2CurrentBuffer(BufferId{request.slot}, request.address,
+                                                       request.size);
         if (!id) {
             return C::InvalidSlot;
         }
@@ -4084,6 +4088,13 @@ void BufferCache<P>::MarkWrittenBuffer(BufferId buffer_id, DAddr device_addr, u3
     if (v2_defer && buffer_id) [[unlikely]] {
         // Ordered after the binding's upload request, as the old order was (a sync skips the
         // GPU-written ranges); bind-time reads see it through V2PendingGpuWrite.
+        // F2-19: the same range already marked in this scope (one buffer bound to several
+        // stages) adds nothing unless it also needs the write tick.
+        if (!needs_sync && std::ranges::find(v2_written_marks,
+                                             std::pair<DAddr, u64>{device_addr, size}) !=
+                               v2_written_marks.end()) {
+            return;
+        }
         V2::Commit::Request request{};
         request.kind = V2::Commit::Kind::BufferMarkWritten;
         request.resource = V2::Commit::Resource::Buffer;

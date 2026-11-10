@@ -1086,6 +1086,7 @@ private:
     V2::Commit::RequestList v2_creates;
     V2::Commit::RequestList v2_binds;
     std::vector<u32> v2_scope_uploads; ///< F2-19: buffers with an upload queued in the scope
+    u64 v2_scope_deletions = 0; ///< F2-19: buffer_deletions when the scope began
     /// Perf fix C: the scope's pending written marks, so a GPU-modified test scans only them.
     boost::container::small_vector<std::pair<DAddr, u64>, 8> v2_written_marks;
     u64 v2_segment = 1;
