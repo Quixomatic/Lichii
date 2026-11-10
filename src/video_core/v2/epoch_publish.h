@@ -151,6 +151,73 @@ private:
     EpochDomain::Reader reader;
 };
 
+/// A read-side section on the calling thread's own reader slot of `domain`, registered on the
+/// thread's first section and given back when the thread exits. Nested sections of one domain
+/// share the outermost (Exit clears the slot). Invalid (protects nothing) when every slot is
+/// taken: the caller must not read published pointers then.
+class ThreadEpochGuard {
+public:
+    explicit ThreadEpochGuard(EpochDomain& domain) {
+        Entry* const entry = Find(domain);
+        if (entry == nullptr) {
+            return;
+        }
+        if (entry->depth++ == 0) {
+            domain.Enter(entry->reader);
+        }
+        current = entry;
+    }
+    ~ThreadEpochGuard() {
+        if (current != nullptr && --current->depth == 0) {
+            current->domain->Exit(current->reader);
+        }
+    }
+    ThreadEpochGuard(const ThreadEpochGuard&) = delete;
+    ThreadEpochGuard& operator=(const ThreadEpochGuard&) = delete;
+
+    [[nodiscard]] bool Valid() const {
+        return current != nullptr;
+    }
+
+private:
+    struct Entry {
+        EpochDomain* domain = nullptr;
+        EpochDomain::Reader reader;
+        u32 depth = 0;
+    };
+    struct Registrations {
+        std::array<Entry, 4> entries{};
+        ~Registrations() {
+            for (Entry& entry : entries) {
+                if (entry.domain != nullptr) {
+                    entry.domain->Unregister(entry.reader);
+                }
+            }
+        }
+    };
+
+    static Entry* Find(EpochDomain& domain) {
+        thread_local Registrations registrations;
+        for (Entry& entry : registrations.entries) {
+            if (entry.domain == &domain) {
+                return &entry;
+            }
+            if (entry.domain == nullptr) {
+                const EpochDomain::Reader reader = domain.Register();
+                if (!reader.Valid()) {
+                    return nullptr;
+                }
+                entry.domain = &domain;
+                entry.reader = reader;
+                return &entry;
+            }
+        }
+        return nullptr;
+    }
+
+    Entry* current = nullptr;
+};
+
 template <typename Key>
 class PublishedMap {
     static_assert(std::is_trivially_copyable_v<Key>);

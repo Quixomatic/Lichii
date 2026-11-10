@@ -247,6 +247,17 @@ private:
     };
     V2Key v2_key{};
     VideoCommon::V2::PipelineLookup<GraphicsPipeline> v2_lookup;
+    /// EDEN_NX2_V2_PARALLEL R3: the shader hashes last published for the shards (and the engine).
+    std::array<u64, 6> v2_published_hashes{};
+    const Tegra::Engines::Maxwell3D* v2_published_engine{};
+
+public:
+    /// EDEN_NX2_V2_PARALLEL R3: the v2 lookup, for the shards' FindShared.
+    [[nodiscard]] const VideoCommon::V2::PipelineLookup<GraphicsPipeline>& V2Lookup() const noexcept {
+        return v2_lookup;
+    }
+
+private:
     /// Forgets the v2 lookup tables (pipelines were destroyed).
     void ClearV2Lookup();
 

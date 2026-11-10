@@ -123,6 +123,88 @@ void ClearShapes() {
     }
 }
 
+// ---- Published programs (R3) ----------------------------------------------------------------------
+
+namespace {
+
+struct ProgramEntry {
+    std::atomic<u64> sequence{};
+    std::atomic<u64> memory{};
+    std::atomic<u64> address{};
+    std::atomic<u64> hash{};
+};
+constexpr size_t ProgramEntries = 4096;
+
+std::array<ProgramEntry, ProgramEntries>& Programs() {
+    static std::array<ProgramEntry, ProgramEntries> entries;
+    return entries;
+}
+
+size_t ProgramSlot(uintptr_t memory, GPUVAddr address) {
+    const u64 key = Mix64(static_cast<u64>(address) ^ (static_cast<u64>(memory) << 1));
+    return static_cast<size_t>(key >> 52) % ProgramEntries;
+}
+
+std::atomic<u64> g_program_generation{0};
+
+} // Anonymous namespace
+
+void PublishProgram(uintptr_t memory, GPUVAddr address, u64 unique_hash) {
+    ProgramEntry& entry = Programs()[ProgramSlot(memory, address)];
+    if (entry.memory.load(std::memory_order_relaxed) == memory &&
+        entry.address.load(std::memory_order_relaxed) == address &&
+        entry.hash.load(std::memory_order_relaxed) == unique_hash) {
+        return;
+    }
+    g_program_generation.fetch_add(1, std::memory_order_acq_rel);
+    const u64 sequence = entry.sequence.load(std::memory_order_relaxed);
+    entry.sequence.store(sequence + 1, std::memory_order_relaxed);
+    std::atomic_thread_fence(std::memory_order_release);
+    entry.memory.store(memory, std::memory_order_relaxed);
+    entry.address.store(address, std::memory_order_relaxed);
+    entry.hash.store(unique_hash, std::memory_order_relaxed);
+    entry.sequence.store(sequence + 2, std::memory_order_release);
+}
+
+bool FindProgram(uintptr_t memory, GPUVAddr address, u64* unique_hash) {
+    const ProgramEntry& entry = Programs()[ProgramSlot(memory, address)];
+    for (u32 attempt = 0; attempt < 16; ++attempt) {
+        const u64 before = entry.sequence.load(std::memory_order_acquire);
+        if ((before & 1) != 0) {
+            CpuRelax();
+            continue;
+        }
+        const u64 stored_memory = entry.memory.load(std::memory_order_relaxed);
+        const u64 stored_address = entry.address.load(std::memory_order_relaxed);
+        const u64 hash = entry.hash.load(std::memory_order_relaxed);
+        std::atomic_thread_fence(std::memory_order_acquire);
+        if (entry.sequence.load(std::memory_order_relaxed) != before) {
+            continue;
+        }
+        if (stored_memory != memory || stored_address != address || hash == 0) {
+            return false;
+        }
+        *unique_hash = hash;
+        return true;
+    }
+    return false;
+}
+
+void ClearPrograms() {
+    g_program_generation.fetch_add(1, std::memory_order_acq_rel);
+    for (ProgramEntry& entry : Programs()) {
+        const u64 sequence = entry.sequence.load(std::memory_order_relaxed);
+        entry.sequence.store(sequence + 1, std::memory_order_relaxed);
+        std::atomic_thread_fence(std::memory_order_release);
+        entry.hash.store(0, std::memory_order_relaxed);
+        entry.sequence.store(sequence + 2, std::memory_order_release);
+    }
+}
+
+u64 ProgramGeneration() {
+    return g_program_generation.load(std::memory_order_acquire);
+}
+
 // ---- Shards ---------------------------------------------------------------------------------------
 
 namespace {
@@ -229,6 +311,10 @@ SerialReason SplitTraits::Resolve(Shard& shard, const Input& input, std::vector<
                     },
                     snapshot.native_turing};
                 pre.pipeline_key = g_pipeline_key(view);
+                // R3: and the pipeline it names, from the published programs and lookup.
+                if (pre.pipeline_key != nullptr && g_shard_pipeline != nullptr) {
+                    g_shard_pipeline(view, snapshot.memory, pre);
+                }
             }
             // The draw-cache shape holds the pipeline key's hash: only the canonical key the
             // serial path uses with EDEN_NX2_V2_PIPEKEY equals the shard's.
@@ -438,6 +524,15 @@ const char* SplitTraits::Compare(const Record& a, const Record& b) {
         (a.pipeline_key->hash != b.pipeline_key->hash ||
          a.pipeline_key->bytes != b.pipeline_key->bytes)) {
         return "pipeline key";
+    }
+    // R3: the pipeline object. A lookup insert or clear, or a program published in between,
+    // changes what the tables answer (dependent).
+    if (a.has_pipeline != b.has_pipeline || a.pipeline != b.pipeline || a.hashes != b.hashes) {
+        if (a.lookup_serial != b.lookup_serial || a.program_generation != b.program_generation) {
+            Count(GetStats().verify_dependent);
+            return nullptr;
+        }
+        return a.hashes != b.hashes ? "pipeline shader hashes" : "pipeline object";
     }
     return nullptr;
 }

@@ -61,6 +61,8 @@
 #include "video_core/shader_environment.h"
 #include "video_core/shader_notify.h"
 #include "video_core/shader_warm/shader_warm_builder.h"
+#include "video_core/v2/commit.h"
+#include "video_core/v2/epoch_publish.h"
 #include "video_core/v2/p3_stats.h"
 #include "video_core/v2/resolve/split_resolve.h"
 #include "video_core/v2/resolve/state_view.h"
@@ -539,10 +541,54 @@ std::shared_ptr<const VideoCommon::V2::Resolve::PipelineKey> ShardPipelineKey(
     return key;
 }
 
-void PublishShardPipelineKey(const DynamicFeatures& features) {
+/// R3: the cache whose lookup the shards read (set with the hooks, cleared at its destruction).
+PipelineCache* g_shard_cache{};
+
+/// R3 (S0-02): a shard's pipeline lookup. The shader hashes come from the programs the commit
+/// thread published (as RefreshStages finds them; mesh pipelines mix program memory into theirs,
+/// so they stay on the commit thread), then the lookup's level-1 cache. Nothing it returns is
+/// dereferenced here; the commit takes it only while the lookup's generation holds.
+void ShardPipeline(const VideoCommon::V2::Resolve::SnapshotView& view, uintptr_t memory,
+                   VideoCommon::V2::Resolve::PreDraw& pre) {
+    namespace V2 = VideoCommon::V2;
+    namespace Resolve = V2::Resolve;
+    const PipelineCache* const cache = g_shard_cache;
+    if (cache == nullptr || pre.pipeline_key == nullptr ||
+        pre.pipeline_key->bytes.size() != sizeof(FixedPipelineState) ||
+        (view.NativeTuring() && view.Regs().IsMeshEnabled())) {
+        return;
+    }
+    pre.program_generation = Resolve::ProgramGeneration();
+    std::array<u64, 6> hashes{};
+    for (size_t index = 0; index < hashes.size(); ++index) {
+        const GPUVAddr address = Resolve::ProgramAddress(view, index);
+        if (address != 0 && !Resolve::FindProgram(memory, address, &hashes[index])) {
+            return;
+        }
+    }
+    const V2::ThreadEpochGuard guard{V2::Commit::Epochs()};
+    if (!guard.Valid()) {
+        return;
+    }
+    const auto& lookup = cache->V2Lookup();
+    // Before the lookup: a clear after this read makes the commit refuse what it finds.
+    pre.lookup_generation = lookup.Generation();
+    pre.lookup_serial = lookup.Serial();
+    FixedPipelineState state;
+    std::memcpy(&state, pre.pipeline_key->bytes.data(), sizeof(state));
+    GraphicsPipeline* const pipeline =
+        lookup.FindShared(hashes, pre.pipeline_key->hash, &state, state.Size());
+    pre.hashes = hashes;
+    pre.pipeline = pipeline;
+    pre.has_pipeline = pipeline != nullptr;
+}
+
+void PublishShardPipelineKey(const DynamicFeatures& features, PipelineCache* cache) {
     g_shard_features = features;
     g_shard_features_generation.fetch_add(1, std::memory_order_relaxed);
+    g_shard_cache = cache;
     VideoCommon::V2::Resolve::g_pipeline_key = &ShardPipelineKey;
+    VideoCommon::V2::Resolve::g_shard_pipeline = &ShardPipeline;
 }
 
 /// The FixedPipelineState field holding byte `offset` (verify logs).
@@ -824,7 +870,8 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
         device.SupportsProvokingVertexLastMode();
     dynamic_features.has_provoking_vertex_tf_preserve =
         device.SupportsTransformFeedbackProvokingVertexPreservation();
-    PublishShardPipelineKey(dynamic_features);
+    v2_lookup.SetDomain(&VideoCommon::V2::Commit::Epochs());
+    PublishShardPipelineKey(dynamic_features, this);
 }
 
 namespace {
@@ -908,6 +955,11 @@ PipelineCache::~PipelineCache() {
     graphics_cache.clear();
     evicted_pipelines.clear();
     VideoCommon::V2::Resolve::g_pipeline_key = nullptr;
+    VideoCommon::V2::Resolve::g_shard_pipeline = nullptr;
+    if (g_shard_cache == this) {
+        g_shard_cache = nullptr;
+    }
+    VideoCommon::V2::Resolve::ClearPrograms();
 }
 
 void PipelineCache::SaveUsedPipelines() {
@@ -1926,14 +1978,35 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineV2() {
     const bool verify = V2::Verify(V2::Switch::PipeKey);
     // EDEN_NX2_V2_PARALLEL (P6c): a shard computed this draw's key from its snapshot view.
     const V2::Resolve::PipelineKey* shard_key = nullptr;
+    const V2::Resolve::PreDraw* shard_pre = nullptr;
     V2::Resolve::SplitResolve* const parallel =
         V2::On(V2::Switch::Parallel) ? V2::Resolve::SplitResolve::t_commit : nullptr;
     if (parallel != nullptr) [[unlikely]] {
-        shard_key = parallel->TakePipelineKey();
+        shard_pre = parallel->TakePipelineRecord();
+        shard_key = shard_pre != nullptr ? shard_pre->pipeline_key.get() : nullptr;
         if (shard_key != nullptr && (shard_key->bytes.size() != sizeof(FixedPipelineState) ||
                                      maxwell3d->engine_state !=
                                          Tegra::Engines::Maxwell3D::EngineHint::None)) {
             shard_key = nullptr;
+            shard_pre = nullptr;
+        }
+        // R3: the programs behind these hashes, for the shards' lookups (again when the shader
+        // set changed, or a shard could not name it: a published entry may have been replaced).
+        if (graphics_key.unique_hashes != v2_published_hashes || maxwell3d != v2_published_engine ||
+            (shard_pre != nullptr && !shard_pre->has_pipeline)) {
+            const V2::Resolve::LiveView live{*maxwell3d};
+            if (!(live.NativeTuring() && maxwell3d->regs.IsMeshEnabled())) {
+                const auto memory = reinterpret_cast<uintptr_t>(gpu_memory);
+                for (size_t index = 0; index < graphics_key.unique_hashes.size(); ++index) {
+                    const GPUVAddr address = V2::Resolve::ProgramAddress(live, index);
+                    if (address != 0 && graphics_key.unique_hashes[index] != 0) {
+                        V2::Resolve::PublishProgram(memory, address,
+                                                    graphics_key.unique_hashes[index]);
+                    }
+                }
+            }
+            v2_published_hashes = graphics_key.unique_hashes;
+            v2_published_engine = maxwell3d;
         }
     }
     const bool use_shard_key = shard_key != nullptr && !verify && !parallel->Verify();
@@ -2025,6 +2098,47 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineV2() {
         data.key_unchanged += repacked == 0 ? 1 : 0;
         data.key_blocks += static_cast<u64>(std::popcount(repacked));
     }
+    // R3: the pipeline a shard looked up for this key (taken above) and these shaders, while no
+    // clear since its lookup can have destroyed it.
+    const bool shard_lookup_holds =
+        shard_pre != nullptr && shard_pre->has_pipeline &&
+        shard_pre->hashes == graphics_key.unique_hashes &&
+        shard_pre->lookup_generation == v2_lookup.Generation();
+    if (use_shard_key && shard_lookup_holds) [[unlikely]] {
+        GraphicsPipeline* const found =
+            static_cast<GraphicsPipeline*>(const_cast<void*>(shard_pre->pipeline));
+        V2::Resolve::Count(
+            V2::Resolve::GetStats().step_shard[static_cast<size_t>(V2::Resolve::Step::Pipeline)]);
+        current_pipeline = found;
+        current_pipeline->MarkUsed(frame_count);
+        v2_key.pipeline = found;
+        v2_key.hashes = graphics_key.unique_hashes;
+        return BuiltPipeline(current_pipeline);
+    }
+    if (parallel != nullptr) [[unlikely]] {
+        V2::Resolve::Count(
+            V2::Resolve::GetStats().step_commit[static_cast<size_t>(V2::Resolve::Step::Pipeline)]);
+    }
+    // PARALLEL=verify: the shard's pipeline against the one the serial lookup settles on (a
+    // shard miss is coverage, not a mismatch; a key the shard computed differently is the
+    // pipeline key's own verify).
+    const auto verify_shard_pipeline = [&](const GraphicsPipeline* serial) {
+        if (!shard_lookup_holds || !parallel->Verify() || verify ||
+            std::memcmp(shard_key->bytes.data(), &graphics_key.state, graphics_key.state.Size()) !=
+                0) {
+            return;
+        }
+        V2::Resolve::Count(V2::Resolve::GetStats().verify_draws);
+        if (shard_pre->pipeline != serial) {
+            V2::Resolve::Count(V2::Resolve::GetStats().verify_draw_mismatches);
+            if (V2::Resolve::ShouldLogMismatch(V2::Resolve::MismatchLog::Draw)) {
+                LOG_WARNING(Render_Vulkan,
+                            "V2 parallel verify: the shard's pipeline lookup found another "
+                            "pipeline than the serial lookup (key hash {:#x})",
+                            shard_key->hash);
+            }
+        }
+    };
     // Same shaders and an unchanged key: the last pipeline, without a lookup.
     GraphicsPipeline* pipeline = v2_key.pipeline;
     if (pipeline != nullptr && v2_key.hashes == graphics_key.unique_hashes &&
@@ -2034,6 +2148,7 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineV2() {
         }
         current_pipeline = pipeline;
         current_pipeline->MarkUsed(frame_count);
+        verify_shard_pipeline(pipeline);
         return BuiltPipeline(current_pipeline);
     }
     const u64 state_hash = use_shard_key ? shard_key->hash : graphics_key.state.Hash();
@@ -2061,6 +2176,7 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineV2() {
     }
     v2_key.pipeline = pipeline;
     v2_key.hashes = graphics_key.unique_hashes;
+    verify_shard_pipeline(pipeline);
     return BuiltPipeline(current_pipeline);
 }
 

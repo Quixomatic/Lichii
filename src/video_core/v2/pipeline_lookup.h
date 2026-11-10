@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "common/common_types.h"
+#include "video_core/v2/epoch_publish.h"
 #include "video_core/v2/regsem.h"
 
 // Pipeline v2 P3 (EDEN_NX2_V2_PIPEKEY): DXVK's two-level pipeline lookup (notes/04 §2.3, §10.1).
@@ -65,15 +66,17 @@ public:
         return nullptr;
     }
 
-    /// Adds a variant. `key` must stay valid while it is in the table (a value's own key).
-    /// The caller holds the owner's insert lock.
+    /// Adds a variant with a copy of its `size` key bytes (R3: a shard may still compare keys
+    /// of a retired table after the value that owned them is gone). The caller holds the
+    /// owner's insert lock.
     void Insert(u64 hash, const void* key, size_t size, Value* value) {
-        auto variant = std::make_unique<Variant>(Variant{
-            .hash = hash,
-            .key = static_cast<const u8*>(key),
-            .size = size,
-            .value = value,
-        });
+        auto variant = std::make_unique<Variant>();
+        variant->owned = std::make_unique<u8[]>(size);
+        std::memcpy(variant->owned.get(), key, size);
+        variant->hash = hash;
+        variant->key = variant->owned.get();
+        variant->size = size;
+        variant->value = value;
         const Variant* const published = variant.get();
         storage.push_back(std::move(variant));
         const u32 linear = linear_count.load(std::memory_order_relaxed);
@@ -96,10 +99,11 @@ public:
 
 private:
     struct Variant {
-        u64 hash;
-        const u8* key;
-        size_t size;
-        Value* value;
+        u64 hash{};
+        const u8* key{};
+        size_t size{};
+        Value* value{};
+        std::unique_ptr<u8[]> owned;
     };
     struct Table {
         explicit Table(size_t size) : slots(size) {}
@@ -176,7 +180,7 @@ public:
         return value;
     }
 
-    /// Adds (shader set, state) -> value; `key` must stay valid while the entry is in the table.
+    /// Adds (shader set, state) -> value (the table keeps a copy of the key).
     void Insert(const Hashes& hashes, u64 state_hash, const void* key, size_t size, Value* value) {
         std::scoped_lock lock{mutex};
         auto [it, is_new] = sets.try_emplace(hashes);
@@ -189,15 +193,56 @@ public:
             set->variants.Insert(state_hash, key, size, value);
         }
         (*cache)[Slot(hashes)].store(set, std::memory_order_release);
+        serial.fetch_add(1, std::memory_order_release);
     }
 
-    /// Forgets every entry (pipelines were destroyed). Not concurrent with lookups.
+    /// Forgets every entry (pipelines were destroyed). With a domain (SetDomain) the shader sets
+    /// are retired through it, so FindShared readers inside an epoch section keep them; the
+    /// values they found are stale from the generation this moves to.
     void Clear() {
         std::scoped_lock lock{mutex};
         for (auto& slot : *cache) {
             slot.store(nullptr, std::memory_order_relaxed);
         }
+        // After the cache is empty: a reader that sees the new generation sees no old set.
+        generation.fetch_add(1, std::memory_order_release);
+        serial.fetch_add(1, std::memory_order_release);
+        if (domain != nullptr && !sets.empty()) {
+            using Retired = std::vector<std::unique_ptr<ShaderSet>>;
+            auto* const retired = new Retired;
+            retired->reserve(sets.size());
+            for (auto& entry : sets) {
+                retired->push_back(std::move(entry.second));
+            }
+            domain->Retire(retired, [](void* pointer) { delete static_cast<Retired*>(pointer); });
+        }
         sets.clear();
+    }
+
+    /// EDEN_NX2_V2_PARALLEL R3: lookups off the owner's thread. Readers (FindShared) run inside
+    /// an epoch section of `domain_`; set before any reader starts.
+    void SetDomain(EpochDomain* domain_) {
+        domain = domain_;
+    }
+    /// Moves at every Clear: a value FindShared returned is still valid (not destroyed) while
+    /// this has the value read before the lookup.
+    [[nodiscard]] u64 Generation() const {
+        return generation.load(std::memory_order_acquire);
+    }
+    /// Moves at every Insert and Clear: two lookups of one key with equal serials answer the
+    /// same (verify tells dependent differences from real ones by it).
+    [[nodiscard]] u64 Serial() const {
+        return serial.load(std::memory_order_acquire);
+    }
+    /// Any thread, inside an epoch section of the domain: the level-1 cache only (no lock, no
+    /// counters). A shader set not cached there yet is a miss; the owner's Find caches it.
+    [[nodiscard]] Value* FindShared(const Hashes& hashes, u64 state_hash, const void* key,
+                                    size_t size) const {
+        const ShaderSet* const set = (*cache)[Slot(hashes)].load(std::memory_order_acquire);
+        if (set == nullptr || set->hashes != hashes) {
+            return nullptr;
+        }
+        return set->variants.Find(state_hash, key, size);
     }
 
     [[nodiscard]] size_t NumSets() const {
@@ -246,7 +291,10 @@ private:
     std::unique_ptr<std::array<std::atomic<ShaderSet*>, CacheEntries>> cache;
     std::unordered_map<Hashes, std::unique_ptr<ShaderSet>, HashesHash> sets;
     std::mutex mutex;
-    Counters counters;
+    Counters counters; ///< Owner thread only (Find); shards count nothing here
+    EpochDomain* domain = nullptr;
+    std::atomic<u64> generation{1};
+    std::atomic<u64> serial{1};
 };
 
 } // namespace VideoCommon::V2

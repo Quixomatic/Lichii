@@ -7,6 +7,7 @@
 #include <atomic>
 #include <deque>
 #include <memory>
+#include <utility>
 #include <vector>
 
 #include "common/common_types.h"
@@ -103,6 +104,21 @@ struct PipelineKey {
 using PipelineKeyFn = std::shared_ptr<const PipelineKey> (*)(const SnapshotView& view);
 inline PipelineKeyFn g_pipeline_key = nullptr;
 
+/// R3 (S0-02): the graphics programs' shader hashes the commit thread found, published for the
+/// shards by (memory manager, program GPU address). Single writer (the commit thread), lock-free
+/// readers. Best effort: the commit compares the hashes a shard used with its own.
+void PublishProgram(uintptr_t memory, GPUVAddr address, u64 unique_hash);
+[[nodiscard]] bool FindProgram(uintptr_t memory, GPUVAddr address, u64* unique_hash);
+void ClearPrograms();
+/// Moves at every PublishProgram and ClearPrograms.
+[[nodiscard]] u64 ProgramGeneration();
+
+struct PreDraw;
+/// R3: the draw's pipeline looked up on the shard from its key (set by the Vulkan pipeline
+/// cache, which owns the lookup tables; null: no shard lookup).
+using ShardPipelineFn = void (*)(const SnapshotView& view, uintptr_t memory, PreDraw& pre);
+inline ShardPipelineFn g_shard_pipeline = nullptr;
+
 /// A draw resolved by a shard.
 struct PreDraw {
     u64 fingerprint = 0; ///< the Draw record's (equals the back's group fingerprint at the draw)
@@ -112,6 +128,15 @@ struct PreDraw {
     u64 cbuf_masks = 0; ///< P6c: CbufMasksHash of the slots `full` used
     u64 shape_generation = 0; ///< ShapeGeneration() before the key read the shape table
     std::shared_ptr<const PipelineKey> pipeline_key; ///< P6c (null: none computed)
+    /// R3: the pipeline the shard's lookup found for (hashes, pipeline_key) (an opaque
+    /// GraphicsPipeline*, never dereferenced off the commit thread), valid while the lookup's
+    /// generation is `lookup_generation`.
+    const void* pipeline = nullptr;
+    u64 lookup_generation = 0;
+    u64 lookup_serial = 0;      ///< the lookup's Serial() (verify: dependent differences)
+    u64 program_generation = 0; ///< ProgramGeneration() before the hashes were read
+    std::array<u64, 6> hashes{};
+    bool has_pipeline = false;
     uintptr_t engine = 0;
     uintptr_t memory = 0;
     u32 relevant = 0;
@@ -262,9 +287,12 @@ public:
     }
     /// The shard's pipeline key for the draw being resolved, once (null: none).
     [[nodiscard]] const PipelineKey* TakePipelineKey() {
-        const PreDraw* const pre = taken;
-        taken = nullptr;
+        const PreDraw* const pre = TakePipelineRecord();
         return pre != nullptr ? pre->pipeline_key.get() : nullptr;
+    }
+    /// R3: the shard's record for the pipeline step (key and lookup), once (null: none).
+    [[nodiscard]] const PreDraw* TakePipelineRecord() {
+        return std::exchange(taken, nullptr);
     }
     [[nodiscard]] bool Verify() const {
         return verify;

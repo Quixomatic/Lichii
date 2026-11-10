@@ -52,10 +52,12 @@ enum class Step : u8 {
     Shape,       ///< P4 draw-cache shape
     DrawKey,     ///< P4 draw-cache key with the constant buffer bindings
     PipelineKey, ///< P3 pipeline key (FixedPipelineState) and its hash
+    Pipeline,    ///< R3: the pipeline lookup (shader hashes + variant table)
     Count,
 };
 inline constexpr size_t NumSteps = static_cast<size_t>(Step::Count);
-inline constexpr std::array<const char*, NumSteps> step_names{"shape", "draw key", "pipeline key"};
+inline constexpr std::array<const char*, NumSteps> step_names{"shape", "draw key", "pipeline key",
+                                                              "pipeline"};
 
 struct Stats {
     static constexpr size_t MaxShards = 16;

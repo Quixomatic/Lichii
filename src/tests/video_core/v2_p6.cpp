@@ -24,6 +24,8 @@
 #include "video_core/renderer_vulkan/vk_state_tracker.h"
 
 #include "video_core/v2/commit.h"
+#include "video_core/v2/epoch_publish.h"
+#include "video_core/v2/pipeline_lookup.h"
 #include "video_core/v2/resolve/cow_regs.h"
 #include "video_core/v2/resolve/multifront.h"
 #include "video_core/v2/resolve/parallel_resolve.h"
@@ -986,6 +988,270 @@ TEST_CASE("V2 P6: an early-submitted segment's shard stops at the end the front 
     }
     Resolve::g_shard_key = saved;
     CHECK(wrong == 0);
+}
+
+// ---- R3: the pipeline lookup on the shards -------------------------------------------------------
+
+TEST_CASE("V2 P6 R3: thread epoch sections register once and nest", "[video_core][v2_p6]") {
+    // Sections run on threads that end before the domain does (a thread keeps its slot).
+    V2::EpochDomain domain;
+    bool freed = false;
+    bool valid = false;
+    bool held = false;
+    std::thread{[&] {
+        {
+            const V2::ThreadEpochGuard outer{domain};
+            valid = outer.Valid();
+            {
+                const V2::ThreadEpochGuard inner{domain};
+                valid = valid && inner.Valid();
+            }
+            // The inner section's end does not end the outer one: what it may hold stays.
+            domain.Retire(&freed, [](void* pointer) { *static_cast<bool*>(pointer) = true; });
+            held = !freed;
+        }
+        domain.Reclaim();
+    }}.join();
+    CHECK(valid);
+    CHECK(held);
+    CHECK(freed);
+    for (u32 i = 0; i < V2::EpochDomain::MaxReaders * 2; ++i) {
+        std::thread{[&] { const V2::ThreadEpochGuard guard{domain}; }}.join();
+    }
+    std::thread{[&] {
+        const V2::ThreadEpochGuard guard{domain};
+        CHECK(guard.Valid()); // slots came back
+    }}.join();
+}
+
+TEST_CASE("V2 P6 R3: shared lookups find inserted pipelines and refuse cleared ones",
+          "[video_core][v2_p6]") {
+    using Lookup = V2::PipelineLookup<int>;
+    V2::EpochDomain domain;
+    Lookup lookup;
+    lookup.SetDomain(&domain);
+    const Lookup::Hashes hashes{1, 2, 3, 0, 0, 5};
+    std::array<u8, 24> key{};
+    key[3] = 7;
+    int value = 42;
+    const auto shared = [&](const Lookup::Hashes& set, const std::array<u8, 24>& bytes) {
+        int* found = nullptr;
+        std::thread{[&] {
+            const V2::ThreadEpochGuard guard{domain};
+            found = lookup.FindShared(set, 9, bytes.data(), bytes.size());
+        }}.join();
+        return found;
+    };
+    CHECK(shared(hashes, key) == nullptr);
+    const u64 serial = lookup.Serial();
+    lookup.Insert(hashes, 9, key.data(), key.size(), &value);
+    CHECK(lookup.Serial() != serial);
+    // The table keeps its own copy of the key: the caller's bytes may go away.
+    std::array<u8, 24> copy = key;
+    key.fill(0xff);
+    const u64 generation = lookup.Generation();
+    CHECK(shared(hashes, copy) == &value);
+    CHECK(shared(hashes, key) == nullptr);
+    CHECK(shared(Lookup::Hashes{1, 2, 3, 0, 0, 6}, copy) == nullptr);
+    // A clear while a reader is inside: the generation moves (the commit refuses what was found
+    // before), the sets stay readable until the reader leaves.
+    std::atomic<int> phase{0};
+    int* held = nullptr;
+    std::thread reader{[&] {
+        const V2::ThreadEpochGuard guard{domain};
+        held = lookup.FindShared(hashes, 9, copy.data(), copy.size());
+        phase.store(1);
+        while (phase.load() != 2) {
+            std::this_thread::yield();
+        }
+    }};
+    while (phase.load() != 1) {
+        std::this_thread::yield();
+    }
+    lookup.Clear();
+    CHECK(lookup.Generation() != generation);
+    CHECK(domain.PendingRetired() == 1); // the reader is inside: not freed
+    phase.store(2);
+    reader.join();
+    CHECK(held == &value);
+    CHECK(shared(hashes, copy) == nullptr);
+    domain.Reclaim();
+    CHECK(domain.PendingRetired() == 0);
+}
+
+TEST_CASE("V2 P6 R3: stress: shard lookups during inserts and clears", "[video_core][v2_p6]") {
+    using Lookup = V2::PipelineLookup<u64>;
+    V2::EpochDomain domain;
+    Lookup lookup;
+    lookup.SetDomain(&domain);
+    constexpr u32 Sets = 16;
+    constexpr u32 Variants = 24;
+    // Values encode their (set, variant): a reader checks what it found is for what it asked.
+    std::vector<u64> values(Sets * Variants);
+    for (u32 i = 0; i < values.size(); ++i) {
+        values[i] = i;
+    }
+    const auto hashes_of = [](u32 set) { return Lookup::Hashes{set + 1, 0, 0, 0, 0, 7}; };
+    const auto key_of = [](u32 variant) {
+        std::array<u8, 32> key{};
+        key[0] = static_cast<u8>(variant);
+        key[31] = static_cast<u8>(variant * 3);
+        return key;
+    };
+    std::atomic<bool> stop{false};
+    std::atomic<u64> wrong{0};
+    std::atomic<u64> hits{0};
+    std::vector<std::jthread> readers;
+    for (u32 thread = 0; thread < 3; ++thread) {
+        readers.emplace_back([&, thread] {
+            std::mt19937 rng{thread + 11};
+            while (!stop.load(std::memory_order_relaxed)) {
+                const u32 set = rng() % Sets;
+                const u32 variant = rng() % Variants;
+                const auto key = key_of(variant);
+                const V2::ThreadEpochGuard guard{domain};
+                const u64* const found =
+                    lookup.FindShared(hashes_of(set), variant * 0x9e37ULL, key.data(), key.size());
+                if (found != nullptr) {
+                    hits.fetch_add(1, std::memory_order_relaxed);
+                    if (*found != set * Variants + variant) {
+                        wrong.fetch_add(1, std::memory_order_relaxed);
+                    }
+                }
+            }
+        });
+    }
+    std::mt19937 rng{3};
+    for (u32 round = 0; round < 200; ++round) {
+        for (u32 i = 0; i < 64; ++i) {
+            const u32 set = rng() % Sets;
+            const u32 variant = rng() % Variants;
+            const auto key = key_of(variant);
+            if (lookup.Find(hashes_of(set), variant * 0x9e37ULL, key.data(), key.size()) ==
+                nullptr) {
+                lookup.Insert(hashes_of(set), variant * 0x9e37ULL, key.data(), key.size(),
+                              &values[set * Variants + variant]);
+            }
+        }
+        if (round % 25 == 24) {
+            lookup.Clear();
+        }
+    }
+    stop.store(true);
+    readers.clear();
+    CHECK(wrong.load() == 0);
+    CHECK(hits.load() != 0);
+}
+
+TEST_CASE("V2 P6 R3: published programs answer by memory and address", "[video_core][v2_p6]") {
+    Resolve::ClearPrograms();
+    u64 hash = 0;
+    CHECK(!Resolve::FindProgram(0x1000, 0x8000, &hash));
+    const u64 generation = Resolve::ProgramGeneration();
+    Resolve::PublishProgram(0x1000, 0x8000, 0xabc);
+    CHECK(Resolve::ProgramGeneration() != generation);
+    REQUIRE(Resolve::FindProgram(0x1000, 0x8000, &hash));
+    CHECK(hash == 0xabc);
+    CHECK(!Resolve::FindProgram(0x2000, 0x8000, &hash)); // another channel's memory
+    CHECK(!Resolve::FindProgram(0x1000, 0x8100, &hash));
+    // Publishing what is there already does not move the generation.
+    const u64 same = Resolve::ProgramGeneration();
+    Resolve::PublishProgram(0x1000, 0x8000, 0xabc);
+    CHECK(Resolve::ProgramGeneration() == same);
+    Resolve::PublishProgram(0x1000, 0x8000, 0xdef);
+    REQUIRE(Resolve::FindProgram(0x1000, 0x8000, &hash));
+    CHECK(hash == 0xdef);
+    Resolve::ClearPrograms();
+    CHECK(!Resolve::FindProgram(0x1000, 0x8000, &hash));
+}
+
+namespace {
+
+std::shared_ptr<const Resolve::PipelineKey> FakePipelineKey(const Resolve::SnapshotView& view) {
+    auto key = std::make_shared<Resolve::PipelineKey>();
+    key->hash = view.Regs().reg_array[0x200] + 1;
+    key->bytes.assign(8, static_cast<u8>(key->hash));
+    return key;
+}
+
+/// A shard lookup that names a pipeline by its key (as the real lookup does, keyed by state).
+void FakeShardPipeline(const Resolve::SnapshotView&, uintptr_t memory, Resolve::PreDraw& pre) {
+    pre.hashes = {memory, 0, 0, 0, 0, 1};
+    pre.pipeline = reinterpret_cast<const void*>(static_cast<uintptr_t>(pre.pipeline_key->hash << 4));
+    pre.has_pipeline = true;
+    pre.lookup_generation = 1;
+    pre.lookup_serial = 5;
+}
+
+} // Anonymous namespace
+
+TEST_CASE("V2 P6 R3: shards look up each draw's pipeline; verify compares the objects",
+          "[video_core][v2_p6]") {
+    ScopedSystemTestContext context;
+    Core::System system;
+    Core::DeviceMemory physical;
+    Tegra::MaxwellDeviceMemoryManager device_memory{physical};
+    Tegra::MemoryManager memory{system, device_memory, 32, 1ULL << 31};
+    Tegra::Engines::Maxwell3D engine{memory};
+    auto snapshot = std::make_unique<Resolve::FrontSnapshot>();
+    Resolve::SnapshotBuilder<0xe00> builder;
+    std::vector<u32> regs(0xe00, 0);
+    regs[0x200] = 0x30;
+    snapshot->regs = builder.Take(regs.data());
+    snapshot->engine_ref = 3;
+    snapshot->memory = 0x7000;
+    RingBuilder ring;
+    V2::Ir::DrawBody body{};
+    body.op = V2::Ir::DrawOp::Predicted;
+    body.engine = 3;
+    body.flags = V2::Ir::DrawHasGroups;
+    body.num_draws = 1;
+    body.draws[0].kind = V2::Ir::DrawKind::Indexed;
+    body.fingerprint = V2::GroupTracker{}.Fingerprint(V2::HashedGroups);
+    ring.Draw(body);
+    body.fingerprint ^= 1; // drift: no key, no lookup
+    ring.Draw(body);
+    Resolve::SegmentInput input;
+    input.id = 1;
+    input.begin = 0;
+    input.end = ring.position;
+    input.snapshot = snapshot.get();
+    input.ring = ring.ring.data();
+    input.arena = &ring.arena;
+    const auto saved_key = Resolve::g_shard_key;
+    const auto saved_pipeline_key = Resolve::g_pipeline_key;
+    const auto saved_pipeline = Resolve::g_shard_pipeline;
+    Resolve::g_shard_key = &FakeShardKey;
+    Resolve::g_pipeline_key = &FakePipelineKey;
+    Resolve::g_shard_pipeline = &FakeShardPipeline;
+    Resolve::SplitTraits::Shard shard;
+    std::vector<Resolve::PreDraw> records;
+    Commit::RequestList requests;
+    requests.Reset(1);
+    const SerialReason reason = Resolve::SplitTraits::Resolve(shard, input, records, requests);
+    Resolve::g_shard_key = saved_key;
+    Resolve::g_pipeline_key = saved_pipeline_key;
+    Resolve::g_shard_pipeline = saved_pipeline;
+    REQUIRE(reason == SerialReason::None);
+    REQUIRE(records.size() == 2);
+    CHECK(records[0].has_pipeline);
+    CHECK(records[0].pipeline == reinterpret_cast<const void*>(uintptr_t{0x31 << 4}));
+    CHECK(records[0].hashes[0] == 0x7000);
+    CHECK(!records[1].has_pipeline);
+    // Verify: another object for the same tables is a mismatch; after an insert or a program
+    // publish in between it is dependent.
+    Resolve::PreDraw serial = records[0];
+    CHECK(Resolve::SplitTraits::Compare(records[0], serial) == nullptr);
+    serial.pipeline = nullptr;
+    serial.has_pipeline = false;
+    CHECK(Resolve::SplitTraits::Compare(records[0], serial) != nullptr);
+    serial.lookup_serial = 6;
+    CHECK(Resolve::SplitTraits::Compare(records[0], serial) == nullptr);
+    serial = records[0];
+    serial.hashes[5] = 2;
+    CHECK(Resolve::SplitTraits::Compare(records[0], serial) != nullptr);
+    serial.program_generation += 1;
+    CHECK(Resolve::SplitTraits::Compare(records[0], serial) == nullptr);
 }
 
 TEST_CASE("V2 P6: published shapes are found by the shards", "[video_core][v2_p6]") {
