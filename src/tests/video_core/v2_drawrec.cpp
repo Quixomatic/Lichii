@@ -125,6 +125,47 @@ TEST_CASE("V2 DRAWREC: a recipe keeps its record template", "[video_core][v2_dra
     REQUIRE(R::CompareRecords(copy.record.Get(), record, 0, reasons, nullptr, nullptr));
 }
 
+TEST_CASE("V2 DRAWREC: a miss base is peeked without touching the recipe table",
+          "[video_core][v2_drawrec]") {
+    // F2-01: MissBase finds the shape's last template through Peek, which must not change the
+    // table's replacement order (DRAWREC=0 keeps the same evictions).
+    namespace DC = VideoCommon::V2::DrawCache;
+    DC::RecipeTable table{1}; // one set of 4 ways
+    bool evicted = false;
+    for (u64 key = 1; key <= 4; ++key) {
+        table.Insert(key, evicted);
+    }
+    table.Insert(1, evicted).record.Store(SampleRecord()); // 1 is the newest now
+    const DC::Recipe* const peeked = table.Peek(2);
+    REQUIRE(peeked != nullptr);
+    REQUIRE(!peeked->record.Valid());
+    REQUIRE(table.Peek(1)->record.Valid());
+    REQUIRE(table.Peek(9) == nullptr);
+    table.Insert(5, evicted); // 2 stays the oldest: the peek did not touch it
+    REQUIRE(evicted);
+    REQUIRE(table.Peek(2) == nullptr);
+    REQUIRE(table.Peek(3) != nullptr);
+}
+
+TEST_CASE("V2 DRAWREC: the stats line reports reuse and time per path",
+          "[video_core][v2_drawrec]") {
+    R::RecordStats& stats = R::GetRecordStats();
+    static_cast<void>(R::TakeRecordStatsText(1.0)); // the counter's origin, old counts taken
+    R::CountRecordStat(stats.drawrec_draws, 3);
+    R::CountRecordStat(stats.by_path[2], 3);
+    R::CountRecordStat(stats.reused_ubos, 7);
+    R::CountRecordStat(stats.reused_tbos, 2);
+    R::CountRecordTime(2, 3000, 1200);
+    const std::string text = R::TakeRecordStatsText(1.0);
+    REQUIRE(text.find("template 3") != std::string::npos);
+    REQUIRE(text.find("reused ubo 7/s tbo 2/s") != std::string::npos);
+    REQUIRE(stats.path_ticks[2].load() == 0);
+    REQUIRE(stats.resolve_ticks[2].load() == 0);
+    REQUIRE(stats.reused_ubos.load() == 0);
+    // A record's uniform keeps the VA it was bound at (reuse compares it with the view's).
+    REQUIRE(R::ResolvedUbo{}.gpu_addr == 0);
+}
+
 TEST_CASE("V2 DRAWREC: record compare names the differing groups", "[video_core][v2_drawrec]") {
     const R::ResolvedDraw resolved = SampleRecord();
     std::string reasons;

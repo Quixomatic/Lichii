@@ -1781,6 +1781,7 @@ V2::Resolve::ResolvedUbo BufferCache<P>::ResolveUniformBinding(const View& view,
     const BufferId id = PeekBuffer(*device_addr, cbuf.size, false);
     ubo.daddr = *device_addr;
     ubo.size = cbuf.size;
+    ubo.gpu_addr = cbuf.address;
     ubo.buffer = {id.index, BufferGeneration(id)};
     return ubo;
 }

@@ -244,6 +244,7 @@ struct ResolvedUbo {
     u32 size{}; ///< the constant buffer's bound size
     Versions::WeakRef buffer{};
     u64 version{}; ///< F2-02: a CbufVersion reference (0: none in Step 0)
+    GPUVAddr gpu_addr{}; ///< the bound constant buffer's VA (F2-01: sub-record reuse by value)
 };
 struct ResolvedSsbo {
     u8 stage{};
@@ -428,8 +429,23 @@ struct RecordStats {
     std::atomic<u64> dependent{};
     std::atomic<u64> purity_violations{};
     std::atomic<u64> deleted_loops{}; ///< ApplyDraw's deleted-images/buffers loops (R-7)
+    /// S0-04: time stamp counter ticks per path (full, delta, template): the whole draw's
+    /// resolve + apply + encode, and its resolve alone.
+    std::array<std::atomic<u64>, 3> path_ticks{};
+    std::array<std::atomic<u64>, 3> resolve_ticks{};
+    /// F2-01: sub-records a resolve took from its base (uniform and texture buffer entries).
+    std::atomic<u64> reused_ubos{};
+    std::atomic<u64> reused_tbos{};
+    std::atomic<u64> nearest_bases{}; ///< full resolves over a shape's template
 };
 [[nodiscard]] RecordStats& GetRecordStats();
+
+/// Adds the ticks of one record-path draw (S0-04).
+inline void CountRecordTime(size_t path, u64 total_ticks, u64 resolve_ticks) {
+    RecordStats& stats = GetRecordStats();
+    stats.path_ticks[path].fetch_add(total_ticks, std::memory_order_relaxed);
+    stats.resolve_ticks[path].fetch_add(resolve_ticks, std::memory_order_relaxed);
+}
 
 /// Counts one relaxed increment (stats).
 inline void CountRecordStat(std::atomic<u64>& counter, u64 value = 1) {

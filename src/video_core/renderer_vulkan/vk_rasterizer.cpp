@@ -5375,6 +5375,36 @@ RasterizerVulkan::DrawRecPurity RasterizerVulkan::TakeDrawRecPurity() const {
     return purity;
 }
 
+const VideoCommon::V2::Resolve::ResolvedDraw* RasterizerVulkan::DrawRecBase(
+    const GraphicsPipeline& pipeline) {
+    namespace R = VideoCommon::V2::Resolve;
+    using VideoCommon::V2::RegGroup;
+    // F2-01: a miss resolves over the nearest record of its shape when it shares more of the
+    // group-hashed sub-records (vertex streams, index buffer) than the pipeline's last record.
+    const R::ResolvedDraw* const last = &pipeline.LastRecord();
+    const R::ResolvedDraw* const nearest = DrawCache().MissBase(pipeline);
+    if (nearest == nullptr) {
+        return last;
+    }
+    const auto& groups = maxwell3d->v2_groups;
+    const auto score = [&](const R::ResolvedDraw& record) {
+        if (record.h.pipeline != &pipeline || !record.h.groups_valid || !groups.valid) {
+            return 0;
+        }
+        int matched = 0;
+        for (const RegGroup group : {RegGroup::VertexStreams, RegGroup::IndexBuffer}) {
+            const size_t index = static_cast<size_t>(group);
+            matched += record.h.group_hashes[index] == groups.hashes[index] ? 1 : 0;
+        }
+        return matched;
+    };
+    if (score(*nearest) <= score(*last)) {
+        return last;
+    }
+    R::CountRecordStat(R::GetRecordStats().nearest_bases);
+    return nearest;
+}
+
 VideoCommon::V2::Resolve::ResolveStatus RasterizerVulkan::ResolveDrawRecord(
     GraphicsPipeline& pipeline, bool is_indexed, bool is_indirect, bool check) {
     namespace R = VideoCommon::V2::Resolve;
@@ -5388,9 +5418,10 @@ VideoCommon::V2::Resolve::ResolveStatus RasterizerVulkan::ResolveDrawRecord(
         .frame_dump = frame_dump.Capturing(),
         .sampled_recording = RecordingSampledTextures(),
         .ordinal = drawrec_ordinal++,
-        // Step 17: DRAWREC=1 reuses unchanged sub-records of the pipeline's last record; verify
-        // resolves without it and compares the reusing resolve below (R-13).
-        .previous = check ? nullptr : &pipeline.LastRecord(),
+        // Step 17 / F2-01: DRAWREC=1 reuses unchanged sub-records of the nearest record (the
+        // shape's template or the pipeline's last record); verify resolves without it and
+        // compares the reusing resolve below (R-13).
+        .previous = check ? nullptr : DrawRecBase(pipeline),
         .features = &DrawRecFeatures(),
     };
     const auto resolve = [&] {
@@ -5426,11 +5457,11 @@ VideoCommon::V2::Resolve::ResolveStatus RasterizerVulkan::ResolveDrawRecord(
     if (status == R::ResolveStatus::CommitOnly) {
         R::CountRecordStat(stats.commit_only[static_cast<size_t>(drawrec_record.h.reason)]);
     }
-    if (check && status == R::ResolveStatus::Ready &&
-        pipeline.LastRecord().h.pipeline == &pipeline) {
-        // R-13: the resolve reusing the last record's sub-records gives the same record.
+    const R::ResolvedDraw* const base = check ? DrawRecBase(pipeline) : nullptr;
+    if (check && status == R::ResolveStatus::Ready && base->h.pipeline == &pipeline) {
+        // R-13: the resolve reusing the nearest record's sub-records gives the same record.
         R::ResolveContext reuse = ctx;
-        reuse.previous = &pipeline.LastRecord();
+        reuse.previous = base;
         drawrec_scratch_buffers.Reset(commit->next_segment++);
         drawrec_scratch_textures.Reset(commit->next_segment++);
         if (pipeline.ResolveDraw(R::LiveView{*maxwell3d}, reuse, drawrec_scratch,
@@ -5459,11 +5490,14 @@ VideoCommon::V2::Resolve::ResolveStatus RasterizerVulkan::ResolveDrawRecord(
 bool RasterizerVulkan::PrepareDrawRecord(GraphicsPipeline& pipeline, bool is_indexed,
                                          bool is_indirect, bool& recorded, bool capture) {
     namespace R = VideoCommon::V2::Resolve;
+    namespace Profile = VideoCommon::Nx2Profile;
     recorded = false;
+    const u64 start = Profile::Ticks();
     if (ResolveDrawRecord(pipeline, is_indexed, is_indirect, false) != R::ResolveStatus::Ready) {
         // D3: what Step 0 doesn't resolve takes the old configure (counted by reason).
         return capture ? pipeline.ConfigureCapture(is_indexed) : pipeline.Configure(is_indexed);
     }
+    const u64 resolved = Profile::Ticks();
     R::RecordStats& stats = R::GetRecordStats();
     R::CountRecordStat(stats.drawrec_draws);
     R::CountRecordStat(stats.by_path[0]);
@@ -5478,6 +5512,7 @@ bool RasterizerVulkan::PrepareDrawRecord(GraphicsPipeline& pipeline, bool is_ind
         return false;
     }
     pipeline.StoreLastRecord(drawrec_record);
+    R::CountRecordTime(0, Profile::Ticks() - start, resolved - start);
     recorded = true;
     return true;
 }
@@ -5514,13 +5549,17 @@ GraphicsPipeline::RecipeResult RasterizerVulkan::PrepareTemplateRecord(
     GraphicsPipeline& pipeline, bool is_indexed, VideoCommon::V2::DrawCache::Recipe& recipe,
     GraphicsPipeline::BufferReplay& buffers, bool& recorded) {
     namespace R = VideoCommon::V2::Resolve;
+    namespace Profile = VideoCommon::Nx2Profile;
     recorded = false;
-    // Step 16: a recipe hit copies the template; its buffers are resolved again (relocation),
-    // its dynamic state computed from the view.
+    const u64 start = Profile::Ticks();
+    // Step 16: a recipe hit copies the template; its buffers are resolved again (relocation,
+    // or the template's own entries while their inputs hold), its dynamic state computed from
+    // the view.
     if (ResolveRecordFromBase(pipeline, is_indexed, recipe.record.Get(), drawrec_record,
                               drawrec_buffers) != R::ResolveStatus::Ready) {
         return GraphicsPipeline::RecipeResult::Rebuild;
     }
+    const u64 resolved = Profile::Ticks();
     drawrec_textures.Reset(commit->next_segment++);
     switch (pipeline.ApplyDraw(drawrec_record, drawrec_textures, drawrec_buffers, drawrec_apply,
                                GraphicsPipeline::ApplyMode::Template, commit->stage, &recipe)) {
@@ -5540,6 +5579,7 @@ GraphicsPipeline::RecipeResult RasterizerVulkan::PrepareTemplateRecord(
     R::RecordStats& stats = R::GetRecordStats();
     R::CountRecordStat(stats.drawrec_draws);
     R::CountRecordStat(stats.by_path[2]);
+    R::CountRecordTime(2, Profile::Ticks() - start, resolved - start);
     recorded = true;
     return GraphicsPipeline::RecipeResult::Recorded;
 }
@@ -5596,13 +5636,16 @@ void RasterizerVulkan::DrawHooks(GraphicsPipeline& pipeline, bool is_indexed, bo
 bool RasterizerVulkan::PrepareDeltaRecord(GraphicsPipeline& pipeline, bool is_indexed,
                                           bool& recorded) {
     namespace R = VideoCommon::V2::Resolve;
+    namespace Profile = VideoCommon::Nx2Profile;
     recorded = false;
+    const u64 start = Profile::Ticks();
     // Step 17: the record diff. The last record keeps its textures; buffers (storage
     // descriptors read again), render targets and dynamic state are resolved from the view.
     if (ResolveRecordFromBase(pipeline, is_indexed, pipeline.LastRecord(), drawrec_record,
                               drawrec_buffers) != R::ResolveStatus::Ready) {
         return false;
     }
+    const u64 resolved = Profile::Ticks();
     drawrec_textures.Reset(commit->next_segment++);
     if (pipeline.ApplyDraw(drawrec_record, drawrec_textures, drawrec_buffers, drawrec_apply,
                            GraphicsPipeline::ApplyMode::Continued, commit->stage) !=
@@ -5618,6 +5661,7 @@ bool RasterizerVulkan::PrepareDeltaRecord(GraphicsPipeline& pipeline, bool is_in
     R::RecordStats& stats = R::GetRecordStats();
     R::CountRecordStat(stats.drawrec_draws);
     R::CountRecordStat(stats.by_path[1]);
+    R::CountRecordTime(1, Profile::Ticks() - start, resolved - start);
     recorded = true;
     return true;
 }

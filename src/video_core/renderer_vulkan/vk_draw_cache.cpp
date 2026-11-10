@@ -379,6 +379,7 @@ DrawCacheGlue::Decision DrawCacheGlue::DecideDraw(bool continued, bool is_indexe
             pending_draw.key = key;
             pending_draw.valid = true;
             Recipe* const recipe = graphics_table.Find(key);
+            pending_draw.found = recipe;
             if (recipe == nullptr) {
                 miss = DC::Miss::NoEntry;
                 // Probation: a recipe only for a key seen before.
@@ -619,6 +620,7 @@ void DrawCacheGlue::BuildGraphicsRecipe(GraphicsPipeline& pipeline, const Decisi
     }
     if (record != nullptr) {
         recipe.record.Store(*record);
+        NoteShapeBase(pending_draw.shape, pending_draw.key);
     }
     // The shape learnt what its shaders use when DecideDraw met it.
     Store(graphics_table, pending_draw.key, recipe, decision, false);
@@ -638,9 +640,31 @@ void DrawCacheGlue::AttachRecordTemplate(const V2::Resolve::ResolvedDraw& record
     }
 }
 
+const V2::Resolve::ResolvedDraw* DrawCacheGlue::MissBase(const GraphicsPipeline& pipeline) const {
+    if (!pending_draw.valid) {
+        return nullptr;
+    }
+    const auto usable = [&](const Recipe* recipe) {
+        return recipe != nullptr && recipe->pipeline == &pipeline && recipe->record.Valid() &&
+               recipe->record.Get().h.pipeline == &pipeline;
+    };
+    if (usable(pending_draw.found)) {
+        return &pending_draw.found->record.Get();
+    }
+    const ShapeBase& base = shape_bases[pending_draw.shape % shape_bases.size()];
+    if (base.shape != pending_draw.shape || base.key == pending_draw.key) {
+        return nullptr;
+    }
+    const Recipe* const recipe = graphics_table.Peek(base.key);
+    return usable(recipe) ? &recipe->record.Get() : nullptr;
+}
+
 void DrawCacheGlue::NoteReplayed(Recipe& recipe) {
     ++recipe.uses;
     ++GraphicsCounters().hits;
+    if (recipe.record.Valid()) {
+        NoteShapeBase(pending_draw.shape, recipe.key);
+    }
 }
 
 void DrawCacheGlue::NoteReplayRebuilt(Recipe& recipe) {

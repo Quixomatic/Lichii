@@ -248,6 +248,9 @@ private:
         bool operator==(const DrawRecPurity&) const = default;
     };
     [[nodiscard]] DrawRecPurity TakeDrawRecPurity() const;
+    /// F2-01: the record a full resolve reuses sub-records from (never null).
+    [[nodiscard]] const VideoCommon::V2::Resolve::ResolvedDraw* DrawRecBase(
+        const GraphicsPipeline& pipeline);
     /// Resolves the draw into drawrec_record (Stale: tables synchronized and resolved again
     /// once; a second Stale is CommitOnly(Retry)); with `check`, around the purity snapshot.
     VideoCommon::V2::Resolve::ResolveStatus ResolveDrawRecord(GraphicsPipeline& pipeline,

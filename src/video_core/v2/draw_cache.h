@@ -518,6 +518,8 @@ public:
 
     /// The recipe for `key`, or nullptr (touches it).
     [[nodiscard]] Recipe* Find(u64 key);
+    /// The recipe for `key`, or nullptr, without touching it.
+    [[nodiscard]] const Recipe* Peek(u64 key) const;
     /// A cleared recipe for `key` (an existing one is reused; else the LRU way of the set is
     /// evicted). `drop(recipe)` sees a live recipe before it is cleared; `evicted` is set when it
     /// was another key's.

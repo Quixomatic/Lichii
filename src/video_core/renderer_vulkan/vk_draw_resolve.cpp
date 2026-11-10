@@ -276,11 +276,13 @@ R::ResolveStatus GraphicsPipeline::ResolveBuffers(const View& view, const R::Res
     // Step 17: a sub-record of the previous record (same pipeline, buffers neither remapped nor
     // deleted since, its handles patched) is reused when its register groups hash equal.
     const R::ResolvedDraw* const previous = ctx.previous;
-    const bool reusable = previous != nullptr && previous->h.pipeline == ctx.pipeline &&
-                          previous->h.status == R::ResolveStatus::Ready && out.h.groups_valid &&
-                          previous->h.groups_valid &&
-                          previous->h.map_serial == out.h.map_serial &&
-                          previous->h.buffer_deletions == out.h.buffer_deletions;
+    // F2-01: sub-records compared by value (uniform VAs, texture buffer views) need only the
+    // same pipeline (same lists in the same order) and buffers neither remapped nor deleted.
+    const bool same_buffers = previous != nullptr && previous->h.pipeline == ctx.pipeline &&
+                              previous->h.status == R::ResolveStatus::Ready &&
+                              previous->h.map_serial == out.h.map_serial &&
+                              previous->h.buffer_deletions == out.h.buffer_deletions;
+    const bool reusable = same_buffers && out.h.groups_valid && previous->h.groups_valid;
     const auto same_groups = [&](std::initializer_list<VideoCommon::V2::RegGroup> groups) {
         for (const VideoCommon::V2::RegGroup group : groups) {
             const size_t index = static_cast<size_t>(group);
@@ -339,6 +341,19 @@ R::ResolveStatus GraphicsPipeline::ResolveBuffers(const View& view, const R::Res
     boost::container::small_vector<R::ResolvedTbo, 16> tbos;
     const auto views = out.Span<const R::ResolvedView>(out.h.views);
     size_t view_index = 0;
+    // F2-01: the previous record's uniform and texture buffer lists, entry for entry (same
+    // pipeline: the same masks and descriptors in the same order).
+    const auto previous_ubos = same_buffers
+                                   ? previous->Span<const R::ResolvedUbo>(previous->h.ubo)
+                                   : std::span<const R::ResolvedUbo>{};
+    const auto previous_views = same_buffers
+                                    ? previous->Span<const R::ResolvedView>(previous->h.views)
+                                    : std::span<const R::ResolvedView>{};
+    const auto previous_tbos = same_buffers && previous_views.size() == views.size()
+                                   ? previous->Span<const R::ResolvedTbo>(previous->h.tbo)
+                                   : std::span<const R::ResolvedTbo>{};
+    u32 reused_ubos = 0;
+    u32 reused_tbos = 0;
     for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
         out.h.ubo_masks[stage] = 0;
         if (!recipe_stages[stage]) {
@@ -349,6 +364,19 @@ R::ResolveStatus GraphicsPipeline::ResolveBuffers(const View& view, const R::Res
         out.h.ubo_masks[stage] = ubo_mask;
         for (u32 mask = ubo_mask; mask != 0; mask &= mask - 1) {
             const u32 slot = static_cast<u32>(std::countr_zero(mask));
+            // A constant buffer bound at the same VA and size translates to the same device
+            // range in the same buffer while nothing was remapped or deleted.
+            if (const size_t at = ubos.size(); at < previous_ubos.size()) {
+                const R::ResolvedUbo& kept = previous_ubos[at];
+                const R::CbufBinding cbuf = view.Cbuf(stage, slot);
+                if (kept.stage == stage && kept.slot == slot && kept.daddr != 0 &&
+                    cbuf.enabled != 0 && kept.gpu_addr == cbuf.address &&
+                    kept.size == cbuf.size && !C::IsProxy(kept.buffer.id)) {
+                    ubos.push_back(kept);
+                    ++reused_ubos;
+                    continue;
+                }
+            }
             R::ResolvedUbo ubo = buffer_cache.ResolveUniformBinding(view, stage, slot);
             if (ubo.size != 0 || ubo.daddr != 0) {
                 resolve_buffer(ubo.buffer, ubo.daddr, ubo.size);
@@ -377,6 +405,16 @@ R::ResolveStatus GraphicsPipeline::ResolveBuffers(const View& view, const R::Res
                 const R::ResolvedView& entry = views[view_index];
                 if (C::IsProxy(entry.view.id)) {
                     return false;
+                }
+                // The same view (id and generation): the same range and format.
+                if (const size_t at = tbos.size(); at < previous_tbos.size() &&
+                                                   previous_views[view_index].view == entry.view &&
+                                                   previous_tbos[at].stage == stage &&
+                                                   previous_tbos[at].index == tbo_index &&
+                                                   !C::IsProxy(previous_tbos[at].buffer.id)) {
+                    tbos.push_back(previous_tbos[at]);
+                    ++reused_tbos;
+                    continue;
                 }
                 const ImageView& image_view{
                     texture_cache.GetImageView(VideoCommon::ImageViewId{entry.view.id})};
@@ -416,6 +454,11 @@ R::ResolveStatus GraphicsPipeline::ResolveBuffers(const View& view, const R::Res
     out.h.ubo = out.Push(std::span<const R::ResolvedUbo>(ubos.data(), ubos.size()));
     out.h.ssbo = out.Push(std::span<const R::ResolvedSsbo>(ssbos.data(), ssbos.size()));
     out.h.tbo = out.Push(std::span<const R::ResolvedTbo>(tbos.data(), tbos.size()));
+    if ((reused_ubos | reused_tbos) != 0) {
+        R::RecordStats& stats = R::GetRecordStats();
+        R::CountRecordStat(stats.reused_ubos, reused_ubos);
+        R::CountRecordStat(stats.reused_tbos, reused_tbos);
+    }
     return R::ResolveStatus::Ready;
 }
 

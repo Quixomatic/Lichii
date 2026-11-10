@@ -3,6 +3,7 @@
 
 #include <fmt/format.h>
 
+#include "video_core/nx2_profile.h"
 #include "video_core/v2/commit.h"
 #include "video_core/v2/resolve/draw_record.h"
 
@@ -228,6 +229,9 @@ RecordStats& GetRecordStats() {
 }
 
 std::string TakeRecordStatsText(double seconds) {
+    // The time stamp counter's rate against the wall clock since the first report (S0-04).
+    static const std::pair<u64, u64> origin{VideoCommon::Nx2Profile::Ticks(),
+                                            VideoCommon::Nx2Profile::Now()};
     RecordStats& stats = GetRecordStats();
     const auto take = [](std::atomic<u64>& counter) {
         return counter.exchange(0, std::memory_order_relaxed);
@@ -269,13 +273,42 @@ std::string TakeRecordStatsText(double seconds) {
             mismatches += fmt::format(" {} {}", record_group_names[i], value);
         }
     }
+    // S0-04: microseconds per draw by path (whole draw / its resolve), the counter converted with the
+    // window's length.
+    std::array<u64, 3> paths{};
+    std::array<u64, 3> path_ticks{};
+    std::array<u64, 3> resolve_ticks{};
+    for (size_t i = 0; i < paths.size(); ++i) {
+        paths[i] = take(stats.by_path[i]);
+        path_ticks[i] = take(stats.path_ticks[i]);
+        resolve_ticks[i] = take(stats.resolve_ticks[i]);
+    }
+    const u64 now_ticks = VideoCommon::Nx2Profile::Ticks();
+    const u64 now_ns = VideoCommon::Nx2Profile::Now();
+    std::string timing;
+    if (now_ticks > origin.first && now_ns > origin.second) {
+        const double us_per_tick = static_cast<double>(now_ns - origin.second) / 1e3 /
+                                   static_cast<double>(now_ticks - origin.first);
+        const auto us = [&](u64 ticks, u64 count) {
+            return count != 0 ? static_cast<double>(ticks) * us_per_tick / static_cast<double>(count)
+                              : 0.0;
+        };
+        timing = fmt::format(
+            ", us/draw full {:.2f} (resolve {:.2f}), delta {:.2f} ({:.2f}), template {:.2f} "
+            "({:.2f})",
+            us(path_ticks[0], paths[0]), us(resolve_ticks[0], paths[0]),
+            us(path_ticks[1], paths[1]), us(resolve_ticks[1], paths[1]),
+            us(path_ticks[2], paths[2]), us(resolve_ticks[2], paths[2]));
+    }
     return fmt::format(
-        "drawrec {:.0f}/s (full {:.0f}, delta {:.0f}, template {:.0f}), commit-only/s:{}, stale "
-        "{:.0f}/s, deleted loops {:.0f}/s, verify {} draws, mismatches:{}, dependent {}, purity "
-        "violations {}",
-        rate(draws), rate(take(stats.by_path[0])), rate(take(stats.by_path[1])),
-        rate(take(stats.by_path[2])), commit_only.empty() ? std::string{" none"} : commit_only,
-        rate(take(stats.stale)), rate(take(stats.deleted_loops)), take(stats.verify_draws),
+        "drawrec {:.0f}/s (full {:.0f}, delta {:.0f}, template {:.0f}){}, reused ubo {:.0f}/s tbo "
+        "{:.0f}/s, nearest bases {:.0f}/s, commit-only/s:{}, stale {:.0f}/s, deleted loops "
+        "{:.0f}/s, verify {} draws, mismatches:{}, dependent {}, purity violations {}",
+        rate(draws), rate(paths[0]), rate(paths[1]), rate(paths[2]), timing,
+        rate(take(stats.reused_ubos)), rate(take(stats.reused_tbos)),
+        rate(take(stats.nearest_bases)),
+        commit_only.empty() ? std::string{" none"} : commit_only, rate(take(stats.stale)),
+        rate(take(stats.deleted_loops)), take(stats.verify_draws),
         mismatches.empty() ? std::string{" none"} : mismatches, take(stats.dependent),
         take(stats.purity_violations));
 }

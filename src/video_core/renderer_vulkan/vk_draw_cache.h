@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <array>
+
 #include "common/common_types.h"
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/engines/maxwell_3d.h"
@@ -78,6 +80,12 @@ public:
     /// record (its proxies looked up again after the configure) as its template, so later hits
     /// compare the template path with the full resolve. Once per stored recipe.
     void AttachRecordTemplate(const VideoCommon::V2::Resolve::ResolvedDraw& record);
+    /// DRAWREC (F2-01): a miss's nearest record of its shape, the base its resolve reuses
+    /// sub-records from: the template of the entry the lookup found (also one that failed
+    /// validation), else of the shape's last stored or replayed recipe; null when none is
+    /// `pipeline`'s. Valid for this draw only.
+    [[nodiscard]] const VideoCommon::V2::Resolve::ResolvedDraw* MissBase(
+        const GraphicsPipeline& pipeline) const;
     /// The replay recorded the draw.
     void NoteReplayed(Recipe& recipe);
     /// The replay found a reason to resolve after all (Rebuild).
@@ -117,7 +125,16 @@ private:
         bool admit{};    ///< build a recipe (second sighting, invalidated entry or verify)
         bool capturing{};
         bool stored{}; ///< this draw's capture stored a recipe under `key`
+        const Recipe* found{}; ///< the entry the lookup found (valid or not)
     };
+    /// The key of a shape's last stored or replayed recipe (direct-mapped by shape).
+    struct ShapeBase {
+        u64 shape{};
+        u64 key{};
+    };
+    void NoteShapeBase(u64 shape, u64 key) {
+        shape_bases[shape % shape_bases.size()] = {shape, key};
+    }
 
     [[nodiscard]] static u64 GraphicsShape(const GraphicsPipeline& pipeline, bool is_indexed,
                                            const Tegra::Engines::Maxwell3D& maxwell3d,
@@ -162,6 +179,7 @@ private:
     VideoCommon::V2::DrawCache::VerifySampler compute_sampler;
     Pending pending_draw;
     Pending pending_dispatch;
+    std::array<ShapeBase, 1024> shape_bases{};
     RecipeCapture capture;
     Recipe built;
 };

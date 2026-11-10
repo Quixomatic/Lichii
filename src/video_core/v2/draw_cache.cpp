@@ -180,6 +180,16 @@ Recipe* RecipeTable::Find(u64 key) {
     return nullptr;
 }
 
+const Recipe* RecipeTable::Peek(u64 key) const {
+    const Entry* const set = &entries[SetOf(key) * Ways];
+    for (size_t way = 0; way < Ways; ++way) {
+        if (set[way].live && set[way].key == key) {
+            return &set[way].recipe;
+        }
+    }
+    return nullptr;
+}
+
 u32 VerifyN() {
     static const u32 n = [] {
         const char* const value = std::getenv("EDEN_NX2_V2_DRAWCACHE_VERIFY_N");
