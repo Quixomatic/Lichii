@@ -158,7 +158,7 @@ TEST_CASE("V2 DRAWREC: the stats line reports reuse and time per path",
     R::CountRecordStat(stats.by_path[2], 3);
     R::CountRecordStat(stats.reused_ubos, 7);
     R::CountRecordStat(stats.reused_tbos, 2);
-    R::CountRecordTime(2, 3000, 1200);
+    R::CountRecordTime(2, 3000, 1200, 800);
     const std::string text = R::TakeRecordStatsText(1.0);
     REQUIRE(text.find("template 3") != std::string::npos);
     REQUIRE(text.find("reused ubo 7/s tbo 2/s") != std::string::npos);
