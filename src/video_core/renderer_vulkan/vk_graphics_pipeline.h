@@ -432,6 +432,16 @@ private:
     template <class View>
     void ResolveTextures(const View& view, VideoCommon::V2::Resolve::ResolvedDraw& out,
                          VideoCommon::V2::Commit::RequestList& textures) const;
+    /// The draw's index, vertex, uniform, storage and texture buffer bindings into `out`, a
+    /// missing buffer as a BufferCreate request with a proxy into `buffers` (in the update
+    /// passes' order). CommitOnly for what the record path doesn't take yet (transform feedback,
+    /// indirect, inline indices, multi-range storage, a texture buffer view not created yet).
+    /// After ResolveTextures (texture buffers come from its views).
+    template <class View>
+    [[nodiscard]] VideoCommon::V2::Resolve::ResolveStatus ResolveBuffers(
+        const View& view, const VideoCommon::V2::Resolve::ResolveContext& ctx,
+        VideoCommon::V2::Resolve::ResolvedDraw& out,
+        VideoCommon::V2::Commit::RequestList& buffers) const;
 
     template <typename Spec, bool Capture = false>
     bool ConfigureImpl(bool is_indexed);

@@ -7,7 +7,9 @@
 // const cache lookups: no engine, no dirty flags, no recording.
 
 #include <array>
+#include <bit>
 #include <cstring>
+#include <optional>
 #include <span>
 #include <type_traits>
 #include <vector>
@@ -31,6 +33,7 @@ namespace Vulkan {
 namespace R = VideoCommon::V2::Resolve;
 namespace C = VideoCommon::V2::Commit;
 using Tegra::Texture::TexturePair;
+using VideoCore::Surface::PixelFormat;
 
 // RESOLVE BEGIN
 
@@ -223,6 +226,152 @@ void GraphicsPipeline::ResolveTextures(const View& view, R::ResolvedDraw& out,
     out.h.reads = out.Push(
         std::span<const VideoCommon::V2::DrawCache::InputRead>(reads.data(), reads.size()));
 }
+
+namespace {
+
+/// The status of a draw the record path does not resolve (counted per reason).
+R::ResolveStatus CommitOnly(R::ResolvedDraw& out, R::CommitOnlyReason reason) {
+    out.h.status = R::ResolveStatus::CommitOnly;
+    out.h.reason = reason;
+    return R::ResolveStatus::CommitOnly;
+}
+
+} // Anonymous namespace
+
+template <class View>
+R::ResolveStatus GraphicsPipeline::ResolveBuffers(const View& view, const R::ResolveContext& ctx,
+                                                  R::ResolvedDraw& out,
+                                                  C::RequestList& buffers) const {
+    const auto& regs = view.Regs();
+    if (regs.transform_feedback_enabled != 0) {
+        return CommitOnly(out, R::CommitOnlyReason::TransformFeedback);
+    }
+    if (ctx.is_indirect) {
+        return CommitOnly(out, R::CommitOnlyReason::Indirect);
+    }
+    // A buffer the lookup can't find is created when the list applies (FindBuffer's proxy).
+    const auto resolve_buffer = [&](VideoCommon::V2::Versions::WeakRef& ref, DAddr device_addr,
+                                    u32 size) {
+        if (ref.id != VideoCommon::BufferId{}.index) {
+            return;
+        }
+        ref.id = buffers.Push(buffer_cache.MakeCreateRequest(device_addr, size, false), true);
+        ref.generation = 0;
+    };
+    // UpdateIndexBuffer.
+    if (ctx.is_indexed) {
+        if (view.InlineIndexDraw()) {
+            return CommitOnly(out, R::CommitOnlyReason::InlineIndex);
+        }
+        out.h.index = buffer_cache.ResolveIndexBinding(view);
+        if (out.h.index.valid) {
+            resolve_buffer(out.h.index.buffer, out.h.index.daddr, out.h.index.size);
+        }
+    }
+    // UpdateVertexBuffers: every slot (a clean slot holds what its registers give).
+    boost::container::small_vector<R::ResolvedVertex, VideoCommon::NUM_VERTEX_BUFFERS> vertex;
+    out.h.vertex_mask = 0;
+    for (u32 slot = 0; slot < VideoCommon::NUM_VERTEX_BUFFERS; ++slot) {
+        std::optional<R::ResolvedVertex> binding = buffer_cache.ResolveVertexBinding(view, slot);
+        if (!binding) {
+            continue;
+        }
+        resolve_buffer(binding->buffer, binding->daddr, binding->size);
+        if (binding->buffer.id != VideoCommon::NULL_BUFFER_ID.index && binding->size != 0) {
+            out.h.vertex_mask |= 1U << slot;
+        }
+        vertex.push_back(*binding);
+    }
+    // Per stage: UpdateUniformBuffers, UpdateStorageBuffers, UpdateTextureBuffers.
+    boost::container::small_vector<R::ResolvedUbo, 32> ubos;
+    boost::container::small_vector<R::ResolvedSsbo, 32> ssbos;
+    boost::container::small_vector<R::ResolvedTbo, 16> tbos;
+    const auto views = out.Span<const R::ResolvedView>(out.h.views);
+    size_t view_index = 0;
+    for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
+        out.h.ubo_masks[stage] = 0;
+        if (!recipe_stages[stage]) {
+            continue;
+        }
+        const Shader::Info& info{stage_infos[stage]};
+        const u32 ubo_mask = enabled_uniform_buffer_masks[stage];
+        out.h.ubo_masks[stage] = ubo_mask;
+        for (u32 mask = ubo_mask; mask != 0; mask &= mask - 1) {
+            const u32 slot = static_cast<u32>(std::countr_zero(mask));
+            R::ResolvedUbo ubo = buffer_cache.ResolveUniformBinding(view, stage, slot);
+            if (ubo.size != 0 || ubo.daddr != 0) {
+                resolve_buffer(ubo.buffer, ubo.daddr, ubo.size);
+            }
+            ubos.push_back(ubo);
+        }
+        u32 ssbo_index = 0;
+        for (const auto& desc : info.storage_buffers_descriptors) {
+            bool multi_range = false;
+            R::ResolvedSsbo ssbo = buffer_cache.ResolveStorageBinding(
+                view, stage, ssbo_index, desc.cbuf_index, desc.cbuf_offset, desc.is_written,
+                desc.indirect_offset, multi_range);
+            if (multi_range) {
+                return CommitOnly(out, R::CommitOnlyReason::MultiRangeStorage);
+            }
+            if (ssbo.size != 0 || ssbo.daddr != 0) {
+                resolve_buffer(ssbo.buffer, ssbo.daddr, ssbo.size);
+            }
+            ssbos.push_back(ssbo);
+            ++ssbo_index;
+        }
+        // Texture and image buffers from the stage's ready views (BindGraphicsTextureBuffer).
+        u32 tbo_index = 0;
+        const auto add_buffer = [&](const auto& desc, bool is_image) {
+            for (u32 i = 0; i < desc.count; ++i, ++view_index, ++tbo_index) {
+                const R::ResolvedView& entry = views[view_index];
+                if (C::IsProxy(entry.view.id)) {
+                    return false;
+                }
+                const ImageView& image_view{
+                    texture_cache.GetImageView(VideoCommon::ImageViewId{entry.view.id})};
+                PixelFormat format{image_view.format};
+                bool is_written = false;
+                if constexpr (std::is_same_v<std::remove_cvref_t<decltype(desc)>,
+                                             Shader::ImageBufferDescriptor>) {
+                    is_written = desc.is_written;
+                    if (const auto explicit_format{PixelFormatFromImageFormat(desc.format)}) {
+                        format = *explicit_format;
+                    }
+                }
+                R::ResolvedTbo tbo = buffer_cache.ResolveTextureBufferBinding(
+                    stage, tbo_index, image_view.GpuAddr(), image_view.BufferSize(), format,
+                    is_written, is_image);
+                if (tbo.size != 0) {
+                    resolve_buffer(tbo.buffer, tbo.daddr, tbo.size);
+                }
+                tbos.push_back(tbo);
+            }
+            return true;
+        };
+        for (const auto& desc : info.texture_buffer_descriptors) {
+            if (!add_buffer(desc, false)) {
+                return CommitOnly(out, R::CommitOnlyReason::TextureBufferViewCreate);
+            }
+        }
+        for (const auto& desc : info.image_buffer_descriptors) {
+            if (!add_buffer(desc, true)) {
+                return CommitOnly(out, R::CommitOnlyReason::TextureBufferViewCreate);
+            }
+        }
+        view_index += Shader::NumDescriptors(info.texture_descriptors);
+        view_index += Shader::NumDescriptors(info.image_descriptors);
+    }
+    out.h.vertex = out.Push(std::span<const R::ResolvedVertex>(vertex.data(), vertex.size()));
+    out.h.ubo = out.Push(std::span<const R::ResolvedUbo>(ubos.data(), ubos.size()));
+    out.h.ssbo = out.Push(std::span<const R::ResolvedSsbo>(ssbos.data(), ssbos.size()));
+    out.h.tbo = out.Push(std::span<const R::ResolvedTbo>(tbos.data(), tbos.size()));
+    return R::ResolveStatus::Ready;
+}
+
+template R::ResolveStatus GraphicsPipeline::ResolveBuffers<R::LiveView>(
+    const R::LiveView&, const R::ResolveContext&, R::ResolvedDraw&, C::RequestList&) const;
+template R::ResolveStatus GraphicsPipeline::ResolveBuffers<R::SnapshotView>(
+    const R::SnapshotView&, const R::ResolveContext&, R::ResolvedDraw&, C::RequestList&) const;
 
 template void GraphicsPipeline::ResolveTextures<R::LiveView>(const R::LiveView&,
                                                              R::ResolvedDraw&,
