@@ -220,10 +220,15 @@ ViewCheck CheckWithView(DmaPusher& dma_pusher, GPUVAddr address, u32 value, V2::
     filter.ranged = V2::ProducerBit(V2::Producer::Release) | V2::ProducerBit(V2::Producer::Report);
     // Releases queued or run but not landed, fence-flagged or not (class B; the landing rule in
     // v2/landing.h keeps later CPU-visible writes behind them).
-    const u32 memory_word = memory.Read<u32>(address);
+    u32 memory_word = memory.Read<u32>(address);
     u32 forwarded = memory_word;
     const V2::HazardResult word =
         split.FindWrites(*device, sizeof(u32), filter, reinterpret_cast<u8*>(&forwarded));
+    if (word.kind == V2::HazardResult::Kind::Clear) {
+        // A release that landed after the read above was retired by the lookup (it loads
+        // `landed` after the operation wrote memory): read memory again, which now holds it.
+        memory_word = memory.Read<u32>(address);
+    }
     const V2::AcquireDecision decision =
         V2::DecideAcquire(op, value, word, forwarded, memory_word,
                           split.PendingUnboundedWrite(V2::Producer::QmdRelease));
@@ -337,6 +342,23 @@ void ReportViewMismatch(DmaPusher& dma_pusher, GPUVAddr address, u32 value, u32 
     }
 }
 
+// F3-X1: a release noted to the word that meets the acquire, whose note the view no longer
+// holds (CheckWithView found nothing), while an operation the back captured is still to land:
+// that operation is most likely the release, and its landing latches the waiter. The net then
+// waits like for a QMD release (bounded, V2::UntrackedDeferUs) instead of draining for it.
+bool NotedReleaseOnItsWay(DmaPusher& dma_pusher, GPUVAddr address, u32 value,
+                          V2::SemaphoreOp op) {
+    if (!VideoCommon::GpuSplit::CapturedLandingPending()) {
+        return false;
+    }
+    const auto device = dma_pusher.memory_manager.GpuToCpuAddress(address);
+    if (!device) {
+        return false;
+    }
+    const auto recent = VideoCommon::GpuSplit::Get().FindRecentRelease(*device);
+    return recent && V2::SemaphoreMet(op, recent->value, value);
+}
+
 } // Anonymous namespace
 
 bool Puller::PendingAcquire::Matches(u32 current) const {
@@ -415,7 +437,8 @@ bool Puller::PollAcquireView(DmaPusher& dma_pusher) {
         const u64 since_old_poll = static_cast<u64>(
             std::chrono::duration_cast<std::chrono::microseconds>(now - acquire.last_old_poll)
                 .count());
-        untracked = split.UntrackedReleasePending();
+        untracked = split.UntrackedReleasePending() ||
+                    NotedReleaseOnItsWay(dma_pusher, address, value, op);
         switch (V2::PlanSuspendedPoll(check.reason == Reason::GpuWritten, since_old_poll,
                                       untracked)) {
         case V2::SuspendedPoll::OldPath:
@@ -472,11 +495,16 @@ bool Puller::PollAcquireView(DmaPusher& dma_pusher) {
             static std::atomic<u32> logged{};
             if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
                 const auto device = dma_pusher.memory_manager.GpuToCpuAddress(address);
+                // F3-X1: whether the front noted the release (and how), against the landing state.
+                const auto recent = device ? split.FindRecentRelease(*device)
+                                           : std::optional<VideoCommon::GpuSplit::RecentRelease>{};
                 LOG_INFO(HW_GPU,
                          "V2 acquire progress poll resumed channel {} semaphore {:#x} (device "
                          "{:#x}) op {} value {:#x}: view reason {}, word {:#x} before the drain, "
                          "{:#x} after, gpu-written page {}, sem_execute {}, QMD release pending "
-                         "{}, waited {} us",
+                         "{}, waited {} us | newest noted release {} (value {:#x}, {} {:#x}), "
+                         "landed {:#x}, back issued {:#x}, front ticket {:#x}, consumed {:#x}, "
+                         "write {:#x}",
                          dma_pusher.channel_state.bind_id, address, device.value_or(0),
                          operation, value, static_cast<u32>(check.reason), view_word,
                          dma_pusher.memory_manager.Read<u32>(address),
@@ -484,7 +512,13 @@ bool Puller::PollAcquireView(DmaPusher& dma_pusher) {
                          untracked,
                          std::chrono::duration_cast<std::chrono::microseconds>(
                              std::chrono::steady_clock::now() - acquire.since)
-                             .count());
+                             .count(),
+                         recent.has_value(), recent ? recent->value : 0,
+                         recent && recent->landing ? "ticket" : "position",
+                         recent ? recent->position : 0,
+                         V2::Landing::landed.load(std::memory_order_acquire),
+                         V2::Landing::issued.load(std::memory_order_acquire),
+                         split.LastLandingTicket(), split.ConsumedNow(), split.WritePosition());
             }
         }
         if (verify && decided) {

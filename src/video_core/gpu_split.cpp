@@ -198,10 +198,12 @@ void GpuSplit::MaybeStart(Core::System& system_) {
     pending_cb = {};
     cb_translations.fill({});
     unlanded.Clear();
+    recent_releases.fill({});
     ticket_position = 0;
     ticket_sub = 0;
     last_ticket = 0;
     V2::Landing::landed.store(0, std::memory_order_relaxed);
+    V2::Landing::issued.store(0, std::memory_order_relaxed);
     V2::Landing::verify = acquire_mode == V2::Mode::Verify || hazard_mode == V2::Mode::Verify;
     // AnyPS5's hand-off spin (HandoffSpin.hpp): spin before a kernel wait only with more than 8
     // logical CPUs, where the waiting thread does not take the other one's core.
@@ -293,6 +295,7 @@ void GpuSplit::Stop() {
         V2::Landing::verify = false;
     }
     V2::Landing::landed.store(0, std::memory_order_relaxed);
+    V2::Landing::issued.store(0, std::memory_order_relaxed);
     SetCpuLaneHook(nullptr, nullptr);
     cpu_lane_requested.store(false, std::memory_order_relaxed);
     back_idle_at.store(~u64{0}, std::memory_order_relaxed);

@@ -9,6 +9,7 @@
 #include <cstring>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <span>
 #include <thread>
 #include <type_traits>
@@ -239,6 +240,7 @@ public:
         FlushCbWrite();
         PrepareHazardNote();
         hazards.NoteKnown(device_address, bytes, size, write_position, producer);
+        RememberRelease(device_address, bytes, size, write_position, false);
     }
     void NoteRangeWrite(u64 device_address, u64 size, V2::Producer producer) {
         if (producer != V2::Producer::CbData) {
@@ -338,6 +340,10 @@ public:
     /// Front: whether a release noted earlier may not have landed yet: the back then defers a
     /// CPU-visible write it would make at once (Landing::MustDefer), so it lands at an
     /// operation too. Conservative: the back defers only if this held when the write was noted.
+    /// Front: the newest landing ticket it gave out.
+    [[nodiscard]] u64 LastLandingTicket() const {
+        return last_ticket;
+    }
     [[nodiscard]] bool LandingPending() const {
         return last_ticket > V2::Landing::landed.load(std::memory_order_acquire);
     }
@@ -357,6 +363,31 @@ public:
             unlanded.Retire(V2::Landing::landed.load(std::memory_order_acquire));
         }
         unlanded.NoteKnown(device_address, bytes, size, ticket, V2::Producer::Release);
+        RememberRelease(device_address, bytes, size, ticket, true);
+    }
+    /// Front (F3-X1 diagnostics): the newest release of known bytes noted to the word at
+    /// `device_address` among the last RecentReleases notes.
+    struct RecentRelease {
+        u64 address = 0;
+        u64 position = 0; ///< Ring position, or the landing ticket when `landing`
+        u32 value = 0;
+        bool landing = false;
+    };
+    [[nodiscard]] std::optional<RecentRelease> FindRecentRelease(u64 device_address) const {
+        for (size_t i = 0; i < recent_releases.size(); ++i) {
+            const RecentRelease& entry =
+                recent_releases[(recent_release_head - 1 - i) % recent_releases.size()];
+            if (entry.address == device_address && entry.position != 0) {
+                return entry;
+            }
+        }
+        return std::nullopt;
+    }
+    /// Any thread: whether an operation the back captured a landing ticket for hasn't run yet
+    /// (V2::Landing::issued), whether or not the front still holds its note.
+    [[nodiscard]] static bool CapturedLandingPending() {
+        return V2::Landing::issued.load(std::memory_order_acquire) >
+               V2::Landing::landed.load(std::memory_order_acquire);
     }
     /// Front: a report whose bytes the front can't tell (a counter, a timestamp) just sent; the
     /// query cache writes it when its operation runs. Until it lands FindWrites answers Wait
@@ -731,6 +762,15 @@ private:
     void FlushCbWriteSlow();
     V2::HazardResult FindWithLanding(u64 device_address, u64 size, u64 done,
                                      const V2::HazardFilter& filter, u8* out);
+    void RememberRelease(u64 device_address, const void* bytes, u32 size, u64 position,
+                         bool landing) {
+        RecentRelease& entry = recent_releases[recent_release_head++ % recent_releases.size()];
+        entry.address = device_address;
+        entry.position = position;
+        entry.value = 0;
+        std::memcpy(&entry.value, bytes, std::min<size_t>(size, sizeof(entry.value)));
+        entry.landing = landing;
+    }
     void PrepareHazardNote() {
         if (hazards.Size() == V2::HazardTable::Capacity) [[unlikely]] {
             hazards.Retire(consumed.load(std::memory_order_acquire));
@@ -958,6 +998,8 @@ private:
     u64 ticket_sub{};
     u64 last_ticket{};
     u64 last_qmd_release{}; ///< Front: write position of the last QmdRelease note
+    std::array<RecentRelease, 256> recent_releases{};
+    size_t recent_release_head = 0;
     u64 back_entry_position{}; ///< Back: ring position of the entry it runs (TracksWrites)
 
     // Back side.

@@ -2281,6 +2281,51 @@ TEST_CASE("V2 hazard: unknown reports block reads of their bytes until they land
     V2::Landing::landed.store(0);
 }
 
+TEST_CASE("V2 landing: the front remembers its releases, the back's captured operations count",
+          "[video_core][gpu_split_dispatch][v2_hazard]") {
+    using Access = VideoCommon::GpuSplitTestAccess;
+    namespace V2 = VideoCommon::V2;
+    Fixture f;
+    f.system.Initialize();
+    VideoCommon::GpuSplit split;
+    Access::Initialize(split, f.system, 100);
+    V2::Landing::landed.store(0);
+    V2::Landing::issued.store(0);
+    constexpr u64 word = 0x5'0000'0040;
+    CHECK(!split.FindRecentRelease(word));
+    const u32 first = 0x778;
+    const u32 second = 0x779;
+    split.NoteUnlandedWrite(word, &first, sizeof(first), split.NextLandingTicket());
+    split.NoteKnownWrite(word + 4, &first, sizeof(first), V2::Producer::Release);
+    const u64 ticket = split.NextLandingTicket();
+    split.NoteUnlandedWrite(word, &second, sizeof(second), ticket);
+    const auto recent = split.FindRecentRelease(word);
+    REQUIRE(recent);
+    CHECK(recent->value == second); // the newest one
+    CHECK(recent->landing);
+    CHECK(recent->position == ticket);
+    CHECK(split.LastLandingTicket() == ticket);
+    const auto other = split.FindRecentRelease(word + 4);
+    REQUIRE(other);
+    CHECK(!other->landing);
+    // The back's capture is what decides, not the front's note.
+    CHECK(!VideoCommon::GpuSplit::CapturedLandingPending());
+    const u64 saved_tag = V2::Landing::tag;
+    const u64 saved_captured = V2::Landing::captured_tag;
+    const u64 saved_pending = V2::Landing::pending;
+    V2::Landing::tag = 900;
+    const u64 captured = V2::Landing::Capture();
+    CHECK(V2::Landing::issued.load() == captured);
+    CHECK(VideoCommon::GpuSplit::CapturedLandingPending());
+    V2::Landing::Note(captured);
+    CHECK(!VideoCommon::GpuSplit::CapturedLandingPending());
+    V2::Landing::tag = saved_tag;
+    V2::Landing::captured_tag = saved_captured;
+    V2::Landing::pending = saved_pending;
+    V2::Landing::landed.store(0);
+    V2::Landing::issued.store(0);
+}
+
 TEST_CASE("V2 landing: one write table, tickets without IR cuts, ordered landing",
           "[video_core][gpu_split_dispatch][v2_hazard]") {
     using Access = VideoCommon::GpuSplitTestAccess;

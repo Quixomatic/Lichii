@@ -36,6 +36,9 @@ inline thread_local u64 pending = 0;
 
 /// The newest ticket whose write is in memory.
 inline std::atomic<u64> landed{0};
+/// The newest ticket the back captured (its `pending`, for other threads): while it is above
+/// `landed` an operation the back queued is still to land, whatever the front noted for it.
+inline std::atomic<u64> issued{0};
 
 /// Landing-order verify (EDEN_NX2_V2_ACQUIRE or _HAZARD = verify): tickets of CPU-visible
 /// writes must land in order; one reported below a ticket already landed is counted.
@@ -61,6 +64,7 @@ inline u64 Capture() {
         ++captured_sub;
     }
     pending = Ticket(tag, captured_sub);
+    issued.store(pending, std::memory_order_release);
     return pending;
 }
 
