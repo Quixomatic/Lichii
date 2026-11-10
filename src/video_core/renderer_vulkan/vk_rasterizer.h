@@ -79,7 +79,19 @@ public:
     bool BufferToImage(const Tegra::DMA::ImageCopy& copy_info, const Tegra::DMA::BufferOperand& src,
                        const Tegra::DMA::ImageOperand& dst) override;
 
+    /// SYNC_SUBMIT_SPEC §11.6 item 4 (rule C counts all work): called after each copy or clear,
+    /// with no cache lock held.
+    void SetWorkHook(void (*hook)(void*), void* argument) {
+        work_hook = hook;
+        work_argument = argument;
+    }
+
 private:
+    void NoteWork() {
+        if (work_hook != nullptr) [[unlikely]] {
+            work_hook(work_argument);
+        }
+    }
     template <bool IS_IMAGE_UPLOAD>
     bool DmaBufferImageCopy(const Tegra::DMA::ImageCopy& copy_info,
                             const Tegra::DMA::BufferOperand& src,
@@ -88,6 +100,8 @@ private:
     BufferCache& buffer_cache;
     TextureCache& texture_cache;
     Scheduler& scheduler;
+    void (*work_hook)(void*){};
+    void* work_argument{};
 };
 
 class RasterizerVulkan final : public VideoCore::RasterizerInterface,

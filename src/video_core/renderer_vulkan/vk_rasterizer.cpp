@@ -870,6 +870,9 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
                 return static_cast<RasterizerVulkan*>(argument)->ServeIdleSleep(prepare);
             },
             this);
+        accelerate_dma.SetWorkHook(
+            [](void* argument) { static_cast<RasterizerVulkan*>(argument)->NoteNonDrawWork(1); },
+            this);
     }
     if (VideoCommon::V2::On(VideoCommon::V2::Switch::Bindless)) [[unlikely]] {
         bindless_heap = BindlessHeap::Create(device, scheduler);
@@ -4725,13 +4728,17 @@ bool RasterizerVulkan::HasDrawTransformFeedback() {
 bool RasterizerVulkan::AccelerateSurfaceCopy(const Tegra::Engines::Fermi2D::Surface& src,
                                              const Tegra::Engines::Fermi2D::Surface& dst,
                                              const Tegra::Engines::Fermi2D::Config& copy_config) {
+    bool result = false;
     if (commit_lock_free) [[unlikely]] {
-        bool result = false;
         WithCaches([&] { result = texture_cache.BlitImage(dst, src, copy_config); });
-        return result;
+    } else {
+        std::scoped_lock lock{texture_cache.mutex};
+        result = texture_cache.BlitImage(dst, src, copy_config);
     }
-    std::scoped_lock lock{texture_cache.mutex};
-    return texture_cache.BlitImage(dst, src, copy_config);
+    if (result) {
+        NoteNonDrawWork(1); // SYNC §11.6 item 4: a copy counts toward rule C
+    }
+    return result;
 }
 
 bool RasterizerVulkan::UsesNvidiaDlss() const {
@@ -5220,18 +5227,31 @@ AccelerateDMA::AccelerateDMA(BufferCache& buffer_cache_, TextureCache& texture_c
     : buffer_cache{buffer_cache_}, texture_cache{texture_cache_}, scheduler{scheduler_} {}
 
 bool AccelerateDMA::BufferClear(GPUVAddr src_address, u64 amount, u32 value) {
-    std::scoped_lock lock{buffer_cache.mutex};
-    return buffer_cache.DMAClear(src_address, amount, value);
+    bool cleared = false;
+    {
+        std::scoped_lock lock{buffer_cache.mutex};
+        cleared = buffer_cache.DMAClear(src_address, amount, value);
+    }
+    if (cleared) {
+        NoteWork();
+    }
+    return cleared;
 }
 
 bool AccelerateDMA::BufferCopy(GPUVAddr src_address, GPUVAddr dest_address, u64 amount) {
-    std::scoped_lock lock{buffer_cache.mutex};
-    buffer_cache.Nx2CollectListCopies(true);
-    const bool copied = buffer_cache.DMACopy(src_address, dest_address, amount);
-    if (buffer_cache.Nx2CopyListPages(scheduler.CurrentTick())) {
-        scheduler.Flush();
+    bool copied = false;
+    {
+        std::scoped_lock lock{buffer_cache.mutex};
+        buffer_cache.Nx2CollectListCopies(true);
+        copied = buffer_cache.DMACopy(src_address, dest_address, amount);
+        if (buffer_cache.Nx2CopyListPages(scheduler.CurrentTick())) {
+            scheduler.Flush();
+        }
+        buffer_cache.Nx2CollectListCopies(false);
     }
-    buffer_cache.Nx2CollectListCopies(false);
+    if (copied) {
+        NoteWork();
+    }
     return copied;
 }
 
@@ -5272,13 +5292,21 @@ bool AccelerateDMA::DmaBufferImageCopy(const Tegra::DMA::ImageCopy& copy_info,
 bool AccelerateDMA::ImageToBuffer(const Tegra::DMA::ImageCopy& copy_info,
                                   const Tegra::DMA::ImageOperand& image_operand,
                                   const Tegra::DMA::BufferOperand& buffer_operand) {
-    return DmaBufferImageCopy<false>(copy_info, buffer_operand, image_operand);
+    const bool copied = DmaBufferImageCopy<false>(copy_info, buffer_operand, image_operand);
+    if (copied) {
+        NoteWork();
+    }
+    return copied;
 }
 
 bool AccelerateDMA::BufferToImage(const Tegra::DMA::ImageCopy& copy_info,
                                   const Tegra::DMA::BufferOperand& buffer_operand,
                                   const Tegra::DMA::ImageOperand& image_operand) {
-    return DmaBufferImageCopy<true>(copy_info, buffer_operand, image_operand);
+    const bool copied = DmaBufferImageCopy<true>(copy_info, buffer_operand, image_operand);
+    if (copied) {
+        NoteWork();
+    }
+    return copied;
 }
 
 void RasterizerVulkan::UpdateDynamicStates(const GraphicsPipeline* pipeline) {

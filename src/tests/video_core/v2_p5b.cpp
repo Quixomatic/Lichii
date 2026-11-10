@@ -1349,6 +1349,26 @@ TEST_CASE("SYNC §11.2 invariant S: no completion wake is lost and no open tick 
         REQUIRE(rule_bc >= 1);
         REQUIRE(rule_bc <= 40);
     }
+    SECTION("§11.6 item 4, 0c86 / e412: a zero-draw stream (copies, clears, fences) that never "
+            "empties the ring is submitted within the chunk bound") {
+        // NoteNonDrawWork(1) after each DMA copy/clear, surface copy, fence and list end: the back
+        // never reaches its sleep point, rule C alone bounds the open tick.
+        FlushParams params;
+        params.pass_boundaries = true;
+        for (const u32 pending : {0u, 1u, 2u, 5u}) {
+            FlushHeuristic heuristic{params};
+            heuristic.NoteSubmit(1);
+            const FlushState state{.pending = pending, .back_behind = true};
+            u32 items = 0;
+            bool submitted = false;
+            while (!submitted && items < 10'000) {
+                ++items;
+                submitted = heuristic.Advance(1, state, 1 + items).action == FlushAction::Flush;
+            }
+            REQUIRE(submitted);
+            REQUIRE(items <= params.max_draws);
+        }
+    }
     SECTION("no finish thread (no completion wake): a non-empty open tick never sleeps") {
         SleepModel m;
         m.wake_guaranteed = false;
