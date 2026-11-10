@@ -327,7 +327,10 @@ struct SemDecision {
             return d;
         }
         if (!w.bound) {
-            d.wake = SemWake::ReleaseParsed;
+            // Only a later release can meet it; its retirement too (an operation that is dropped
+            // writes no bytes: memory decides then, SESSION_HANDOFF §5 "every suspended acquire
+            // needs a progress path").
+            d.wake = SemWake::ReleaseParsed | SemWake::Consumed | SemWake::Landing;
             return d;
         }
         // A lower bound that doesn't meet it: decided like an unknown writer below.

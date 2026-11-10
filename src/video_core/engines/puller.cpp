@@ -236,155 +236,67 @@ bool ReleasesLandAtOnce() {
 struct ViewCheck {
     V2::AcquireVerdict verdict; ///< Met, MetByQueued, NotMet or Fallback
     Reason reason;
-    bool narrowed;  ///< It waited for one producer first
     u64 landing{}; ///< MetByQueued on a release still to land: its landing ticket
     u64 release{}; ///< MetByQueued: the ring position of the release that decided
-    u64 qmd_target{}; ///< The QMD producer an Equal/Mask acquire waits for (GpuSplit::QmdTargetFor)
-    bool by_reductions{}; ///< MetByQueued on the pending QMD reductions (QmdReductionView)
+    V2::SemDecision decision{}; ///< The semaphore view's row, wake classes and producer
 };
 
-/// CheckWithView's `qmd_target` when the acquire is parsed: snapshot the producer now.
-constexpr u64 SnapshotQmdTarget = ~u64{0};
+V2::SemDecision DecideSem(DmaPusher& dma_pusher, GPUVAddr address, u32 value, V2::SemaphoreOp op,
+                          bool word_landed);
 
-// EDEN_NX2_V2_ACQUIRE (MASTER_PLAN.md section 6): decides an acquire from the front's semaphore
-// view (the hazard table's releases) and memory, without draining the split. A targeted wait
-// for one write (V2::AcquireVerdict::WaitFor) is done here, after which memory decides.
-// `wait`: a decision that needs a queued dispatch to run first waits for it here. Without it
-// (ACQUIRE=1) such an acquire is not met yet: the channel suspends and its polls decide once the
-// back ran the dispatch (MASTER_PLAN §6: suspend, don't block the front).
-// `word_landed`: a GPU-written word was just read back (V2::WordReadback): memory holds it.
-// `qmd_target` (Fix F3h, F3-X1): the QMD release an Equal/Mask acquire orders behind, recorded
-// when it was parsed (SnapshotQmdTarget there); its polls wait for that one producer, not for
-// the newest QMD release the front noted since (a moving target only the net used to end).
-ViewCheck CheckWithViewToday(DmaPusher& dma_pusher, GPUVAddr address, u32 value,
-                             V2::SemaphoreOp op, bool wait, bool word_landed, u64 qmd_target) {
+// EDEN_NX2_V2_ACQUIRE (SYNC_SUBMIT_SPEC §2.1; MASTER_PLAN §5.1, §6 classes A/B, §10): decides an
+// acquire from S1's semaphore view and memory, never from when a fence lands and never by
+// draining. Not met: the channel suspends with the wake classes that can change the answer
+// (decision.wake). `word_landed`: a GPU-written word was just read back (V2::WordReadback).
+// Settings the view doesn't model (accurate GPU, delayed fences, macros on the back) take the
+// old path exactly (MP §13 strict profiles, v1 identity).
+ViewCheck CheckWithView(DmaPusher& dma_pusher, GPUVAddr address, u32 value, V2::SemaphoreOp op,
+                        bool word_landed = false) {
     auto& split = VideoCommon::GpuSplit::Get();
     // Macros on the back send 3D reports the front doesn't see.
     if (!split.Active() || !split.FrontMacros() || !ReleasesLandAtOnce()) {
-        return {V2::AcquireVerdict::Fallback, Reason::Settings, false};
+        return {V2::AcquireVerdict::Fallback, Reason::Settings};
     }
-    auto& memory = dma_pusher.memory_manager;
-    const auto device = memory.GpuToCpuAddress(address);
-    if (!device) {
-        // Fix F3h (R2-F3-03): an unmapped word. A map the back hasn't run yet may map it: wait
-        // for it (suspended; the back's `consumed` store rings the front). Otherwise nothing can
-        // write it: decide on the word as the guest reads it (the old path's read, 84de5dbac4:
-        // gequal 0 passes at once), without the old path's drain and forced fences.
-        if (split.MapQueued()) {
-            return {V2::AcquireVerdict::NotMet, Reason::Unmapped, false};
-        }
-        const bool met = V2::SemaphoreMet(op, memory.Read<u32>(address), value);
-        return {met ? V2::AcquireVerdict::Met : V2::AcquireVerdict::NotMet, Reason::Unmapped,
-                false};
-    }
-    if (qmd_target == SnapshotQmdTarget) {
-        qmd_target =
-            V2::SemaphoreWaitsToReach(op) ? 0 : split.QmdTargetFor(*device, sizeof(u32));
-    }
-    // A word the buffer cache may hold newer than memory is read back first (class C).
-    if (!word_landed && Nx2MayBeGpuWritten(*device, sizeof(u32))) {
-        return {V2::AcquireVerdict::Fallback, Reason::GpuWritten, false};
-    }
-    V2::HazardFilter filter;
-    filter.ranged = V2::ProducerBit(V2::Producer::Release) | V2::ProducerBit(V2::Producer::Report);
-    // Releases queued or run but not landed, fence-flagged or not (class B; the landing rule in
-    // v2/landing.h keeps later CPU-visible writes behind them).
-    u32 memory_word = memory.Read<u32>(address);
-    u32 forwarded = memory_word;
-    const V2::HazardResult word =
-        split.FindWrites(*device, sizeof(u32), filter, reinterpret_cast<u8*>(&forwarded));
-    if (word.kind == V2::HazardResult::Kind::Clear) {
-        // A release that landed after the read above was retired by the lookup (it loads
-        // `landed` after the operation wrote memory): read memory again, which now holds it.
-        memory_word = memory.Read<u32>(address);
-    }
-    const bool unknown_qmd = word.kind == V2::HazardResult::Kind::Clear &&
-                             split.UnknownQmdMayWrite(*device, sizeof(u32));
-    if (unknown_qmd && V2Stats::Enabled()) [[unlikely]] {
-        V2Stats::NoteReductionReject(V2Stats::ReductionReject::UnknownQmdMayWrite);
-    }
-    if (word.kind == V2::HazardResult::Kind::Clear && !unknown_qmd) {
-        // Fix F3h (chunk C2: U-02 / R2-F3-05, §6 class A, diagram 2.3): only QMD reduction and
-        // max releases the front's exact model saw write the word. Since d5e451eebf they land
-        // at their fence; the word they leave is known now: memory plus the pending ones in
-        // order. Met by it: the in-order back applies them before the acquire's channel goes on
-        // (class B ordering, landing rule), so the channel goes on now instead of waiting for
-        // the fence (67e9: ~817 such waits/s). Not met by it: decided as before.
-        const auto view = split.QmdReductionView(*device, memory, address);
-        if (view.reject != 0 && V2Stats::Enabled()) [[unlikely]] {
-            V2Stats::NoteReductionReject(static_cast<V2Stats::ReductionReject>(view.reject - 1));
-        }
-        if (view.known && view.any && V2::SemaphoreMet(op, view.value, value)) {
-            return {V2::AcquireVerdict::MetByQueued, Reason::None, false, 0, view.position,
-                    qmd_target, true};
-        }
-    }
-    // The producer stops counting once its entry ran and its operations landed.
-    const u64 pending_qmd = split.QmdTargetSettled(qmd_target) ? 0 : qmd_target;
-    const V2::AcquireDecision decision =
-        V2::DecideAcquire(op, value, word, forwarded, memory_word, pending_qmd);
+    const V2::SemDecision decision = DecideSem(dma_pusher, address, value, op, word_landed);
+    ViewCheck check{.verdict = decision.verdict, .reason = Reason::None, .decision = decision};
     switch (decision.verdict) {
     case V2::AcquireVerdict::Met:
-        return {decision.verdict, Reason::None, false, 0, 0, qmd_target};
+        break;
     case V2::AcquireVerdict::MetByQueued:
-        return {decision.verdict, Reason::None, false, word.landing ? word.position : 0,
-                V2::RingPositionOf(word), qmd_target};
-    case V2::AcquireVerdict::NotMet:
-        return {decision.verdict,
-                word.kind == V2::HazardResult::Kind::Forward ? Reason::QueuedNotMet
-                                                              : Reason::NotMet,
-                false, 0, 0, qmd_target};
-    case V2::AcquireVerdict::WaitFor: {
-        if (!wait) {
-            // Suspended: its polls resume it once that producer settled (the back's `consumed`
-            // and the operation's landing both ring the front's sleep).
-            return {V2::AcquireVerdict::NotMet, Reason::QmdProducer, false, 0, 0, qmd_target};
-        }
-        split.WaitForPosition(decision.position, VideoCommon::DrainSite::Acquire);
-        // The dispatch waited for may have written the word through the buffer cache.
-        if (!word_landed && Nx2MayBeGpuWritten(*device, sizeof(u32))) {
-            return {V2::AcquireVerdict::Fallback, Reason::GpuWritten, true, 0, 0, qmd_target};
-        }
-        const bool met = V2::SemaphoreMet(op, memory.Read<u32>(address), value);
-        return {met ? V2::AcquireVerdict::Met : V2::AcquireVerdict::NotMet,
-                met ? Reason::None : Reason::NotMet, true, 0, 0, qmd_target};
-    }
+        check.release = decision.position;
+        check.landing = decision.retire == V2::SemView::Retire::Landing ? decision.ticket : 0;
+        break;
     case V2::AcquireVerdict::Fallback:
+        check.reason = Reason::GpuWritten;
+        break;
+    default:
+        switch (decision.row) {
+        case V2::SemRow::MapQueued:
+        case V2::SemRow::Unmapped:
+            check.reason = Reason::Unmapped;
+            break;
+        case V2::SemRow::PendingKnown:
+            check.reason = Reason::QueuedNotMet;
+            break;
+        case V2::SemRow::UnknownAtExecute:
+            check.reason = Reason::UnknownWrite;
+            break;
+        case V2::SemRow::UnknownAtFence:
+            check.reason = decision.retire == V2::SemView::Retire::Landing ? Reason::Unlanded
+                                                                           : Reason::QmdProducer;
+            break;
+        default:
+            check.reason = Reason::NotMet;
+            break;
+        }
         break;
     }
-    const Reason reason = word.landing ? Reason::Unlanded
-                          : word.overflow ? Reason::Overflow
-                                          : Reason::UnknownWrite;
-    return {V2::AcquireVerdict::Fallback, reason, false, 0, 0, qmd_target};
+    return check;
 }
 
 bool Passes(const ViewCheck& check) {
     return check.verdict == V2::AcquireVerdict::Met ||
            check.verdict == V2::AcquireVerdict::MetByQueued;
-}
-
-V2::SemDecision DecideSem(DmaPusher& dma_pusher, GPUVAddr address, u32 value, V2::SemaphoreOp op,
-                          bool word_landed);
-void ShadowCompare(const V2::SemDecision& decision, bool today_passes);
-
-ViewCheck CheckWithView(DmaPusher& dma_pusher, GPUVAddr address, u32 value, V2::SemaphoreOp op,
-                        bool wait = true, bool word_landed = false,
-                        u64 qmd_target = SnapshotQmdTarget) {
-    auto& split = VideoCommon::GpuSplit::Get();
-    // SYNC Step 1: in ACQUIRE=verify the semaphore view decides alongside (shadow), first: a
-    // verify check may wait for a producer below.
-    const bool shadow = split.AcquireMode() == V2::Mode::Verify && split.Active() &&
-                        split.FrontMacros() && ReleasesLandAtOnce();
-    V2::SemDecision sem{};
-    if (shadow) [[unlikely]] {
-        sem = DecideSem(dma_pusher, address, value, op, word_landed);
-    }
-    const ViewCheck check =
-        CheckWithViewToday(dma_pusher, address, value, op, wait, word_landed, qmd_target);
-    if (shadow) [[unlikely]] {
-        ShadowCompare(sem, Passes(check));
-    }
-    return check;
 }
 
 // SYNC_SUBMIT_SPEC §2.1: the acquire decided from S1's semaphore view (DecideFromView). The word
@@ -414,29 +326,6 @@ V2::SemDecision DecideSem(DmaPusher& dma_pusher, GPUVAddr address, u32 value, V2
     return decision;
 }
 
-bool SemPasses(const V2::SemDecision& decision) {
-    return decision.verdict == V2::AcquireVerdict::Met ||
-           decision.verdict == V2::AcquireVerdict::MetByQueued;
-}
-
-/// SYNC Step 1 (ACQUIRE=verify): the shadow decision of the last acquire check, compared with
-/// the drained path once it ran (front thread only).
-struct SemShadowState {
-    bool valid = false;
-    bool passes = false;
-    V2::SemRow row{};
-    u64 position = 0;
-};
-SemShadowState g_sem_shadow;
-
-void ShadowCompare(const V2::SemDecision& decision, bool today_passes) {
-    g_sem_shadow = {true, SemPasses(decision), decision.row, decision.position};
-    if (g_sem_shadow.passes != today_passes) {
-        V2Stats::NoteSemShadow(g_sem_shadow.passes ? V2Stats::SemShadow::PassesTodayWaits
-                                                   : V2Stats::SemShadow::WaitsTodayPasses);
-    }
-}
-
 // EDEN_NX2_V2_ACQUIRE=1 (MASTER_PLAN §6, Fix F3-05): an acquire the view doesn't pass suspends
 // the channel; no drain, no forced fence. Settings the view doesn't model (accurate GPU, delayed
 // fences, macros on the back) take the old path; unmapped words suspend too (Fix F3h, R2-F3-03:
@@ -451,11 +340,9 @@ void NoteViewDecision(const ViewCheck& check) {
     }
     const auto site = VideoCommon::DrainSite::Acquire;
     if (check.verdict == V2::AcquireVerdict::MetByQueued) {
-        // F3h chunk C2: passed by the pending QMD reductions (class A) counted apart.
-        V2Stats::NoteDecision(site, Decision::Forwarded,
-                              check.by_reductions ? Reason::ReductionView : Reason::None);
+        V2Stats::NoteDecision(site, Decision::Forwarded);
     } else if (Passes(check)) {
-        V2Stats::NoteDecision(site, check.narrowed ? Decision::Narrowed : Decision::Avoided);
+        V2Stats::NoteDecision(site, Decision::Avoided);
     } else {
         V2Stats::NoteDecision(site, Decision::Waited, check.reason);
     }
@@ -471,8 +358,12 @@ void NoteViewDecision(const ViewCheck& check) {
 // write the back made at once, so `landed` can stay below it), and not only for landing
 // passes: a release the front noted as made at once is deferred by the back behind an earlier
 // one still to land (Landing::MustDefer), and the drain alone doesn't land it.
-bool LandForVerify(DmaPusher& dma_pusher) {
+// SYNC Step 1 verify (the 8acd shadow run: ~30k passes/s on pending QMD reductions the drained
+// path couldn't see): the untracked operations (QMD releases at their fence) that write the
+// acquire's word land too, so a class B pass on a QMD writer is confirmed once it produced it.
+bool LandForVerify(DmaPusher& dma_pusher, GPUVAddr address) {
     auto& split = VideoCommon::GpuSplit::Get();
+    const auto device = dma_pusher.memory_manager.GpuToCpuAddress(address);
     return split.CompleteLanding(
         V2::Landing::Ticket(split.WritePosition(), V2::Landing::SubMask),
         VideoCommon::DrainSite::Acquire,
@@ -480,7 +371,8 @@ bool LandForVerify(DmaPusher& dma_pusher) {
             return VideoCommon::V2::IrExec::LandCaptured(
                 *static_cast<VideoCore::RasterizerInterface*>(rasterizer));
         },
-        dma_pusher.rasterizer);
+        dma_pusher.rasterizer, device ? split.WritePosition() : 0, device.value_or(0),
+        sizeof(u32));
 }
 
 void ReportViewMismatch(DmaPusher& dma_pusher, GPUVAddr address, u32 value, u32 operation,
@@ -489,7 +381,7 @@ void ReportViewMismatch(DmaPusher& dma_pusher, GPUVAddr address, u32 value, u32 
     if (view_passes == old_passed) {
         return;
     }
-    const bool landed = view_passes && LandForVerify(dma_pusher);
+    const bool landed = view_passes && LandForVerify(dma_pusher, address);
     if (landed && V2::SemaphoreMet(op, dma_pusher.memory_manager.Read<u32>(address), value)) {
         return;
     }
@@ -511,54 +403,55 @@ void ReportViewMismatch(DmaPusher& dma_pusher, GPUVAddr address, u32 value, u32 
     }
 }
 
-// SYNC Step 1 (ACQUIRE=verify): the drained path decided `drained_passes` on the acquire whose
-// shadow decision is pending. A view pass the drained path doesn't make counts only when the
-// captured operations' landing doesn't confirm it either (as ReportViewMismatch).
-void ShadowDrained(DmaPusher& dma_pusher, GPUVAddr address, u32 value, u32 operation,
-                   V2::SemaphoreOp op, bool drained_passes) {
-    if (!std::exchange(g_sem_shadow.valid, false) || g_sem_shadow.passes == drained_passes) {
-        return;
-    }
-    if (!g_sem_shadow.passes) {
-        V2Stats::NoteSemShadow(V2Stats::SemShadow::WaitsDrainedPasses);
-        return;
-    }
-    if (LandForVerify(dma_pusher) &&
-        V2::SemaphoreMet(op, dma_pusher.memory_manager.Read<u32>(address), value)) {
-        return;
-    }
-    V2Stats::NoteSemShadow(V2Stats::SemShadow::PassesDrainedFails);
-    static std::atomic<u32> logged{};
-    if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
-        LOG_WARNING(HW_GPU,
-                    "V2 semaphore view verify: channel {} semaphore {:#x} op {} value {:#x}: the "
-                    "view passes (row {}, writer at {:#x}), the drained path waits (word now "
-                    "{:#x})",
-                    dma_pusher.channel_state.bind_id, address, operation, value,
-                    static_cast<u32>(g_sem_shadow.row), g_sem_shadow.position,
-                    dma_pusher.memory_manager.Read<u32>(address));
-    }
+
+/// Landings of either kind (the "landing" wake class).
+u64 Landings() {
+    return V2::Landing::landed.load(std::memory_order_acquire) +
+           V2::Landing::untracked_landed.load(std::memory_order_acquire);
 }
 
-// F3-X1: a release noted to the word that meets the acquire, whose note the view no longer
-// holds (CheckWithView found nothing), while an operation the back captured is still to land:
-// that operation is most likely the release, and its landing latches the waiter once its fence
-// is submitted (the poll asks for it).
-bool NotedReleaseOnItsWay(DmaPusher& dma_pusher, GPUVAddr address, u32 value,
-                          V2::SemaphoreOp op) {
-    if (!VideoCommon::GpuSplit::CapturedLandingPending()) {
-        return false;
+// SYNC_SUBMIT_SPEC §2.2 wake table: a suspended acquire is re-checked only once an event of one
+// of its wake classes happened since its last check (one compare per class, no lookups). The
+// epochs are taken before the check, so an event during it is seen by the next pass. A guest CPU
+// waiter (no writer pending) re-reads memory on every pass (MP §8 "polled, writes are seen only
+// at epochs"): no timer stands between the CPU's store and the resume.
+bool WakeMoved(const Puller::PendingAcquire& acquire) {
+    const u8 bits = acquire.wake_bits;
+    if (bits == 0 || (bits & (V2::SemWake::Cpu | V2::SemWake::Readback)) != 0) {
+        return true;
     }
-    const auto device = dma_pusher.memory_manager.GpuToCpuAddress(address);
-    if (!device) {
-        return false;
+    auto& split = VideoCommon::GpuSplit::Get();
+    return ((bits & V2::SemWake::ReleaseParsed) != 0 &&
+            split.Sem().Notes() != acquire.seen_notes) ||
+           ((bits & V2::SemWake::Consumed) != 0 && split.ConsumedNow() != acquire.seen_consumed) ||
+           ((bits & V2::SemWake::Landing) != 0 && Landings() != acquire.seen_landings) ||
+           ((bits & V2::SemWake::Map) != 0 &&
+            (VideoCommon::GpuSplit::MapsExecuted() != acquire.seen_maps || !split.MapQueued()));
+}
+
+void TakeWakeEpochs(Puller::PendingAcquire& acquire) {
+    auto& split = VideoCommon::GpuSplit::Get();
+    acquire.seen_notes = split.Sem().Notes();
+    acquire.seen_consumed = split.ConsumedNow();
+    acquire.seen_landings = Landings();
+    acquire.seen_maps = VideoCommon::GpuSplit::MapsExecuted();
+}
+
+// SEM_EXECUTE acquires never blocked before v2: a stuck one passes after 2 s. NOT IN PLAN; kept
+// as a counted residual (MP §6 "every one goes through a tagged DrainSite") until the gates show
+// it never fires, then removed (SYNC_SUBMIT_SPEC §2.2, Step 10).
+bool SemExecuteGiveUp(Puller::PendingAcquire& acquire) {
+    acquire.reported = true;
+    if (V2Stats::Enabled()) [[unlikely]] {
+        V2Stats::NoteDecision(VideoCommon::DrainSite::Acquire, Decision::Waited,
+                              Reason::SemExecutePass);
     }
-    using Kind = VideoCommon::GpuSplit::ReleaseKind;
-    const auto recent = VideoCommon::GpuSplit::Get().FindRecentRelease(*device);
-    // A reduction's or max release's value is its operand, not the word it leaves (those are
-    // untracked: UntrackedReleasePending covers them).
-    return recent && recent->kind != Kind::QmdReduction && recent->kind != Kind::QmdMax &&
-           V2::SemaphoreMet(op, recent->value, value);
+    static std::atomic<u32> logged{};
+    if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+        LOG_WARNING(HW_GPU, "SEM_EXECUTE acquire {:#x} value {:#x} passed unmet after 2 s",
+                    acquire.address, acquire.value);
+    }
+    return true;
 }
 
 } // Anonymous namespace
@@ -619,9 +512,17 @@ bool Puller::PollAcquireView(DmaPusher& dma_pusher) {
         word_readback->Land();
         acquire.readback_sent = false;
         word_landed = true;
+    } else if (!verify && !WakeMoved(acquire)) {
+        // SYNC_SUBMIT_SPEC §2.2: nothing that can change the answer happened since the last
+        // check (its wake classes' epochs); a guest CPU waiter re-reads memory every pass.
+        if (acquire.sem_execute && !acquire.reported &&
+            std::chrono::steady_clock::now() - acquire.since > std::chrono::seconds{2}) {
+            return SemExecuteGiveUp(acquire);
+        }
+        return false;
     }
-    const ViewCheck check = CheckWithView(dma_pusher, address, value, op, verify, word_landed,
-                                          acquire.qmd_target);
+    TakeWakeEpochs(acquire);
+    const ViewCheck check = CheckWithView(dma_pusher, address, value, op, word_landed);
     bool decided = false;
     bool passes = false;
     if (Passes(check)) {
@@ -635,17 +536,13 @@ bool Puller::PollAcquireView(DmaPusher& dma_pusher) {
         decided = true;
         const auto now = std::chrono::steady_clock::now();
         const bool gpu_written = check.reason == Reason::GpuWritten;
-        // Fix F3h (F3-X1): no timed net. Which producers of the word land at a fence is asked
-        // again with each submit request (at once, then once per millisecond): the back may
-        // have run what was queued since, or landed it.
+        // SYNC §2.1: re-checked only on its wake classes; only the class D / at-fence row has a
+        // producer that lands at a fence (its submit is asked for).
+        acquire.wake_bits = check.decision.wake;
         const bool ask =
             !acquire.submit_requested || now - acquire.last_request >= std::chrono::milliseconds{1};
         if (ask && !gpu_written) {
-            const auto device = dma_pusher.memory_manager.GpuToCpuAddress(address);
-            acquire.producer_lands =
-                check.reason == Reason::Unlanded || !split.QmdTargetSettled(acquire.qmd_target) ||
-                (device && split.QmdReleaseMayWrite(*device, sizeof(u32))) ||
-                NotedReleaseOnItsWay(dma_pusher, address, value, op);
+            acquire.producer_lands = check.decision.request;
         }
         const bool queued = split.ConsumedNow() < split.WritePosition();
         // F3-X1 follow-up (8d31 deadlock: four channels on QMD reduction words 0x13 short, back
@@ -689,12 +586,13 @@ bool Puller::PollAcquireView(DmaPusher& dma_pusher) {
         }
         if (V2Stats::Enabled()) [[unlikely]] {
             using Wake = V2Stats::WakeClass;
+            const u8 bits = check.decision.wake;
             const Wake wake = gpu_written                         ? Wake::Readback
-                              : check.reason == Reason::Unmapped  ? Wake::Map
-                              : acquire.producer_lands            ? Wake::Landing
-                              : check.reason == Reason::QueuedNotMet ? Wake::ReleaseParsed
-                              : queued                             ? Wake::Consumed
-                                                                   : Wake::Cpu;
+                              : (bits & V2::SemWake::Map) != 0      ? Wake::Map
+                              : (bits & V2::SemWake::Landing) != 0  ? Wake::Landing
+                              : (bits & V2::SemWake::Consumed) != 0 ? Wake::Consumed
+                              : (bits & V2::SemWake::Cpu) != 0      ? Wake::Cpu
+                                                                    : Wake::ReleaseParsed;
             acquire.wake = static_cast<u8>(wake);
         }
         switch (V2::PlanSuspendedPoll(gpu_written, acquire.producer_lands, queued)) {
@@ -723,18 +621,10 @@ bool Puller::PollAcquireView(DmaPusher& dma_pusher) {
                 // often does not exist yet at the first ask). Only the producer's position: the
                 // known QMD producer, else what was sent when the channel suspended (019d asked
                 // for everything sent so far every millisecond: 69 submits/f).
-                const auto word_device = dma_pusher.memory_manager.GpuToCpuAddress(address);
-                const u64 untracked_ticket =
-                    word_device ? V2::Landing::UntrackedTargetFor(*word_device, sizeof(u32)) : 0;
-                if (acquire.qmd_target != 0) {
-                    V2::LandingFence::Want(acquire.qmd_target);
-                } else if (untracked_ticket != 0) {
-                    // F3h: the tracked QMD reduction/max release to this word (d5e4: reductions
-                    // waited up to 91 ms for their fence): its entry's fence is urgent.
-                    V2::LandingFence::Want(V2::Landing::UntrackedPosition(untracked_ticket));
-                } else if (first_ask) {
-                    V2::LandingFence::Want(split.WritePosition());
-                }
+                // The producer the semaphore view names: its entry's fence is urgent.
+                V2::LandingFence::Want(check.decision.retire == V2::SemView::Retire::Landing
+                                           ? V2::Landing::RingPosition(check.decision.ticket)
+                                           : check.decision.position);
                 V2::LandingFence::Request(V2::LandingFence::TickForPending());
                 split.RequestIdleHook();
             }
@@ -762,14 +652,12 @@ bool Puller::PollAcquireView(DmaPusher& dma_pusher) {
             acquire.reported = true;
             LOG_WARNING(HW_GPU,
                         "Channel {} waits on semaphore {:#x} (op {}, {:#x}, now {:#x}) for 2 s "
-                        "(view: {})",
+                        "(view: {}, row {})",
                         dma_pusher.channel_state.bind_id, address, operation, value,
                         dma_pusher.memory_manager.Read<u32>(address),
-                        static_cast<u32>(check.reason));
+                        static_cast<u32>(check.reason), static_cast<u32>(check.decision.row));
             if (acquire.sem_execute) {
-                // SEM_EXECUTE acquires never blocked before: keep a stuck one from hanging the
-                // channel for good.
-                return true;
+                return SemExecuteGiveUp(acquire);
             }
         }
     } else {
@@ -802,9 +690,6 @@ bool Puller::PollAcquireView(DmaPusher& dma_pusher) {
                          recent ? VideoCommon::GpuSplit::ReleaseKindName(recent->kind) : "none",
                          recent ? recent->value : 0);
             }
-        }
-        if (verify) {
-            ShadowDrained(dma_pusher, address, value, operation, op, old_passed);
         }
         if (verify && decided) {
             ReportViewMismatch(dma_pusher, address, value, operation, passes, old_passed,
@@ -845,11 +730,12 @@ void Puller::SendWordReadback(DmaPusher& dma_pusher) {
     acquire.readback_sent = true;
 }
 
-void Puller::SuspendOnView(DmaPusher& dma_pusher, PendingAcquire acquire, bool gpu_written,
-                           u64 qmd_target) {
-    acquire.qmd_target = qmd_target;
+void Puller::SuspendOnView(DmaPusher& dma_pusher, PendingAcquire acquire, bool gpu_written) {
     acquire.wake = static_cast<u8>(gpu_written ? V2Stats::WakeClass::Readback
                                                : V2Stats::WakeClass::Cpu);
+    // The first poll checks again at once: its epochs are taken before it decides, so no event
+    // between this decision and them is missed (wake_bits 0 until a poll decides).
+    acquire.wake_bits = 0;
     // operation 0: a SEM_EXECUTE comparison the latch can't make (circular, mask zero); the polls
     // read the word.
     auto& waiters = Nx2SemaphoreWaiters::Get();
@@ -857,11 +743,9 @@ void Puller::SuspendOnView(DmaPusher& dma_pusher, PendingAcquire acquire, bool g
         device && acquire.operation != 0) {
         waiters.Add(this, *device, acquire.value, acquire.operation);
     }
-    // Releases only what already signalled (nothing with async fences): the fencing thread lands
-    // releases as the GPU passes them, and a release among them latches the waiter.
-    OnBackBarrier(dma_pusher, VideoCommon::V2::Ir::BarrierOp::ReleaseFences,
-                  [rasterizer = dma_pusher.rasterizer] { rasterizer->ReleaseFences(false); },
-                  VideoCommon::V2::Ir::ReleaseFencesUnforced);
+    // SYNC_SUBMIT_SPEC §2.2: no ReleaseFences(false) barrier record here. It only asked the back
+    // to pop fences that already signalled, which the fencing thread does anyway (MP §5.5
+    // "Finish ... completes readbacks"); a landing latches the waiter and rings the front.
     acquire.last_request = std::chrono::steady_clock::now();
     pending_acquire = acquire;
     if (gpu_written) {
@@ -1102,9 +986,8 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
         u64 view_landing = 0;
         const V2::Mode view_mode = split.AcquireMode();
         if (view_mode != V2::Mode::Off) [[unlikely]] {
-            const ViewCheck view =
-                CheckWithView(dma_pusher, acquire.address, acquire.value,
-                              ViewOp(acquire.operation), view_mode != V2::Mode::On);
+            const ViewCheck view = CheckWithView(dma_pusher, acquire.address, acquire.value,
+                                                 ViewOp(acquire.operation));
             view_passes = Passes(view);
             view_landing = view.landing;
             if (view_mode == V2::Mode::On && SuspendsOnView(view)) {
@@ -1117,8 +1000,7 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
                 }
                 NoteAcquireRecord(dma_pusher, acquire.address, acquire.value, acquire.operation,
                                   static_cast<u32>(view.verdict));
-                SuspendOnView(dma_pusher, acquire, view.reason == Reason::GpuWritten,
-                              view.qmd_target);
+                SuspendOnView(dma_pusher, acquire, view.reason == Reason::GpuWritten);
                 return;
             }
             NoteViewDecision(view);
@@ -1136,10 +1018,6 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
         NoteAcquireRecord(dma_pusher, acquire.address, acquire.value, acquire.operation, ~0U);
         // Verify: a pass of the view must be one of the old path too (no suspension).
         const auto verify_result = [&](bool old_passed) {
-            if (view_mode == V2::Mode::Verify) [[unlikely]] {
-                ShadowDrained(dma_pusher, acquire.address, acquire.value, acquire.operation,
-                              ViewOp(acquire.operation), old_passed);
-            }
             if (view_passes) [[unlikely]] {
                 ReportViewMismatch(dma_pusher, acquire.address, acquire.value,
                                    acquire.operation, true, old_passed, "acquire", view_landing,
@@ -1288,8 +1166,7 @@ void Puller::ProcessSemaphoreExecute(DmaPusher& dma_pusher, u32 argument) {
         // EDEN_NX2_V2_ACQUIRE: one the view meets skips the drain and the fence release; with
         // =1 one it doesn't suspends the channel.
         const bool on = view_mode == V2::Mode::On;
-        const ViewCheck view =
-            CheckWithView(dma_pusher, address, payload, view_ops[operation], !on);
+        const ViewCheck view = CheckWithView(dma_pusher, address, payload, view_ops[operation]);
         view_passes = Passes(view);
         view_landing = view.landing;
         if (on && SuspendsOnView(view)) {
@@ -1315,7 +1192,7 @@ void Puller::ProcessSemaphoreExecute(DmaPusher& dma_pusher, u32 argument) {
                               .view_op = static_cast<u8>(view_ops[operation]),
                               .sem_execute = true,
                           },
-                          view.reason == Reason::GpuWritten, view.qmd_target);
+                          view.reason == Reason::GpuWritten);
             return;
         }
         NoteViewDecision(view);
@@ -1344,10 +1221,6 @@ void Puller::ProcessSemaphoreExecute(DmaPusher& dma_pusher, u32 argument) {
                                         : true;
     if (sync_class != V2Stats::SyncClass::Count) [[unlikely]] {
         V2Stats::NoteAcquire(sync_class, false, ready);
-    }
-    if (operation < 6 && VideoCommon::GpuSplit::Get().AcquireMode() == V2::Mode::Verify)
-        [[unlikely]] {
-        ShadowDrained(dma_pusher, address, payload, operation, view_ops[operation], ready);
     }
     if (view_passes) [[unlikely]] {
         ReportViewMismatch(dma_pusher, address, payload, operation, true, ready, "SEM_EXECUTE",

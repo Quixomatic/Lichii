@@ -105,11 +105,15 @@ public:
         /// fence land (0: never), and the landing counts it saw since.
         u64 released_at{};
         u64 landings_seen{};
-        /// Fix F3h (F3-X1): the QMD release an Equal/Mask acquire orders behind, recorded when
-        /// it was parsed (GpuSplit::QmdTargetFor); 0 when none.
-        u64 qmd_target{};
         /// SYNC Step 0: what its last poll waited for (V2::Stats::WakeClass), for the STATS line.
         u8 wake{};
+        /// SYNC_SUBMIT_SPEC §2.2: the wake classes that can change its answer (V2::SemWake; 0:
+        /// check every pass) and their epochs at the last check.
+        u8 wake_bits{};
+        u64 seen_notes{};
+        u64 seen_consumed{};
+        u64 seen_landings{};
+        u64 seen_maps{};
 
         [[nodiscard]] bool Matches(u32 current) const;
     };
@@ -134,8 +138,7 @@ private:
     [[nodiscard]] bool PollAcquireView(DmaPusher& dma_pusher);
     /// EDEN_NX2_V2_ACQUIRE=1: suspends the channel on an acquire the view doesn't pass, without
     /// draining (MASTER_PLAN §6). `gpu_written`: its word is read back (V2::WordReadback).
-    void SuspendOnView(DmaPusher& dma_pusher, PendingAcquire acquire, bool gpu_written,
-                       u64 qmd_target);
+    void SuspendOnView(DmaPusher& dma_pusher, PendingAcquire acquire, bool gpu_written);
     /// Sends the readback of the pending acquire's GPU-written word (no wait).
     void SendWordReadback(DmaPusher& dma_pusher);
 

@@ -99,6 +99,8 @@ enum class Reason : u8 {
     Forced,
     /// An acquire passed (forwarded) on the word its pending QMD reductions leave (F3h, class A)
     ReductionView,
+    /// SYNC: a SEM_EXECUTE acquire passed unmet after 2 s (counted residual)
+    SemExecutePass,
     Count,
 };
 
@@ -138,15 +140,6 @@ void NoteForcedLanding(u64 ns);
 /// evictions.
 void NoteSemRow(u8 row);
 void NoteSemEvictions(u64 count);
-/// SYNC Step 1 (ACQUIRE=verify shadow): where the view's decision differs.
-enum class SemShadow : u8 {
-    PassesTodayWaits,   ///< The view passes, today's decision waits
-    WaitsTodayPasses,   ///< The view waits, today's decision passes
-    PassesDrainedFails, ///< The view passes, the drained path (after landing) doesn't: serious
-    WaitsDrainedPasses, ///< The view waits, the drained path passes (benign)
-    Count,
-};
-void NoteSemShadow(SemShadow kind);
 
 /// Attributes the waits for the back made while it lives (acquire sites) to `sync_class`.
 class AcquireContext {

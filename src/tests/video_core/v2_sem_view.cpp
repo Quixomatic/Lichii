@@ -74,7 +74,7 @@ TEST_CASE("SYNC SemView: reductions over a pending payload and over memory",
     // Nothing pending: memory holds every earlier GPU write and is the base.
     view.NoteReduction(word + 4, false, 0, 0x13, 20, Retire::Consumed, 0, Kind::QmdReduction,
                        At(0), true, Reduce, read);
-    REQUIRE(view.Find(word + 4, At(0)).writer.value == 0x113);
+    REQUIRE(view.Find(word + 4, At(0)).writer.value == 100 + 0x13);
     // An incomplete base (an unknown writer may still change memory): a lower bound for ADD,
     // unknown for an op that may lower the word.
     view.NoteReduction(word + 8, false, 0, 1, 20, Retire::Consumed, 0, Kind::QmdReduction, At(0),
@@ -145,4 +145,120 @@ TEST_CASE("SYNC SemView: overflow answers unknown at the newest evicted position
     REQUIRE_FALSE(view.Find(0x10000, At(count, 0, count)).pending);
     view.Clear();
     REQUIRE_FALSE(view.Find(0x10000, At(0)).pending);
+}
+
+TEST_CASE("SYNC step 2: DecideFromView, every row of the table", "[video_core][v2_sem_view]") {
+    SemView view;
+    constexpr u64 word = 0x5000;
+    SemInputs in;
+    SECTION("unmapped, a map queued: suspend until it ran") {
+        in.mapped = false;
+        in.map_queued = true;
+        const auto d = DecideFromView(SemaphoreOp::Gequal, 1, {}, in);
+        REQUIRE(d.row == SemRow::MapQueued);
+        REQUIRE(d.verdict == AcquireVerdict::NotMet);
+        REQUIRE(d.wake == SemWake::Map);
+    }
+    SECTION("unmapped, no map queued: memory as the guest reads it (84de: gequal 0 passes)") {
+        in.mapped = false;
+        in.memory_word = 0;
+        REQUIRE(DecideFromView(SemaphoreOp::Gequal, 0, {}, in).verdict == AcquireVerdict::Met);
+        REQUIRE(DecideFromView(SemaphoreOp::Equal, 1, {}, in).verdict == AcquireVerdict::NotMet);
+    }
+    SECTION("GPU-written word: class C readback") {
+        in.gpu_written = true;
+        const auto d = DecideFromView(SemaphoreOp::Equal, 1, {}, in);
+        REQUIRE(d.row == SemRow::GpuWritten);
+        REQUIRE(d.verdict == AcquireVerdict::Fallback);
+        REQUIRE(d.wake == SemWake::Readback);
+    }
+    SECTION("no pending writer: memory decides; Equal waits for a queued unknown QMD") {
+        in.memory_word = 3;
+        REQUIRE(DecideFromView(SemaphoreOp::Equal, 3, {}, in).verdict == AcquireVerdict::Met);
+        const auto unmet = DecideFromView(SemaphoreOp::Gequal, 4, {}, in);
+        REQUIRE(unmet.verdict == AcquireVerdict::NotMet);
+        REQUIRE((unmet.wake & SemWake::Cpu) != 0);
+        REQUIRE((unmet.wake & SemWake::ReleaseParsed) != 0);
+        in.unbounded_unknown = 40;
+        const auto equal = DecideFromView(SemaphoreOp::Equal, 3, {}, in);
+        REQUIRE(equal.verdict == AcquireVerdict::NotMet);
+        REQUIRE(equal.wake == SemWake::Consumed);
+        REQUIRE(equal.position == 40);
+        // A word that only advances: the unknown QMD can't move it back (§10).
+        REQUIRE(DecideFromView(SemaphoreOp::Gequal, 3, {}, in).verdict == AcquireVerdict::Met);
+    }
+    SECTION("pending known writer: class B, or wait for a later release") {
+        view.Note(word, 9, true, 50, Retire::Landing, 0x3200, Kind::Release, At(0));
+        const auto answer = view.Find(word, At(60, 0x31ff));
+        in.memory_word = 8;
+        const auto met = DecideFromView(SemaphoreOp::Equal, 9, answer, in);
+        REQUIRE(met.row == SemRow::PendingKnown);
+        REQUIRE(met.verdict == AcquireVerdict::MetByQueued);
+        REQUIRE(met.position == 50);
+        const auto unmet = DecideFromView(SemaphoreOp::Gequal, 10, answer, in);
+        REQUIRE(unmet.verdict == AcquireVerdict::NotMet);
+        REQUIRE((unmet.wake & SemWake::ReleaseParsed) != 0);
+        REQUIRE_FALSE(unmet.request);
+    }
+    SECTION("pending unknown writer at execute") {
+        view.Note(word, 0, false, 70, Retire::Consumed, 0, Kind::Release, At(0));
+        const auto answer = view.Find(word, At(60));
+        in.memory_word = 5;
+        // Gequal passes on memory with an unknown writer pending (§10 monotonic).
+        REQUIRE(DecideFromView(SemaphoreOp::Gequal, 5, answer, in).verdict ==
+                AcquireVerdict::Met);
+        // Equal waits for it, then resumes once the back consumed it.
+        const auto equal = DecideFromView(SemaphoreOp::Equal, 5, answer, in);
+        REQUIRE(equal.row == SemRow::UnknownAtExecute);
+        REQUIRE(equal.verdict == AcquireVerdict::NotMet);
+        REQUIRE((equal.wake & SemWake::Consumed) != 0);
+        REQUIRE(equal.position == 70);
+        REQUIRE_FALSE(equal.request);
+        const auto after = DecideFromView(SemaphoreOp::Equal, 5, view.Find(word, At(70)), in);
+        REQUIRE(after.verdict == AcquireVerdict::Met);
+    }
+    SECTION("pending unknown writer at a fence (class D): one request for its ticket") {
+        view.Note(word, 0, false, 80, Retire::Landing, 0x5000, Kind::Counter, At(0));
+        in.memory_word = 1;
+        const auto d = DecideFromView(SemaphoreOp::Equal, 2, view.Find(word, At(90)), in);
+        REQUIRE(d.row == SemRow::UnknownAtFence);
+        REQUIRE(d.verdict == AcquireVerdict::NotMet);
+        REQUIRE(d.request);
+        REQUIRE(d.ticket == 0x5000);
+        REQUIRE((d.wake & SemWake::Landing) != 0);
+    }
+}
+
+TEST_CASE("SYNC step 2 idle back: an Equal acquire on a word an unknown QMD writes resumes "
+          "once the back ran it, without a submit",
+          "[video_core][v2_sem_view]") {
+    SemView view;
+    view.NoteUnboundedUnknown(100);
+    SemInputs in;
+    in.memory_word = 7;
+    in.unbounded_unknown = view.UnboundedUnknown(90);
+    auto d = DecideFromView(SemaphoreOp::Equal, 7, view.Find(0x6000, At(90)), in);
+    REQUIRE(d.verdict == AcquireVerdict::NotMet);
+    REQUIRE(d.wake == SemWake::Consumed);
+    REQUIRE_FALSE(d.request);
+    // The back ran it and went idle: nothing to submit, memory decides.
+    in.unbounded_unknown = view.UnboundedUnknown(100);
+    d = DecideFromView(SemaphoreOp::Equal, 7, view.Find(0x6000, At(100)), in);
+    REQUIRE(d.verdict == AcquireVerdict::Met);
+    REQUIRE_FALSE(d.request);
+}
+
+TEST_CASE("SYNC step 2 idle back: an acquire met by a fence-flagged release whose fence is not "
+          "submitted passes at once (class B)",
+          "[video_core][v2_sem_view]") {
+    SemView view;
+    // A 4-byte release lands at its fence (#337); the back ran it, its fence is unsubmitted.
+    view.Note(0x7000, 3, true, 10, Retire::Landing, (u64{10} << 8), Kind::Release, At(0));
+    SemInputs in;
+    in.memory_word = 2;
+    const auto d =
+        DecideFromView(SemaphoreOp::Gequal, 3, view.Find(0x7000, At(10, 0)), in);
+    REQUIRE(d.verdict == AcquireVerdict::MetByQueued);
+    REQUIRE_FALSE(d.request);
+    REQUIRE(d.position == 10);
 }
