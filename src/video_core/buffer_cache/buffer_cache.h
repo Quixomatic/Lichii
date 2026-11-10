@@ -4817,6 +4817,19 @@ template <class P>
 void BufferCache<P>::SynchronizeGeometryBuffer(u32 slot, BufferId buffer_id, DAddr device_addr,
                                                u32 size) {
     if (v2_defer && buffer_id) [[unlikely]] {
+        // F2-19 (R2-P5a-01): the skip test at the lookup. Until this scope's commit only a
+        // queued creation (a join) can move what it reads, so without one it decides as the
+        // apply would; verify keeps the apply-time test (and its re-scan).
+        if (v2_creates.Empty() && !Nx2Perf::Verify()) {
+            const GeometrySync& sync = geometry_syncs[slot];
+            if (memory_tracker.IsSynchronized(slot) && sync.buffer_id == buffer_id &&
+                sync.device_addr == device_addr && sync.size == size &&
+                sync.deletions == buffer_deletions) {
+                ++geometry_stats.syncs;
+                ++geometry_stats.syncs_skipped;
+                return;
+            }
+        }
         V2::Commit::Request request{};
         request.kind = V2::Commit::Kind::BufferGeometrySync;
         request.resource = V2::Commit::Resource::Buffer;
@@ -4825,6 +4838,8 @@ void BufferCache<P>::SynchronizeGeometryBuffer(u32 slot, BufferId buffer_id, DAd
         request.size = size;
         request.arg = slot;
         v2_binds.Push(request);
+        // A real sync may upload: this buffer's usage marks in the scope order after it.
+        v2_scope_uploads.push_back(buffer_id.index);
         return;
     }
     Buffer& buffer = slot_buffers[buffer_id];
