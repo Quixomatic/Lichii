@@ -271,9 +271,8 @@ void PresentManager::Present(Frame* frame) {
     }
     if (use_present_thread) {
         scheduler.Record([this, frame](vk::CommandBuffer) {
-            // EDEN_NX2_V2_SUBMITTHREAD: the submission signalling render_ready must reach the
-            // queue before the present thread waits on it.
-            scheduler.WaitSubmitThread();
+            // U-10: the present thread waits for the submit thread (PresentThread), not the
+            // worker here: the encoder never blocks.
             std::unique_lock lock{queue_mutex};
             present_queue.push_back(frame);
             frame_cv.notify_one();
@@ -430,6 +429,9 @@ void PresentManager::PresentThread(std::stop_token token) {
             // before the queue lock goes out of scope. This way the swapchain
             // lock in WaitPresent is guaranteed to occur after here.
             void(std::exchange(lock, std::unique_lock{swapchain_mutex}));
+            // EDEN_NX2_V2_SUBMITTHREAD: the submission signalling render_ready was handed before
+            // the frame was queued; it must reach the queue before CopyToSwapchain waits on it.
+            scheduler.WaitSubmitThread();
             CopyToSwapchain(frame);
 
             // Free the frame for reuse
