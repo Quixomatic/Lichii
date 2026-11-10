@@ -1108,17 +1108,28 @@ void TextureCache<P>::SynchronizeDescriptors(bool compute) {
             ++texture_bindings_serial;
         }
     } else {
-        const bool linked_tsc = maxwell3d->regs.sampler_binding == Tegra::Engines::Maxwell3D::Regs::SamplerBinding::ViaHeaderBinding;
-        const u32 tic_limit = maxwell3d->regs.tex_header.limit;
-        const u32 tsc_limit = linked_tsc ? tic_limit : maxwell3d->regs.tex_sampler.limit;
-        bool bindings_changed = false;
-        if (channel_state->graphics_sampler_table.Synchronize(maxwell3d->regs.tex_sampler.Address(), tsc_limit))
-            bindings_changed = true;
-        if (channel_state->graphics_image_table.Synchronize(maxwell3d->regs.tex_header.Address(), tic_limit))
-            bindings_changed = true;
-        if (bindings_changed) {
-            ++texture_bindings_serial;
-        }
+        SyncDescriptorTables(V2::Resolve::TablesOf(V2::Resolve::LiveView{*maxwell3d}));
+    }
+}
+
+template <class P>
+bool TextureCache<P>::DescriptorTablesMatch(
+    const V2::Resolve::DescriptorTablesKey& key) const noexcept {
+    const auto& samplers = channel_state->graphics_sampler_table;
+    const auto& images = channel_state->graphics_image_table;
+    return samplers.current_gpu_addr == key.tsc_addr && samplers.current_limit == key.tsc_limit &&
+           images.current_gpu_addr == key.tic_addr && images.current_limit == key.tic_limit;
+}
+
+template <class P>
+void TextureCache<P>::SyncDescriptorTables(const V2::Resolve::DescriptorTablesKey& key) {
+    bool bindings_changed = false;
+    if (channel_state->graphics_sampler_table.Synchronize(key.tsc_addr, key.tsc_limit))
+        bindings_changed = true;
+    if (channel_state->graphics_image_table.Synchronize(key.tic_addr, key.tic_limit))
+        bindings_changed = true;
+    if (bindings_changed) {
+        ++texture_bindings_serial;
     }
 }
 
@@ -1346,6 +1357,11 @@ void TextureCache<P>::SaveRenderTargetInputs() {
 
 template <class P>
 bool TextureCache<P>::RenderTargetInputsHold() const {
+    return RenderTargetInputsHold(V2::Resolve::RtKeyOf(V2::Resolve::LiveView{*maxwell3d}));
+}
+
+template <class P>
+bool TextureCache<P>::RenderTargetInputsHold(const V2::Resolve::RtKey& regs) const {
     // F2-06: the registers every lookup of the full update reads are the ones it last read, no
     // image was registered, deleted or rescaled since, and it ran this frame (its scale ratings
     // move per frame): it would bind the same views and compute the same targets.
@@ -1355,7 +1371,6 @@ bool TextureCache<P>::RenderTargetInputsHold() const {
         rt_inputs.map_serial != gpu_memory->MapSerial()) {
         return false;
     }
-    const auto& regs = maxwell3d->regs;
     const auto same = [](const auto& lhs, const auto& rhs) {
         return std::memcmp(&lhs, &rhs, sizeof(lhs)) == 0;
     };
@@ -1363,6 +1378,77 @@ bool TextureCache<P>::RenderTargetInputsHold() const {
            same(rt_inputs.zeta, regs.zeta) && same(rt_inputs.surface_clip, regs.surface_clip) &&
            same(rt_inputs.zeta_size, regs.zeta_size) && rt_inputs.zeta_enable == regs.zeta_enable &&
            same(rt_inputs.anti_alias_samples_mode, regs.anti_alias_samples_mode);
+}
+
+template <class P>
+auto TextureCache<P>::PredictRenderTargets(const V2::Resolve::RtKey& key) const -> RtPrediction {
+    RtPrediction prediction{};
+    if (RenderTargetInputsHold(key)) {
+        // F2-06: the full update binds what it bound.
+        for (size_t index = 0; index < NUM_RT; ++index) {
+            prediction.ids[index] = render_targets.color_buffer_ids[index].index;
+        }
+        prediction.ids[NUM_RT] = render_targets.depth_buffer_id.index;
+        prediction.known = true;
+        prediction.inputs_hold = true;
+        return prediction;
+    }
+    // PredictRenderTargetUpdate's test without its effects: a target binds the view bound at
+    // its slot when the registers name that view's address, format and size; FindColorBuffer's
+    // and FindDepthBuffer's "no target" cases bind none.
+    prediction.known = true;
+    const auto predict = [&](ImageViewId bound, const ImageInfo& info, GPUVAddr gpu_addr) {
+        if (!bound || bound == NULL_IMAGE_VIEW_ID) {
+            prediction.known = false;
+            return ImageViewId{};
+        }
+        const ImageViewBase& view = slot_image_views[bound];
+        if (view.gpu_addr != gpu_addr || view.format != info.format ||
+            view.size.width != info.size.width || view.size.height != info.size.height) {
+            prediction.known = false;
+        }
+        return bound;
+    };
+    for (size_t index = 0; index < NUM_RT; ++index) {
+        prediction.ids[index] = ImageViewId{}.index;
+        if (index >= key.rt_control.count) {
+            continue;
+        }
+        const auto& rt = key.rt[index];
+        const GPUVAddr gpu_addr = rt.Address();
+        if (gpu_addr == 0 || rt.format == Tegra::RenderTargetFormat::NONE) {
+            continue;
+        }
+        prediction.ids[index] = predict(render_targets.color_buffer_ids[index],
+                                        ImageInfo(rt, key.anti_alias_samples_mode), gpu_addr)
+                                    .index;
+    }
+    prediction.ids[NUM_RT] = ImageViewId{}.index;
+    if (key.zeta_enable) {
+        const GPUVAddr gpu_addr = key.zeta.Address();
+        if (gpu_addr != 0) {
+            prediction.ids[NUM_RT] =
+                predict(render_targets.depth_buffer_id,
+                        ImageInfo(key.zeta, key.zeta_size, key.anti_alias_samples_mode), gpu_addr)
+                    .index;
+        }
+    }
+    return prediction;
+}
+
+template <class P>
+u32 TextureCache<P>::ApplyDrawRequest(const V2::Commit::Request& request, bool& has_blacklisted) {
+    namespace C = V2::Commit;
+    if (request.kind == C::Kind::SamplerBind || request.kind == C::Kind::SamplerCreate) {
+        // As CommitSamplerLookups applies a sampler request: outside a sampler scope.
+        const bool scope = std::exchange(v2_sampler_scope, false);
+        const u32 id =
+            GetSamplerId(static_cast<u32>(request.address), (request.arg & C::ArgCompute) != 0)
+                .index;
+        v2_sampler_scope = scope;
+        return id;
+    }
+    return ApplyTextureRequest(request, has_blacklisted);
 }
 
 template <class P>

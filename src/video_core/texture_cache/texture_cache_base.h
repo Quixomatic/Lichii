@@ -52,6 +52,8 @@
 #include "video_core/textures/unswizzle_worker.h"
 #include "video_core/v2/commit.h"
 #include "video_core/v2/residency.h"
+#include "video_core/v2/resolve/draw_record.h"
+#include "video_core/v2/versions.h"
 
 namespace Tegra {
 namespace Control {
@@ -509,6 +511,47 @@ public:
     /// resolves nothing and binds the same views, so the replay needs no check after it. Pure.
     [[nodiscard]] bool RenderTargetsUnchanged(std::span<const u32, NUM_RT> color_ids,
                                               u32 depth_id) const noexcept;
+
+    // Pipeline v2 P6 Step 0 (EDEN_NX2_V2_DRAWREC, notes/STEP0_SPEC.md §2 items 1, 3, 4, 7): pure
+    // twins of the fused entry points and the appliers ApplyDraw runs.
+    /// Whether the graphics descriptor tables are the ones `key` selects (no Synchronize due).
+    [[nodiscard]] bool DescriptorTablesMatch(const V2::Resolve::DescriptorTablesKey& key) const
+        noexcept;
+    /// SynchronizeDescriptors(false) for the tables `key` selects.
+    void SyncDescriptorTables(const V2::Resolve::DescriptorTablesKey& key);
+    /// RenderTargetInputsHold for the registers in `key`.
+    [[nodiscard]] bool RenderTargetInputsHold(const V2::Resolve::RtKey& key) const;
+    /// The render target views a full update for `key` binds, as far as the bound views show
+    /// them (pure; no prepares, no effects).
+    struct RtPrediction {
+        std::array<u32, NUM_RT + 1> ids{}; ///< color targets, then depth (ImageViewId indices)
+        bool known = false;
+        bool inputs_hold = false;
+    };
+    [[nodiscard]] RtPrediction PredictRenderTargets(const V2::Resolve::RtKey& key) const;
+    /// Applies one request of a draw record's texture list: sampler kinds as GetSamplerId
+    /// outside a sampler scope (CommitSamplerLookups), views as the commit's own applier.
+    u32 ApplyDrawRequest(const V2::Commit::Request& request, bool& has_blacklisted);
+    /// Whether an image was deleted since the last call (and clears it).
+    [[nodiscard]] bool TakeDeletedImages() noexcept {
+        return std::exchange(has_deleted_images, false);
+    }
+    [[nodiscard]] u32 ViewGeneration(ImageViewId id) const noexcept {
+        return V2::Versions::Gens().Get(V2::Versions::Kind::ImageView, id.index);
+    }
+    [[nodiscard]] u32 SamplerGeneration(SamplerId id) const noexcept {
+        return V2::Versions::Gens().Get(V2::Versions::Kind::Sampler, id.index);
+    }
+    /// The record stamps: the graphics tables' change counts and the bindings serial.
+    [[nodiscard]] u64 GraphicsImageTableChanges() const noexcept {
+        return channel_state->graphics_image_table.changes;
+    }
+    [[nodiscard]] u64 GraphicsSamplerTableChanges() const noexcept {
+        return channel_state->graphics_sampler_table.changes;
+    }
+    [[nodiscard]] u64 TextureBindingsSerial() const noexcept {
+        return texture_bindings_serial;
+    }
 
 private:
     /// FillImageViews with COMMIT=1: pure lookups into requests, then one commit.
