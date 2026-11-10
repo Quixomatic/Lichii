@@ -1649,7 +1649,6 @@ struct Maxwell3D::FrontState {
     std::array<MacroSlot, 64> v2_macro_slots{};
     u64 v2_macro_generation{~u64{0}};
     std::unique_ptr<VideoCommon::V2::MacroHle::Observation> v2_observation;
-    bool v2_targets_dirty{true};
     // FrontNoteDraw's verdict on the bound programs' stores, kept until a Shaders-group register,
     // a register it reads, a summary (ShaderWrites::Generation) or a mapping (MapEpoch) changes.
     bool v2_programs_dirty{true};
@@ -1657,8 +1656,6 @@ struct Maxwell3D::FrontState {
     u32 v2_programs_state{};
     u32 v2_programs_generation{};
     u32 v2_programs_map_epoch{};
-    u32 v2_target_count{};
-    std::array<std::pair<u64, u64>, 9> v2_targets{};
     /// A method the draw manager handles was sent since the back last ran DrawDeferred: only
     /// then can it have a deferred instanced draw to issue at the end of a macro.
     bool draw_pending{true};
@@ -1827,10 +1824,7 @@ Maxwell3D::FrontState& Maxwell3D::Front(Core::System& system, VideoCommon::GpuSp
             for (u32 method = 0; method < Regs::NUM_REGS; ++method) {
                 const u32 flags = table.flags[method];
                 front->v2_note_writes[method] =
-                    table.groups[method] == V2::RegGroup::RenderTargets ||
                     table.groups[method] == V2::RegGroup::Shaders ||
-                    method == MAXWELL3D_REG_INDEX(anti_alias_samples_mode) ||
-                    method == MAXWELL3D_REG_INDEX(zeta_enable) ||
                     method == MAXWELL3D_REG_INDEX(clear_surface) ||
                     method == MAXWELL3D_REG_INDEX(launch_dma) ||
                     (flags & (V2::RegSem::DrawEnd | V2::RegSem::InlineData | V2::RegSem::CbData |
@@ -2505,11 +2499,7 @@ void Maxwell3D::FrontNoteWrites(VideoCommon::GpuSplit& split, FrontState& fs, u3
     namespace V2 = VideoCommon::V2;
     const auto& table = V2::RegSem::GetTable3D();
     const u32 flags = table.flags[method];
-    if (table.groups[method] == V2::RegGroup::RenderTargets ||
-        method == MAXWELL3D_REG_INDEX(anti_alias_samples_mode) ||
-        method == MAXWELL3D_REG_INDEX(zeta_enable)) {
-        fs.v2_targets_dirty = true;
-    } else if (table.groups[method] == V2::RegGroup::Shaders) {
+    if (table.groups[method] == V2::RegGroup::Shaders) {
         fs.v2_programs_dirty = true;
     }
     if ((flags & V2::RegSem::DrawEnd) != 0 || method == MAXWELL3D_REG_INDEX(clear_surface)) {
@@ -2543,7 +2533,9 @@ void Maxwell3D::FrontNoteDraw(VideoCommon::GpuSplit& split, FrontState& fs) {
     namespace V2 = VideoCommon::V2;
     // The front's registers have the engine's layout.
     const auto& r = *reinterpret_cast<const Regs*>(fs.regs.data());
-    // Stores other than to the targets: every bound program must be known to store nothing.
+    // Shader stores: every bound program must be known to store nothing. Render and depth
+    // targets are not noted (MASTER_PLAN §5.1): their data reaches guest memory only through
+    // texture cache writebacks (S3), and reads of GPU-written pages already take the back.
     // The verdict is cached: recomputed only when what it reads may have changed (B4).
     const bool native = GetNativeMacroEngine().native_turing;
     const u32 inputs = (r.transform_feedback_enabled != 0 ? 1U : 0U) |
@@ -2561,7 +2553,6 @@ void Maxwell3D::FrontNoteDraw(VideoCommon::GpuSplit& split, FrontState& fs) {
     if (fs.v2_programs_unbounded) {
         split.NoteUnboundedWrite(V2::Producer::Draw);
     }
-    FrontNoteTargets(split, fs, r);
 }
 
 bool Maxwell3D::FrontProgramsUnbounded(const Regs& r, bool native) {
@@ -2586,36 +2577,6 @@ bool Maxwell3D::FrontProgramsUnbounded(const Regs& r, bool native) {
         unbounded = !summary || !summary->WritesNothing();
     }
     return unbounded;
-}
-
-void Maxwell3D::FrontNoteTargets(VideoCommon::GpuSplit& split, FrontState& fs, const Regs& r) {
-    namespace V2 = VideoCommon::V2;
-    if (fs.v2_targets_dirty) {
-        fs.v2_targets_dirty = false;
-        fs.v2_target_count = 0;
-        const auto add = [&](GPUVAddr address, u64 size) {
-            if (address == 0 || size == 0 || fs.v2_target_count == fs.v2_targets.size()) {
-                return;
-            }
-            std::array<std::pair<u64, u64>, 1> range;
-            if (V2::DeviceRanges(memory_manager, address, size, range) != 0) {
-                fs.v2_targets[fs.v2_target_count++] = range[0];
-            }
-        };
-        for (u32 index = 0; index < std::min<u32>(r.rt_control.count, Regs::NumRenderTargets);
-             ++index) {
-            const auto& rt = r.rt[index];
-            if (rt.Address() != 0 && rt.format != Tegra::RenderTargetFormat::NONE) {
-                const VideoCommon::ImageInfo info(rt, r.anti_alias_samples_mode);
-                add(rt.Address(), VideoCommon::CalculateGuestSizeInBytes(info));
-            }
-        }
-        if (r.zeta_enable && r.zeta.Address() != 0) {
-            const VideoCommon::ImageInfo info(r.zeta, r.zeta_size, r.anti_alias_samples_mode);
-            add(r.zeta.Address(), VideoCommon::CalculateGuestSizeInBytes(info));
-        }
-    }
-    split.NoteDrawTargets(std::span{fs.v2_targets.data(), fs.v2_target_count});
 }
 
 void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split,
@@ -3294,9 +3255,8 @@ bool Maxwell3D::FrontDmaReadHazard(VideoCommon::GpuSplit& split, GPUVAddr source
     filter.unbounded = V2::ProducerBit(V2::Producer::Dispatch) |
                        V2::ProducerBit(V2::Producer::Copy) |
                        V2::ProducerBit(V2::Producer::Upload);
-    // Draws: their stores and targets, those sent before the last host-level wait.
+    // Draws: their shader stores, those sent before the last host-level wait.
     filter.unbounded_synced = V2::ProducerBit(V2::Producer::Draw);
-    filter.synced_draw_targets = true;
     bool narrowed = false;
     for (int attempt = 0; attempt < 3; ++attempt) {
         if (Nx2MayBeGpuWritten(*device, bytes)) {

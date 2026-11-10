@@ -3495,7 +3495,6 @@ private:
                            const VideoCommon::V2::DrawOutput& out, u32 pending_method,
                            bool may_cut);
     bool FrontProgramsUnbounded(const Regs& regs, bool native);
-    void FrontNoteTargets(VideoCommon::GpuSplit& split, FrontState& state, const Regs& regs);
     VideoCommon::V2::Ir::CompactBody FrontCompactDraw(VideoCommon::GpuSplit& split,
                                                       FrontState& state,
                                                       VideoCommon::V2::Ir::DrawOp op, u32 count);

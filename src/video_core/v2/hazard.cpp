@@ -28,9 +28,6 @@ void HazardTable::Clear() {
     wide_entries.fill(Link{});
     wide_head = 0;
     wide_count = 0;
-    target_sets.fill(TargetSet{});
-    target_current = 0;
-    targets_overflow = 0;
     unbounded.fill(0);
     unbounded_synced.fill(0);
     overflow_position = 0;
@@ -148,26 +145,6 @@ void HazardTable::NoteUnbounded(Producer producer, u64 position) {
 void HazardTable::NoteSync(u64 position) {
     (void)position;
     unbounded_synced = unbounded;
-    for (TargetSet& set : target_sets) {
-        set.synced = set.position;
-    }
-}
-
-void HazardTable::NoteDrawTargets(std::span<const std::pair<u64, u64>> ranges, u64 position) {
-    const size_t num = std::min(ranges.size(), MaxTargets);
-    TargetSet& current = target_sets[target_current];
-    if (current.count == num &&
-        std::equal(ranges.begin(), ranges.begin() + num, current.ranges.begin())) {
-        current.position = position;
-        return;
-    }
-    target_current = (target_current + 1) % TargetSets;
-    TargetSet& next = target_sets[target_current];
-    targets_overflow = std::max(targets_overflow, next.synced);
-    next.count = static_cast<u32>(num);
-    std::copy(ranges.begin(), ranges.begin() + num, next.ranges.begin());
-    next.position = position;
-    next.synced = 0;
 }
 
 void HazardTable::Retire(u64 consumed) {
@@ -322,24 +299,6 @@ HazardResult HazardTable::Find(u64 address, u64 size, u64 consumed, const Hazard
                         }
                     }
                     link = entry.previous;
-                }
-            }
-        }
-    }
-    if (filter.synced_draw_targets) {
-        if (targets_overflow > consumed) {
-            wait = std::max(wait, targets_overflow);
-            result.overflow = true;
-        }
-        for (const TargetSet& set : target_sets) {
-            if (set.synced <= consumed) {
-                continue;
-            }
-            for (u32 i = 0; i < set.count; ++i) {
-                if (set.ranges[i].first < end && set.ranges[i].second > address) {
-                    wait = std::max(wait, set.synced);
-                    result.producers |= ProducerBit(Producer::Draw);
-                    break;
                 }
             }
         }

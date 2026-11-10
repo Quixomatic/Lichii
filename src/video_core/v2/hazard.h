@@ -35,7 +35,7 @@ enum class Producer : u8 {
     Upload,   ///< Inline-to-memory, 3D and compute uploads
     Copy,     ///< Copy engine and 2D transfers
     Dispatch, ///< Compute dispatches: their shaders' stores
-    Draw,     ///< 3D draws: shader stores, transform feedback (render targets: NoteDrawTargets)
+    Draw,     ///< 3D draws: shader stores, transform feedback (render targets are not noted)
     QmdRelease, ///< The semaphore releases compute QMDs make (the front doesn't parse them)
     Count,
 };
@@ -54,8 +54,6 @@ struct HazardFilter {
     u32 ranged = AllProducers;   ///< Ranged writes of these producers that overlap
     u32 unbounded = 0;           ///< Unbounded writes of these producers, any still queued
     u32 unbounded_synced = 0;    ///< ...only those sent before the last host-level sync
-    /// Render and depth targets of draws sent before the last host-level sync that overlap.
-    bool synced_draw_targets = false;
 };
 
 struct HazardResult {
@@ -97,9 +95,6 @@ public:
     void NoteRange(u64 address, u64 size, u64 position, Producer producer);
     /// A write the front can't bound.
     void NoteUnbounded(Producer producer, u64 position);
-    /// A draw at `position` writes these device ranges (its render and depth targets). Draws
-    /// keep the same targets for long runs: an unchanged set only takes the new position.
-    void NoteDrawTargets(std::span<const std::pair<u64, u64>> ranges, u64 position);
     /// A host-level wait was sent at `position`: the unbounded writes before it are complete
     /// before what the front fetches after it (HazardFilter::unbounded_synced).
     void NoteSync(u64 position);
@@ -146,16 +141,6 @@ private:
 
     static constexpr size_t PageSlots = 4096;
     static constexpr size_t MaxWide = 64;
-    static constexpr size_t MaxTargets = 9;
-    static constexpr size_t TargetSets = 8;
-
-    /// Render targets of a run of draws, the last of them and the last before the last sync.
-    struct TargetSet {
-        std::array<std::pair<u64, u64>, MaxTargets> ranges{};
-        u32 count = 0;
-        u64 position = 0;
-        u64 synced = 0;
-    };
 
     Entry& Push(u64 address, u64 end, u64 position, Producer producer);
     /// Links a new entry into its page slot's chain, or marks it wide.
@@ -177,9 +162,6 @@ private:
     /// Per producer: the newest position of a wide write that fell out of wide_entries; lookups
     /// for it scan every pending entry.
     std::array<u64, static_cast<size_t>(Producer::Count)> wide{};
-    std::array<TargetSet, TargetSets> target_sets{};
-    size_t target_current = 0;
-    u64 targets_overflow = 0; ///< The newest draw of a target set that was replaced
     std::array<u64, static_cast<size_t>(Producer::Count)> unbounded{};
     std::array<u64, static_cast<size_t>(Producer::Count)> unbounded_synced{};
     u64 overflow_position = 0; ///< Pending entries that no longer fit

@@ -440,29 +440,6 @@ TEST_CASE("V2 hazard table: wide writes and draw targets", "[video_core][v2_haza
         CHECK(table.Find(0x10000000 + 0x10, 4, 0, all).position == 1);
         CHECK(table.Find(0x10000000 + 69 * 0x100000, 4, 0, all).position == 70);
     }
-
-    SECTION("draw targets count once a host-level sync follows them") {
-        const std::array<std::pair<u64, u64>, 2> targets{{{0x50000, 0x60000}, {0x80000, 0x81000}}};
-        table.NoteDrawTargets(targets, 5);
-        HazardFilter draws;
-        draws.ranged = 0;
-        draws.synced_draw_targets = true;
-        // Not before a sync: draws after the last host-level wait don't order the reads.
-        CHECK(table.Find(0x50010, 4, 0, draws).kind == Kind::Clear);
-        table.NoteDrawTargets(targets, 7); // same targets: the run goes on
-        table.NoteSync(8);
-        const HazardResult hit = table.Find(0x50010, 4, 0, draws);
-        CHECK(hit.kind == Kind::Wait);
-        CHECK(hit.position == 7);
-        CHECK(table.Find(0x70000, 4, 0, draws).kind == Kind::Clear);
-        CHECK(table.Find(0x80000, 4, 7, draws).kind == Kind::Clear);
-        // New targets: the old run still counts until the back ran it.
-        const std::array<std::pair<u64, u64>, 1> other{{{0x90000, 0x91000}}};
-        table.NoteDrawTargets(other, 9);
-        table.NoteSync(10);
-        CHECK(table.Find(0x50010, 4, 0, draws).position == 7);
-        CHECK(table.Find(0x90010, 4, 0, draws).position == 9);
-    }
 }
 
 TEST_CASE("V2 write ranges: uploads and shader write summaries", "[video_core][v2_hazard]") {
