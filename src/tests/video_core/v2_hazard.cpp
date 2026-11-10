@@ -593,6 +593,50 @@ TEST_CASE("V2 acquire: a suspended acquire whose release the view never records 
         CHECK(PlanSuspendedPoll(true, false, true) == SuspendedPoll::ReadBack);
         CHECK(PlanSuspendedPoll(true, true, false) == SuspendedPoll::ReadBack);
     }
+    SECTION("8d31 deadlock: an operation at a fence nothing submits lands when the back idles") {
+        // Four channels waited on QMD reduction words 0x13 short, back idle, nothing queued:
+        // the reductions sat at a fence no submit request reached. The model: the fence lands
+        // only when forced (ReleaseFences); submit requests alone never land it.
+        for (const bool producer_known : {true, false}) {
+            u32 word = 0x8099;
+            bool fence_pending = true;
+            bool submit_requested = false;
+            u64 landings = 0;
+            u64 landings_seen = 0;
+            u64 released_at = 0;
+            const u64 consumed = 500; // the back is idle there
+            bool resumed = false;
+            for (int poll = 0; poll < 8 && !resumed; ++poll) {
+                const bool landed_since = landings != landings_seen;
+                if (ForcePendingLandings(false, false, submit_requested, producer_known,
+                                         landed_since, released_at == consumed + 1)) {
+                    released_at = consumed + 1;
+                    if (fence_pending) {
+                        fence_pending = false;
+                        word += 0x13; // the reductions run at their fence
+                        ++landings;
+                    }
+                    landings_seen = landings;
+                } else if (landed_since) {
+                    landings_seen = landings;
+                }
+                resumed = SemaphoreMet(SemaphoreOp::Equal, word, 0x80ac);
+                if (!resumed && PlanSuspendedPoll(false, producer_known, false) ==
+                                    SuspendedPoll::Submit) {
+                    submit_requested = true; // asked; the idle hook never submits it here
+                }
+            }
+            CHECK(resumed);
+        }
+        // Once per back position: not again until the back ran new work, and not while work is
+        // queued, landings arrive, or the word is read back.
+        CHECK(!ForcePendingLandings(false, false, true, true, false, true));
+        CHECK(!ForcePendingLandings(true, false, true, true, false, false));
+        CHECK(!ForcePendingLandings(false, false, true, true, true, false));
+        CHECK(!ForcePendingLandings(false, true, true, true, false, false));
+        // A known producer gets its submit request first.
+        CHECK(!ForcePendingLandings(false, false, false, true, false, false));
+    }
     SECTION("a producer that lands at a fence makes the poll ask for its submit, never a drain") {
         // F3F5b-5 / F3-X1: a QMD release (or a release still to land) that may write the word
         // latches the waiter when its operation runs; the poll asks for the submit that runs it,

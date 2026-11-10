@@ -490,6 +490,32 @@ bool Puller::PollAcquireView(DmaPusher& dma_pusher) {
                 NotedReleaseOnItsWay(dma_pusher, address, value, op);
         }
         const bool queued = split.ConsumedNow() < split.WritePosition();
+        // F3-X1 follow-up (8d31 deadlock: four channels on QMD reduction words 0x13 short, back
+        // idle, nothing queued, no landing): an operation can sit at a fence nothing submits
+        // (a reduction deferred behind a landing, an operation the front can't see). Once the
+        // back is idle and nothing the polls asked for landed since the back last moved, the
+        // waiter makes every pending fence land (the v1 acquire's ReleaseFences, on the back):
+        // once per back position, so it repeats only after new work ran — never on a timer.
+        const u64 landings = V2::Landing::landed.load(std::memory_order_acquire) +
+                             V2::Landing::untracked_landed.load(std::memory_order_acquire);
+        if (V2::ForcePendingLandings(queued, gpu_written, acquire.submit_requested,
+                                     acquire.producer_lands, landings != acquire.landings_seen,
+                                     acquire.released_at == split.ConsumedNow() + 1)) {
+            acquire.released_at = split.ConsumedNow() + 1;
+            if (V2Stats::Enabled()) [[unlikely]] {
+                V2Stats::NoteDecision(VideoCommon::DrainSite::Acquire, Decision::Waited,
+                                      Reason::Valve);
+            }
+            ReleaseFences(dma_pusher);
+            acquire.landings_seen = V2::Landing::landed.load(std::memory_order_acquire) +
+                                    V2::Landing::untracked_landed.load(std::memory_order_acquire);
+            if (Nx2SemaphoreWaiters::Get().Latched(this) ||
+                V2::SemaphoreMet(op, dma_pusher.memory_manager.Read<u32>(address), value)) {
+                return true; // NoteSyncAt not needed: nothing queued
+            }
+        } else if (landings != acquire.landings_seen) {
+            acquire.landings_seen = landings;
+        }
         switch (V2::PlanSuspendedPoll(gpu_written, acquire.producer_lands, queued)) {
         case V2::SuspendedPoll::ReadBack:
             // Read the word back again once the back ran what was sent since (at most per

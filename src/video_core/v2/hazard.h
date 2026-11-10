@@ -307,6 +307,19 @@ enum class SuspendedPoll : u8 {
 ///   again with what the back made of it;
 /// - nothing known and nothing queued: the old read, once (a guest CPU write is read at every
 ///   poll; the front sleeps one timer tick at most).
+/// F3-X1 follow-up (8d31 deadlock): whether a suspended poll makes every pending fence land now
+/// (the v1 acquire's ReleaseFences, on the back). An operation can sit at a fence nothing submits
+/// (one the front can't see, or deferred behind a landing); with the back idle (nothing queued)
+/// and no landing since the last poll after the submit was asked for (or with no producer known
+/// to ask for), nothing else lands it. Once per back position (`released_here`): it repeats only
+/// after the back ran new work, never on a timer.
+[[nodiscard]] constexpr bool ForcePendingLandings(bool queued, bool gpu_written,
+                                                  bool submit_requested, bool producer_lands,
+                                                  bool landed_since, bool released_here) {
+    return !queued && !gpu_written && !released_here && !landed_since &&
+           (submit_requested || !producer_lands);
+}
+
 [[nodiscard]] constexpr SuspendedPoll PlanSuspendedPoll(bool gpu_written, bool producer_lands,
                                                         bool queued) {
     if (gpu_written) {

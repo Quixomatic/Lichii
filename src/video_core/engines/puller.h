@@ -101,6 +101,10 @@ public:
         /// as the last submit request found; and whether the old read was counted.
         bool producer_lands{};
         bool old_read{};
+        /// F3-X1 follow-up: the back position + 1 at which this acquire last made every pending
+        /// fence land (0: never), and the landing counts it saw since.
+        u64 released_at{};
+        u64 landings_seen{};
         /// Fix F3h (F3-X1): the QMD release an Equal/Mask acquire orders behind, recorded when
         /// it was parsed (GpuSplit::QmdTargetFor); 0 when none.
         u64 qmd_target{};
