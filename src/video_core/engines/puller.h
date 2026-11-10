@@ -94,17 +94,11 @@ public:
         bool sem_execute{};
         /// A GPU-written word's readback (V2::WordReadback) was sent and not landed yet.
         bool readback_sent{};
-        /// Fix F3f (F3-X1b): whether a poll already asked for the submit a release still to
-        /// land needs (the first ask is at once, later ones once per millisecond).
-        bool submit_requested{};
-        /// Fix F3h (F3-X1): a producer of the word lands at a fence (V2::PlanSuspendedPoll),
-        /// as the last submit request found; and whether the old read was counted.
-        bool producer_lands{};
-        bool old_read{};
-        /// F3-X1 follow-up: the back position + 1 at which this acquire last made every pending
-        /// fence land (0: never), and the landing counts it saw since.
-        u64 released_at{};
-        u64 landings_seen{};
+        /// SYNC_SUBMIT_SPEC §2.2 (V2::PlanSuspendedPoll): the fence tick it asked to be
+        /// submitted last (one request per tick change), and the back position + 1 at which it
+        /// had a fence signalled for an uncarried capture (0: never).
+        u64 requested_tick{};
+        u64 fence_job_at{};
         /// SYNC Step 0: what its last poll waited for (V2::Stats::WakeClass), for the STATS line.
         u8 wake{};
         /// SYNC_SUBMIT_SPEC §2.2: the wake classes that can change its answer (V2::SemWake; 0:

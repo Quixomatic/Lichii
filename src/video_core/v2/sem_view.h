@@ -358,7 +358,8 @@ struct SemDecision {
     if (at_fence) {
         // MP §6 class D / a write the landing rule deferred: wait for its landing, and file one
         // submit request for its tick (§6 "an interrupt forces a submit").
-        d.wake = SemWake::Landing | SemWake::ReleaseParsed;
+        // Consumed too: once the back ran it, its fence tick is known (or a fence must be made).
+        d.wake = SemWake::Landing | SemWake::Consumed | SemWake::ReleaseParsed;
         d.request = true;
     } else {
         d.wake = SemWake::Consumed | SemWake::ReleaseParsed;

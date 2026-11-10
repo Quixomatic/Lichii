@@ -289,51 +289,37 @@ struct AcquireDecision {
 
 /// What a poll of a channel suspended by the view does while the acquire stays unmet.
 enum class SuspendedPoll : u8 {
-    Wait,     ///< Keep waiting: the back's `consumed` store rings the front (queued work)
-    ReadBack, ///< Read the GPU-written word back (class C)
-    Submit,   ///< A producer of the word lands at a fence: ask for its submit, then wait
-    OldRead,  ///< No producer known, nothing queued: the old read (flush, read), counted
+    Wait,      ///< Its wake classes bring the next check (consumed, landing, release, CPU, map)
+    ReadBack,  ///< Read the GPU-written word back (class C)
+    Request,   ///< File one submit request for the producer's fence tick (rule W)
+    FenceJob,  ///< The back ran the producer and idles, no fence carries it yet: have it signal one
 };
 
-/// Fix F3h (F3-X1, MASTER_PLAN §6 class C): a suspended acquire resumes on its producer, never
-/// on a timed net. Every poll reads memory and the view (a queued release meeting it passes,
-/// class B), and a release landing latches it. What else lets it go on, by what is known:
-/// - the word is GPU-written: its readback behind the writers;
-/// - a producer of the word lands at a fence (a release or report still to land, a QMD release
-///   that may write it, an operation the back captured for a release the front noted, the QMD
-///   producer an Equal/Mask acquire orders behind): ask for that fence's submit (SESSION_HANDOFF
-///   §5g: the wait causes its submit), then the landing rings the front;
-/// - work the back hasn't run yet: its `consumed` store rings the front, and the next poll asks
-///   again with what the back made of it;
-/// - nothing known and nothing queued: the old read, once (a guest CPU write is read at every
-///   poll; the front sleeps one timer tick at most).
-/// F3-X1 follow-up (8d31 deadlock): whether a suspended poll makes every pending fence land now
-/// (the v1 acquire's ReleaseFences, on the back). An operation can sit at a fence nothing submits
-/// (one the front can't see, or deferred behind a landing); with the back idle (nothing queued)
-/// and no landing in a whole request cycle after the submit was asked for, nothing else lands
-/// it. Once per back position (`released_here`): it repeats only after the back ran new work.
-/// d5e4 (10-14k forces/s, "valve"): only for a known producer (every QMD reduction and max
-/// release is tracked since d5e451eebf, reports and releases have tickets) whose submit was
-/// asked for, while an operation is pending, judged once per request cycle by the caller
-/// (`landed_since`: any landing since the previous request). A wait with no known producer
-/// (a guest CPU release) never forces: nothing at a fence can meet it.
-[[nodiscard]] constexpr bool ForcePendingLandings(bool queued, bool gpu_written,
-                                                  bool submit_requested, bool producer_lands,
-                                                  bool landed_since, bool released_here,
-                                                  bool landing_pending = true) {
-    return landing_pending && producer_lands && submit_requested && !queued && !gpu_written &&
-           !released_here && !landed_since;
-}
-
-[[nodiscard]] constexpr SuspendedPoll PlanSuspendedPoll(bool gpu_written, bool producer_lands,
-                                                        bool queued) {
+/// SYNC_SUBMIT_SPEC §2.1/§2.2 (MP §6: class D "land on a host fence", "an interrupt forces a
+/// submit if the sync is not yet submitted"; SESSION_HANDOFF §5: a wait for a landing causes its
+/// submit, an idle back is woken): what a suspended poll does besides waiting for its wake
+/// classes. Only the at-fence row (`request`: a producer that lands at a fence operation) asks
+/// for anything:
+/// - its fence is queued (`tick` != 0): one request per tick change (no timed re-ask);
+/// - no fence carries it yet: once the back ran the producer and is idle (nothing else will
+///   signal a fence), a back job signals the delayed fence that carries it and submits
+///   (IrExec::LandCaptured), once per back position (`job_here`). 019d case (b): an operation
+///   queued without a fence in the open command buffer.
+/// No forced landing (the back never blocks on the GPU for an acquire, §2.7), no drain.
+[[nodiscard]] constexpr SuspendedPoll PlanSuspendedPoll(bool gpu_written, bool request, u64 tick,
+                                                        u64 requested_tick, bool producer_ran,
+                                                        bool back_idle, bool job_here) {
     if (gpu_written) {
         return SuspendedPoll::ReadBack;
     }
-    if (producer_lands) {
-        return SuspendedPoll::Submit;
+    if (!request) {
+        return SuspendedPoll::Wait;
     }
-    return queued ? SuspendedPoll::Wait : SuspendedPoll::OldRead;
+    if (tick != 0) {
+        return tick != requested_tick ? SuspendedPoll::Request : SuspendedPoll::Wait;
+    }
+    return producer_ran && back_idle && !job_here ? SuspendedPoll::FenceJob
+                                                  : SuspendedPoll::Wait;
 }
 
 } // namespace VideoCommon::V2

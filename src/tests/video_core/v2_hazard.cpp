@@ -574,147 +574,85 @@ TEST_CASE("V2 acquire: a suspended acquire whose release the view never records 
                 break;
             }
             REQUIRE(ViewSuspends(view.verdict, false));
-            switch (PlanSuspendedPoll(false, false, queued != 0)) {
-            case SuspendedPoll::OldRead:
-                resumed = SemaphoreMet(SemaphoreOp::Equal, memory_word, 1);
+            // SYNC Step 4: no producer at a fence: the poll waits for its wake classes (the
+            // back's `consumed`, a guest CPU write read every pass); nothing is asked for.
+            REQUIRE(PlanSuspendedPoll(false, false, 0, 0, true, queued == 0, false) ==
+                    SuspendedPoll::Wait);
+            if (--queued == 0) {
+                memory_word = 1; // the last queued entry wrote it
+            }
+        }
+        CHECK(resumed);
+        CHECK(PlanSuspendedPoll(true, false, 0, 0, true, true, false) == SuspendedPoll::ReadBack);
+        CHECK(PlanSuspendedPoll(true, true, 5, 0, true, true, false) == SuspendedPoll::ReadBack);
+    }
+    SECTION("8d31: an at-fence producer whose fence is queued: one request per tick, idle back") {
+        // SYNC Step 4: the 8d31 reductions are class B now (the semaphore view knows them). An
+        // unknown producer at a fence (a counter report) still waits for its landing: the poll
+        // files one request for its fence's tick, served even with the back idle (rule W), and
+        // asks again only when the tick changes. The model: the fence lands once its tick is
+        // submitted.
+        u64 submitted = 0;
+        u64 requested = 0;
+        u32 requests = 0;
+        const u64 fence_tick = 42;
+        bool landed = false;
+        for (int poll = 0; poll < 50 && !landed; ++poll) {
+            switch (PlanSuspendedPoll(false, true, fence_tick, requested, true, true, false)) {
+            case SuspendedPoll::Request:
+                requested = fence_tick;
+                ++requests;
+                submitted = fence_tick; // the idle back serves it at once
                 break;
             case SuspendedPoll::Wait:
-                if (--queued == 0) {
-                    memory_word = 1; // the last queued entry wrote it
-                }
                 break;
-            case SuspendedPoll::ReadBack:
-            case SuspendedPoll::Submit:
-                FAIL("no producer is known");
-                break;
+            default:
+                FAIL("only a request or a wait");
             }
+            landed = submitted >= fence_tick;
         }
-        CHECK(resumed);
-        CHECK(PlanSuspendedPoll(true, false, true) == SuspendedPoll::ReadBack);
-        CHECK(PlanSuspendedPoll(true, true, false) == SuspendedPoll::ReadBack);
+        CHECK(landed);
+        CHECK(requests == 1);
+        // A newer tick (a later fence carries it) asks once more; the same tick never again.
+        CHECK(PlanSuspendedPoll(false, true, 43, 42, true, true, false) == SuspendedPoll::Request);
+        CHECK(PlanSuspendedPoll(false, true, 42, 42, true, true, false) == SuspendedPoll::Wait);
+        // No producer at a fence: nothing is asked for (a guest CPU release, queued work).
+        CHECK(PlanSuspendedPoll(false, false, 42, 0, true, true, false) == SuspendedPoll::Wait);
     }
-    SECTION("8d31 deadlock: an operation at a fence nothing submits lands when the back idles") {
-        // Four channels waited on QMD reduction words 0x13 short, back idle, nothing queued:
-        // the reductions sat at a fence no submit request reached. The model: the fence lands
-        // only when forced (ReleaseFences); submit requests alone never land it. Since
-        // d5e451eebf the reductions are tracked: the producer is known.
-        for (const bool producer_known : {true}) {
-            u32 word = 0x8099;
-            bool fence_pending = true;
-            bool submit_requested = false;
-            u64 landings = 0;
-            u64 landings_seen = 0;
-            u64 released_at = 0;
-            const u64 consumed = 500; // the back is idle there
-            bool resumed = false;
-            for (int poll = 0; poll < 8 && !resumed; ++poll) {
-                const bool landed_since = landings != landings_seen;
-                if (ForcePendingLandings(false, false, submit_requested, producer_known,
-                                         landed_since, released_at == consumed + 1)) {
-                    released_at = consumed + 1;
-                    if (fence_pending) {
-                        fence_pending = false;
-                        word += 0x13; // the reductions run at their fence
-                        ++landings;
-                    }
-                    landings_seen = landings;
-                } else if (landed_since) {
-                    landings_seen = landings;
-                }
-                resumed = SemaphoreMet(SemaphoreOp::Equal, word, 0x80ac);
-                if (!resumed && PlanSuspendedPoll(false, producer_known, false) ==
-                                    SuspendedPoll::Submit) {
-                    submit_requested = true; // asked; the idle hook never submits it here
-                }
-            }
-            CHECK(resumed);
-        }
-        // Once per back position: not again until the back ran new work, and not while work is
-        // queued, landings arrive, or the word is read back.
-        CHECK(!ForcePendingLandings(false, false, true, true, false, true));
-        CHECK(!ForcePendingLandings(true, false, true, true, false, false));
-        CHECK(!ForcePendingLandings(false, false, true, true, true, false));
-        CHECK(!ForcePendingLandings(false, true, true, true, false, false));
-        // A known producer gets its submit request first; with no known producer (a guest CPU
-        // release) nothing at a fence can meet it: never forced.
-        CHECK(!ForcePendingLandings(false, false, false, true, false, false));
-        CHECK(!ForcePendingLandings(false, false, true, false, false, false));
-    }
-    SECTION("019d livelock: a producer in the open command buffer lands once; no re-fire") {
+    SECTION("019d: a producer in the open command buffer gets a fence once; no re-fire") {
         // The producer was an operation queued without a fence (SyncOperation) in work not yet
-        // submitted: a forced release of the existing fences found nothing, and its ring record
-        // moved `consumed`, so the guard re-armed every poll (~2,500 forces/s). The model: the
-        // operation lands only if the force signals a fence for it AND submits; the force adds
-        // no ring record (a back job), so `consumed` stays.
+        // submitted. SYNC Step 4: once the back ran it and idles, one back job signals the
+        // delayed fence that carries it and submits (no forced release, the back never waits for
+        // the GPU); then its tick is known and the request path above applies.
         struct Back {
-            bool open_operation = true; ///< queued without a fence, in the open command buffer
-            bool fence_for_it = false;
+            bool open_operation = true;
+            u64 fence_tick = 0; ///< 0: no fence carries the capture
             bool submitted = false;
             u64 consumed = 700;
-            u32 word = 0x3e7eb;
-            void ReleaseFencesForced() { // runs the operations of submitted fences only
-                if (fence_for_it && submitted && open_operation) {
-                    open_operation = false;
-                    ++word;
-                }
-            }
-            void LandEverythingPending() { // what the waiter's job does
-                fence_for_it = true;       // SignalFence: carries the uncommitted operations
-                submitted = true;          // FlushCommands: the open command buffer
-                ReleaseFencesForced();
+            void FenceJob() {
+                fence_tick = 9;
+                submitted = true;
             }
         } back;
-        // The old force (existing fences only) lands nothing.
-        back.ReleaseFencesForced();
-        CHECK(back.word == 0x3e7eb);
-        u64 released_at = 0;
-        u32 forces = 0;
-        bool resumed = false;
-        for (int poll = 0; poll < 100 && !resumed; ++poll) {
-            // The report's landing ticket is the known producer; its submit was asked for.
-            if (ForcePendingLandings(false, false, true, true, false,
-                                     released_at == back.consumed + 1)) {
-                ++forces;
-                back.LandEverythingPending();
-                released_at = back.consumed + 1; // unchanged: the job added no record
-            }
-            resumed = SemaphoreMet(SemaphoreOp::Gequal, back.word, 0x3e7ec);
-        }
-        CHECK(resumed);
-        CHECK(forces == 1);
-        // Unmet after a force with nothing new at the back: no further force, poll after poll.
-        u64 again_at = 701;
-        u32 refires = 0;
+        u64 job_at = 0;
+        u32 jobs = 0;
+        // Before the back ran the producer: wait for `consumed`.
+        CHECK(PlanSuspendedPoll(false, true, 0, 0, false, false, false) == SuspendedPoll::Wait);
+        // Back busy (more queued): its own work signals fences; wait for it to idle.
+        CHECK(PlanSuspendedPoll(false, true, 0, 0, true, false, false) == SuspendedPoll::Wait);
         for (int poll = 0; poll < 100; ++poll) {
-            refires += ForcePendingLandings(false, false, true, true, false,
-                                            again_at == back.consumed + 1)
-                           ? 1
-                           : 0;
+            const auto plan = PlanSuspendedPoll(false, true, back.fence_tick, 9, true, true,
+                                                job_at == back.consumed + 1);
+            if (plan == SuspendedPoll::FenceJob) {
+                ++jobs;
+                back.FenceJob();
+                job_at = back.consumed + 1; // a job adds no ring record
+            }
         }
-        CHECK(refires == 0);
-        // d5e4 (20-30k forces/s): a wait with nothing pending at all (a guest CPU release)
-        // never forces, however the back moves.
-        u32 idle_forces = 0;
-        for (u64 position = 800; position < 900; ++position) {
-            idle_forces += ForcePendingLandings(false, false, true, true, false, false, false)
-                               ? 1
-                               : 0;
-            idle_forces += ForcePendingLandings(false, false, true, false, false, false, true)
-                               ? 1
-                               : 0;
-        }
-        CHECK(idle_forces == 0);
-        // Judged per request cycle: a landing anywhere since the last request defers it.
-        CHECK(!ForcePendingLandings(false, false, true, true, true, false, true));
-    }
-    SECTION("a producer that lands at a fence makes the poll ask for its submit, never a drain") {
-        // F3F5b-5 / F3-X1: a QMD release (or a release still to land) that may write the word
-        // latches the waiter when its operation runs; the poll asks for the submit that runs it,
-        // queued work or not, and never takes the old path for it.
-        CHECK(PlanSuspendedPoll(false, true, true) == SuspendedPoll::Submit);
-        CHECK(PlanSuspendedPoll(false, true, false) == SuspendedPoll::Submit);
-        CHECK(PlanSuspendedPoll(false, false, true) == SuspendedPoll::Wait);
-        CHECK(PlanSuspendedPoll(false, false, false) == SuspendedPoll::OldRead);
+        CHECK(back.submitted);
+        CHECK(jobs == 1);
+        // Unmet with nothing new at the back and no fence: never again at this position.
+        CHECK(PlanSuspendedPoll(false, true, 0, 0, true, true, true) == SuspendedPoll::Wait);
     }
     SECTION("an Equal acquire waits for the QMD producer it was given, not a newer one") {
         // 0fe4: the poll passed the newest unknown QMD release noted (moving every signal), so

@@ -1111,31 +1111,19 @@ TEST_CASE("V2 P5b a landing wait asks for its fence's tick and an idle back subm
     REQUIRE_FALSE(requests.Urgent(current_tick.load()));
     REQUIRE(LandingFence::TickForPending() == 0);
 
-    // A suspended acquire asked before its producer's fence existed (8d31: the ask found no
-    // fence, the next one came 1 ms later): the fence the back queues for work sent up to the
-    // ask is urgent at once; later work's fences are not.
-    LandingFence::NoteFence(8); // settle: nothing new captured
-    LandingFence::wanted_position.store(0);
-    LandingFence::Want(2000);
-    Landing::issued.store(Landing::Ticket(1500, 0)); // captured at or before the ask
-    REQUIRE(LandingFence::NoteFence(9));
-    Landing::issued.store(Landing::Ticket(2500, 0)); // previous fence's newest at 1500 <= 2000
-    REQUIRE(LandingFence::NoteFence(10));            // one entry too many at most
-    Landing::issued.store(Landing::Ticket(3000, 0)); // after the ask only
-    REQUIRE_FALSE(LandingFence::NoteFence(11));
-    REQUIRE_FALSE(LandingFence::NoteFence(12)); // nothing new captured
-    // Chunk B2: a tracked QMD reduction's fence is stubbed (no GPU work of its own); it is noted
-    // with the newest lazy fence's tick, whose pop it waits behind. The waiter's want makes that
-    // tick urgent and TickFor names it; an idle back's hook then submits it (Urgent).
-    LandingFence::Want(3500);
+    // SYNC Step 4: nothing is urgent when a fence is queued (019d/95fd made ~18 submits/f);
+    // a waiter that blocks on a capture asks for the tick that carries it, once it exists.
+    // A deferred QMD reduction's fence is stubbed (no GPU work of its own); it is noted with the
+    // newest lazy fence's tick, whose pop it waits behind. TickFor names that tick; the waiter's
+    // request makes an idle back's hook submit it (Urgent), and nothing else does.
     const u64 reduction = Landing::Ticket(3400, 0);
     Landing::issued.store(reduction);
-    REQUIRE(LandingFence::NoteFence(11)); // the newest lazy fence is in tick 11
+    LandingFence::NoteFence(11); // the newest lazy fence is in tick 11
     REQUIRE(LandingFence::TickFor(reduction, 0) == 11);
     SubmitRequests stubbed;
+    REQUIRE_FALSE(stubbed.Urgent(11));
     stubbed.Request(11, true);
     REQUIRE(stubbed.AtIdleHook(false, true, false, 11, 11, false) == Action::Urgent);
-    LandingFence::wanted_position.store(0);
 
     LandingFence::request_hook = nullptr;
     LandingFence::request_argument = nullptr;

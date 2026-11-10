@@ -118,6 +118,9 @@ enum class Counter : u32 {
     SubmitsPresent,      ///< the present's own submission
     QmdReductionsAtExecute, ///< SYNC Step 3: QMD reduction/max releases run at execute time
     QmdReductionsDeferred,  ///< ... at their fence (delayed fences, the landing rule)
+    RequestsAcquire,  ///< SYNC Step 4: submit requests filed by suspended acquires (at-fence row)
+    FenceJobsAcquire, ///< ... fences signalled for a capture no fence carried (idle back)
+    RequestsLanding,  ///< ... filed by front landing waits (WaitLanded/WaitUntrackedLanded)
     Count,
 };
 

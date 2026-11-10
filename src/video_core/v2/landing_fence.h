@@ -29,36 +29,16 @@ inline std::atomic<u64> untracked{0};
 inline void (*request_hook)(void*, u64) = nullptr;
 inline void* request_argument = nullptr;
 
-/// Front (a suspended acquire whose producer lands at a fence): the producer is at or before ring
-/// position `position` (the front's write position when it asked). Its fence may not be queued
-/// yet when the waiter asks; the back makes it urgent when it is (NoteFence).
-inline std::atomic<u64> wanted_position{0};
-inline void Want(u64 position) {
-    Landing::RaiseTo(wanted_position, position);
-}
-
-/// Back: a lazy fence waiting for host tick `fence_tick` was queued. True when it carries a
-/// capture a suspended waiter may need (made at or before `wanted_position`): the caller files
-/// the urgent request for it (MASTER_PLAN §6: a submit is forced for an unsubmitted sync). The
-/// test is by the newest capture of the previous fence, so it may include one entry too many,
-/// never one too few.
-inline bool NoteFence(u64 fence_tick) {
-    const u64 previous_issued = issued.load(std::memory_order_relaxed);
-    const u64 previous_untracked = untracked.load(std::memory_order_relaxed);
+/// Back: a lazy fence waiting for host tick `fence_tick` was queued: the captures made by now
+/// ride it. SYNC_SUBMIT_SPEC §2.5: nothing is urgent at queue time (the 019d/95fd "urgent at
+/// queue" made ~18 submits/f through FlushDeferred); a thread that blocks on one of them files
+/// its own request for this tick (TickFor), served at the back's next entry boundary.
+inline void NoteFence(u64 fence_tick) {
     const u64 now_issued = Landing::issued.load(std::memory_order_relaxed);
     const u64 now_untracked = Landing::untracked_issued.load(std::memory_order_relaxed);
     tick.store(fence_tick, std::memory_order_release);
     issued.store(now_issued, std::memory_order_release);
     untracked.store(now_untracked, std::memory_order_release);
-    const u64 wanted = wanted_position.load(std::memory_order_acquire);
-    if (wanted == 0) {
-        return false;
-    }
-    const bool tracked =
-        now_issued > previous_issued && Landing::RingPosition(previous_issued) <= wanted;
-    const bool other = now_untracked > previous_untracked &&
-                       Landing::UntrackedPosition(previous_untracked) <= wanted;
-    return tracked || other;
 }
 
 /// Any thread: the host tick to submit for the capture `ticket` (or the untracked capture

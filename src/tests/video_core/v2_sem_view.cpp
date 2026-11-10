@@ -4,7 +4,9 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include "video_core/native_qmd.h"
+#include "video_core/v2/hazard.h"
 #include "video_core/v2/sem_view.h"
+#include "video_core/v2/submit_requests.h"
 
 // SYNC_SUBMIT_SPEC §2.1: S1's semaphore view.
 namespace {
@@ -272,6 +274,80 @@ TEST_CASE("SYNC step 3 idle back: a QMD reduction deferred behind a landing stil
     REQUIRE_FALSE(d.request);
     // Once they landed, memory holds the value and nothing is pending.
     REQUIRE_FALSE(view.Find(word, At(100, 0, 100)).pending);
+}
+
+TEST_CASE("SYNC step 4 idle back: every wake row of §2.2 resumes once its event happened",
+          "[video_core][v2_sem_view]") {
+    // With the back idle and nothing queued, each suspended state names the wake class whose
+    // event resolves it; after that event (and nothing else) the same decision passes.
+    SemView view;
+    SemInputs in;
+    SECTION("map: a queued map ran and mapped the word") {
+        in.mapped = false;
+        in.map_queued = true;
+        auto d = DecideFromView(SemaphoreOp::Gequal, 1, {}, in);
+        REQUIRE((d.wake & SemWake::Map) != 0);
+        in.mapped = true;
+        in.map_queued = false;
+        in.memory_word = 1;
+        d = DecideFromView(SemaphoreOp::Gequal, 1, view.Find(0x9000, At(10)), in);
+        REQUIRE(d.verdict == AcquireVerdict::Met);
+    }
+    SECTION("consumed: the back ran an unknown writer") {
+        view.Note(0x9000, 0, false, 20, Retire::Consumed, 0, Kind::Release, At(0));
+        in.memory_word = 4;
+        auto d = DecideFromView(SemaphoreOp::Equal, 4, view.Find(0x9000, At(10)), in);
+        REQUIRE((d.wake & SemWake::Consumed) != 0);
+        d = DecideFromView(SemaphoreOp::Equal, 4, view.Find(0x9000, At(20)), in);
+        REQUIRE(d.verdict == AcquireVerdict::Met);
+    }
+    SECTION("landing: a counter report's operation ran") {
+        view.Note(0x9000, 0, false, 20, Retire::Landing, 0x1400, Kind::Counter, At(0));
+        in.memory_word = 4;
+        auto d = DecideFromView(SemaphoreOp::Equal, 4, view.Find(0x9000, At(30, 0x13ff)), in);
+        REQUIRE((d.wake & SemWake::Landing) != 0);
+        REQUIRE(d.request);
+        d = DecideFromView(SemaphoreOp::Equal, 4, view.Find(0x9000, At(30, 0x1400)), in);
+        REQUIRE(d.verdict == AcquireVerdict::Met);
+    }
+    SECTION("readback: the GPU-written word was read back") {
+        in.gpu_written = true;
+        auto d = DecideFromView(SemaphoreOp::Equal, 4, {}, in);
+        REQUIRE((d.wake & SemWake::Readback) != 0);
+        in.gpu_written = false; // word_landed: memory holds it
+        in.memory_word = 4;
+        d = DecideFromView(SemaphoreOp::Equal, 4, {}, in);
+        REQUIRE(d.verdict == AcquireVerdict::Met);
+    }
+    SECTION("CPU write: no writer, the guest stored the value") {
+        in.memory_word = 3;
+        auto d = DecideFromView(SemaphoreOp::Gequal, 4, view.Find(0x9000, At(10)), in);
+        REQUIRE((d.wake & SemWake::Cpu) != 0);
+        in.memory_word = 4;
+        d = DecideFromView(SemaphoreOp::Gequal, 4, view.Find(0x9000, At(10)), in);
+        REQUIRE(d.verdict == AcquireVerdict::Met);
+    }
+    SECTION("release parsed: another channel's release to the word was parsed") {
+        in.memory_word = 3;
+        auto d = DecideFromView(SemaphoreOp::Gequal, 4, view.Find(0x9000, At(10)), in);
+        REQUIRE((d.wake & SemWake::ReleaseParsed) != 0);
+        const u64 notes = view.Notes();
+        view.Note(0x9000, 4, true, 30, Retire::Landing, 0x1e00, Kind::Release, At(10));
+        REQUIRE(view.Notes() != notes); // the epoch the waiter watches moved
+        d = DecideFromView(SemaphoreOp::Gequal, 4, view.Find(0x9000, At(10)), in);
+        REQUIRE(d.verdict == AcquireVerdict::MetByQueued);
+    }
+}
+
+TEST_CASE("SYNC step 4: no submit when nobody waits and the GPU is busy",
+          "[video_core][v2_sem_view]") {
+    // A suspended acquire with no producer at a fence asks for nothing.
+    REQUIRE(PlanSuspendedPoll(false, false, 9, 0, true, true, false) == SuspendedPoll::Wait);
+    // An idle hook with only a lazy fence's open tick, no request and DXVK's rule not due:
+    // the work is left for the next boundary (no urgent-at-queue request exists any more).
+    SubmitRequests requests;
+    REQUIRE(requests.AtIdleHook(false, true, false, 9, 9, false) ==
+            SubmitRequests::IdleAction::Leave);
 }
 
 TEST_CASE("SYNC step 2 idle back: an acquire met by a fence-flagged release whose fence is not "

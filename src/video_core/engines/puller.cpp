@@ -37,6 +37,7 @@
 #include "video_core/v2/ir_exec.h"
 #include "video_core/v2/landing.h"
 #include "video_core/v2/landing_fence.h"
+#include "video_core/v2/p5b_stats.h"
 #include "video_core/v2/v2_stats.h"
 #include "video_core/v2/versions.h"
 #include "video_core/v2/word_readback.h"
@@ -149,47 +150,36 @@ void ReleaseFences(DmaPusher& dma_pusher) {
                    VideoCommon::DrainSite::FenceRelease);
 }
 
-// F3-X1 follow-up (019d livelock): makes everything the back holds land, as a job on the back
-// after its current entry (no ring record: the waiter's guard on `consumed` holds): a delayed
-// fence that carries the operations queued without one (SyncOperation, as LandCaptured), the
-// submit of the open command buffer, then the forced release that waits for every fence and
-// runs their operations. Returns false if the back stopped before running it.
-bool LandEverythingPending(VideoCore::RasterizerInterface* rasterizer) {
+// SYNC_SUBMIT_SPEC §2.2 (V2::SuspendedPoll::FenceJob; 019d case b): the producer of an
+// acquire's word is an operation the idle back captured that no fence carries yet (queued by
+// SyncOperation in the open command buffer). A job on the back (no ring record) signals the
+// delayed fence that carries it and submits the open command buffer, as IrExec::LandCaptured.
+// The fencing thread lands it once the GPU passed it; the landing rings the front. The back
+// never waits for the GPU here (no forced ReleaseFences: the 41/s LandEverythingPending blocks).
+// The front waits only for the job (the back is idle), as every other front job does.
+void SignalFenceForCaptures(VideoCore::RasterizerInterface* rasterizer) {
     struct Job {
         VideoCore::RasterizerInterface* rasterizer{};
-        u64 blocked_ns{}; ///< SYNC Step 0: how long the back spent on it
         std::atomic<bool> done{false};
     };
     // Static: a job a stopping back never ran must not point at a dead frame. Front only.
     static Job job;
     job.rasterizer = rasterizer;
-    job.blocked_ns = 0;
     job.done.store(false, std::memory_order_relaxed);
     auto& split = VideoCommon::GpuSplit::Get();
     split.RequestBackJob(
         [](void* argument) {
             auto& self = *static_cast<Job*>(argument);
-            const auto start = std::chrono::steady_clock::now();
             VideoCore::g_signaling_query_report_fence = true;
             self.rasterizer->SignalFence([] {});
             VideoCore::g_signaling_query_report_fence = false;
             self.rasterizer->FlushCommands();
-            self.rasterizer->ReleaseFences(true);
-            self.blocked_ns = static_cast<u64>(
-                std::chrono::duration_cast<std::chrono::nanoseconds>(
-                    std::chrono::steady_clock::now() - start)
-                    .count());
             self.done.store(true, std::memory_order_release);
         },
         &job);
     while (!job.done.load(std::memory_order_acquire) && split.BackRunning()) {
         std::this_thread::yield();
     }
-    const bool done = job.done.load(std::memory_order_acquire);
-    if (done) {
-        VideoCommon::V2::Stats::NoteForcedLanding(job.blocked_ns);
-    }
-    return done;
 }
 
 namespace V2Stats = VideoCommon::V2::Stats;
@@ -536,54 +526,11 @@ bool Puller::PollAcquireView(DmaPusher& dma_pusher) {
         decided = true;
         const auto now = std::chrono::steady_clock::now();
         const bool gpu_written = check.reason == Reason::GpuWritten;
-        // SYNC §2.1: re-checked only on its wake classes; only the class D / at-fence row has a
-        // producer that lands at a fence (its submit is asked for).
+        // SYNC_SUBMIT_SPEC §2.1/§2.2: re-checked only on its wake classes. Only the at-fence
+        // row (class D, or a write the landing rule deferred) asks for anything: one submit
+        // request per change of its fence's tick, or, while no fence carries it and the back
+        // idles, one fence job per back position. No forced landing, no timed re-ask, no drain.
         acquire.wake_bits = check.decision.wake;
-        const bool ask =
-            !acquire.submit_requested || now - acquire.last_request >= std::chrono::milliseconds{1};
-        if (ask && !gpu_written) {
-            acquire.producer_lands = check.decision.request;
-        }
-        const bool queued = split.ConsumedNow() < split.WritePosition();
-        // F3-X1 follow-up (8d31 deadlock: four channels on QMD reduction words 0x13 short, back
-        // idle, nothing queued, no landing): an operation can sit at a fence nothing submits
-        // (a reduction deferred behind a landing, an operation the front can't see). Once the
-        // back is idle and nothing the polls asked for landed since the back last moved, the
-        // waiter makes every pending fence land (the v1 acquire's ReleaseFences, on the back):
-        // once per back position, so it repeats only after new work ran — never on a timer.
-        const u64 landed_now = V2::Landing::landed.load(std::memory_order_acquire);
-        const u64 untracked_landed_now =
-            V2::Landing::untracked_landed.load(std::memory_order_acquire);
-        const u64 landings = landed_now + untracked_landed_now;
-        const bool landing_pending =
-            V2::Landing::issued.load(std::memory_order_acquire) > landed_now ||
-            V2::Landing::untracked_issued.load(std::memory_order_acquire) > untracked_landed_now;
-        // Judged once per submit request cycle (`ask`, at most 1/ms), not per poll: landings
-        // since the previous request, not since the previous poll (90k polls/s made "nothing
-        // landed since" almost always true: d5e4 forced 10-14k times a second).
-        const bool landed_since = landings != acquire.landings_seen;
-        if (ask) {
-            acquire.landings_seen = landings;
-        }
-        if (ask && V2::ForcePendingLandings(queued, gpu_written, acquire.submit_requested,
-                                            acquire.producer_lands, landed_since,
-                                            acquire.released_at == split.ConsumedNow() + 1,
-                                            landing_pending)) {
-            if (V2Stats::Enabled()) [[unlikely]] {
-                V2Stats::NoteDecision(VideoCommon::DrainSite::Acquire, Decision::Waited,
-                                      Reason::Forced);
-            }
-            LandEverythingPending(dma_pusher.rasterizer);
-            // After it (a job adds no ring record, but other channels' work may have run):
-            // the next force needs new work at the back.
-            acquire.released_at = split.ConsumedNow() + 1;
-            acquire.landings_seen = V2::Landing::landed.load(std::memory_order_acquire) +
-                                    V2::Landing::untracked_landed.load(std::memory_order_acquire);
-            if (Nx2SemaphoreWaiters::Get().Latched(this) ||
-                V2::SemaphoreMet(op, dma_pusher.memory_manager.Read<u32>(address), value)) {
-                return true; // NoteSyncAt not needed: nothing queued
-            }
-        }
         if (V2Stats::Enabled()) [[unlikely]] {
             using Wake = V2Stats::WakeClass;
             const u8 bits = check.decision.wake;
@@ -595,7 +542,22 @@ bool Puller::PollAcquireView(DmaPusher& dma_pusher) {
                                                                     : Wake::ReleaseParsed;
             acquire.wake = static_cast<u8>(wake);
         }
-        switch (V2::PlanSuspendedPoll(gpu_written, acquire.producer_lands, queued)) {
+        // The at-fence producer's fence tick: by its landing ticket, or (a QMD write) the
+        // newest untracked operation captured over the word.
+        u64 tick = 0;
+        if (check.decision.request && !gpu_written) {
+            if (check.decision.retire == V2::SemView::Retire::Landing) {
+                tick = V2::LandingFence::TickFor(check.decision.ticket, 0);
+            } else if (const auto device = dma_pusher.memory_manager.GpuToCpuAddress(address)) {
+                const u64 untracked = V2::Landing::UntrackedTargetFor(*device, sizeof(u32));
+                tick = untracked != 0 ? V2::LandingFence::TickFor(0, untracked) : 0;
+            }
+        }
+        const u64 consumed_now = split.ConsumedNow();
+        const bool back_idle = consumed_now == split.WritePosition();
+        switch (V2::PlanSuspendedPoll(gpu_written, check.decision.request, tick,
+                                      acquire.requested_tick, consumed_now >= check.decision.position,
+                                      back_idle, acquire.fence_job_at == consumed_now + 1)) {
         case V2::SuspendedPoll::ReadBack:
             // Read the word back again once the back ran what was sent since (at most per
             // 200 us): no drain, no synchronous download on the back.
@@ -604,44 +566,21 @@ bool Puller::PollAcquireView(DmaPusher& dma_pusher) {
                 SendWordReadback(dma_pusher);
             }
             break;
-        case V2::SuspendedPoll::Submit:
-            if (ask) {
-                // Its fence may sit in a deferred submission: the wait causes its submit
-                // (SESSION_HANDOFF §5g). The first ask is at once.
-                const bool first_ask = !acquire.submit_requested;
-                if (first_ask && V2Stats::Enabled()) [[unlikely]] {
-                    // A wait on a known producer (counted once per suspension, F3h).
-                    V2Stats::NoteDecision(VideoCommon::DrainSite::Acquire, Decision::Narrowed,
-                                          Reason::QmdProducer);
-                }
-                acquire.submit_requested = true;
-                acquire.last_request = now;
-                // F4-X2 (R2-F4-01): urgently, for the tick of the newest fence still to land;
-                // and the fence the back queues later for the producer is urgent at once (it
-                // often does not exist yet at the first ask). Only the producer's position: the
-                // known QMD producer, else what was sent when the channel suspended (019d asked
-                // for everything sent so far every millisecond: 69 submits/f).
-                // The producer the semaphore view names: its entry's fence is urgent.
-                V2::LandingFence::Want(check.decision.retire == V2::SemView::Retire::Landing
-                                           ? V2::Landing::RingPosition(check.decision.ticket)
-                                           : check.decision.position);
-                V2::LandingFence::Request(V2::LandingFence::TickForPending());
-                split.RequestIdleHook();
-            }
+        case V2::SuspendedPoll::Request:
+            // Rule W (§2.5): this channel blocks on that tick; the back serves the request at its
+            // next entry boundary, or at once if idle (SESSION_HANDOFF §5: the wait causes its
+            // submit).
+            acquire.requested_tick = tick;
+            V2::LandingFence::Request(tick);
+            split.RequestIdleHook();
+            V2::P5bStats::Add(V2::P5bStats::Counter::RequestsAcquire);
+            break;
+        case V2::SuspendedPoll::FenceJob:
+            acquire.fence_job_at = consumed_now + 1;
+            SignalFenceForCaptures(dma_pusher.rasterizer);
+            V2::P5bStats::Add(V2::P5bStats::Counter::FenceJobsAcquire);
             break;
         case V2::SuspendedPoll::Wait:
-            break;
-        case V2::SuspendedPoll::OldRead:
-            // No producer known and nothing queued: the old poll's read (nothing to drain; it
-            // flushes and reads the word as the guest would). Counted once per suspension.
-            decided = false;
-            if (!acquire.old_read) {
-                acquire.old_read = true;
-                if (V2Stats::Enabled()) [[unlikely]] {
-                    V2Stats::NoteDecision(VideoCommon::DrainSite::Acquire, Decision::Waited,
-                                          Reason::Valve);
-                }
-            }
             break;
         }
         if (decided && V2Stats::Enabled()) [[unlikely]] {
@@ -663,34 +602,10 @@ bool Puller::PollAcquireView(DmaPusher& dma_pusher) {
     } else {
         NoteViewDecision(check);
     }
+    // The settings fallback and ACQUIRE=verify take the old (drained) poll. SYNC Step 4: the
+    // view's own memory read replaces the old OldRead path's drain (DG 2.2 "no drain").
     if (!decided || verify) {
-        const u32 view_word = dma_pusher.memory_manager.Read<u32>(address);
         const bool old_passed = PollAcquire(dma_pusher);
-        if (acquire.old_read && old_passed && !verify) [[unlikely]] {
-            // The old read passed what the view didn't: a release no front note or latch
-            // covers (should not happen; the first 32 are logged).
-            static std::atomic<u32> logged{};
-            if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
-                const auto recent =
-                    [&]() -> std::optional<VideoCommon::GpuSplit::RecentRelease> {
-                    const auto device = dma_pusher.memory_manager.GpuToCpuAddress(address);
-                    return device ? split.FindRecentRelease(*device) : std::nullopt;
-                }();
-                LOG_INFO(HW_GPU,
-                         "V2 acquire: the old read resumed channel {} semaphore {:#x} op {} "
-                         "value {:#x}: view reason {}, word {:#x} at the view, {:#x} after, "
-                         "waited {} us, newest noted release {} (kind {}, value {:#x})",
-                         dma_pusher.channel_state.bind_id, address, operation, value,
-                         static_cast<u32>(check.reason), view_word,
-                         dma_pusher.memory_manager.Read<u32>(address),
-                         std::chrono::duration_cast<std::chrono::microseconds>(
-                             std::chrono::steady_clock::now() - acquire.since)
-                             .count(),
-                         recent.has_value(),
-                         recent ? VideoCommon::GpuSplit::ReleaseKindName(recent->kind) : "none",
-                         recent ? recent->value : 0);
-            }
-        }
         if (verify && decided) {
             ReportViewMismatch(dma_pusher, address, value, operation, passes, old_passed,
                                "poll", check.landing, op);

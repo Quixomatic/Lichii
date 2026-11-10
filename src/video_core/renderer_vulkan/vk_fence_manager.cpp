@@ -26,14 +26,14 @@ InnerFence::~InnerFence() = default;
 void InnerFence::Queue(bool lazy_) {
     if (is_stubbed) {
         if (scheduler.LazyFencesHere()) [[unlikely]] {
-            // F4-X2 (chunk B2): a stubbed fence (a delayed fence with nothing to flush: tracked
-            // QMD reductions and max releases, d5e451eebf) needs no GPU work of its own, but its
-            // operations land only after every earlier fence popped, i.e. once the newest lazy
-            // fence's tick is done. A waiter's Want reaches them through that tick, at once.
+            // F4-X2 (chunk B2): a stubbed fence (a delayed fence with nothing to flush: deferred
+            // QMD reductions and max releases) needs no GPU work of its own, but its operations
+            // land only after every earlier fence popped, i.e. once the newest lazy fence's tick
+            // is done: a waiter for them asks for that tick (LandingFence::TickFor). SYNC Step 4:
+            // not urgent at queue time.
             const u64 tick = scheduler.LazyOutstandingTick();
-            if (tick != 0 && VideoCommon::V2::LandingFence::NoteFence(tick) &&
-                !scheduler.IsSubmitted(tick)) {
-                scheduler.RequestLazyFlush(tick, true);
+            if (tick != 0) {
+                VideoCommon::V2::LandingFence::NoteFence(tick);
             }
         }
         return;
@@ -47,11 +47,9 @@ void InnerFence::Queue(bool lazy_) {
         adaptive = true;
         queued_at = std::chrono::steady_clock::now();
         scheduler.NoteLazyFence(wait_tick);
-        // F4-X2: a thread blocking on an operation of this fence asks for this tick; a suspended
-        // front acquire that asked before the fence existed makes it urgent now.
-        if (VideoCommon::V2::LandingFence::NoteFence(wait_tick)) {
-            scheduler.RequestLazyFlush(wait_tick, true);
-        }
+        // F4-X2: a thread blocking on an operation of this fence asks for this tick (SYNC Step 4:
+        // none is made urgent here).
+        VideoCommon::V2::LandingFence::NoteFence(wait_tick);
         return;
     }
     if (lazy_) {
