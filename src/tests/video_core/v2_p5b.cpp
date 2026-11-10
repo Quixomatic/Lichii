@@ -1105,6 +1105,21 @@ TEST_CASE("V2 P5b a landing wait asks for its fence's tick and an idle back subm
     REQUIRE_FALSE(requests.Urgent(current_tick.load()));
     REQUIRE(LandingFence::TickForPending() == 0);
 
+    // A suspended acquire asked before its producer's fence existed (8d31: the ask found no
+    // fence, the next one came 1 ms later): the fence the back queues for work sent up to the
+    // ask is urgent at once; later work's fences are not.
+    LandingFence::NoteFence(8); // settle: nothing new captured
+    LandingFence::wanted_position.store(0);
+    LandingFence::Want(2000);
+    Landing::issued.store(Landing::Ticket(1500, 0)); // captured at or before the ask
+    REQUIRE(LandingFence::NoteFence(9));
+    Landing::issued.store(Landing::Ticket(2500, 0)); // previous fence's newest at 1500 <= 2000
+    REQUIRE(LandingFence::NoteFence(10));            // one entry too many at most
+    Landing::issued.store(Landing::Ticket(3000, 0)); // after the ask only
+    REQUIRE_FALSE(LandingFence::NoteFence(11));
+    REQUIRE_FALSE(LandingFence::NoteFence(12)); // nothing new captured
+    LandingFence::wanted_position.store(0);
+
     LandingFence::request_hook = nullptr;
     LandingFence::request_argument = nullptr;
     Landing::issued.store(saved_issued);

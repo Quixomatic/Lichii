@@ -531,7 +531,10 @@ bool Puller::PollAcquireView(DmaPusher& dma_pusher) {
                 // (SESSION_HANDOFF §5g). The first ask is at once.
                 acquire.submit_requested = true;
                 acquire.last_request = now;
-                // F4-X2 (R2-F4-01): urgently, for the tick of the newest fence still to land.
+                // F4-X2 (R2-F4-01): urgently, for the tick of the newest fence still to land;
+                // and a fence the back queues later for work sent up to now is urgent at once
+                // (the producer's fence often does not exist yet at the first ask).
+                V2::LandingFence::Want(split.WritePosition());
                 V2::LandingFence::Request(V2::LandingFence::TickForPending());
                 split.RequestIdleHook();
             }

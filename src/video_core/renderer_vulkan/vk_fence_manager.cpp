@@ -36,8 +36,11 @@ void InnerFence::Queue(bool lazy_) {
         adaptive = true;
         queued_at = std::chrono::steady_clock::now();
         scheduler.NoteLazyFence(wait_tick);
-        // F4-X2: a thread blocking on an operation of this fence asks for this tick.
-        VideoCommon::V2::LandingFence::NoteFence(wait_tick);
+        // F4-X2: a thread blocking on an operation of this fence asks for this tick; a suspended
+        // front acquire that asked before the fence existed makes it urgent now.
+        if (VideoCommon::V2::LandingFence::NoteFence(wait_tick)) {
+            scheduler.RequestLazyFlush(wait_tick, true);
+        }
         return;
     }
     if (lazy_) {
