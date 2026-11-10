@@ -3145,8 +3145,11 @@ bool BufferCache<P>::BindRingVersion(size_t stage, u32 index, DAddr device_addr,
             snap = watch.Take(device_addr, entry->size);
             epoch_now = V2::Versions::Epochs().Current();
             path = V2::CbufRing::ChooseBindPath(
-                *entry, snap.words, epoch_now, shared.decode_epoch.load(std::memory_order_acquire),
+                *entry, size, snap.words, epoch_now,
+                shared.decode_epoch.load(std::memory_order_acquire),
                 shared.decoders.load(std::memory_order_relaxed));
+            // The armed list keeps pages binds use (CLOCK) when it is over its cap.
+            watch.Touch(device_addr, entry->size);
             if (path == Path::Compared) {
                 // The words before the bytes: a foreign write from now on moves them.
                 watch.MarkUsed(device_addr, entry->size);
@@ -3180,6 +3183,7 @@ bool BufferCache<P>::BindRingVersion(size_t stage, u32 index, DAddr device_addr,
             if (watching && path == Path::Compared) {
                 entry->checked_epoch = epoch_now;
                 entry->checked_words = snap.words;
+                entry->checked_size = size;
             }
         }
         if (stats) {

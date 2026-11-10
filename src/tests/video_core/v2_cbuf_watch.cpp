@@ -273,6 +273,52 @@ TEST_CASE("V2 F2-03: the armed list releases its oldest pages over the cap",
     }
 }
 
+TEST_CASE("V2 F2-03: over the cap the armed list keeps the pages binds use (CLOCK)",
+          "[video_core][v2_cbufwatch]") {
+    auto watch = std::make_unique<W::Watch>();
+    W::Arming arming{*watch};
+    FakeCounts counts;
+    u64 frame = 1;
+    const auto page_at = [](u64 i) { return 0x100000 + i * W::PageSize; };
+    for (u64 i = 0; i < W::Arming::MaxArmed; ++i) {
+        watch->RequestArm(page_at(i), 4);
+    }
+    while (arming.Waiting() != 0 || watch->stats.arms.load() < W::Arming::MaxArmed) {
+        arming.Tick(frame++, false, counts);
+        REQUIRE(frame < 100);
+    }
+    // The oldest 16 pages are bound; the referenced bit is bookkeeping, not part of a snapshot.
+    const W::Snap before = watch->Take(page_at(0), 4);
+    for (u64 i = 0; i < 16; ++i) {
+        watch->Touch(page_at(i), 4);
+    }
+    REQUIRE(watch->Take(page_at(0), 4).words == before.words);
+    for (u64 i = 0; i < 32; ++i) {
+        watch->RequestArm(page_at(W::Arming::MaxArmed + i), 4);
+    }
+    arming.Tick(frame++, false, counts);
+    REQUIRE(arming.Armed() == W::Arming::MaxArmed);
+    for (u64 i = 0; i < 16; ++i) {
+        REQUIRE(watch->Take(page_at(i), 4).armed); // used: second chance
+    }
+    for (u64 i = 16; i < 48; ++i) {
+        REQUIRE_FALSE(watch->Take(page_at(i), 4).armed); // the oldest unused went
+    }
+    REQUIRE(watch->Take(page_at(W::Arming::MaxArmed + 31), 4).armed);
+    // Without new uses their second chance is spent: they go first next time.
+    for (u64 i = 0; i < 16; ++i) {
+        watch->RequestArm(page_at(2 * W::Arming::MaxArmed + i), 4);
+    }
+    arming.Tick(frame++, false, counts);
+    for (u64 i = 0; i < 16; ++i) {
+        REQUIRE_FALSE(watch->Take(page_at(i), 4).armed);
+    }
+    arming.ReleaseAll(counts);
+    for (const auto& [page, count] : counts.counts) {
+        REQUIRE(count == 0);
+    }
+}
+
 namespace {
 
 constexpr u64 DeviceBase = 0x100000;
@@ -552,8 +598,9 @@ TEST_CASE("V2 F2-03: the back binds trusted versions without a compare, others o
     V2::CbufRing::BackTable table;
     table.Set(page, 0x100, 0x400, snap.words, 3, true);
     const auto* const entry = table.Find(page, 0x100);
-    const auto choose = [&](u64 collect_epoch, u32 decode_epoch = 3, u32 decoders = 1) {
-        return V2::CbufRing::ChooseBindPath(*entry, watch->Take(page, 0x100).words,
+    const auto choose = [&](u64 collect_epoch, u32 decode_epoch = 3, u32 decoders = 1,
+                            u32 size = 0x100) {
+        return V2::CbufRing::ChooseBindPath(*entry, size, watch->Take(page, 0x100).words,
                                             collect_epoch, decode_epoch, decoders);
     };
     REQUIRE(choose(10) == Path::Trusted);
@@ -569,6 +616,11 @@ TEST_CASE("V2 F2-03: the back binds trusted versions without a compare, others o
     watch->MarkUsed(page, 0x100);
     entry->checked_epoch = 10;
     entry->checked_words = watch->Take(page, 0x100).words;
+    entry->checked_size = 0x40; // a shorter bind of the entry compared
+    REQUIRE(choose(10, 3, 1, 0x40) == Path::Memo);
+    REQUIRE(choose(10, 3, 1, 0x20) == Path::Memo);
+    REQUIRE(choose(10) == Path::Compared); // its tail was never compared (R2-F2-02)
+    entry->checked_size = 0x100;
     REQUIRE(choose(10) == Path::Memo);
     REQUIRE(choose(11) == Path::Compared); // a new collect epoch: CPU writes ordered since
     // A foreign write within the epoch ends the memo too (the page is unarmed: its words move).

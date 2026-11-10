@@ -158,10 +158,11 @@ public:
         u64 words{};
         u32 epoch{};
         bool trusted{};
-        /// The fallback memo: the bytes equalled guest memory at this collect epoch, with the
-        /// pages' words then (a foreign write since moves them).
+        /// The fallback memo: the first `checked_size` bytes equalled guest memory at this
+        /// collect epoch, with the pages' words then (a foreign write since moves them).
         mutable u64 checked_epoch{};
         mutable u64 checked_words{};
+        mutable u32 checked_size{};
     };
 
     void Set(u64 device_addr, u32 size, u64 position, u64 words = 0, u32 epoch = 0,
@@ -221,16 +222,18 @@ enum class BindPath : u8 {
     Compared, ///< compare now
 };
 
-/// `words_now`: the watch's words of the entry's pages now; `collect_epoch`:
-/// Versions::Epochs().Current(); `decode_epoch`, `decoders`: Shared's now.
-[[nodiscard]] inline BindPath ChooseBindPath(const BackTable::Entry& entry, u64 words_now,
-                                             u64 collect_epoch, u32 decode_epoch, u32 decoders) {
+/// `size`: the bind's bytes (at most the entry's); `words_now`: the watch's words of the entry's
+/// pages now; `collect_epoch`: the epoch the back validates at; `decode_epoch`, `decoders`:
+/// Shared's now. The memo vouches only for the bytes its compare covered.
+[[nodiscard]] inline BindPath ChooseBindPath(const BackTable::Entry& entry, u32 size,
+                                             u64 words_now, u64 collect_epoch, u32 decode_epoch,
+                                             u32 decoders) {
     if (entry.trusted && words_now == entry.words && entry.epoch == decode_epoch &&
         decoders == 1) {
         return BindPath::Trusted;
     }
     if (entry.checked_epoch == collect_epoch && entry.checked_words == words_now &&
-        words_now != 0) {
+        words_now != 0 && size <= entry.checked_size) {
         return BindPath::Memo;
     }
     return BindPath::Compared;

@@ -25,7 +25,7 @@
 // back; the back re-arms it later, after a backoff that doubles for pages trapped soon after
 // their arm (up to 64 frames) and halves otherwise.
 //
-// Every device page has a word: (sequence << 3) | owed | queued | armed. A version snapshots
+// Every device page has a word: (sequence << 4) | referenced | owed | queued | armed. A version snapshots
 // the words of its 1-2 pages before its bytes are read; it is trusted while every page was armed
 // at the snapshot and the words are still the same: no CPU store trapped (the trap moves the
 // sequence before the store lands) and no foreign write was noted since.
@@ -34,6 +34,8 @@
 //    count owed (the back gives it back), an unarmed one only moves its sequence. Disarming
 //    closes the window between the note and the bytes landing: a snapshot in it is unarmed.
 //  - Queued: the front asked for an arm (one request per page until the back handles it).
+//  - Referenced: a back bind used the armed page since the armed list's CLOCK hand last passed
+//    it; over the cap, unreferenced pages are released first.
 // Words live in chunks allocated on first request (front) or use (back), never freed, so any
 // thread can read them without a lock. An unallocated page reads 0 (unarmed).
 namespace VideoCommon::V2::CbufWatch {
@@ -43,11 +45,13 @@ inline constexpr u64 PageSize = u64{1} << PageBits;
 inline constexpr u32 ArmedBit = 1;
 inline constexpr u32 QueuedBit = 2;
 inline constexpr u32 OwedBit = 4;
-inline constexpr u32 SeqOne = 8;
+inline constexpr u32 RefBit = 8;
+inline constexpr u32 SeqOne = 16;
 
-/// What a version snapshots of a page word: sequence and armed (queued/owed are bookkeeping).
+/// What a version snapshots of a page word: sequence and armed (queued/owed/referenced are
+/// bookkeeping).
 [[nodiscard]] constexpr u32 SnapshotOf(u32 word) noexcept {
-    return word & ~(QueuedBit | OwedBit);
+    return word & ~(QueuedBit | OwedBit | RefBit);
 }
 
 /// A page's protection by its cached count and whether the watch's +1 is part of it
@@ -200,6 +204,24 @@ public:
     /// (the compare memo keys on them).
     void MarkUsed(u64 addr, u32 size);
 
+    /// Back, at a bind: the window's armed pages are referenced (one load per page; a store only
+    /// when the bit is not set yet).
+    void Touch(u64 addr, u32 size) noexcept {
+        if (size == 0) {
+            return;
+        }
+        const u64 first = addr >> PageBits;
+        const u64 last = (addr + size - 1) >> PageBits;
+        for (u64 page = first; page <= last && page <= first + 1; ++page) {
+            const u32 word = words.Load(page);
+            if ((word & (ArmedBit | RefBit)) == ArmedBit) {
+                if (std::atomic<u32>* const slot = words.Slot(page)) {
+                    slot->fetch_or(RefBit, std::memory_order_relaxed);
+                }
+            }
+        }
+    }
+
     /// Back: the requests since the last call.
     void TakeRequests(std::vector<u32>& out) {
         std::scoped_lock lock{queue_mutex};
@@ -258,7 +280,8 @@ public:
 
     /// Once per frame: disarmed pages leave the armed list (backoff), owed counts are given
     /// back, requests whose backoff ended are armed (`only_held`: only pages others hold), and
-    /// the oldest pages over the cap are released.
+    /// pages over the cap are released, the ones no bind used since the hand last passed first
+    /// (CLOCK, oldest first among equals).
     template <typename Ops>
     void Tick(u64 frame, bool only_held, Ops& ops) {
         release.clear();
@@ -273,14 +296,7 @@ public:
             Arm(frame, only_held, ops);
         }
         if (armed.size() > MaxArmed) {
-            const size_t over = armed.size() - MaxArmed;
-            for (size_t i = 0; i < over; ++i) {
-                meta[armed[i]].listed = false;
-                if (DisarmBack(armed[i])) {
-                    release.push_back(armed[i]);
-                }
-            }
-            armed.erase(armed.begin(), armed.begin() + static_cast<std::ptrdiff_t>(over));
+            ReleaseOverCap();
         }
         if (!release.empty()) {
             HoldPages(ops, release, -1);
@@ -366,6 +382,27 @@ private:
         return false; // a trap or an unmap gave it back
     }
 
+    /// Releases the pages over the cap: the first pass gives referenced pages a second chance
+    /// (their bit is cleared), the second takes the oldest left.
+    void ReleaseOverCap() {
+        size_t over = armed.size() - MaxArmed;
+        for (int pass = 0; pass < 2 && over != 0; ++pass) {
+            size_t kept = 0;
+            for (const u32 page : armed) {
+                if (over != 0 && !ClearBits(page, RefBit)) {
+                    meta[page].listed = false;
+                    if (DisarmBack(page)) {
+                        release.push_back(page);
+                    }
+                    --over;
+                    continue;
+                }
+                armed[kept++] = page;
+            }
+            armed.resize(kept);
+        }
+    }
+
     void ScanArmed(u64 frame) {
         size_t kept = 0;
         for (const u32 page : armed) {
@@ -439,7 +476,8 @@ private:
             u32 expected = before[i];
             // Arm complete: the page is protected now; a write in between leaves it unarmed.
             if ((expected & (ArmedBit | OwedBit)) == 0 &&
-                slot->compare_exchange_strong(expected, (expected | ArmedBit) & ~QueuedBit,
+                slot->compare_exchange_strong(expected,
+                                              (expected | ArmedBit) & ~(QueuedBit | RefBit),
                                               std::memory_order_acq_rel)) {
                 Meta& m = meta[page];
                 m.listed = true;
