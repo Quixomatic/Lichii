@@ -5540,13 +5540,14 @@ bool RasterizerVulkan::PrepareDrawRecord(GraphicsPipeline& pipeline, bool is_ind
         GraphicsPipeline::ApplyResult::Ok) {
         return false;
     }
+    const u64 applied = Profile::Ticks();
     pipeline.NoteRecordDelta(drawrec_apply);
     if (!pipeline.EncodeDraw(drawrec_record, drawrec_apply, nullptr,
                              GraphicsPipeline::EncodeMode::Normal)) {
         return false;
     }
     pipeline.StoreLastRecord(drawrec_record);
-    R::CountRecordTime(0, Profile::Ticks() - start, resolved - start);
+    R::CountRecordTime(0, Profile::Ticks() - start, resolved - start, applied - resolved);
     recorded = true;
     return true;
 }
@@ -5604,6 +5605,7 @@ GraphicsPipeline::RecipeResult RasterizerVulkan::PrepareTemplateRecord(
     case GraphicsPipeline::ApplyResult::Failed:
         return GraphicsPipeline::RecipeResult::Failed;
     }
+    const u64 applied = Profile::Ticks();
     if (!pipeline.EncodeDraw(drawrec_record, drawrec_apply, nullptr,
                              GraphicsPipeline::EncodeMode::Replay, &recipe, &DrawCache().Memo(),
                              &buffers)) {
@@ -5613,7 +5615,7 @@ GraphicsPipeline::RecipeResult RasterizerVulkan::PrepareTemplateRecord(
     R::RecordStats& stats = R::GetRecordStats();
     R::CountRecordStat(stats.drawrec_draws);
     R::CountRecordStat(stats.by_path[2]);
-    R::CountRecordTime(2, Profile::Ticks() - start, resolved - start);
+    R::CountRecordTime(2, Profile::Ticks() - start, resolved - start, applied - resolved);
     recorded = true;
     return GraphicsPipeline::RecipeResult::Recorded;
 }
@@ -5687,6 +5689,7 @@ bool RasterizerVulkan::PrepareDeltaRecord(GraphicsPipeline& pipeline, bool is_in
         recorded = true; // as ConfigureDelta returning false: the draw can't be recorded
         return false;
     }
+    const u64 applied = Profile::Ticks();
     if (!pipeline.EncodeDraw(drawrec_record, drawrec_apply, &pipeline.LastRecord(),
                              GraphicsPipeline::EncodeMode::Normal)) {
         recorded = true;
@@ -5695,7 +5698,7 @@ bool RasterizerVulkan::PrepareDeltaRecord(GraphicsPipeline& pipeline, bool is_in
     R::RecordStats& stats = R::GetRecordStats();
     R::CountRecordStat(stats.drawrec_draws);
     R::CountRecordStat(stats.by_path[1]);
-    R::CountRecordTime(1, Profile::Ticks() - start, resolved - start);
+    R::CountRecordTime(1, Profile::Ticks() - start, resolved - start, applied - resolved);
     recorded = true;
     return true;
 }

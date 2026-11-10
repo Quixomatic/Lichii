@@ -518,6 +518,7 @@ struct RecordStats {
     /// resolve + apply + encode, and its resolve alone.
     std::array<std::atomic<u64>, 3> path_ticks{};
     std::array<std::atomic<u64>, 3> resolve_ticks{};
+    std::array<std::atomic<u64>, 3> apply_ticks{}; ///< ApplyDraw alone (the rest is encode)
     /// F2-01: sub-records a resolve took from its base (uniform and texture buffer entries).
     std::atomic<u64> reused_ubos{};
     std::atomic<u64> reused_tbos{};
@@ -526,10 +527,11 @@ struct RecordStats {
 [[nodiscard]] RecordStats& GetRecordStats();
 
 /// Adds the ticks of one record-path draw (S0-04).
-inline void CountRecordTime(size_t path, u64 total_ticks, u64 resolve_ticks) {
+inline void CountRecordTime(size_t path, u64 total_ticks, u64 resolve_ticks, u64 apply_ticks) {
     RecordStats& stats = GetRecordStats();
     stats.path_ticks[path].fetch_add(total_ticks, std::memory_order_relaxed);
     stats.resolve_ticks[path].fetch_add(resolve_ticks, std::memory_order_relaxed);
+    stats.apply_ticks[path].fetch_add(apply_ticks, std::memory_order_relaxed);
 }
 
 /// Counts one relaxed increment (stats).

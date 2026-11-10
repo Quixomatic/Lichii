@@ -445,10 +445,12 @@ std::string TakeRecordStatsText(double seconds) {
     std::array<u64, 3> paths{};
     std::array<u64, 3> path_ticks{};
     std::array<u64, 3> resolve_ticks{};
+    std::array<u64, 3> apply_ticks{};
     for (size_t i = 0; i < paths.size(); ++i) {
         paths[i] = take(stats.by_path[i]);
         path_ticks[i] = take(stats.path_ticks[i]);
         resolve_ticks[i] = take(stats.resolve_ticks[i]);
+        apply_ticks[i] = take(stats.apply_ticks[i]);
     }
     const u64 now_ticks = VideoCommon::Nx2Profile::Ticks();
     const u64 now_ns = VideoCommon::Nx2Profile::Now();
@@ -461,11 +463,13 @@ std::string TakeRecordStatsText(double seconds) {
                               : 0.0;
         };
         timing = fmt::format(
-            ", us/draw full {:.2f} (resolve {:.2f}), delta {:.2f} ({:.2f}), template {:.2f} "
-            "({:.2f})",
+            ", us/draw full {:.2f} (resolve {:.2f}, apply {:.2f}), delta {:.2f} ({:.2f}, "
+            "{:.2f}), template {:.2f} ({:.2f}, {:.2f})",
             us(path_ticks[0], paths[0]), us(resolve_ticks[0], paths[0]),
-            us(path_ticks[1], paths[1]), us(resolve_ticks[1], paths[1]),
-            us(path_ticks[2], paths[2]), us(resolve_ticks[2], paths[2]));
+            us(apply_ticks[0], paths[0]), us(path_ticks[1], paths[1]),
+            us(resolve_ticks[1], paths[1]), us(apply_ticks[1], paths[1]),
+            us(path_ticks[2], paths[2]), us(resolve_ticks[2], paths[2]),
+            us(apply_ticks[2], paths[2]));
     }
     // S0-G16: each path's share of the record draws, and why hits / continued draws went
     // elsewhere (the verify modes resolve theirs in full by design).
