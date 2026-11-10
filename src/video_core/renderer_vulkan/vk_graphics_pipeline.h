@@ -83,6 +83,10 @@ class Scheduler;
 void NoteRecipePush(VideoCommon::V2::DrawCache::RecipeCapture& capture,
                     const RescalingPushConstant& rescaling,
                     const RenderAreaPushConstant& render_area, const std::vector<u32>& heap_words);
+/// The same into a recipe's fields (F2-01: a recipe filled from a record directly).
+void NoteRecipePush(std::array<u32, 32>& push, u32& push_words, std::vector<u32>& heap_words_out,
+                    const RescalingPushConstant& rescaling,
+                    const RenderAreaPushConstant& render_area, const std::vector<u32>& heap_words);
 
 /// Mesh emulation on a device without VK_EXT_mesh_shader: the mesh program (stage 0) is built as
 /// a compute shader that writes its output to a storage buffer, and this vertex shader draws it
@@ -532,12 +536,11 @@ public:
     [[nodiscard]] const VideoCommon::V2::Resolve::ResolvedDraw& LastRecord() const noexcept {
         return last_record;
     }
-    /// DRAWREC (step 15): what a capturing ConfigureImpl records for the recipe builder, from an
-    /// encoded record (handle and storage descriptor reads, views, samplers, push data, the heap
-    /// words the encode pushed). Ineligible for computed handles and table pointers.
-    void FillRecipeCapture(const VideoCommon::V2::Resolve::ResolvedDraw& record,
-                           const DrawApplyOut& out,
-                           VideoCommon::V2::DrawCache::RecipeCapture& capture) const;
+    /// F2-01: the push words (rescaling, render area) and heap words the encode pushed for the
+    /// record, as a recipe built from it replays them.
+    void NoteRecordPush(const VideoCommon::V2::Resolve::ResolvedDraw& record,
+                        const DrawApplyOut& out, std::array<u32, 32>& push, u32& push_words,
+                        std::vector<u32>& heap_words) const;
     /// DRAWREC=verify (step 12): ApplyDraw(DeriveOnly) on the observed draw's record, its heap and
     /// rescaling words compared with the ones the configure used.
     void VerifyDrawApply(VideoCommon::V2::Resolve::ResolvedDraw& record,

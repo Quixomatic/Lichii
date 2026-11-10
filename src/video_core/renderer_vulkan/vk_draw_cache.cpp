@@ -54,6 +54,176 @@ constexpr bool ShapeWord(size_t word) {
 
 using Maxwell = Tegra::Engines::Maxwell3D::Regs;
 
+/// What a recipe's inputs are filled from: a configure's capture.
+struct CaptureSource {
+    const DC::RecipeCapture& capture;
+
+    [[nodiscard]] bool Ineligible() const {
+        return capture.ineligible;
+    }
+    [[nodiscard]] std::span<const DC::InputRead> Reads() const {
+        return capture.reads;
+    }
+    template <typename Fn>
+    void ForEachView(Fn&& fn) const {
+        for (const DC::RecipeView& view : capture.views) {
+            fn(view.index, view.id, view.blacklist);
+        }
+    }
+    template <typename Fn>
+    void ForEachTsc(Fn&& fn) const {
+        for (const u32 index : capture.tsc_indices) {
+            fn(index);
+        }
+    }
+    template <typename Fn>
+    void ForEachSampler(Fn&& fn) const {
+        for (const u32 sampler : capture.samplers) {
+            fn(sampler);
+        }
+    }
+    void Push(DC::Recipe& recipe) const {
+        recipe.push = capture.push;
+        recipe.push_words = capture.push_words;
+        recipe.heap_words = capture.heap_words;
+    }
+};
+
+/// F2-01: ... or a recorded draw's record and encode, read in place (no capture staging).
+struct RecordSource {
+    const V2::Resolve::ResolvedDraw& record;
+    const DrawApplyOut& out;
+    const GraphicsPipeline& pipeline;
+
+    [[nodiscard]] bool Ineligible() const {
+        return (record.h.flags &
+                (V2::Resolve::DrawFlagComputedHandles | V2::Resolve::DrawFlagTablePointers)) != 0;
+    }
+    [[nodiscard]] std::span<const DC::InputRead> Reads() const {
+        return record.Span<const DC::InputRead>(record.h.reads);
+    }
+    template <typename Fn>
+    void ForEachView(Fn&& fn) const {
+        for (const auto& entry : record.Span<const V2::Resolve::ResolvedView>(record.h.views)) {
+            fn(entry.tic_index, entry.view.id, entry.blacklist != 0);
+        }
+    }
+    template <typename Fn>
+    void ForEachTsc(Fn&& fn) const {
+        for (const auto& entry :
+             record.Span<const V2::Resolve::ResolvedSampler>(record.h.samplers)) {
+            fn(entry.tsc_index);
+        }
+    }
+    template <typename Fn>
+    void ForEachSampler(Fn&& fn) const {
+        for (const auto& entry :
+             record.Span<const V2::Resolve::ResolvedSampler>(record.h.samplers)) {
+            fn(entry.sampler.id);
+        }
+    }
+    void Push(DC::Recipe& recipe) const {
+        pipeline.NoteRecordPush(record, out, recipe.push, recipe.push_words, recipe.heap_words);
+    }
+};
+
+/// The recipe's validated inputs (words compared on a hit), views, samplers and push data.
+template <typename Source>
+bool FillRecipeInputs(DC::Recipe& recipe, bool compute, Tegra::MemoryManager& memory,
+                      TextureCache& texture_cache, const Source& source) {
+    if (source.Ineligible()) {
+        return false;
+    }
+    // Every word must still hold what the resolve read (a hit compares them with memory again).
+    bool ok = false;
+    SCOPE_EXIT {
+        if (!ok) {
+            recipe.inputs.words.clear();
+        }
+    };
+    const Versions::Generations& gens = Versions::Gens();
+    const auto add_word = [&](const DC::InputRead& read) {
+        if ((read.address & Core::Memory::YUZU_PAGEMASK) + read.size > Core::Memory::YUZU_PAGESIZE) {
+            return false;
+        }
+        const u8* const host = memory.GetPointer(read.address);
+        const std::optional<DAddr> device = memory.GpuToCpuAddress(read.address);
+        if (host == nullptr || !device) {
+            return false;
+        }
+        DC::Capture word{
+            .host = host,
+            .device = *device,
+            .size = read.size,
+            .what = read.what,
+        };
+        std::memcpy(word.bytes.data(), read.bytes.data(), read.size);
+        recipe.inputs.words.push_back(word);
+        // Memory must still hold what the resolve read.
+        return std::memcmp(host, read.bytes.data(), read.size) == 0;
+    };
+    for (const DC::InputRead& read : source.Reads()) {
+        if (!add_word(read)) {
+            return false;
+        }
+    }
+    const auto add_descriptor = [&](bool sampler, u32 index) {
+        DC::Capture word{.size = 32, .what = sampler ? DC::Capture::What::Tsc : DC::Capture::What::Tic};
+        GPUVAddr address{};
+        if (!texture_cache.CaptureDescriptor(compute, sampler, index, address, word.host,
+                                             std::span<u8, 32>{word.bytes})) {
+            return false;
+        }
+        if (word.host == nullptr) {
+            return true;
+        }
+        const std::optional<DAddr> device = memory.GpuToCpuAddress(address);
+        if (!device) {
+            return false;
+        }
+        word.device = *device;
+        recipe.inputs.words.push_back(word);
+        return std::memcmp(word.host, word.bytes.data(), word.size) == 0;
+    };
+    recipe.views.clear();
+    bool views_ok = true;
+    source.ForEachView([&](u32 index, u32 id, bool blacklist) {
+        if (!views_ok) {
+            return;
+        }
+        recipe.views.push_back({
+            .index = index,
+            .id = id,
+            .generation = gens.Get(Versions::Kind::ImageView, id),
+            .blacklist = blacklist,
+        });
+        const VideoCommon::ImageViewId view_id{id};
+        if (view_id && !add_descriptor(false, index)) {
+            views_ok = false;
+            return;
+        }
+        if (const auto range = texture_cache.ViewImageRange(view_id)) {
+            recipe.inputs.content.push_back({range->first, range->second, true});
+        }
+    });
+    if (!views_ok) {
+        return false;
+    }
+    bool samplers_ok = true;
+    source.ForEachTsc([&](u32 tsc_index) {
+        samplers_ok = samplers_ok && add_descriptor(true, tsc_index);
+    });
+    if (!samplers_ok) {
+        return false;
+    }
+    source.ForEachSampler([&](u32 sampler) {
+        recipe.samplers.push_back({sampler, gens.Get(Versions::Kind::Sampler, sampler)});
+    });
+    source.Push(recipe);
+    ok = true;
+    return true;
+}
+
 /// The draw shape: the pipeline key's hash (`state_hash`, FixedPipelineState::Hash), the program
 /// and render target groups, and the draw's inputs outside both. Shared by the serial path (the
 /// looked-up pipeline's hash) and the P6 shards (their own pipeline key's), so both compute the
@@ -432,84 +602,7 @@ DrawCacheGlue::RecipeCapture* DrawCacheGlue::BeginDrawCapture(
 
 bool DrawCacheGlue::FillFromCapture(Recipe& recipe, bool compute, Tegra::MemoryManager& memory,
                                     TextureCache& texture_cache) {
-    if (capture.ineligible) {
-        return false;
-    }
-    // Every word must still hold what the resolve read (a hit compares them with memory again).
-    bool ok = false;
-    SCOPE_EXIT {
-        if (!ok) {
-            recipe.inputs.words.clear();
-        }
-    };
-    const Versions::Generations& gens = Versions::Gens();
-    const auto add_word = [&](const DC::InputRead& read) {
-        if ((read.address & Core::Memory::YUZU_PAGEMASK) + read.size > Core::Memory::YUZU_PAGESIZE) {
-            return false;
-        }
-        const u8* const host = memory.GetPointer(read.address);
-        const std::optional<DAddr> device = memory.GpuToCpuAddress(read.address);
-        if (host == nullptr || !device) {
-            return false;
-        }
-        DC::Capture word{
-            .host = host,
-            .device = *device,
-            .size = read.size,
-            .what = read.what,
-        };
-        std::memcpy(word.bytes.data(), read.bytes.data(), read.size);
-        recipe.inputs.words.push_back(word);
-        // Memory must still hold what the resolve read.
-        return std::memcmp(host, read.bytes.data(), read.size) == 0;
-    };
-    for (const DC::InputRead& read : capture.reads) {
-        if (!add_word(read)) {
-            return false;
-        }
-    }
-    const auto add_descriptor = [&](bool sampler, u32 index) {
-        DC::Capture word{.size = 32, .what = sampler ? DC::Capture::What::Tsc : DC::Capture::What::Tic};
-        GPUVAddr address{};
-        if (!texture_cache.CaptureDescriptor(compute, sampler, index, address, word.host,
-                                             std::span<u8, 32>{word.bytes})) {
-            return false;
-        }
-        if (word.host == nullptr) {
-            return true;
-        }
-        const std::optional<DAddr> device = memory.GpuToCpuAddress(address);
-        if (!device) {
-            return false;
-        }
-        word.device = *device;
-        recipe.inputs.words.push_back(word);
-        return std::memcmp(word.host, word.bytes.data(), word.size) == 0;
-    };
-    recipe.views = capture.views;
-    for (DC::RecipeView& view : recipe.views) {
-        view.generation = gens.Get(Versions::Kind::ImageView, view.id);
-        const VideoCommon::ImageViewId id{view.id};
-        if (id && !add_descriptor(false, view.index)) {
-            return false;
-        }
-        if (const auto range = texture_cache.ViewImageRange(id)) {
-            recipe.inputs.content.push_back({range->first, range->second, true});
-        }
-    }
-    for (const u32 index : capture.tsc_indices) {
-        if (!add_descriptor(true, index)) {
-            return false;
-        }
-    }
-    for (const u32 sampler : capture.samplers) {
-        recipe.samplers.push_back({sampler, gens.Get(Versions::Kind::Sampler, sampler)});
-    }
-    recipe.push = capture.push;
-    recipe.push_words = capture.push_words;
-    recipe.heap_words = capture.heap_words;
-    ok = true;
-    return true;
+    return FillRecipeInputs(recipe, compute, memory, texture_cache, CaptureSource{capture});
 }
 
 void DrawCacheGlue::Store(DC::RecipeTable& table, u64 key, Recipe& recipe,
@@ -551,8 +644,8 @@ void DrawCacheGlue::FinishDrawCapture(GraphicsPipeline& pipeline, const Decision
         return;
     }
     pending_draw.capturing = false;
-    BuildGraphicsRecipe(pipeline, decision, is_indexed, nullptr, maxwell3d, memory, texture_cache,
-                        buffer_cache);
+    BuildGraphicsRecipe(pipeline, decision, is_indexed, nullptr, nullptr, maxwell3d, memory,
+                        texture_cache, buffer_cache);
 }
 
 void DrawCacheGlue::FinishDrawRecord(GraphicsPipeline& pipeline, const Decision& decision,
@@ -565,13 +658,14 @@ void DrawCacheGlue::FinishDrawRecord(GraphicsPipeline& pipeline, const Decision&
         return;
     }
     pending_draw.capturing = false;
-    pipeline.FillRecipeCapture(record, out, capture);
-    BuildGraphicsRecipe(pipeline, decision, is_indexed, &record, maxwell3d, memory, texture_cache,
-                        buffer_cache);
+    // F2-01: the recipe is filled from the record and its encode directly (no capture staging).
+    BuildGraphicsRecipe(pipeline, decision, is_indexed, &record, &out, maxwell3d, memory,
+                        texture_cache, buffer_cache);
 }
 
 void DrawCacheGlue::BuildGraphicsRecipe(GraphicsPipeline& pipeline, const Decision& decision,
                                         bool is_indexed, const V2::Resolve::ResolvedDraw* record,
+                                        const DrawApplyOut* out,
                                         const Tegra::Engines::Maxwell3D& maxwell3d,
                                         Tegra::MemoryManager& memory, TextureCache& texture_cache,
                                         BufferCache& buffer_cache) {
@@ -584,7 +678,12 @@ void DrawCacheGlue::BuildGraphicsRecipe(GraphicsPipeline& pipeline, const Decisi
     recipe.rescale_epoch = gens.GetEpoch(Versions::Epoch::Rescale);
     recipe.map_serial = memory.MapSerial();
     recipe.host_serial = memory.HostPointerSerial();
-    if (!FillFromCapture(recipe, false, memory, texture_cache)) {
+    const bool filled =
+        record != nullptr && out != nullptr
+            ? FillRecipeInputs(recipe, false, memory, texture_cache,
+                               RecordSource{*record, *out, pipeline})
+            : FillFromCapture(recipe, false, memory, texture_cache);
+    if (!filled) {
         return;
     }
     for (size_t stage = 0; stage < Tegra::Engines::Maxwell3D::Regs::MaxShaderStage; ++stage) {

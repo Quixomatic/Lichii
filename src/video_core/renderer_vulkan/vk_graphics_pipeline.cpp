@@ -343,16 +343,22 @@ void ReportTextureMemo() {
 void NoteRecipePush(VideoCommon::V2::DrawCache::RecipeCapture& capture,
                     const RescalingPushConstant& rescaling,
                     const RenderAreaPushConstant& render_area, const std::vector<u32>& heap_words) {
+    NoteRecipePush(capture.push, capture.push_words, capture.heap_words, rescaling, render_area,
+                   heap_words);
+}
+
+void NoteRecipePush(std::array<u32, 32>& push, u32& push_words, std::vector<u32>& heap_words_out,
+                    const RescalingPushConstant& rescaling,
+                    const RenderAreaPushConstant& render_area, const std::vector<u32>& heap_words) {
     const auto& words = rescaling.Data();
     static_assert(std::tuple_size_v<std::decay_t<decltype(words)>> + 4 <= 32);
-    std::copy(words.begin(), words.end(), capture.push.begin());
-    capture.push_words = static_cast<u32>(words.size());
+    std::copy(words.begin(), words.end(), push.begin());
+    push_words = static_cast<u32>(words.size());
     if (render_area.uses_render_area) {
-        std::memcpy(&capture.push[capture.push_words], render_area.words.data(),
-                    sizeof(render_area.words));
-        capture.push_words += static_cast<u32>(render_area.words.size());
+        std::memcpy(&push[push_words], render_area.words.data(), sizeof(render_area.words));
+        push_words += static_cast<u32>(render_area.words.size());
     }
-    capture.heap_words = heap_words;
+    heap_words_out = heap_words;
 }
 
 std::chrono::nanoseconds GraphicsPipeline::TakeHoldTime() noexcept {

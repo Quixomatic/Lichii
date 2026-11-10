@@ -156,11 +156,11 @@ private:
     /// captured (crosses a page, memory moved under it).
     [[nodiscard]] bool FillFromCapture(Recipe& recipe, bool compute, Tegra::MemoryManager& memory,
                                        TextureCache& texture_cache);
-    /// The graphics recipe from the filled capture and the bound state, stored (with the record
-    /// template when `record` is set).
+    /// The graphics recipe from the bound state and the capture, or (F2-01) the record and its
+    /// encode `out` directly; stored (with the record template when `record` is set).
     void BuildGraphicsRecipe(GraphicsPipeline& pipeline, const Decision& decision, bool is_indexed,
                              const VideoCommon::V2::Resolve::ResolvedDraw* record,
-                             const Tegra::Engines::Maxwell3D& maxwell3d,
+                             const DrawApplyOut* out, const Tegra::Engines::Maxwell3D& maxwell3d,
                              Tegra::MemoryManager& memory, TextureCache& texture_cache,
                              BufferCache& buffer_cache);
     /// Builds into the table, or aside and compares (verify).

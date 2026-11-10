@@ -1254,33 +1254,16 @@ void GraphicsPipeline::NoteRecordDelta(const DrawApplyOut& out) {
     delta_views_valid = true;
 }
 
-void GraphicsPipeline::FillRecipeCapture(const R::ResolvedDraw& record, const DrawApplyOut& out,
-                                         VideoCommon::V2::DrawCache::RecipeCapture& capture) const {
-    const R::DrawHeader& h = record.h;
-    capture.Clear();
-    capture.ineligible =
-        (h.flags & (R::DrawFlagComputedHandles | R::DrawFlagTablePointers)) != 0;
-    const auto reads = record.Span<const VideoCommon::V2::DrawCache::InputRead>(h.reads);
-    capture.reads.assign(reads.begin(), reads.end());
-    for (const R::ResolvedView& entry : record.Span<const R::ResolvedView>(h.views)) {
-        capture.views.push_back({
-            .index = entry.tic_index,
-            .id = entry.view.id,
-            .generation = 0,
-            .blacklist = entry.blacklist != 0,
-        });
-    }
-    for (const R::ResolvedSampler& entry : record.Span<const R::ResolvedSampler>(h.samplers)) {
-        capture.samplers.push_back(entry.sampler.id);
-        capture.tsc_indices.push_back(entry.tsc_index);
-    }
+void GraphicsPipeline::NoteRecordPush(const R::ResolvedDraw& record, const DrawApplyOut& out,
+                                      std::array<u32, 32>& push, u32& push_words,
+                                      std::vector<u32>& heap_words) const {
     RenderAreaPushConstant render_area;
-    render_area.uses_render_area = h.render_area.uses;
-    if (h.render_area.uses) {
-        render_area.words = {h.render_area.w, h.render_area.h};
+    render_area.uses_render_area = record.h.render_area.uses;
+    if (record.h.render_area.uses) {
+        render_area.words = {record.h.render_area.w, record.h.render_area.h};
     }
     // The heap words as the encode pushed them (texel words interleaved, as the configure's).
-    NoteRecipePush(capture, out.rescaling, render_area, heap_push.words);
+    NoteRecipePush(push, push_words, heap_words, out.rescaling, render_area, heap_push.words);
 }
 
 void GraphicsPipeline::NoteRecipeDelta(const VideoCommon::V2::DrawCache::Recipe& recipe,
