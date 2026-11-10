@@ -658,7 +658,9 @@ void BufferCache<P>::WaitMappedHostRead(u64 producer) {
             return;
         }
     }
-    runtime.FinishForHostRead();
+    if constexpr (requires { runtime.FinishForHostRead(); }) {
+        runtime.FinishForHostRead();
+    }
 }
 
 template <class P>
