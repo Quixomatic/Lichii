@@ -533,3 +533,42 @@ TEST_CASE("V2 F2-03: published versions carry their trust; bases read in flight 
     REQUIRE(entry->checked_epoch == 0);
     arming.ReleaseAll(counts);
 }
+
+TEST_CASE("V2 F2-03: the back binds trusted versions without a compare, others once per epoch",
+          "[video_core][v2_cbufwatch]") {
+    using Path = V2::CbufRing::BindPath;
+    auto watch = std::make_unique<W::Watch>();
+    W::Arming arming{*watch};
+    FakeCounts counts;
+    constexpr u64 page = 0x50000;
+    watch->RequestArm(page, 0x100);
+    arming.Tick(1, false, counts);
+    const W::Snap snap = watch->Take(page, 0x100);
+    V2::CbufRing::BackTable table;
+    table.Set(page, 0x100, 0x400, snap.words, 3, true);
+    const auto* const entry = table.Find(page, 0x100);
+    const auto choose = [&](u64 collect_epoch, u32 decode_epoch = 3, u32 decoders = 1) {
+        return V2::CbufRing::ChooseBindPath(*entry, watch->Take(page, 0x100).words,
+                                            collect_epoch, decode_epoch, decoders);
+    };
+    REQUIRE(choose(10) == Path::Trusted);
+    REQUIRE(choose(11) == Path::Trusted); // across epochs too
+    REQUIRE(choose(10, 4) == Path::Compared);    // the decoder untrusted everything since
+    REQUIRE(choose(10, 3, 2) == Path::Compared); // two decoders: neither knows the other's windows
+    // A trapped CPU store moves the words: compared, then memoised for the rest of the epoch.
+    watch->OnCpuWrite(page + 8, 4, [&](u64 p) {
+        counts.Hold(std::span<const std::pair<u64, u64>>{std::array{std::pair{p, W::PageSize}}},
+                    -1);
+    });
+    REQUIRE(choose(10) == Path::Compared);
+    watch->MarkUsed(page, 0x100);
+    entry->checked_epoch = 10;
+    entry->checked_words = watch->Take(page, 0x100).words;
+    REQUIRE(choose(10) == Path::Memo);
+    REQUIRE(choose(11) == Path::Compared); // a new collect epoch: CPU writes ordered since
+    // A foreign write within the epoch ends the memo too (the page is unarmed: its words move).
+    watch->NoteForeign(page + 0x40, 4);
+    REQUIRE(choose(10) == Path::Compared);
+    arming.Tick(2, false, counts);
+    REQUIRE(counts.Count(page) == 0);
+}

@@ -8,6 +8,7 @@
 
 #include "common/logging.h"
 #include "video_core/v2/cbuf_ring.h"
+#include "video_core/v2/cbuf_watch.h"
 #include "video_core/v2/p3_stats.h"
 
 namespace VideoCommon::V2::P3Stats {
@@ -137,6 +138,43 @@ void Report(const char* thread_name, u64 window_ns) {
         last_bind = bind;
         last_flight = flight;
         last_refused = refused;
+        // F2-03: how the hits were validated, and the write watch.
+        auto& watch = CbufWatch::Get();
+        auto& ws = watch.stats;
+        static std::array<u64, 12> last{};
+        const std::array<u64, 12> now{
+            ws.arms.load(std::memory_order_relaxed),
+            ws.traps.load(std::memory_order_relaxed),
+            ws.foreign_disarms.load(std::memory_order_relaxed),
+            ws.foreign_bumps.load(std::memory_order_relaxed),
+            ws.requests.load(std::memory_order_relaxed),
+            ws.releases.load(std::memory_order_relaxed),
+            shared.overlap_patches.load(std::memory_order_relaxed),
+            shared.cow_versions.load(std::memory_order_relaxed),
+            shared.write_drops.load(std::memory_order_relaxed),
+            shared.trusted_versions.load(std::memory_order_relaxed),
+            shared.trust_upgrades.load(std::memory_order_relaxed),
+            0,
+        };
+        const auto rate = [&](size_t i) { return PerSecond(now[i] - last[i], window_ns); };
+        LOG_INFO(HW_GPU,
+                 "V2 stats {} F2-03 cbuf watch: hits trusted {:.1f}%, memo {:.1f}%, compared "
+                 "{:.1f}%; compares {:.0f}/s; verify: trusted and differs {}, memo and differs "
+                 "{} | pages armed {}, waiting {} (in backoff {}), hot {}; arms {:.0f}/s, "
+                 "traps {:.0f}/s, foreign disarms {:.0f}/s, foreign bumps {:.0f}/s, requests "
+                 "{:.0f}/s, releases {:.0f}/s | front: overlap patches {:.0f}/s, copy-on-write "
+                 "{:.0f}/s, dropped by ranged writes {:.0f}/s, trusted versions {:.0f}/s, "
+                 "trusted after a compare {:.0f}/s, decoders {}",
+                 thread_name, Percent(d.ring_trusted, d.ring_hits),
+                 Percent(d.ring_memo, d.ring_hits), Percent(d.ring_compared_hits, d.ring_hits),
+                 PerSecond(d.ring_compares, window_ns), d.ring_trusted_differs,
+                 d.ring_memo_differs, ws.armed.load(std::memory_order_relaxed),
+                 ws.waiting.load(std::memory_order_relaxed),
+                 ws.backoff.load(std::memory_order_relaxed),
+                 ws.hot.load(std::memory_order_relaxed), rate(0), rate(1), rate(2), rate(3),
+                 rate(4), rate(5), rate(6), rate(7), rate(8), rate(9), rate(10),
+                 shared.decoders.load(std::memory_order_relaxed));
+        last = now;
     }
     const u64 heap_work = d.heap_draws + d.heap_partial_draws + d.heap_fallback_draws +
                           d.heap_dispatches + d.heap_partial_dispatches +

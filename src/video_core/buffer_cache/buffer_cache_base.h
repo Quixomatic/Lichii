@@ -47,6 +47,7 @@
 #include "video_core/nx2_download_trace.h"
 #include "video_core/surface.h"
 #include "video_core/texture_cache/types.h"
+#include "video_core/v2/cbuf_ring.h"
 #include "video_core/v2/cbuf_watch.h"
 #include "video_core/v2/commit.h"
 #include "video_core/v2/draw_cache.h"
@@ -744,6 +745,11 @@ private:
     const u8* V2GuestBytes(DAddr device_addr, u32 size);
     /// F2-03: once per frame, the write watch's arming (v2/cbuf_watch.h).
     void V2TickCbufWatch();
+    /// F2-03, CBUFRING=verify: a ring version that differs from guest memory, by how it was
+    /// validated (first 32, then every 4096th).
+    void V2RingVerifyLog(size_t stage, u32 index, DAddr device_addr, u32 size,
+                         const VideoCommon::V2::CbufRing::BackTable::Entry& entry,
+                         const char* path, u64 words_now, u64 epoch_now);
 
     void BindHostGraphicsStorageBuffers(size_t stage);
 

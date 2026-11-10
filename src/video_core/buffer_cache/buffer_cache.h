@@ -3044,6 +3044,36 @@ const u8* BufferCache<P>::V2GuestBytes(DAddr device_addr, u32 size) {
 }
 
 template <class P>
+void BufferCache<P>::V2RingVerifyLog(size_t stage, u32 index, DAddr device_addr, u32 size,
+                                     const VideoCommon::V2::CbufRing::BackTable::Entry& entry,
+                                     const char* path, u64 words_now, u64 epoch_now) {
+    // CBUFRING=verify: a trusted version that differs is a write source the watch missed (the
+    // gate is 0); a memo one a write inside an epoch; a compared one the old fallback.
+    static std::atomic<u64> count{};
+    const u64 n = count.fetch_add(1, std::memory_order_relaxed);
+    if (n >= 32 && n % 4096 != 0) {
+        return;
+    }
+    namespace V2 = VideoCommon::V2;
+    const auto& shared = V2::CbufRing::Get();
+    const u64 page = device_addr & ~(V2::CbufWatch::PageSize - 1);
+    const u32 word = V2::CbufWatch::Get().words.Load(page >> V2::CbufWatch::PageBits);
+    LOG_WARNING(HW_GPU,
+                "V2 cbuf ring verify ({} of them): stage {} cbuf {} at {:#x}+{:#x}: the {} "
+                "version at {:#x} differs from guest memory | trusted {} words {:#x} now {:#x} "
+                "page armed {} owed {} queued {} | decoder epoch {} now {} decoders {} | memo "
+                "epoch {} now {} | backoff {} | overlap patches {} cow {}",
+                n + 1, stage, index, device_addr, size, path, entry.position, entry.trusted,
+                entry.words, words_now, (word & V2::CbufWatch::ArmedBit) != 0,
+                (word & V2::CbufWatch::OwedBit) != 0, (word & V2::CbufWatch::QueuedBit) != 0,
+                entry.epoch, shared.decode_epoch.load(std::memory_order_relaxed),
+                shared.decoders.load(std::memory_order_relaxed), entry.checked_epoch, epoch_now,
+                v2_cbuf_arming ? v2_cbuf_arming->Backoff(page) : 0,
+                shared.overlap_patches.load(std::memory_order_relaxed),
+                shared.cow_versions.load(std::memory_order_relaxed));
+}
+
+template <class P>
 void BufferCache<P>::V2TickCbufWatch() {
     namespace W = VideoCommon::V2::CbufWatch;
     if constexpr (requires { runtime.CbufRingRef(u64{}); }) {
@@ -3096,25 +3126,64 @@ bool BufferCache<P>::BindRingVersion(size_t stage, u32 index, DAddr device_addr,
             }
             return false;
         }
-        // The version is what the shader reads only while its bytes equal guest memory now:
-        // a write the front could not see (guest CPU) ends it here (F2-03 replaces this
-        // compare with write tracking).
+        // The version is what the shader reads while its bytes equal guest memory now. F2-03
+        // (v2/cbuf_watch.h): a trusted version whose pages' words did not move since its
+        // snapshot is known to (every write the front did not decode moves them); otherwise a
+        // compare, at most once per collect epoch while the words hold (a guest CPU write is
+        // ordered against the GPU only at an epoch; a foreign write moves the words).
         const u64 offset = ring.Offset(entry->position);
-        if (std::memcmp(shared.shadow.get() + offset, V2GuestBytes(device_addr, size), size) !=
-            0) {
+        const bool verify = V2::Verify(V2::Switch::CbufRing);
+        using Path = V2::CbufRing::BindPath;
+        Path path = Path::Compared;
+        V2::CbufWatch::Snap snap{};
+        u64 epoch_now = 0;
+        const bool watching = V2::CbufWatch::Enabled();
+        if (watching) {
+            auto& watch = V2::CbufWatch::Get();
+            snap = watch.Take(device_addr, entry->size);
+            epoch_now = V2::Versions::Epochs().Current();
+            path = V2::CbufRing::ChooseBindPath(
+                *entry, snap.words, epoch_now, shared.decode_epoch.load(std::memory_order_acquire),
+                shared.decoders.load(std::memory_order_relaxed));
+            if (path == Path::Compared) {
+                // The words before the bytes: a foreign write from now on moves them.
+                watch.MarkUsed(device_addr, entry->size);
+                snap = watch.Take(device_addr, entry->size);
+            }
+        }
+        if (path == Path::Compared || verify) {
+            const bool same = std::memcmp(shared.shadow.get() + offset,
+                                          V2GuestBytes(device_addr, size), size) == 0;
             if (stats) {
-                ++data.ring_mismatches;
+                ++data.ring_compares;
             }
-            if (V2::Verify(V2::Switch::CbufRing)) {
-                static std::atomic<u32> logged{};
-                if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
-                    LOG_WARNING(HW_GPU,
-                                "V2 cbuf ring verify: stage {} cbuf {} at {:#x}+{:#x}: the "
-                                "decode-time version at {:#x} differs from guest memory",
-                                stage, index, device_addr, size, entry->position);
+            if (!same) {
+                if (stats) {
+                    ++data.ring_mismatches;
+                    if (path == Path::Trusted) {
+                        ++data.ring_trusted_differs;
+                    } else if (path == Path::Memo) {
+                        ++data.ring_memo_differs;
+                    }
                 }
+                if (verify) {
+                    V2RingVerifyLog(stage, index, device_addr, size, *entry,
+                                    path == Path::Trusted ? "trusted"
+                                    : path == Path::Memo  ? "memo"
+                                                          : "compared",
+                                    snap.words, epoch_now);
+                }
+                return false;
             }
-            return false;
+            if (watching && path == Path::Compared) {
+                entry->checked_epoch = epoch_now;
+                entry->checked_words = snap.words;
+            }
+        }
+        if (stats) {
+            ++(path == Path::Trusted ? data.ring_trusted
+               : path == Path::Memo  ? data.ring_memo
+                                     : data.ring_compared_hits);
         }
         ring.Use(tick, entry->position);
         runtime.RebindStreamUniform(runtime.CbufRingRef(offset), size);

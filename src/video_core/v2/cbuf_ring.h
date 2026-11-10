@@ -214,6 +214,28 @@ private:
     std::array<Entry, NumEntries> entries{};
 };
 
+/// F2-03: how the back validates a ring version at a bind.
+enum class BindPath : u8 {
+    Trusted,  ///< trusted by its decoder, and the watch's words did not move: no compare
+    Memo,     ///< compared in this collect epoch, and the words did not move since
+    Compared, ///< compare now
+};
+
+/// `words_now`: the watch's words of the entry's pages now; `collect_epoch`:
+/// Versions::Epochs().Current(); `decode_epoch`, `decoders`: Shared's now.
+[[nodiscard]] inline BindPath ChooseBindPath(const BackTable::Entry& entry, u64 words_now,
+                                             u64 collect_epoch, u32 decode_epoch, u32 decoders) {
+    if (entry.trusted && words_now == entry.words && entry.epoch == decode_epoch &&
+        decoders == 1) {
+        return BindPath::Trusted;
+    }
+    if (entry.checked_epoch == collect_epoch && entry.checked_words == words_now &&
+        words_now != 0) {
+        return BindPath::Memo;
+    }
+    return BindPath::Compared;
+}
+
 /// The ring's memory and the counters both threads report (one GPU).
 struct Shared {
     static constexpr u64 Capacity = u64{16} << 20;

@@ -67,6 +67,13 @@ struct Data {
     u64 ring_none_small{};   ///< ... the version is shorter than the bind
     u64 ring_old{};        ///< below the bind floor
     u64 ring_mismatches{}; ///< the version's bytes differ from guest memory
+    // F2-03 (v2/cbuf_watch.h): how ring hits were validated
+    u64 ring_trusted{};         ///< trusted, words unchanged: no compare
+    u64 ring_memo{};            ///< compared earlier in this collect epoch, words unchanged
+    u64 ring_compared_hits{};   ///< compared now
+    u64 ring_compares{};        ///< byte compares run (verify compares every bind)
+    u64 ring_trusted_differs{}; ///< verify: trusted and differs (must be 0)
+    u64 ring_memo_differs{};    ///< verify: memo and differs (race class, ~0)
     // EDEN_NX2_V2_BINDLESS
     u64 heap_draws{};          ///< every image descriptor in the heap
     u64 heap_partial_draws{};  ///< some left out (heap_reasons)
