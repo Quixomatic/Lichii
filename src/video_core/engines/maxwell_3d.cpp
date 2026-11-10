@@ -3293,6 +3293,18 @@ void Maxwell3D::FrontSyncShadowRenderEnable(VideoCommon::GpuSplit& split, FrontS
     fs.shadow[RenderEnableMode] = v2_hle_tracked_mode;
 }
 
+u32 Maxwell3D::FrontRegisterForTest(u32 method) const {
+    return front ? front->regs[method] : 0;
+}
+
+u32 Maxwell3D::FrontShadowForTest(u32 method) const {
+    return front ? front->shadow[method] : 0;
+}
+
+bool Maxwell3D::FrontRenderEnableUnknownForTest() const {
+    return front && front->v2_render_enable_unknown;
+}
+
 void Maxwell3D::FrontShadowControlWritten(VideoCommon::GpuSplit& split, FrontState& fs) {
     if (fs.control == Regs::ShadowRamControl::Replay) [[unlikely]] {
         FrontSyncShadowRenderEnable(split, fs);

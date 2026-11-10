@@ -1833,17 +1833,15 @@ struct Maxwell3DTestAccess {
     static bool EndMacro(Maxwell3D& engine, Core::System& system, VideoCommon::GpuSplit& split) {
         return engine.FrontEndMacro(system, split, engine.Front(system, split));
     }
-    static u32 FrontRegister(Maxwell3D& engine, Core::System& system,
-                             VideoCommon::GpuSplit& split, u32 method) {
-        return engine.Front(system, split).regs[method];
+    static u32 FrontRegister(Maxwell3D& engine, Core::System&, VideoCommon::GpuSplit&,
+                             u32 method) {
+        return engine.FrontRegisterForTest(method);
     }
-    static u32 FrontShadow(Maxwell3D& engine, Core::System& system, VideoCommon::GpuSplit& split,
-                           u32 method) {
-        return engine.Front(system, split).shadow[method];
+    static u32 FrontShadow(Maxwell3D& engine, Core::System&, VideoCommon::GpuSplit&, u32 method) {
+        return engine.FrontShadowForTest(method);
     }
-    static bool RenderEnableUnknown(Maxwell3D& engine, Core::System& system,
-                                    VideoCommon::GpuSplit& split) {
-        return engine.Front(system, split).v2_render_enable_unknown;
+    static bool RenderEnableUnknown(Maxwell3D& engine, Core::System&, VideoCommon::GpuSplit&) {
+        return engine.FrontRenderEnableUnknownForTest();
     }
     static u32 TrackedMode(const Maxwell3D& engine) {
         return engine.v2_hle_tracked_mode;
@@ -1982,7 +1980,6 @@ TEST_CASE("V2 macro HLE: a conditional render under shadow RAM tracking runs on 
         0x00200003, 0x18c00000, 0x302c0300,
     };
     constexpr u32 Mode556 = MAXWELL3D_REG_INDEX(render_enable.mode);
-    constexpr u32 ShadowControl = MAXWELL3D_REG_INDEX(shadow_ram_control);
     Fixture f;
     f.system.Initialize();
     auto& engine = f.fast;

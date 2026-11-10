@@ -3532,6 +3532,10 @@ private:
     /// MACROHLE (back writes, front reads after a drain): the mode the last conditional render
     /// HLE call evaluated under shadow RAM tracking.
     u32 v2_hle_tracked_mode{};
+    /// Tests: the split front's register, shadow copy and render-enable flag (front taken).
+    [[nodiscard]] u32 FrontRegisterForTest(u32 method) const;
+    [[nodiscard]] u32 FrontShadowForTest(u32 method) const;
+    [[nodiscard]] bool FrontRenderEnableUnknownForTest() const;
     // EDEN_NX2_V2_REGSEM on the executing engine: the register update through the semantics
     // table (=1), or the engine's own path compared with it on a register copy (verify).
     void CallMethodV2(u32 method, u32 method_argument, bool is_last_call, bool fast);
