@@ -1716,10 +1716,6 @@ struct Maxwell3D::FrontState {
     std::unique_ptr<VideoCommon::V2::CbufRing::Decode> v2_cbuf_ring;
     /// Register blocks of 64 changed since the last P6 snapshot (all after a copy or resync).
     u64 v2_dirty_blocks{~u64{0}};
-    /// Fix F3d: when each block of these registers (or their shadow copies) last changed, for
-    /// the macro memo's fingerprint and no-op replays. Kept by the table path (Store3D);
-    /// anything else that sets registers invalidates it. Read only under S1 (s1_exec).
-    VideoCommon::V2::ChangeClock v2_change_clock;
     std::unique_ptr<VideoCommon::V2::RegSem::Front3D> v2;
     /// EDEN_NX2_V2_REGSEM=1 (v2 non-null and On): FrontWrite's table-driven fast path.
     bool v2_on{};
@@ -2398,7 +2394,6 @@ void Maxwell3D::FrontRegSemResync(FrontState& fs) {
     // The front's registers were set without the write path (copied, or resynchronized with
     // the back by EDEN_NX2_SPLIT_VERIFY).
     fs.v2_dirty_blocks = ~u64{0};
-    fs.v2_change_clock.Invalidate();
     for (size_t stage = 0; stage < VideoCommon::V2::Resolve::CbufStages; ++stage) {
         for (size_t slot = 0; slot < VideoCommon::V2::Resolve::CbufSlots; ++slot) {
             const auto& cbuf = state.shader_stages[stage].const_buffers[slot];
@@ -2869,7 +2864,7 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
             }
             // Fix F3d (F3c's test was a second compare in front of Write3D's): under S1 the
             // write path is inlined here and Write3D's compare-on-write drops a write that
-            // changes nothing, once. No-op memo hits skip those writes before this.
+            // changes nothing, once. Memo hits leave those writes out before this (F3e).
             if (fs.s1_exec) [[likely]] {
                 FrontWriteS1(split, fs, address, value, true, true);
                 return true;
@@ -2945,34 +2940,32 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
                                       ? RenderEnableMode
                                       : ~0U,
                 .key = call_key,
-                // Fix F3d: the table path keeps the change clock (S1 only); a no-op replay
-                // needs Write3D to drop same-value writes (skip_same, not under Replay) and
-                // every write seen when the HLE checks or the dump observe them.
-                .clock = fs.s1_exec ? &fs.v2_change_clock : nullptr,
+                // Fix F3e: a replay leaves out the writes Write3D would drop (S1's
+                // FrontWriteS1, skip_same, not under Replay; every write seen when the HLE
+                // checks or the dump observe them).
+                .skip_same = fs.s1_exec && fs.skip_same && !fs.v2_observation &&
+                             fs.control != Regs::ShadowRamControl::Replay,
                 .flags = fs.v2_table->flags.data(),
                 .exec_mask = VideoCommon::V2::RegSem::Exec,
                 .barrier_mask = VideoCommon::V2::RegSem::ShadowControl,
-                .context = fs.s1_exec && fs.skip_same && !fs.v2_observation &&
-                                   fs.control != Regs::ShadowRamControl::Replay
-                               ? static_cast<u32>(fs.control)
-                               : MacroMemo::NoContext,
+                .shadow = fs.control == Regs::ShadowRamControl::Track ||
+                                  fs.control == Regs::ShadowRamControl::TrackWithFilter
+                              ? fs.shadow.data()
+                              : nullptr,
                 .writes_skippable =
                     [](const void* model) {
                         return !static_cast<const VideoCommon::V2::DrawModel*>(model)
                                     ->HasDeferredDraw();
                     },
                 .skippable_arg = &fs.v2_draw_model,
-                .shadow = fs.control == Regs::ShadowRamControl::Track ||
-                                  fs.control == Regs::ShadowRamControl::TrackWithFilter
-                              ? fs.shadow.data()
-                              : nullptr,
+                .dropped_writes = &fs.s1_same_writes,
 #ifdef ARCHITECTURE_x86_64
                 .jit_data_ram = true,
 #endif
             };
             result = MacroMemo::Call(*fs.v2_memo, engine.native_interpreter, call, live, read,
                                      write, dma);
-            // The writes a no-op hit left out, counted as FrontWriteS1 counts dropped ones.
+            // The writes a hit left out, counted as FrontWriteS1 counts dropped ones.
             fs.s1_writes += fs.v2_memo->last_skipped;
             fs.s1_same_writes += fs.v2_memo->last_skipped;
         } else {
@@ -3368,7 +3361,6 @@ void Maxwell3D::FrontHleRenderEnable(Core::System& system, VideoCommon::GpuSplit
     fs.v2_render_enable_unknown = true;
     if (tracked) {
         fs.shadow[RenderEnableMode] = ShadowUnknown;
-        fs.v2_change_clock.Change(RenderEnableMode);
     }
     const VideoCommon::V2::Ir::ReadbackBody body{
         .op = VideoCommon::V2::Ir::ReadbackOp::MacroRenderEnable,
@@ -3446,7 +3438,6 @@ void Maxwell3D::FrontSyncRenderEnable(VideoCommon::GpuSplit& split, FrontState& 
         VideoCommon::V2::RegSem::Store3D(fs, *fs.v2_table, RenderEnableMode, value);
     } else {
         fs.regs[RenderEnableMode] = value;
-        fs.v2_change_clock.Change(RenderEnableMode);
         if (fs.v2 != nullptr) {
             FrontRegSemResync(fs); // REGSEM=verify: the mirror and groups follow
         }
@@ -3831,7 +3822,6 @@ void Maxwell3D::FrontVerify(VideoCommon::GpuSplit& split, FrontState& fs) {
             fs.regs[i] = expected[i];
         }
     }
-    fs.v2_change_clock.Invalidate(); // set outside the write path
     fs.v2_render_enable_unknown = false; // The back's value, just taken
     if (fs.s1_exec) {
         // S1: the shadow RAM lives on the front only (the back never sees the method words).

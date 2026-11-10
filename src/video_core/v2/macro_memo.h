@@ -14,7 +14,6 @@
 
 #include "common/common_types.h"
 #include "video_core/macro_turing.h"
-#include "video_core/v2/change_clock.h"
 
 // Pipeline v2 F5: NVN2 macro call statistics and memoisation on the split front (MASTER_PLAN
 // §5.1: "memoisation keyed by (macro, args, relevant register fingerprint)").
@@ -65,7 +64,6 @@ struct Trace {
 /// A stored call; the spans point into the memo and stay valid until the next Store.
 struct Record {
     u32 offset; ///< In the memo's arena
-    u32 info;   ///< RecordInfo bits
     std::span<const u32> guards;      ///< (address, value): each register read once, in range
     std::span<const u32> reads;       ///< (address, value, writes_before); calls with DMA only
     std::span<const u32> dram_reads;  ///< (index, value)
@@ -89,14 +87,10 @@ struct Statistics {
     u64 verified{};
     u64 verify_mismatches{};
     u64 clears{};
-    u64 fingerprint_hits{}; ///< Fix F3d: guards taken from the change clock, not compared
-    u64 noop_hits{};        ///< Fix F3d: hits that made only their executable writes
-    u64 skipped_writes{};   ///< Writes those hits left out (their registers held them)
-    u64 cost_bypasses{};    ///< Windows whose estimated cost exceeded the JIT's
+    u64 noop_hits{};      ///< Hits that left out at least one write (Fix F3e: per write)
+    u64 skipped_writes{}; ///< Writes hits left out (Write3D would have dropped them)
+    u64 cost_bypasses{};  ///< Windows whose estimated cost exceeded the JIT's
 };
-
-/// CallInfo::context when no no-op replay is possible.
-inline constexpr u32 NoContext = ~0U;
 
 /// The key's hash (also the exact-repeat statistic's).
 [[nodiscard]] u64 Hash(u32 start, std::span<const u32> parameters);
@@ -135,22 +129,14 @@ public:
     }
     /// An earlier call with this key whose reads still hold (`call.regs[address]`, or 0 past
     /// `num_regs`, as the engines' MME STATE reads; data RAM words). `key`: Hash(start,
-    /// parameters). Fix F3d: with a change clock, guards whose blocks didn't change since they
-    /// were last known to hold are not compared (MACROMEMO=verify compares them anyway).
+    /// parameters).
     [[nodiscard]] bool Find(u64 key, const CallInfo& call, Record& record);
-    /// `fresh`: a whole recording (no prefix made before it).
     void Store(u64 key, const CallInfo& call, std::span<const u32> parameters,
                const Trace& recorded, std::span<const std::pair<u32, u32>> dram_reads,
-               std::span<const std::pair<u32, u32>> dram_writes, bool fresh);
+               std::span<const std::pair<u32, u32>> dram_writes);
     /// After each call through the memo: decides Wanted from the estimated cost of its calls
-    /// against the JIT's. `skipped`: writes a no-op hit left out.
+    /// against the JIT's. `skipped`: writes the hit left out.
     void NoteOutcome(u32 start, Outcome outcome, u32 skipped = 0, bool interpreter = false);
-    /// Fix F3d: whether a hit of `record` may make only its executable writes (its other
-    /// writes are those its registers and shadow copies hold since it was last applied).
-    [[nodiscard]] bool NoopReplay(const Record& record, const CallInfo& call) const;
-    /// Fix F3d: `record`'s writes were just applied (replayed or run): its state writes hold now,
-    /// and so do its guards when its writes can't change them.
-    void NoteApplied(const Record& record, const CallInfo& call);
 
     /// Records in the table.
     [[nodiscard]] size_t Size() const;
@@ -170,30 +156,20 @@ public:
     /// JIT recordings of code that touches data RAM: its reads and writes (reused).
     std::vector<std::pair<u32, u32>> dram_read_scratch;
     std::vector<std::pair<u32, u32>> dram_write_scratch;
-    u32 last_skipped{}; ///< Writes the last call's no-op hit left out
+    u32 last_skipped{}; ///< Writes the last call's hit left out
 
-    /// Record header words (Fix F3d after the counts): block masks and ticks of the change clock
-    /// as two words each, then the RecordInfo bits and the context.
-    static constexpr size_t GuardMask = 9;
-    static constexpr size_t GuardTick = 11;
-    static constexpr size_t WriteMask = 13;
-    static constexpr size_t WriteTick = 15;
-    static constexpr size_t InfoWord = 17;
-    static constexpr size_t ContextWord = 18;
-    static constexpr size_t HeaderWords = 19;
-    /// RecordInfo bits.
-    static constexpr u32 Idempotent = 1; ///< Each state register written once-valued, no barrier,
-                                         ///< no side-effect register, no DMA
-    static constexpr u32 GuardsKeep = 2; ///< No write can change a register the call read
+    static constexpr size_t HeaderWords = 9;
 
-    // Cost estimate per call (ns, MSVC Castle Town, F3d breakdown) [est]: a hit's lookup, a JIT
-    // run (entry plus per static instruction), a write a no-op hit leaves out (the write
-    // callback and the table compare), a recording by the JIT or the interpreter.
-    static constexpr s64 HitNs = 30;
-    static constexpr s64 JitBaseNs = 25;
-    static constexpr s64 JitInstructionNs = 2;
-    static constexpr s64 SkippedWriteNs = 12;
-    static constexpr s64 JitRecordingNs = 90;
+    // Cost estimate per call (ns, MSVC Castle Town, eac4735 profile) [est]: a hit's lookup and
+    // replay bookkeeping, a JIT run with its emit callbacks (entry plus per static instruction),
+    // a write a hit leaves out (the write callback and FrontWriteS1's early return), a recording
+    // by the JIT (callbacks, trace, Store) or the interpreter. F3d's 30/25/2 took a hit as
+    // nearly free; the profile measured ~110 ns of memo work per call against ~95 per JIT run.
+    static constexpr s64 HitNs = 45;
+    static constexpr s64 JitBaseNs = 40;
+    static constexpr s64 JitInstructionNs = 3;
+    static constexpr s64 SkippedWriteNs = 10;
+    static constexpr s64 JitRecordingNs = 150;
     static constexpr s64 InterpreterRecordingNs = 400;
 
 private:
@@ -201,6 +177,7 @@ private:
     struct StartInfo {
         u32 start{~0U};
         u32 last{NoRecord}; ///< Offset of the last record found or stored
+        u64 last_key{};     ///< Its key (Fix F3e: no arena load for another key)
         u32 calls{};        ///< Calls through the memo in the current window
         u32 unstored{};     ///< Unmemoisable calls in a row
         u32 lifetime_hits{};
@@ -218,17 +195,10 @@ private:
     static constexpr size_t Window = 2048;   ///< Calls per hit-rate decision
     static constexpr u32 BypassCalls = 32768; ///< Calls left to the JIT after a poor window
     // Header: start, parameters, guards, reads, data RAM reads, data RAM writes, writes,
-    // DMA reads, DMA words; then the F3d words above.
+    // DMA reads, DMA words.
     static constexpr size_t MaxArenaWords = size_t{1} << 22;
 
     [[nodiscard]] bool Match(u32 offset, const CallInfo& call, Record& record);
-    [[nodiscard]] static u64 Get64(const u32* words) {
-        return u64{words[0]} | (u64{words[1]} << 32);
-    }
-    static void Set64(u32* words, u64 value) {
-        words[0] = static_cast<u32>(value);
-        words[1] = static_cast<u32>(value >> 32);
-    }
     [[nodiscard]] static size_t RecordWords(const u32* header);
     [[nodiscard]] StartInfo& Info(u32 start);
     void Clear();
@@ -260,26 +230,26 @@ struct CallInfo {
     u32 stale_register = ~0U;
     /// Hash(start, parameters) when the caller has it (0: Call computes it).
     u64 key = 0;
-    /// Fix F3d (null: the caller keeps none): when each block of `regs` and their shadow copies
-    /// last changed. A record's guards that held at a tick still hold while their blocks are
-    /// unchanged (the §5.1 register fingerprint, exact), and a hit whose state writes are still
-    /// the last ones applied to their registers makes only its executable writes.
-    const ChangeClock* clock = nullptr;
-    /// With `clock`: a write is executable when `flags[method] & exec_mask` (it acts even with
-    /// the value its register holds); a record writing a method with `flags & barrier_mask`
-    /// (the shadow RAM mode, which changes what later writes do) is never a no-op replay.
+    /// Fix F3e (replaces F3d's change clock): a replayed write that Write3D would drop is left
+    /// out before the write callback, decided per write from the registers as they are then:
+    /// with `skip_same`, a write is left out when `!(flags[method] & exec_mask)` (a state
+    /// write), `regs[method] == value` and, with `shadow` (shadow RAM tracking), `shadow[method]
+    /// == value`. `skip_same` is false whenever Write3D wouldn't drop it (no compare-on-write,
+    /// shadow RAM replay, writes observed).
+    bool skip_same = false;
     const u16* flags = nullptr;
     u16 exec_mask = 0;
+    /// An executable write with `flags & barrier_mask` (the shadow RAM mode) changes what the
+    /// later writes do: none after it is left out.
     u16 barrier_mask = 0;
-    /// What a state write needs besides its register to change nothing (the shadow RAM mode);
-    /// NoContext: no no-op replay now.
-    u32 context = NoContext;
-    /// No-op replays: asked before the first and after each executable write; false sends
-    /// the remaining writes through `write` (a deferred draw makes every write act).
+    const u32* shadow = nullptr;
+    /// Asked before the first write and after each executable one; false sends the remaining
+    /// writes through `write` (a deferred draw makes every write act).
     bool (*writes_skippable)(const void*) = nullptr;
     const void* skippable_arg = nullptr;
-    /// MACROMEMO=verify: the shadow copies a skipped write must also hold (null: none).
-    const u32* shadow = nullptr;
+    /// MACROMEMO=verify (null: not checked): the count `write` raises for each write it drops;
+    /// every write the replay would leave out must raise it.
+    const u64* dropped_writes = nullptr;
     /// `live(read, emit, dram_read, dram_write)` runs the JIT with data RAM hooks, so misses of
     /// code that touches data RAM are recorded by the JIT too.
     bool jit_data_ram = false;
@@ -289,10 +259,16 @@ namespace Detail {
 void LogVerifyMismatch(u32 start, std::span<const u32> record_writes,
                        const Pairs& captured_writes);
 void LogRecordFailure(u32 start, std::string_view error);
-/// MACROMEMO=verify, Fix F3d: the change clock passed a guard that no longer holds, or a no-op
-/// replay would have left out a write that changes its register.
-void LogFastPathMismatch(u32 start, const char* what, u32 address, u32 expected, u32 found);
+/// MACROMEMO=verify, Fix F3e: a write the replay would leave out was not dropped by `write`.
+void LogSkipMismatch(u32 start, u32 method, u32 value);
 } // namespace Detail
+
+/// Fix F3e: whether Write3D would drop this write now (CallInfo::skip_same).
+[[nodiscard]] inline bool SkippableWrite(const CallInfo& call, u32 method, u32 value) {
+    return (call.flags[method] & call.exec_mask) == 0 && call.regs[method] == value &&
+           (call.shadow == nullptr || call.shadow[method] == value) &&
+           method != call.dma_fifoed && method != call.dma_ram;
+}
 
 /// Runs a call recording it, with the first `prefix` writes already made (their reads served
 /// from `served`, their DMA words already in the FIFO, `prefix_words` each): the interpreter,
@@ -372,7 +348,7 @@ Result RecordCall(Memo& memo, Tegra::TuringMacroInterpreter& interpreter, const 
         result = live(read_fn, emit_fn);
         stored = result.success && trace.memoisable && *call.generation == generation;
         if (stored) {
-            memo.Store(key, call, parameters, trace, {}, {}, true);
+            memo.Store(key, call, parameters, trace, {}, {});
         }
     } else if (prefix == 0 && call.jit_data_ram) {
         // Fix F3d: code that may touch data RAM, recorded by the JIT through data RAM hooks
@@ -399,7 +375,7 @@ Result RecordCall(Memo& memo, Tegra::TuringMacroInterpreter& interpreter, const 
         result = live(read_fn, emit_fn, dram_read, dram_write);
         stored = result.success && trace.memoisable && !reread && *call.generation == generation;
         if (stored) {
-            memo.Store(key, call, parameters, trace, dram_reads, dram_writes, true);
+            memo.Store(key, call, parameters, trace, dram_reads, dram_writes);
         }
     } else {
         // The JIT reads never-written MME registers as 0; so does the recording.
@@ -411,7 +387,7 @@ Result RecordCall(Memo& memo, Tegra::TuringMacroInterpreter& interpreter, const 
                  *call.generation == generation;
         if (stored) {
             memo.Store(key, call, parameters, trace, interpreter.data_ram_reads,
-                       interpreter.data_ram_writes, prefix == 0);
+                       interpreter.data_ram_writes);
         }
     }
     if (!stored && result.success) {
@@ -453,31 +429,35 @@ Result Call(Memo& memo, Tegra::TuringMacroInterpreter& interpreter, const CallIn
         return RecordCall(memo, interpreter, call, key, num_parameters, 0, {}, {}, live, read,
                           write, dma);
     }
+    // Fix F3e: the writes a hit leaves out are decided as it goes (SkippableWrite).
+    bool skip = call.skip_same &&
+                (call.writes_skippable == nullptr || call.writes_skippable(call.skippable_arg));
+    u32 skipped = 0;
+    // After an executable write made under `skip`.
+    const auto keep_skipping = [&call](u32 method) {
+        return (call.flags[method] & call.barrier_mask) == 0 &&
+               (call.writes_skippable == nullptr || call.writes_skippable(call.skippable_arg));
+    };
     if (call.verify) {
-        if (memo.NoopReplay(record, call)) {
-            // The writes a no-op hit would leave out must change nothing.
-            for (size_t i = 0; i < record.writes.size(); i += 2) {
-                const u32 method = record.writes[i];
-                const u32 value = record.writes[i + 1];
-                if ((call.flags[method] & call.exec_mask) != 0) {
-                    continue;
-                }
-                const u32 held = call.regs[method];
-                const bool kept = call.shadow == nullptr || call.shadow[method] == value;
-                if (held != value || !kept) {
-                    ++memo.statistics.verify_mismatches;
-                    Detail::LogFastPathMismatch(call.start, "no-op replay", method, value,
-                                                held != value ? held : call.shadow[method]);
-                    break;
-                }
-            }
-        }
-        // The JIT makes the writes; the record must have predicted them.
+        // The JIT makes the writes; the record must have predicted them. Each write the replay
+        // would have left out must be one `write` drops.
         memo.captured.clear();
         memo.captured_words.clear();
         const auto capture = [&](u32 method, u32 value) {
+            const bool predicted = skip && SkippableWrite(call, method, value);
+            const u64 dropped = call.dropped_writes != nullptr ? *call.dropped_writes : 0;
             if (!write(method, value)) {
                 return false;
+            }
+            if (predicted) {
+                ++skipped;
+                if (call.dropped_writes != nullptr && *call.dropped_writes != dropped + 1)
+                    [[unlikely]] {
+                    ++memo.statistics.verify_mismatches;
+                    Detail::LogSkipMismatch(call.start, method, value);
+                }
+            } else if (skip && (call.flags[method] & call.exec_mask) != 0) {
+                skip = keep_skipping(method);
             }
             memo.captured.emplace_back(method, value);
             if (method == call.dma_fifoed || method == call.dma_ram) {
@@ -511,43 +491,15 @@ Result Call(Memo& memo, Tegra::TuringMacroInterpreter& interpreter, const CallIn
             ++memo.statistics.verify_mismatches;
             Detail::LogVerifyMismatch(call.start, record.writes, memo.captured);
         }
-        if (result.success && same_words) {
-            memo.NoteApplied(record, call);
-        }
-        memo.NoteOutcome(call.start, Outcome::Hit);
+        // What the replay would have left out (the stats line's no-op counts under verify).
+        memo.statistics.noop_hits += skipped != 0 ? 1 : 0;
+        memo.statistics.skipped_writes += skipped;
+        memo.NoteOutcome(call.start, Outcome::Hit, skipped);
         return result;
     }
-    if (memo.NoopReplay(record, call)) {
-        // Fix F3d: every state write of the record is what its register (and shadow copy) holds
-        // since the record was last applied: Write3D would drop each one. Only the executable
-        // writes act, until something (a deferred draw) makes every write count.
-        ++memo.statistics.noop_hits;
-        bool skip = call.writes_skippable == nullptr || call.writes_skippable(call.skippable_arg);
-        u32 skipped = 0;
-        for (size_t i = 0; i < record.writes.size(); i += 2) {
-            const u32 method = record.writes[i];
-            const u32 value = record.writes[i + 1];
-            if ((call.flags[method] & call.exec_mask) != 0) {
-                write(method, value);
-                skip = skip && (call.writes_skippable == nullptr ||
-                                call.writes_skippable(call.skippable_arg));
-            } else if (skip) {
-                ++skipped;
-            } else {
-                write(method, value);
-            }
-        }
-        for (size_t i = 0; i < record.dram_writes.size(); i += 2) {
-            call.dram[record.dram_writes[i]] = record.dram_writes[i + 1];
-        }
-        memo.last_skipped = skipped;
-        memo.statistics.skipped_writes += skipped;
-        ++memo.statistics.hits;
-        memo.NoteApplied(record, call);
-        memo.NoteOutcome(call.start, Outcome::Hit, skipped);
-        return Result{true, call.start, num_parameters, {}};
-    }
     // Replay. A DMA read is made where the call made it and must return the recorded words.
+    // Fix F3e: a state write its register (and shadow copy) already holds is left out here, as
+    // Write3D would drop it, without the write callback; FrontRunMacro counts it as dropped.
     memo.appended.clear();
     const size_t num_writes = record.writes.size() / 2;
     size_t next_dma = 0;
@@ -555,7 +507,18 @@ Result Call(Memo& memo, Tegra::TuringMacroInterpreter& interpreter, const CallIn
     for (size_t i = 0; i < num_writes; ++i) {
         const u32 method = record.writes[i * 2];
         const u32 value = record.writes[i * 2 + 1];
-        write(method, value);
+        if (skip) {
+            if (SkippableWrite(call, method, value)) {
+                ++skipped;
+                continue; // never a DMA write (SkippableWrite)
+            }
+            write(method, value);
+            if ((call.flags[method] & call.exec_mask) != 0) {
+                skip = keep_skipping(method);
+            }
+        } else {
+            write(method, value);
+        }
         if (next_dma * 2 >= record.dma.size() || record.dma[next_dma * 2] != i) {
             continue;
         }
@@ -571,8 +534,11 @@ Result Call(Memo& memo, Tegra::TuringMacroInterpreter& interpreter, const CallIn
             // The rest depends on the new words: the interpreter finishes the call (the record's
             // reads are copied first, Store may move them).
             ++memo.statistics.refetches;
+            // The prefix's left-out writes changed nothing: as made as the others.
             const std::vector<u32> served{record.reads.begin(), record.reads.end()};
             const std::vector<u32> prefix_words = memo.appended;
+            memo.last_skipped = skipped;
+            memo.statistics.skipped_writes += skipped;
             return RecordCall(memo, interpreter, call, key, num_parameters, i + 1, served,
                               prefix_words, live, read, write, dma);
         }
@@ -583,8 +549,10 @@ Result Call(Memo& memo, Tegra::TuringMacroInterpreter& interpreter, const CallIn
         call.dram[record.dram_writes[i]] = record.dram_writes[i + 1];
     }
     ++memo.statistics.hits;
-    memo.NoteApplied(record, call);
-    memo.NoteOutcome(call.start, Outcome::Hit);
+    memo.statistics.noop_hits += skipped != 0 ? 1 : 0;
+    memo.statistics.skipped_writes += skipped;
+    memo.last_skipped = skipped;
+    memo.NoteOutcome(call.start, Outcome::Hit, skipped);
     return Result{true, call.start, num_parameters, {}};
 }
 

@@ -133,7 +133,6 @@ add_library(video_core STATIC
     v2/epoch_publish.h
     v2/cbuf_ring.h
     v2/cbuf_version.h
-    v2/change_clock.h
     v2/continued_draw.h
     v2/desc_cache.h
     v2/draw_cache.cpp

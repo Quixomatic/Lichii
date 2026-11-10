@@ -108,14 +108,6 @@ inline void NoteCbufBind3D(State& s, u32 method) {
 #define REGSEM_FORCE_INLINE inline __attribute__((always_inline))
 #endif
 
-/// Fix F3d: a register or its shadow copy changed (states with a change clock: the front's).
-template <typename State>
-REGSEM_FORCE_INLINE void Changed3D(State& s, u32 index) {
-    if constexpr (requires { s.v2_change_clock; }) {
-        s.v2_change_clock.Change(index);
-    }
-}
-
 /// States with a `v2_hash_log` (the front's FrontState) defer the group hashes to the log's
 /// Fold (HashLog3D); the others (verify mirrors, tests) update them per write.
 template <typename State>
@@ -123,7 +115,6 @@ REGSEM_FORCE_INLINE void Store3D(State& s, const Table3D& table, u32 index, u32 
     const u32 old_value = s.regs[index];
     if (old_value != value) {
         s.regs[index] = value;
-        Changed3D(s, index);
         if constexpr (requires { s.v2_dirty_blocks; }) {
             s.v2_dirty_blocks |= u64{1} << (index >> 6); // P6 snapshots: blocks of 64
         }
@@ -143,9 +134,6 @@ REGSEM_FORCE_INLINE bool Write3D(State& s, const Table3D& table, u32 method, u32
                                  bool from_macro, Effects&& effects) {
     bool shadow_kept = true;
     const u32 value = ApplyShadow3D(s.control, s.shadow.data(), method, argument, &shadow_kept);
-    if (!shadow_kept) {
-        Changed3D(s, method);
-    }
     const u16 flags = table.flags[method];
     if ((flags & Exec) == 0) {
         // The back skips same-value state writes and its shadow RAM holds the value already.
@@ -177,7 +165,6 @@ REGSEM_FORCE_INLINE bool Write3D(State& s, const Table3D& table, u32 method, u32
     if ((flags & ShadowControl) != 0) {
         s.control = static_cast<ShadowRamControl>(argument);
         s.shadow[method] = argument;
-        Changed3D(s, method);
     } else if ((flags & MacroCodePointer) != 0) {
         effects(Effect::ClearCode, s.regs[table.instruction_ptr], 0);
     } else if ((flags & MacroCode) != 0) {
@@ -222,7 +209,6 @@ void WriteMulti3D(State& s, const Table3D& table, u32 method, const u32* words, 
             const u32 last = words[amount - 1];
             if (tracked) {
                 s.shadow[method] = last;
-                Changed3D(s, method);
             }
             Store3D(s, table, method, last);
         }
@@ -231,11 +217,7 @@ void WriteMulti3D(State& s, const Table3D& table, u32 method, const u32* words, 
         // Each word as a CallMethod; a word may change the shadow RAM mode for the next.
         for (u32 i = 0; i < amount; ++i) {
             const u32 argument = words[i];
-            bool kept = true;
-            const u32 value = ApplyShadow3D(s.control, s.shadow.data(), method, argument, &kept);
-            if (!kept) {
-                Changed3D(s, method);
-            }
+            const u32 value = ApplyShadow3D(s.control, s.shadow.data(), method, argument);
             Store3D(s, table, method, value);
             if ((flags & DrawBegin) != 0) {
                 const u32 instance = (value >> 26) & 3;
@@ -253,7 +235,6 @@ void WriteMulti3D(State& s, const Table3D& table, u32 method, const u32* words, 
             if ((flags & ShadowControl) != 0) {
                 s.control = static_cast<ShadowRamControl>(argument);
                 s.shadow[method] = argument;
-                Changed3D(s, method);
             } else if ((flags & MacroCodePointer) != 0) {
                 effects(Effect::ClearCode, value, 0);
             } else if ((flags & MacroCode) != 0) {

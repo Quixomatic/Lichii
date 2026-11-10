@@ -15,7 +15,6 @@
 #ifdef ARCHITECTURE_x86_64
 #include "video_core/macro_turing_jit.h"
 #endif
-#include "video_core/v2/change_clock.h"
 #include "video_core/v2/macro_hle.h"
 #include "video_core/v2/macro_memo.h"
 
@@ -71,12 +70,17 @@ struct Front {
     u32 stale = ~0U;         ///< CallInfo::stale_register
     u32 live_runs = 0;       ///< Calls of the JIT stand-in (bypassed, verify, JIT recordings)
     u32 hooked_runs = 0;     ///< JIT runs with data RAM hooks (F3d recordings)
-    // Fix F3d: the change clock the front keeps, the table's executable bit (1) and shadow
-    // RAM mode barrier (4), the context and the JIT's data RAM recordings.
-    VideoCommon::V2::ChangeClock clock;
-    bool with_clock = false;
+    // Fix F3e: Write3D's compare-on-write (skip_same), the table's executable bit (1) and
+    // shadow RAM mode barrier (4), shadow RAM tracking, a deferred draw, the count of dropped
+    // writes (`drop_counted` false: a write path that doesn't drop what it should). F3d: the
+    // JIT's data RAM recordings.
+    bool skip_same = false;
     std::array<u16, 0x1000> flags{};
-    u32 context = MacroMemo::NoContext;
+    bool track = false;
+    std::array<u32, 0x1000> shadow{};
+    bool deferred_draw = false;
+    u64 dropped = 0;
+    bool drop_counted = true;
     bool jit_data_ram = false;
     Tegra::TuringMacroInterpreter interpreter;
     MacroMemo::Memo memo;
@@ -90,17 +94,17 @@ struct Front {
             return false;
         }
         const u32 stored = status_d00 && method == 0xd00 ? 1 : value;
-        if (regs[method] != stored) {
-            regs[method] = stored;
-            clock.Change(method);
-        }
         writes.emplace_back(method, value);
+        const bool kept = !track || shadow[method] == value;
+        if (track) {
+            shadow[method] = value;
+        }
+        if (skip_same && (flags[method] & 1) == 0 && regs[method] == stored && kept) {
+            dropped += drop_counted ? 1 : 0; // as Write3D drops it
+            return true;
+        }
+        regs[method] = stored;
         return true;
-    }
-    /// A register set outside the write path, as the front's resync does.
-    void Set(u32 method, u32 value) {
-        regs[method] = value;
-        clock.Change(method);
     }
     void Dma(std::vector<u32>& fifo, u32 method, u32 value) {
         ++dma_reads;
@@ -146,11 +150,15 @@ struct Front {
             .dma_ram = 0x157,
             .verify = verify,
             .stale_register = stale,
-            .clock = with_clock ? &clock : nullptr,
+            .skip_same = skip_same,
             .flags = flags.data(),
             .exec_mask = 1,
             .barrier_mask = 4,
-            .context = context,
+            .shadow = track ? shadow.data() : nullptr,
+            .writes_skippable =
+                [](const void* front) { return !static_cast<const Front*>(front)->deferred_draw; },
+            .skippable_arg = this,
+            .dropped_writes = &dropped,
             .jit_data_ram = jit_data_ram,
         };
         const auto read = [&](u32 address) { return address < regs.size() ? regs[address] : 0U; };
@@ -350,111 +358,122 @@ TEST_CASE("V2 macro memo: verify compares the JIT with the record", "[video_core
     CHECK(front.memo.statistics.verify_mismatches == 0);
 }
 
-TEST_CASE("V2 change clock: blocks of 64 registers", "[video_core][v2_macro]") {
-    ChangeClock clock;
-    const u64 before = clock.Now();
-    clock.Change(0x48c);
-    const u64 after = clock.Now();
-    CHECK(!clock.Unchanged(ChangeClock::Block(0x48c), before));
-    CHECK(clock.Unchanged(ChangeClock::Block(0x48c), after));
-    CHECK(clock.Unchanged(ChangeClock::Block(0x674), before)); // another block
-    CHECK(ChangeClock::Block(0x480) == ChangeClock::Block(0x4bf));
-    CHECK(!clock.Unchanged(0, 0)); // never known to hold
-    clock.Invalidate();
-    CHECK(!clock.Unchanged(ChangeClock::Block(0x674), after));
-    CHECK(clock.Unchanged(ChangeClock::Block(0x674), clock.Now()));
-}
-
-TEST_CASE("V2 macro memo: guards checked by the change clock", "[video_core][v2_macro]") {
-    // Fix F3d: the guard walk is replaced by the blocks' change stamps.
+TEST_CASE("V2 macro memo: the slot record is tried only for its key", "[video_core][v2_macro]") {
+    // Fix F3e: a call with another key goes to the table without reading the last record.
     Front front{state_read_code};
-    front.with_clock = true;
-    front.Set(0x48c, 3);
-    const Pairs expected = front.Plain({5});
-    CHECK(front.Memoised({5}) == expected); // recorded: the guard holds from now
-    CHECK(front.Memoised({5}) == expected);
-    CHECK(front.memo.statistics.hits == 1);
-    CHECK(front.memo.statistics.fingerprint_hits == 1);
-    front.Set(0x48d, 7); // the guard's block, another register: compared, still holds
-    CHECK(front.Memoised({5}) == expected);
+    front.regs[0x48c] = 2;
+    const Pairs five = front.Plain({5});
+    const Pairs six = front.Plain({6});
+    CHECK(front.Memoised({5}) == five);
+    CHECK(front.Memoised({6}) == six);
+    CHECK(front.Memoised({5}) == five); // the table's record, not the slot's
+    CHECK(front.memo.statistics.slot_hits == 0);
+    CHECK(front.Memoised({5}) == five); // now the slot's
+    CHECK(front.memo.statistics.slot_hits == 1);
     CHECK(front.memo.statistics.hits == 2);
-    CHECK(front.memo.statistics.fingerprint_hits == 1);
-    CHECK(front.Memoised({5}) == expected); // compared at the last call
-    CHECK(front.memo.statistics.fingerprint_hits == 2);
-    front.stale = 0x48c; // a stale register is always compared (and fails)
-    CHECK(front.Memoised({5}) == expected);
-    CHECK(front.memo.statistics.guard_failures == 1);
-    front.stale = ~0U;
-    front.Set(0x48c, 2);
-    const Pairs fewer = front.Plain({5});
-    CHECK(front.Memoised({5}) == fewer);
-    CHECK(front.memo.statistics.guard_failures == 2);
-    SECTION("verify compares the guards the clock passed") {
-        CHECK(front.Memoised({5}) == fewer); // recorded under 2, holds
-        front.regs[0x48c] = 9;               // set without a stamp: a missed change
+    CHECK(front.memo.statistics.stores == 2);
+}
+
+// 3D f64c931408c5b052 (Castle Town's constant buffer select): writes 0x8e0..0x8e3.
+const std::string cb_select_code =
+    "00186383:18c0014d:f1907b00 20a00460:18c40240:318c0301 20202f03:98c408c0:018c4300";
+
+TEST_CASE("V2 macro memo: hits leave out the writes Write3D would drop",
+          "[video_core][v2_macro]") {
+    // Fix F3e (replaces F3d's change clock, which never engaged in game: 64-register blocks
+    // were stamped by the writes between calls): decided per write, from the registers.
+    Front front{state_read_code};
+    front.skip_same = true;
+    front.regs[0x48c] = 3;
+    const Pairs expected = front.Plain({5});
+    REQUIRE(expected.size() == 3);
+    // The writes Write3D would send from registers `regs`, in order.
+    const auto sent = [&](std::array<u32, 0x1000> regs) {
+        Pairs out;
+        for (const auto& [method, value] : expected) {
+            if (regs[method] != value) {
+                regs[method] = value;
+                out.emplace_back(method, value);
+            }
+        }
+        return out;
+    };
+    const auto [method, value] = expected[0];
+    front.regs[method] = ~value;
+    CHECK(front.Memoised({5}) == expected); // recorded: every write made
+    const Pairs held = sent(front.regs);
+    REQUIRE(held.size() < expected.size()); // the last value at least is held
+    const u64 dropped = front.dropped;
+    CHECK(front.Memoised({5}) == held); // hit
+    CHECK(front.memo.statistics.hits == 1);
+    CHECK(front.memo.statistics.noop_hits == 1);
+    CHECK(front.memo.last_skipped == expected.size() - held.size());
+    CHECK(front.memo.statistics.skipped_writes == front.memo.last_skipped);
+    CHECK(front.dropped == dropped); // left out before the write path
+    front.regs[method] = ~value; // changed by another write
+    const Pairs changed = sent(front.regs);
+    CHECK(!changed.empty());
+    CHECK(front.Memoised({5}) == changed);
+    CHECK(front.regs == [&] {
+        std::array<u32, 0x1000> after = front.regs;
+        for (const auto& [m, v] : expected) {
+            after[m] = v;
+        }
+        return after;
+    }());
+    SECTION("not without compare-on-write") {
+        front.skip_same = false;
+        CHECK(front.Memoised({5}) == expected);
+        CHECK(front.memo.last_skipped == 0);
+    }
+    SECTION("executable writes are always made") {
+        front.flags[method] = 1;
+        CHECK(front.Memoised({5}) == expected);
+        CHECK(front.memo.last_skipped == 0);
+    }
+    SECTION("a shadow copy that differs makes the write") {
+        front.track = true;
+        front.shadow[method] = expected.back().second; // as the last write left it
+        CHECK(front.Memoised({5}) == held);
+        front.shadow[method] = ~expected.back().second;
+        const Pairs made = front.Memoised({5});
+        CHECK(!made.empty());
+        CHECK(made.front() == expected[0]);
+        CHECK(front.shadow[method] == expected.back().second);
+    }
+    SECTION("a deferred draw makes every write") {
+        front.deferred_draw = true;
+        CHECK(front.Memoised({5}) == expected);
+        CHECK(front.memo.last_skipped == 0);
+    }
+    SECTION("verify: every write the replay would leave out must be dropped") {
+        const u64 skipped = front.memo.statistics.skipped_writes;
+        const u64 dropped_before = front.dropped;
+        CHECK(front.Memoised({5}, true) == expected); // the JIT makes every write
+        CHECK(front.memo.statistics.verify_mismatches == 0);
+        const u64 predicted = front.memo.statistics.skipped_writes - skipped;
+        CHECK(predicted == expected.size() - held.size());
+        CHECK(front.dropped - dropped_before == predicted);
+        CHECK(front.memo.last_skipped == 0); // made, so FrontRunMacro counts nothing
+        front.drop_counted = false;          // a write path that keeps them
         front.Memoised({5}, true);
-        CHECK(front.memo.statistics.verify_mismatches == 1);
+        CHECK(front.memo.statistics.verify_mismatches == predicted);
     }
 }
 
-TEST_CASE("V2 macro memo: no-op hits make only the executable writes",
+TEST_CASE("V2 macro memo: a shadow RAM mode write stops the left-out writes",
           "[video_core][v2_macro]") {
-    // Fix F3d: a hit whose state writes are still what their registers hold leaves them out.
-    Front front{data_ram_code};
-    front.with_clock = true;
-    front.context = 0; // Passthrough
-    front.dram[0x53b] = 7;
-    CHECK(front.Memoised({9}) == Pairs{{0x376, 9}}); // record A
-    CHECK(front.Memoised({9}).empty());              // record B (word 0x53b holds 9)
-    front.dram[0x53b] = 7;
-    CHECK(front.Memoised({9}).empty()); // A: 0x376 holds 9 since A ran
-    CHECK(front.memo.statistics.noop_hits == 1);
-    CHECK(front.memo.statistics.skipped_writes == 1);
-    CHECK(front.memo.last_skipped == 1);
-    CHECK(front.dram[0x53b] == 9); // its data RAM write still made
-    CHECK(front.regs[0x376] == 9);
-    front.dram[0x53b] = 7;
-    front.Set(0x376, 1); // another write changed the register
-    CHECK(front.Memoised({9}) == Pairs{{0x376, 9}});
-    CHECK(front.memo.statistics.noop_hits == 1);
-    CHECK(front.memo.statistics.hits == 2);
-    SECTION("only under the context it was applied in") {
-        front.dram[0x53b] = 7;
-        front.context = 1;
-        CHECK(front.Memoised({9}) == Pairs{{0x376, 9}});
-        CHECK(front.memo.statistics.noop_hits == 1);
-    }
-    SECTION("verify checks the writes it would leave out") {
-        front.dram[0x53b] = 7;
-        front.regs[0x376] = 5; // set without a stamp
-        CHECK(front.Memoised({9}, true) == Pairs{{0x376, 9}});
-        CHECK(front.memo.statistics.verify_mismatches == 1);
-    }
-    SECTION("executable writes are always made; a barrier write disables it") {
-        Front exec{data_ram_code};
-        exec.with_clock = true;
-        exec.context = 0;
-        exec.flags[0x376] = 1;
-        exec.dram[0x53b] = 7;
-        CHECK(exec.Memoised({9}) == Pairs{{0x376, 9}});
-        exec.dram[0x53b] = 7;
-        CHECK(exec.Memoised({9}) == Pairs{{0x376, 9}});
-        exec.dram[0x53b] = 7;
-        CHECK(exec.Memoised({9}) == Pairs{{0x376, 9}});
-        CHECK(exec.memo.statistics.noop_hits == 2); // nothing left out
-        CHECK(exec.memo.statistics.skipped_writes == 0);
-        Front barrier{data_ram_code};
-        barrier.with_clock = true;
-        barrier.context = 0;
-        barrier.flags[0x376] = 4;
-        barrier.dram[0x53b] = 7;
-        barrier.Memoised({9});
-        barrier.Memoised({9});
-        barrier.dram[0x53b] = 7;
-        CHECK(barrier.Memoised({9}) == Pairs{{0x376, 9}});
-        CHECK(barrier.memo.statistics.hits == 1);
-        CHECK(barrier.memo.statistics.noop_hits == 0);
-    }
+    Front front{cb_select_code};
+    front.skip_same = true;
+    const Pairs expected = front.Plain({0x194});
+    REQUIRE(expected.size() >= 2);
+    CHECK(front.Memoised({0x194}) == expected);
+    CHECK(front.Memoised({0x194}).empty());
+    front.flags[expected[0].first] = 1; // executable: made, the rest still left out
+    CHECK(front.Memoised({0x194}) == Pairs{expected[0]});
+    front.flags[expected[0].first] = 1 | 4; // and a barrier: every later write made
+    CHECK(front.Memoised({0x194}) == expected);
+    CHECK(front.memo.statistics.hits == 3);
 }
 
 #ifdef ARCHITECTURE_x86_64
