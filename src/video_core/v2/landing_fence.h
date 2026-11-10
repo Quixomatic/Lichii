@@ -28,8 +28,10 @@ inline std::atomic<u64> untracked{0};
 /// recording and fencing threads with relaxed stores, read only for that line).
 /// Scheduler::CurrentTick after the last submission (the open tick; also the tick an idle-back
 /// waiter asks for, 9c4a)
-inline std::atomic<u64> diag_open_tick{0};
+inline std::atomic<u64> diag_open_tick{1};
 inline std::atomic<u64> diag_lazy_tick{0};       ///< The newest lazy fence's tick
+/// The recording thread recorded a command since its last submission (the open tick holds work).
+inline std::atomic<bool> open_work{false};
 inline std::atomic<bool> diag_submit_wanted{false};
 inline std::atomic<u64> diag_fence_wait_tick{0}; ///< The tick the fencing thread blocks on (0: none)
 

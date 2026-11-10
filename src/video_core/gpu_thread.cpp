@@ -76,6 +76,8 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
         // SYNC: the event epoch of the last suspended-channel pass, and whether the next must run.
         u64 last_event_epoch = ~u64{0};
         bool resume_due = true;
+        bool cpu_waiter_due = false;
+        auto last_pass = std::chrono::steady_clock::now();
         namespace Profile = VideoCommon::Nx2Profile;
         auto& split = VideoCommon::GpuSplit::Get();
         while (!stop_token.stop_requested()) {
@@ -92,14 +94,22 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                 // parsed), or the last pass resumed a channel or polled a guest CPU waiter.
                 const bool view_pass = split.AcquireMode() != V2::Mode::Off;
                 const u64 event_epoch = ring_epoch + (view_pass ? split.Sem().Notes() : 0);
-                if (!view_pass || resume_due || event_epoch != last_event_epoch) {
+                // A guest CPU waiter alone (nothing rings for a CPU store) is read once per
+                // quarter millisecond, as the front's tick sleep reads it (spec §2.2 "the poll is
+                // a memory read on wake; the tick-bounded sleep is the epoch"), not every loop.
+                const auto now = std::chrono::steady_clock::now();
+                const bool cpu_epoch =
+                    cpu_waiter_due && now - last_pass >= std::chrono::microseconds{250};
+                if (!view_pass || resume_due || cpu_epoch || event_epoch != last_event_epoch) {
                     static_cast<void>(V2::FrontWake::TakeTickWaiter());
                     {
                         Profile::Scope scope{Profile::Zone::ResumePending};
                         resumed = scheduler.ResumePending(system.GPU());
                     }
                     last_event_epoch = event_epoch;
-                    resume_due = resumed || V2::FrontWake::TickWaiter();
+                    last_pass = now;
+                    resume_due = resumed;
+                    cpu_waiter_due = V2::FrontWake::TickWaiter();
                 }
                 if (resumed) {
                     last_progress = std::chrono::steady_clock::now();
@@ -128,7 +138,7 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                         // or a new command ends the tick at once (v2/front_wake.h). SYNC Step 5
                         // (spec §2.2): one tick only while a guest CPU waiter polls memory;
                         // otherwise every wake source rings, so sleep until one does.
-                        if (V2::FrontWake::TakeTickWaiter()) {
+                        if (cpu_waiter_due || V2::FrontWake::TakeTickWaiter()) {
                             V2::FrontWake::Sleep();
                             V2::Stats::NoteFrontSleep(static_cast<u8>(V2::FrontWake::SleepEnd::Tick));
                         } else {

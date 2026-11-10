@@ -1169,6 +1169,45 @@ TEST_CASE("SYNC 9c4a quiet deadlock: back idle, open tick with work but no lazy 
     REQUIRE_FALSE(requests.Urgent(open + 1));
 }
 
+TEST_CASE("SYNC 142874f storm: an unmet waiter on an idle back never asks for an empty tick; new "
+          "work is submitted exactly once",
+          "[video_core][v2_p5b]") {
+    using VideoCommon::V2::SubmitRequests;
+    using Action = SubmitRequests::IdleAction;
+    // Model of Puller::PollAcquireView's ask (open tick holds work, back consumed new entries
+    // since the last ask) and ServeSplitIdleHook (an empty tick is never submitted).
+    u64 open = 100;
+    bool open_work = false;
+    u64 consumed = 5000;
+    u64 asked_at_consumed = ~u64{0};
+    u32 submits = 0;
+    SubmitRequests requests;
+    const auto poll_and_serve = [&] {
+        if (open_work && consumed != asked_at_consumed) {
+            asked_at_consumed = consumed;
+            requests.Request(open, true);
+        }
+        const auto action = requests.AtIdleHook(false, true, false, 0, open, false);
+        if (action == Action::Urgent && open_work) {
+            ++submits;
+            ++open;           // every submit opens a new tick
+            open_work = false; // ... with nothing recorded in it
+        }
+    };
+    // The waiter stays unmet, the back idle, the open tick empty: nothing is submitted.
+    for (int poll = 0; poll < 1000; ++poll) {
+        poll_and_serve();
+    }
+    REQUIRE(submits == 0);
+    // The back runs new entries that record work: exactly one submission.
+    consumed += 64;
+    open_work = true;
+    for (int poll = 0; poll < 1000; ++poll) {
+        poll_and_serve();
+    }
+    REQUIRE(submits == 1);
+}
+
 TEST_CASE("SYNC step 9: the post-pass list runs in order after the pass, before the submit",
           "[video_core][v2_p5b]") {
     // Model of the recording stream: the scheduler runs the list at the pass end (EndRenderPass)

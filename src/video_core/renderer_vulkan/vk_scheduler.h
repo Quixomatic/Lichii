@@ -134,6 +134,9 @@ public:
         if (open_since_us == 0) {
             open_since_us = NowUs(); // SYNC §7.3: the open tick's age at its submit
         }
+        // A fence's tick must be submitted for it to signal: the open tick holds work.
+        open_tick_has_work = true;
+        VideoCommon::V2::LandingFence::open_work.store(true, std::memory_order_release);
     }
     /// Recording thread: the newest lazy fence's tick (0: none yet).
     [[nodiscard]] u64 LazyOutstandingTick() const noexcept {
@@ -422,6 +425,11 @@ public:
             // recording call site (STATS full barriers by site).
             FlushAllPendingWrites(location);
         }
+        if (lazy_fences && !open_tick_has_work) [[unlikely]] {
+            // SYNC (142874f storm): a waiter may ask for the open tick only when it holds work.
+            open_tick_has_work = true;
+            VideoCommon::V2::LandingFence::open_work.store(true, std::memory_order_release);
+        }
         if (chunk->Record(command)) {
             return;
         }
@@ -672,6 +680,7 @@ private:
         after_pass.Run();
     }
     u64 open_since_us{}; ///< SYNC §7.3: when the open tick first held a lazy fence (0: none)
+    bool open_tick_has_work{}; ///< SYNC: a command was recorded since the last submission
     /// SYNC §7.3 counters and the 2 s line's state, at a lazy-fence-mode submission.
     void NoteOpenTickSubmitted() {
         if (open_since_us != 0) {
@@ -680,6 +689,8 @@ private:
             open_since_us = 0;
         }
         VideoCommon::V2::LandingFence::diag_submit_wanted.store(false, std::memory_order_relaxed);
+        open_tick_has_work = false;
+        VideoCommon::V2::LandingFence::open_work.store(false, std::memory_order_release);
     }
     void (*pre_submit_hook)(void*){};   ///< SYNC Step 8: SetPreSubmitHook
     void* pre_submit_argument{};

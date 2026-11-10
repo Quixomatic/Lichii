@@ -594,14 +594,18 @@ bool Puller::PollAcquireView(DmaPusher& dma_pusher) {
         // fence, no lazy fence or list end in it, every waiter row 3): rule I has nothing to
         // weigh and nobody else asks. MP §6 "an interrupt forces a submit if the sync is not yet
         // submitted", SESSION_HANDOFF §5 "every wait causes its submit": an unmet waiter with
-        // the back idle (it ran everything sent) files rule W for the open tick, once per tick
-        // across all waiters. Not a timer: the back idles at most once per tick here.
-        if (!gpu_written && split.ConsumedNow() == split.WritePosition()) {
-            static u64 asked_open_tick = 0; // Front thread only
+        // the back idle (it ran everything sent) files rule W for the open tick. 142874f storm:
+        // only when the open tick holds recorded work (an empty tick is never asked for) and the
+        // back consumed new entries since the last ask (once per back position across all
+        // waiters, not per tick: every submit opens a new tick).
+        const u64 consumed_now = split.ConsumedNow();
+        if (!gpu_written && consumed_now == split.WritePosition() &&
+            V2::LandingFence::open_work.load(std::memory_order_acquire)) {
+            static u64 asked_at_consumed = ~u64{0}; // Front thread only
             const u64 open_tick =
                 V2::LandingFence::diag_open_tick.load(std::memory_order_relaxed);
-            if (open_tick != 0 && open_tick != asked_open_tick) {
-                asked_open_tick = open_tick;
+            if (open_tick != 0 && consumed_now != asked_at_consumed) {
+                asked_at_consumed = consumed_now;
                 V2::LandingFence::Request(open_tick);
                 split.RequestIdleHook();
                 V2::P5bStats::Add(V2::P5bStats::Counter::RequestsAcquire);
