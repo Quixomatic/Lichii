@@ -215,6 +215,34 @@ TEST_CASE("V2 DRAWREC: a proxy matches a resource created in the draw", "[video_
     REQUIRE(reasons == "vertex");
 }
 
+TEST_CASE("V2 DRAWREC: a buffer the draw's join deleted is dependent", "[video_core][v2_drawrec]") {
+    // F2f: the resolve found buffer 900; the configure created 901 and deleted 900 (a join).
+    // The apply looks every binding up again after a deletion, so this is not a mismatch.
+    namespace Versions = V2::Versions;
+    constexpr u32 found = 900;
+    const u32 generation = Versions::Gens().Get(Versions::Kind::Buffer, found);
+    const auto with_vertex = [](u32 id, u32 gen) {
+        R::ResolvedDraw record = SampleRecord();
+        record.h.vertex = record.Push(std::span<const R::ResolvedVertex>(std::array{
+            R::ResolvedVertex{.slot = 0, .buffer = {id, gen}, .daddr = 0x20000, .size = 0x400,
+                              .stride = 16}}));
+        return record;
+    };
+    const R::ResolvedDraw resolved = with_vertex(found, generation);
+    const R::ResolvedDraw observed = with_vertex(901, 0);
+    constexpr u32 buffers_created = 1U << static_cast<u32>(R::RecordGroup::Vertex);
+    std::string reasons;
+    u32 dependent = 0;
+    // Still live: a real difference.
+    REQUIRE_FALSE(R::CompareRecords(resolved, observed, buffers_created, reasons, nullptr,
+                                    nullptr));
+    Versions::Gens().Bump(Versions::Kind::Buffer, found);
+    REQUIRE(R::CompareRecords(resolved, observed, buffers_created, reasons, nullptr, &dependent));
+    REQUIRE(dependent == 1);
+    // Nothing created in the draw: still a mismatch.
+    REQUIRE_FALSE(R::CompareRecords(resolved, observed, 0, reasons, nullptr, nullptr));
+}
+
 TEST_CASE("V2 DRAWREC: a table update to a known view compares as that view",
           "[video_core][v2_drawrec]") {
     // F2e (c236: views differ on 13% of draws): a ViewBind proxy (the TIC entry changed, its
