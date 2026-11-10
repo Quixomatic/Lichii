@@ -259,6 +259,7 @@ public:
             FlushCbWrite();
             if (producer == V2::Producer::QmdRelease) {
                 last_qmd_release = write_position;
+                qmd_release_notes.NoteRange(device_address, size, write_position, producer);
             }
             if (range_write_listener != nullptr) [[unlikely]] {
                 range_write_listener(range_write_context, device_address, size);
@@ -270,6 +271,7 @@ public:
     void NoteUnboundedWrite(V2::Producer producer) {
         if (producer == V2::Producer::QmdRelease) {
             last_qmd_release = write_position;
+            qmd_release_notes.NoteUnbounded(producer, write_position);
         }
         hazards.NoteUnbounded(producer, write_position);
     }
@@ -302,10 +304,14 @@ public:
         hazards.Retire(done);
         constexpr u32 landing_producers =
             V2::ProducerBit(V2::Producer::Release) | V2::ProducerBit(V2::Producer::Report);
-        if ((filter.ranged & landing_producers) == 0 || unlanded.Size() == 0) {
-            return hazards.Find(device_address, size, done, filter, out);
+        const V2::HazardResult result =
+            (filter.ranged & landing_producers) == 0 || unlanded.Size() == 0
+                ? hazards.Find(device_address, size, done, filter, out)
+                : FindWithLanding(device_address, size, done, filter, out);
+        if (result.kind == V2::HazardResult::Kind::Wait) {
+            return result;
         }
-        return FindWithLanding(device_address, size, done, filter, out);
+        return FindUntracked(device_address, size, done, filter, result);
     }
     [[nodiscard]] u64 PendingUnboundedWrite(V2::Producer producer) const {
         return hazards.PendingUnbounded(producer, ConsumedNow());
@@ -464,19 +470,33 @@ public:
     /// signals their fence), 0 when memory holds everything; the front then waits for that
     /// ticket, asking for the deferred submit (no drain). False when it did not land within
     /// `LandingBound` or the back stopped: the caller takes its residual drain.
-    bool CompleteLanding(u64 ticket, DrainSite site, u64 (*complete)(void*), void* argument);
+    /// Fix F3f (F3-X6): `untracked_position` (a HazardResult::untracked Wait's position, 0:
+    /// none) and the device range read: the QMD release operations the back queued by then that
+    /// write the range (untracked, no ticket: a four-word release's timestamp, a delayed
+    /// reduction) are waited for the same way, even when `ticket` already landed; on success
+    /// `*settled` (if given) is the ring position up to which the range has no such operation
+    /// to land (FindQueuedWrites' `untracked_floor`).
+    bool CompleteLanding(u64 ticket, DrainSite site, u64 (*complete)(void*), void* argument,
+                         u64 untracked_position = 0, u64 untracked_address = 0,
+                         u64 untracked_size = 0, u64* settled = nullptr);
     /// Liveness bound of a landing wait that made its fence (a fence completes in GPU time; a
     /// longer wait means something else is stuck, and the old path's drain decides).
     static constexpr u64 LandingBoundUs = 2'000'000;
     /// Front: FindWrites over the queued writes only (after CompleteLanding wrote the landing
     /// writes of a range to memory).
+    /// `untracked_floor`: QMD release notes up to there are settled for this range (what
+    /// CompleteLanding's `settled` returned).
     [[nodiscard]] V2::HazardResult FindQueuedWrites(u64 device_address, u64 size,
                                                     const V2::HazardFilter& filter,
-                                                    u8* out = nullptr) {
+                                                    u8* out = nullptr, u64 untracked_floor = 0) {
         FlushCbWrite();
         const u64 done = ConsumedNow();
         hazards.Retire(done);
-        return hazards.Find(device_address, size, done, filter, out);
+        const V2::HazardResult result = hazards.Find(device_address, size, done, filter, out);
+        if (result.kind == V2::HazardResult::Kind::Wait) {
+            return result;
+        }
+        return FindUntracked(device_address, size, done, filter, result, untracked_floor);
     }
     /// Any thread, EDEN_NX2_V2_CPULANE: has the back run `hook` after its current entry (or at
     /// once if it waits for work).
@@ -821,6 +841,13 @@ private:
     void FlushCbWriteSlow();
     V2::HazardResult FindWithLanding(u64 device_address, u64 size, u64 done,
                                      const V2::HazardFilter& filter, u8* out);
+    /// FindWrites' last step: a QMD release `filter` orders against whose entry the back ran
+    /// but whose operation may not have (Fix F3f, F3-X6) answers Wait (untracked), else `found`.
+    V2::HazardResult FindUntracked(u64 device_address, u64 size, u64 done,
+                                   const V2::HazardFilter& filter, const V2::HazardResult& found,
+                                   u64 floor = 0);
+    /// Waits until untracked `ticket` landed, asking for the deferred submit (no drain).
+    bool WaitUntrackedLanded(u64 ticket, DrainSite site, u64 timeout_us);
     void RememberRelease(u64 device_address, const void* bytes, u32 size, u64 position,
                          bool landing, ReleaseKind kind, u8 op = 0) {
         RecentRelease& entry = recent_releases[recent_release_head++ % recent_releases.size()];
@@ -1061,6 +1088,9 @@ private:
     u64 ticket_sub{};
     u64 last_ticket{};
     u64 last_qmd_release{}; ///< Front: write position of the last QmdRelease note
+    /// Front (Fix F3f): QmdRelease notes by ring position, live until their entry's untracked
+    /// operations ran (V2::Landing::UntrackedSettled), not only until the back consumed them.
+    V2::HazardTable qmd_release_notes;
     std::array<RecentRelease, 256> recent_releases{};
     size_t recent_release_head = 0;
     u64 back_entry_position{}; ///< Back: ring position of the entry it runs (TracksWrites)
@@ -1081,6 +1111,10 @@ private:
         u64 (*complete)(void*);
         void* argument;
         u64 target; ///< What `complete` returned
+        u64 untracked_address; ///< The range whose untracked operations it looks for
+        u64 untracked_size;
+        u64 untracked_target; ///< The newest of them still to land then, or 0
+        u64 position; ///< The back's ring position when it ran (the entries it had run)
         std::atomic<bool> done;
     };
     LandingJob landing_job{}; ///< CompleteLanding (front, one at a time)

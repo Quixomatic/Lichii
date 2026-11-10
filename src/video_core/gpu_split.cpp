@@ -204,6 +204,8 @@ void GpuSplit::MaybeStart(Core::System& system_) {
     last_ticket = 0;
     V2::Landing::landed.store(0, std::memory_order_relaxed);
     V2::Landing::issued.store(0, std::memory_order_relaxed);
+    qmd_release_notes.Clear();
+    V2::Landing::ResetUntracked();
     V2::Landing::verify = acquire_mode == V2::Mode::Verify || hazard_mode == V2::Mode::Verify;
     // AnyPS5's hand-off spin (HandoffSpin.hpp): spin before a kernel wait only with more than 8
     // logical CPUs, where the waiting thread does not take the other one's core.
@@ -296,6 +298,8 @@ void GpuSplit::Stop() {
     }
     V2::Landing::landed.store(0, std::memory_order_relaxed);
     V2::Landing::issued.store(0, std::memory_order_relaxed);
+    qmd_release_notes.Clear();
+    V2::Landing::ResetUntracked();
     SetCpuLaneHook(nullptr, nullptr);
     cpu_lane_requested.store(false, std::memory_order_relaxed);
     back_idle_at.store(~u64{0}, std::memory_order_relaxed);
@@ -441,6 +445,67 @@ V2::HazardResult GpuSplit::FindWithLanding(u64 device_address, u64 size, u64 don
     return merged;
 }
 
+V2::HazardResult GpuSplit::FindUntracked(u64 device_address, u64 size, u64 done,
+                                          const V2::HazardFilter& filter,
+                                          const V2::HazardResult& found, u64 floor) {
+    constexpr u32 qmd = V2::ProducerBit(V2::Producer::QmdRelease);
+    V2::HazardFilter untracked_filter;
+    untracked_filter.ranged = filter.ranged & qmd;
+    untracked_filter.unbounded = (filter.unbounded | filter.unbounded_synced) & qmd;
+    if ((untracked_filter.ranged | untracked_filter.unbounded) == 0) {
+        return found;
+    }
+    // A QMD release lands at its dispatch's fence (a four-word one writes its timestamp only
+    // there, Landing::Untracked): once the back ran the entry, `hazards` no longer holds it,
+    // but memory doesn't either until the operation ran.
+    const u64 settled = V2::Landing::UntrackedSettled(done);
+    qmd_release_notes.Retire(settled);
+    V2::HazardResult result = qmd_release_notes.Find(device_address, size,
+                                                     std::max(settled, floor), untracked_filter);
+    if (result.kind == V2::HazardResult::Kind::Clear) {
+        return found;
+    }
+    result.kind = V2::HazardResult::Kind::Wait;
+    result.untracked = true;
+    result.producers |= found.producers;
+    return result;
+}
+
+bool GpuSplit::WaitUntrackedLanded(u64 ticket, DrainSite site, u64 timeout_us) {
+    const auto landed = [ticket] {
+        return V2::Landing::untracked_landed.load(std::memory_order_acquire) >= ticket;
+    };
+    if (landed()) {
+        return true;
+    }
+    Nx2Profile::Scope scope{Nx2Profile::Zone::WriterWait};
+    const bool v2_stats = V2::Stats::Enabled();
+    const u64 start = Nx2Profile::Enabled() || v2_stats ? Nx2Profile::Ticks() : 0;
+    const auto begin = std::chrono::steady_clock::now();
+    auto next_request = begin;
+    for (u32 spins = 0; !landed(); ++spins) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now - begin >= std::chrono::microseconds{timeout_us} || !BackRunning()) {
+            return landed();
+        }
+        if (now >= next_request) {
+            // Its fence may sit in a deferred submission (F4-02): ask for it, never drain.
+            RequestIdleHook();
+            next_request = now + std::chrono::milliseconds{1};
+        }
+        if (spins < 64) {
+            Pause();
+        } else {
+            std::this_thread::yield();
+        }
+    }
+    Nx2Profile::AddDrain(site, start);
+    if (v2_stats) [[unlikely]] {
+        V2::Stats::NoteDrain(site, start);
+    }
+    return true;
+}
+
 bool GpuSplit::WaitLanded(u64 ticket, DrainSite site, u64 timeout_us) {
     if (V2::Landing::landed.load(std::memory_order_acquire) >= ticket) {
         return true;
@@ -477,16 +542,33 @@ bool GpuSplit::WaitLanded(u64 ticket, DrainSite site, u64 timeout_us) {
 }
 
 bool GpuSplit::CompleteLanding(u64 ticket, DrainSite site, u64 (*complete)(void*),
-                               void* argument) {
-    if (V2::Landing::landed.load(std::memory_order_acquire) >= ticket) {
+                               void* argument, u64 untracked_position, u64 untracked_address,
+                               u64 untracked_size, u64* settled) {
+    const auto untracked_settled = [&] {
+        const u64 position = V2::Landing::UntrackedSettled(ConsumedNow());
+        if (position < untracked_position) {
+            return false;
+        }
+        if (settled != nullptr) {
+            *settled = position;
+        }
+        return true;
+    };
+    const auto landed = [&] {
+        return V2::Landing::landed.load(std::memory_order_acquire) >= ticket &&
+               (untracked_position == 0 || untracked_settled());
+    };
+    if (landed()) {
         return true;
     }
     // The back must have run the write before anything can complete it.
-    WaitForPosition(V2::Landing::RingPosition(ticket), site);
-    if (V2::Landing::landed.load(std::memory_order_acquire) >= ticket) {
+    WaitForPosition(std::max(V2::Landing::RingPosition(ticket), untracked_position), site);
+    if (landed()) {
         return true;
     }
     u64 target = 0;
+    u64 untracked_target = 0;
+    u64 job_position = 0;
     {
         Nx2Profile::Scope scope{Nx2Profile::Zone::WriterWait};
         const bool v2_stats = V2::Stats::Enabled();
@@ -494,11 +576,22 @@ bool GpuSplit::CompleteLanding(u64 ticket, DrainSite site, u64 (*complete)(void*
         landing_job.complete = complete;
         landing_job.argument = argument;
         landing_job.target = 0;
+        landing_job.untracked_address = untracked_address;
+        landing_job.untracked_size = untracked_position != 0 ? untracked_size : 0;
+        landing_job.untracked_target = 0;
+        landing_job.position = 0;
         landing_job.done.store(false, std::memory_order_relaxed);
         RequestBackJob(
             [](void* job_argument) {
                 auto& job = *static_cast<LandingJob*>(job_argument);
                 job.target = job.complete(job.argument);
+                // Captured on this thread before now: every untracked operation of the entries
+                // it ran (Landing::tag: the end of the last one) that writes the range.
+                if (job.untracked_size != 0) {
+                    job.untracked_target = V2::Landing::UntrackedTargetFor(job.untracked_address,
+                                                                           job.untracked_size);
+                }
+                job.position = V2::Landing::tag;
                 job.done.store(true, std::memory_order_release);
             },
             &landing_job);
@@ -511,6 +604,8 @@ bool GpuSplit::CompleteLanding(u64 ticket, DrainSite site, u64 (*complete)(void*
             return false; // The back stopped
         }
         target = landing_job.target;
+        untracked_target = landing_job.untracked_target;
+        job_position = landing_job.position;
         Nx2Profile::AddDrain(site, start);
         if (v2_stats) [[unlikely]] {
             V2::Stats::NoteDrain(site, start);
@@ -520,7 +615,19 @@ bool GpuSplit::CompleteLanding(u64 ticket, DrainSite site, u64 (*complete)(void*
     // a final value leaves it out): the job signalled their fence; its operations run in order,
     // so once the back's newest ticket landed every one the back made before the job did.
     // WaitLanded asks for the deferred submit while it waits (SESSION_HANDOFF §5g).
-    return target == 0 || WaitLanded(target, site, LandingBoundUs);
+    if (target != 0 && !WaitLanded(target, site, LandingBoundUs)) {
+        return false;
+    }
+    // F3-X6: the QMD release operations queued by then that write the range, the same way
+    // (untracked tickets land in capture order too). After them the range has nothing of the
+    // entries the back ran before the job still to land.
+    if (untracked_target != 0 && !WaitUntrackedLanded(untracked_target, site, LandingBoundUs)) {
+        return false;
+    }
+    if (settled != nullptr && untracked_position != 0) {
+        *settled = std::max(job_position, untracked_position);
+    }
+    return true;
 }
 
 void GpuSplit::Drain(DrainSite site) {

@@ -3722,14 +3722,18 @@ bool Maxwell3D::FrontDmaReadHazard(VideoCommon::GpuSplit& split, GPUVAddr source
     // host-level wait. Draws after it are not visible to the 3D engine's reads before a wait.
     V2::HazardFilter filter;
     filter.ranged = V2::AllProducers;
+    // QMD releases the front can't place (unknown QMDs) may write any word too; they land at
+    // their dispatch's fence (Fix F3f, F3-X6).
     filter.unbounded = V2::ProducerBit(V2::Producer::Dispatch) |
                        V2::ProducerBit(V2::Producer::Copy) |
-                       V2::ProducerBit(V2::Producer::Upload);
+                       V2::ProducerBit(V2::Producer::Upload) |
+                       V2::ProducerBit(V2::Producer::QmdRelease);
     // Draws: their shader stores, those sent before the last host-level wait.
     filter.unbounded_synced = V2::ProducerBit(V2::Producer::Draw);
     bool narrowed = false;
     bool read_back = false;
     bool reports_flushed = false;
+    u64 untracked_settled = 0;
     for (int attempt = 0; attempt < 4; ++attempt) {
         for (size_t i = 0; i < out.size(); ++i) {
             out[i] = memory_manager.Read<u32>(source + i * sizeof(u32));
@@ -3737,16 +3741,21 @@ bool Maxwell3D::FrontDmaReadHazard(VideoCommon::GpuSplit& split, GPUVAddr source
         // Releases still to land are applied, then the queued writes (GpuSplit::FindWrites).
         // Once the range's reports were written out, memory holds what they leave.
         const V2::HazardResult result =
-            reports_flushed ? split.FindQueuedWrites(*device, out.size() * sizeof(u32), filter,
-                                                     reinterpret_cast<u8*>(out.data()))
-                            : split.FindWrites(*device, out.size() * sizeof(u32), filter,
-                                               reinterpret_cast<u8*>(out.data()));
-        if (result.kind == V2::HazardResult::Kind::Wait && result.landing) {
+            reports_flushed
+                ? split.FindQueuedWrites(*device, out.size() * sizeof(u32), filter,
+                                         reinterpret_cast<u8*>(out.data()), untracked_settled)
+                : split.FindWrites(*device, out.size() * sizeof(u32), filter,
+                                   reinterpret_cast<u8*>(out.data()));
+        if (result.kind == V2::HazardResult::Kind::Wait && (result.landing || result.untracked)) {
             // A counter or timestamp only its operation writes, and that operation waits for a
             // fence an idle back never makes (SESSION_HANDOFF §5g): as the old path's deferred
             // QueryFlush (Perf fix A item 9), the back writes the range's reports out itself,
-            // after the entry it runs, submitting and waiting as it needs to.
-            if (!FrontFlushReports(split, source, bytes, result.position)) {
+            // after the entry it runs, submitting and waiting as it needs to. F3-X6: a QMD
+            // release (no landing ticket; a four-word one's timestamp is written only by its
+            // operation, after the early write of its value) waits for its entry's operations.
+            if (!FrontFlushReports(split, source, bytes, result.landing ? result.position : 0,
+                                   result.untracked ? result.position : 0, *device,
+                                   &untracked_settled)) {
                 return fall_back(Reason::Unlanded);
             }
             reports_flushed = true;
@@ -3781,7 +3790,8 @@ bool Maxwell3D::FrontDmaReadHazard(VideoCommon::GpuSplit& split, GPUVAddr source
 }
 
 bool Maxwell3D::FrontFlushReports(VideoCommon::GpuSplit& split, GPUVAddr source, size_t bytes,
-                                  u64 ticket) {
+                                  u64 ticket, u64 untracked_position, DAddr device,
+                                  u64* settled) {
     struct Job {
         Tegra::MemoryManager* memory{};
         VideoCore::RasterizerInterface* rasterizer{};
@@ -3800,7 +3810,7 @@ bool Maxwell3D::FrontFlushReports(VideoCommon::GpuSplit& split, GPUVAddr source,
             // (words 2-3) to its operation; the read must see it as the drained path does.
             return VideoCommon::V2::IrExec::LandCaptured(*self.rasterizer);
         },
-        &job);
+        &job, untracked_position, device, bytes, settled);
 }
 
 void Maxwell3D::FrontReadBack(VideoCommon::GpuSplit& split, DAddr device, size_t bytes) {

@@ -76,6 +76,10 @@ struct HazardResult {
     /// landed; waiting for the back to consume doesn't settle it. Forward: the newest store
     /// applied is a release still to land.
     bool landing = false;
+    /// GpuSplit::FindWrites, Wait: a QMD release (Producer::QmdRelease, no landing ticket) the
+    /// back consumed may still be to land at its operation; `position` is the ring position of
+    /// its entry. Waiting for the back to consume doesn't settle it (GpuSplit::CompleteLanding).
+    bool untracked = false;
 };
 
 /// Landing tickets (v2/landing.h): ring position << LandingSubBits | index within the entry.

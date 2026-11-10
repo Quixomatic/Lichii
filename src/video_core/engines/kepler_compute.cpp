@@ -406,8 +406,17 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
                 // Fix F3e (F3-X1, eac4735's 23 resume lines without a noted release, the word
                 // stepping by 0x13): reduction and max releases land at their fence too, so they
                 // report it like the Untracked queries (UntrackedReleasePending holds meanwhile).
-                const bool at_fence = (flags & ((1U << 26) | (1U << 19))) != 0 && !four_words;
-                const u64 untracked = at_fence ? VideoCommon::V2::Landing::CaptureUntracked() : 0;
+                // Fix F3f: only when their fence delays them; otherwise SignalFence runs them at
+                // once, before `consumed` moves, and a ticket landing at once would pass the
+                // delayed queries' tickets still to land (they must land in capture order).
+                const bool at_fence = (flags & ((1U << 26) | (1U << 19))) != 0 && !four_words &&
+                                      VideoCommon::V2::FencesDelayed();
+                const auto untracked_device =
+                    at_fence ? memory_manager.GpuToCpuAddress(address) : std::nullopt;
+                const u64 untracked =
+                    untracked_device ? VideoCommon::V2::Landing::CaptureUntracked(
+                                           *untracked_device, sizeof(u32))
+                                     : 0;
                 if (flags & (1U << 26)) {
                     rasterizer->SignalFence([this, address, payload, flags, untracked] {
                         const u32 value = ReduceSemaphore((flags >> 20) & 7, (flags >> 24) & 1,

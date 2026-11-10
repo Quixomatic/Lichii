@@ -566,23 +566,71 @@ TEST_CASE("V2 acquire: a suspended acquire whose release the view never records 
         const u64 landed = Landing::untracked_landed.load();
         Landing::untracked_issued.store(0);
         Landing::untracked_landed.store(0);
-        CHECK(Landing::CaptureUntracked() == 0); // outside an Untracked scope
+        Landing::untracked_captured_tag = 0;
+        CHECK(Landing::CaptureUntracked(0x1000, 4) == 0); // outside an Untracked scope
         Landing::tag = 700;
         u64 position = 0;
         {
             const Landing::Untracked untracked;
             CHECK(Landing::Capture() == 0); // no ticket: the front never numbered it
-            position = Landing::CaptureUntracked();
+            position = Landing::CaptureUntracked(0x1000, 4);
         }
         CHECK(Landing::tag == 700);
         CHECK(Landing::untracked_tag == 0);
-        CHECK(position == 700);
+        CHECK(position == Landing::UntrackedTicket(700, 0));
         CHECK(Landing::untracked_issued.load() > Landing::untracked_landed.load()); // pending
         Landing::NoteUntracked(position);
         CHECK(Landing::untracked_issued.load() == Landing::untracked_landed.load());
         Landing::tag = saved_tag;
         Landing::untracked_issued.store(issued);
         Landing::untracked_landed.store(landed);
+    }
+    SECTION("F3-X6: untracked tickets tell one entry's operations apart and settle in order") {
+        const u64 saved_tag = Landing::tag;
+        Landing::ResetUntracked();
+        Landing::untracked_captured_tag = 0;
+        u64 a = 0;
+        u64 b = 0;
+        u64 c = 0;
+        {
+            Landing::tag = 300;
+            const Landing::Untracked untracked;
+            a = Landing::CaptureUntracked(0x1000, 16);
+            b = Landing::CaptureUntracked(0x2000, 4);
+        }
+        {
+            Landing::tag = 310;
+            const Landing::Untracked untracked;
+            c = Landing::CaptureUntracked(0x3000, 4);
+        }
+        CHECK(a == Landing::UntrackedTicket(300, 0));
+        CHECK(b == Landing::UntrackedTicket(300, 1));
+        CHECK(c == Landing::UntrackedTicket(310, 0));
+        // Nothing landed: no entry is settled, whatever the back consumed.
+        CHECK(Landing::UntrackedSettled(320) == 0);
+        // The ranges: a read of 0x2000 waits for b only, one of 0x4000 for nothing.
+        CHECK(Landing::UntrackedTargetFor(0x2000, 4) == b);
+        CHECK(Landing::UntrackedTargetFor(0x1008, 4) == a);
+        CHECK(Landing::UntrackedTargetFor(0x4000, 4) == 0);
+        // The first operation of entry 300 ran: entry 300 is not settled yet (b may not have).
+        Landing::NoteUntracked(a);
+        CHECK(Landing::UntrackedSettled(320) == 299);
+        CHECK(Landing::UntrackedTargetFor(0x1000, 16) == 0);
+        // One of a later entry ran: every earlier one did (operations run in capture order).
+        Landing::NoteUntracked(b);
+        Landing::NoteUntracked(c);
+        CHECK(Landing::UntrackedSettled(320) == 320); // all landed: up to what was consumed
+        // Ranges that fell out of the slots are waited for conservatively.
+        Landing::tag = 400;
+        {
+            const Landing::Untracked untracked;
+            for (size_t i = 0; i <= Landing::UntrackedWriteSlots; ++i) {
+                (void)Landing::CaptureUntracked(0x10000 + i * 16, 4);
+            }
+        }
+        CHECK(Landing::UntrackedTargetFor(0x4000, 4) == Landing::untracked_issued.load());
+        Landing::tag = saved_tag;
+        Landing::ResetUntracked();
     }
 }
 

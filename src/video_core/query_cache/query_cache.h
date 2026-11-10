@@ -278,8 +278,10 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
     const bool immediate = at_once && !deferred;
     const u64 landing = immediate ? 0 : VideoCommon::V2::Landing::Capture();
     // QMD releases (Landing::Untracked) take no ticket; their landing is still reported.
-    const u64 untracked =
-        immediate || landing != 0 ? 0 : VideoCommon::V2::Landing::CaptureUntracked();
+    const u64 untracked = immediate || landing != 0
+                              ? 0
+                              : VideoCommon::V2::Landing::CaptureUntracked(
+                                    cpu_addr, has_timestamp ? 16 : sizeof(u32));
     const size_t new_query_id = streamer->WriteCounter(cpu_addr, has_timestamp, payload, subreport);
     auto* query = streamer->GetQuery(new_query_id);
     if (is_fence) {

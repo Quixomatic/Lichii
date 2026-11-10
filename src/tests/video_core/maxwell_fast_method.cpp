@@ -2358,13 +2358,14 @@ TEST_CASE("V2 landing: remembered releases name their producer kind (F3-X1)",
     const u64 landed = V2::Landing::untracked_landed.load();
     V2::Landing::untracked_issued.store(0);
     V2::Landing::untracked_landed.store(0);
+    V2::Landing::untracked_captured_tag = 0;
     V2::Landing::tag = 300;
     u64 position = 0;
     {
         const V2::Landing::Untracked untracked;
-        position = V2::Landing::CaptureUntracked();
+        position = V2::Landing::CaptureUntracked(word, sizeof(u32));
     }
-    CHECK(position == 300);
+    CHECK(position == V2::Landing::UntrackedTicket(300, 0));
     CHECK(split.UntrackedReleasePending());
     V2::Landing::NoteUntracked(position);
     CHECK(!split.UntrackedReleasePending());
@@ -2592,6 +2593,100 @@ TEST_CASE("V2 landing: one write table, tickets without IR cuts, ordered landing
             [](void* argument) -> u64 { return static_cast<Never*>(argument)->target; }, &never));
         CHECK(std::chrono::steady_clock::now() - begin < std::chrono::seconds{1});
         stopper.join();
+    }
+
+    SECTION("F3-X6: a QMD release holds a read until its operation ran (idle back, submit asked)") {
+        // b0dac33's HAZARD=verify line: a four-word QMD release (no landing ticket) the back had
+        // run but whose operation, which writes the timestamp, waited for its fence: the read
+        // took memory's older words. The read must wait for that operation, and the wait must
+        // make the idle back submit (F4-02 lazy fences), never spin on a timeout.
+        namespace Landing = V2::Landing;
+        Landing::ResetUntracked();
+        Landing::untracked_captured_tag = 0;
+        V2::HazardFilter reads;
+        reads.unbounded = V2::ProducerBit(V2::Producer::QmdRelease);
+        Access::SetEnd(split, 200);
+        split.NoteRangeWrite(word_a, 16, V2::Producer::QmdRelease);
+        CHECK(split.FindWrites(word_a, 16, reads).kind == Kind::Wait); // queued
+        // The back ran the entry: the release's operation is queued behind its fence.
+        Landing::tag = 200;
+        u64 ticket = 0;
+        {
+            const Landing::Untracked untracked;
+            ticket = Landing::CaptureUntracked(word_a, 16);
+        }
+        Landing::tag = 0;
+        CHECK(ticket == Landing::UntrackedTicket(200, 0));
+        Access::SetBack(split, 200, true);
+        const V2::HazardResult pending = split.FindWrites(word_a, 16, reads);
+        CHECK(pending.kind == Kind::Wait);
+        CHECK(pending.untracked);
+        CHECK(pending.position == 200);
+        CHECK(split.FindWrites(word_b, 4, reads).kind == Kind::Clear); // another word
+        // The back is idle: it serves front requests, and the operation lands only once a
+        // submit was asked for (the idle hook).
+        struct Hook {
+            std::atomic<bool> asked{false};
+        } hook;
+        split.SetIdleHook([](void* argument) { static_cast<Hook*>(argument)->asked.store(true); },
+                          &hook);
+        std::atomic<bool> stop{false};
+        std::jthread back([&] {
+            while (!stop.load()) {
+                Access::ServeHookRequests(split);
+                std::this_thread::yield();
+            }
+        });
+        std::jthread fencing([&] {
+            while (!hook.asked.load() && !stop.load()) {
+                std::this_thread::yield();
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds{2});
+            Landing::NoteUntracked(ticket);
+        });
+        u64 settled = 0;
+        const auto begin = std::chrono::steady_clock::now();
+        CHECK(split.CompleteLanding(
+            0, VideoCommon::DrainSite::MacroDmaRead, [](void*) -> u64 { return 0; }, nullptr,
+            pending.position, word_a, 16, &settled));
+        CHECK(hook.asked.load());
+        CHECK(Landing::untracked_landed.load() >= ticket); // returned only once it landed
+        CHECK(settled >= 200);
+        CHECK(std::chrono::steady_clock::now() - begin < std::chrono::seconds{1});
+        fencing.join();
+        CHECK(split.FindQueuedWrites(word_a, 16, reads, nullptr, settled).kind == Kind::Clear);
+        CHECK(split.FindWrites(word_a, 16, reads).kind == Kind::Clear);
+        // An unbounded QMD release (an unknown QMD): settled once the operations of its entry
+        // and the earlier ones ran, a range no queued operation writes needs no landing wait.
+        Access::SetEnd(split, 300);
+        split.NoteUnboundedWrite(V2::Producer::QmdRelease);
+        Landing::tag = 300;
+        u64 other = 0;
+        {
+            const Landing::Untracked untracked;
+            other = Landing::CaptureUntracked(word_b, 4);
+        }
+        Landing::tag = 0;
+        Access::SetBack(split, 300, true);
+        const V2::HazardResult unbounded = split.FindWrites(word_a, 16, reads);
+        CHECK(unbounded.kind == Kind::Wait);
+        CHECK(unbounded.untracked);
+        hook.asked.store(false);
+        settled = 0;
+        CHECK(split.CompleteLanding(
+            0, VideoCommon::DrainSite::MacroDmaRead, [](void*) -> u64 { return 0; }, nullptr,
+            unbounded.position, word_a, 16, &settled));
+        CHECK(Landing::untracked_landed.load() < other); // word_b's operation: not waited for
+        CHECK(split.FindQueuedWrites(word_a, 16, reads, nullptr, settled).kind == Kind::Clear);
+        stop.store(true);
+        back.join();
+        // A stopped back: the wait for an operation that can't land returns false at once.
+        Access::SetBack(split, 300, false);
+        CHECK(!split.CompleteLanding(
+            0, VideoCommon::DrainSite::MacroDmaRead, [](void*) -> u64 { return 0; }, nullptr,
+            unbounded.position, word_b, 4, &settled));
+        split.SetIdleHook(nullptr, nullptr);
+        Landing::ResetUntracked();
     }
 
     SECTION("class C readback: a front job runs on the back after its current entry") {

@@ -3598,9 +3598,11 @@ private:
     void FrontReadBack(VideoCommon::GpuSplit& split, DAddr device, size_t bytes);
     /// Fix F3-08: makes the reports in [source, source + bytes) reach memory (the back writes
     /// them out after its current entry, GpuSplit::CompleteLanding) and waits for that, their
-    /// operations included. False when they didn't land (the caller drains).
+    /// operations included. False when they didn't land (the caller drains). Fix F3f (F3-X6):
+    /// `untracked_position` != 0: the QMD release operations writing [device, device + bytes)
+    /// too; `*settled` gets what FindQueuedWrites may then take as settled.
     bool FrontFlushReports(VideoCommon::GpuSplit& split, GPUVAddr source, size_t bytes,
-                           u64 ticket);
+                           u64 ticket, u64 untracked_position, DAddr device, u64* settled);
     std::unique_ptr<FrontState> front;
     bool front_macros{};
     friend struct Maxwell3DTestAccess;
