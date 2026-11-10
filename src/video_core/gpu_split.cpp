@@ -196,6 +196,7 @@ void GpuSplit::MaybeStart(Core::System& system_) {
     feed_idle_back = acquire_mode != V2::Mode::Off;
     hazards.Clear();
     pending_cb = {};
+    cb_translations.fill({});
     unlanded.Clear();
     ticket_position = 0;
     ticket_sub = 0;
@@ -387,8 +388,24 @@ void GpuSplit::ParallelPublish() {
 void GpuSplit::FlushCbWriteSlow() {
     const PendingCb pending = pending_cb;
     pending_cb = {};
-    V2::NoteRangeWriteGpu(*this, *pending.memory, pending.begin, pending.end - pending.begin,
-                          V2::Producer::CbData);
+    const u64 page = pending.begin >> 12;
+    if (((pending.end - 1) >> 12) != page) {
+        V2::NoteRangeWriteGpu(*this, *pending.memory, pending.begin, pending.end - pending.begin,
+                              V2::Producer::CbData);
+        return;
+    }
+    // One page: its GPU→device translation from a small cache, valid until any map runs.
+    // Constant buffers are rewritten on the same few pages all frame.
+    const u64 maps = maps_executed.load(std::memory_order_acquire);
+    CbTranslation& cached = cb_translations[page % cb_translations.size()];
+    if (cached.memory != pending.memory || cached.page != page || cached.maps != maps) {
+        const auto device = pending.memory->GpuToCpuAddress(page << 12);
+        cached = {pending.memory, page, maps, device ? *device : ~u64{0}};
+    }
+    if (cached.device != ~u64{0}) {
+        NoteRangeWrite(cached.device + (pending.begin & 0xfff), pending.end - pending.begin,
+                       V2::Producer::CbData);
+    }
 }
 
 V2::HazardResult GpuSplit::FindWithLanding(u64 device_address, u64 size, u64 done,

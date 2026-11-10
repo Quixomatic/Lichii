@@ -424,6 +424,7 @@ struct GPU::Impl {
 
     void ExecuteMap(const VideoCommon::V2::Ir::MapBody& map) {
         using VideoCommon::V2::Ir::MapOp;
+        VideoCommon::GpuSplit::NoteMapExecuted();
         auto* const gmmu = reinterpret_cast<Tegra::MemoryManager*>(map.object);
         switch (map.op) {
         case MapOp::GmmuMap:

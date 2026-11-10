@@ -295,6 +295,11 @@ public:
     [[nodiscard]] u32 MapEpoch() const {
         return map_epoch;
     }
+    /// Any thread: a GPU memory map, unmap or remap ran (GPU::ExecuteMap). Cached front
+    /// translations (FlushCbWriteSlow) are checked against it, maps without a drain included.
+    static void NoteMapExecuted() {
+        maps_executed.fetch_add(1, std::memory_order_release);
+    }
     /// Front: the newest compute/copy work sent before the last host-level sync (NoteSync).
     [[nodiscard]] u64 SyncedWriterPosition() const {
         return std::min(last_writer_position, last_sync_position);
@@ -898,6 +903,14 @@ private:
         u64 end;
     };
     PendingCb pending_cb{}; ///< NoteCbWrite
+    struct CbTranslation {
+        const Tegra::MemoryManager* memory;
+        u64 page;   ///< GPU page (4 KiB)
+        u64 maps;   ///< maps_executed when translated
+        u64 device; ///< ~0: unmapped
+    };
+    static inline std::atomic<u64> maps_executed{0};
+    std::array<CbTranslation, 64> cb_translations{}; ///< FlushCbWriteSlow
     u32 map_epoch{};        ///< MapEpoch
     u64 front_spin_start{};
     V2::HazardTable hazards;
