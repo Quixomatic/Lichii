@@ -92,6 +92,7 @@ struct FrontData {
     // P2 decisions.
     std::array<std::array<u64, static_cast<size_t>(Decision::Count)>, NumSites> decisions{};
     std::array<std::array<u64, static_cast<size_t>(Reason::Count)>, NumSites> reasons{};
+    std::array<std::array<u64, 8>, NumSites> narrowed_by{};
     std::array<u64, NumSites> mismatches{};
     std::array<u64, NumSites> benign_mismatches{};
 };
@@ -383,6 +384,20 @@ void ReportDecisions(const FrontData& data, const char* thread_name, u64 window_
             reasons.pop_back();
             line += fmt::format(" (waited for:{})", reasons);
         }
+        static constexpr std::array<const char*, 8> producers{
+            "release", "report", "cbuf data", "upload", "copy", "dispatch", "draw", "qmd release",
+        };
+        std::string narrowed;
+        for (size_t p = 0; p < producers.size(); ++p) {
+            if (data.narrowed_by[site][p] != 0) {
+                narrowed += fmt::format(" {} {:.0f},", producers[p],
+                                        PerSecond(data.narrowed_by[site][p], window_ns));
+            }
+        }
+        if (!narrowed.empty()) {
+            narrowed.pop_back();
+            line += fmt::format(" (narrowed by:{})", narrowed);
+        }
         if (data.mismatches[site] != 0) {
             line += fmt::format(", verify mismatches {}", data.mismatches[site]);
         }
@@ -548,6 +563,16 @@ void NoteDecision(DrainSite site, Decision decision, Reason reason) {
     ++data.decisions[s][static_cast<size_t>(decision)];
     if (reason != Reason::None) {
         ++data.reasons[s][static_cast<size_t>(reason)];
+    }
+}
+
+void NoteNarrowedBy(DrainSite site, u32 producers) {
+    if (!Enabled()) [[likely]] {
+        return;
+    }
+    auto& counts = Front().data.narrowed_by[static_cast<size_t>(site)];
+    for (size_t p = 0; p < counts.size(); ++p) {
+        counts[p] += (producers >> p) & 1;
     }
 }
 

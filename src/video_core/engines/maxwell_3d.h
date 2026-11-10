@@ -3562,6 +3562,9 @@ private:
     /// Returns false when the old path must read.
     bool FrontDmaReadHazard(VideoCommon::GpuSplit& split, GPUVAddr source, size_t bytes,
                             std::span<u32> out);
+    /// Fix F3-08: reads GPU-written words back into guest memory through the readback path,
+    /// recorded by the back after its current entry; waits for that download only.
+    void FrontReadBack(VideoCommon::GpuSplit& split, DAddr device, size_t bytes);
     std::unique_ptr<FrontState> front;
     bool front_macros{};
     friend struct Maxwell3DTestAccess;

@@ -12,6 +12,7 @@
 #include <limits>
 #include <optional>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include "common/assert.h"
 #include "common/bit_util.h"
@@ -44,6 +45,7 @@
 #include "video_core/v2/resolve/split_resolve.h"
 #include "video_core/v2/s1_deltas.h"
 #include "video_core/v2/shader_writes.h"
+#include "video_core/v2/word_readback.h"
 #ifdef ARCHITECTURE_x86_64
 #include "video_core/macro_turing_jit.h"
 #endif
@@ -3244,9 +3246,9 @@ bool Maxwell3D::FrontDmaReadHazard(VideoCommon::GpuSplit& split, GPUVAddr source
             return fall_back(Reason::Unmapped);
         }
     }
-    // Reports the query cache may still hold back (FindUnlanded below: tracked per report until
-    // it lands, not by sticky pages), and words the buffer cache may hold newer than memory,
-    // need the back's flushes (the old path).
+    // Fix F3-08 (MASTER_PLAN §6): no drain. Counters and timestamps still to land (class D,
+    // strict) are waited for by landing ticket; words the buffer cache may hold newer than
+    // memory (class C) are read back behind their writers, through the readback path.
     // What can have written the words in command order (7429fba04e): methods that write memory
     // (ranged, or unbounded: dispatches, copies, uploads) and the work before the last
     // host-level wait. Draws after it are not visible to the 3D engine's reads before a wait.
@@ -3258,10 +3260,8 @@ bool Maxwell3D::FrontDmaReadHazard(VideoCommon::GpuSplit& split, GPUVAddr source
     // Draws: their shader stores, those sent before the last host-level wait.
     filter.unbounded_synced = V2::ProducerBit(V2::Producer::Draw);
     bool narrowed = false;
-    for (int attempt = 0; attempt < 3; ++attempt) {
-        if (Nx2MayBeGpuWritten(*device, bytes)) {
-            return fall_back(Reason::GpuWritten);
-        }
+    bool read_back = false;
+    for (int attempt = 0; attempt < 4; ++attempt) {
         for (size_t i = 0; i < out.size(); ++i) {
             out[i] = memory_manager.Read<u32>(source + i * sizeof(u32));
         }
@@ -3270,23 +3270,64 @@ bool Maxwell3D::FrontDmaReadHazard(VideoCommon::GpuSplit& split, GPUVAddr source
             split.FindWrites(*device, out.size() * sizeof(u32), filter,
                              reinterpret_cast<u8*>(out.data()));
         if (result.kind == V2::HazardResult::Kind::Wait && result.landing) {
-            return fall_back(Reason::ReportPage); // A counter or timestamp: only its operation has it
+            // A counter or timestamp only its operation writes: wait for that landing.
+            if (attempt == 3 || !split.WaitLanded(result.position, site, 50'000)) {
+                return fall_back(Reason::ReportPage);
+            }
+            narrowed = true;
+            continue;
         }
         const u64 wait = result.kind == V2::HazardResult::Kind::Wait ? result.position : 0;
         if (wait == 0) {
+            if (!read_back && Nx2MayBeGpuWritten(*device, bytes)) {
+                // Every writer the table knows has run: read the words back behind them.
+                FrontReadBack(split, *device, bytes);
+                read_back = true;
+                narrowed = true;
+                continue; // Memory holds them now; the queued writes still go on top
+            }
             const bool forwarded = result.kind == V2::HazardResult::Kind::Forward;
-            V2::Stats::NoteDecision(site, narrowed    ? Decision::Narrowed
-                                          : forwarded ? Decision::Forwarded
-                                                      : Decision::Avoided);
+            V2::Stats::NoteDecision(site,
+                                    narrowed    ? Decision::Narrowed
+                                    : forwarded ? Decision::Forwarded
+                                                : Decision::Avoided,
+                                    read_back ? Reason::GpuWritten : Reason::None);
             return true;
         }
-        if (attempt == 2) {
+        if (attempt == 3) {
             break;
         }
+        V2::Stats::NoteNarrowedBy(site, result.producers);
         split.WaitForPosition(wait, site);
         narrowed = true;
     }
     return fall_back(Reason::Overflow);
+}
+
+void Maxwell3D::FrontReadBack(VideoCommon::GpuSplit& split, DAddr device, size_t bytes) {
+    // The back records the download after the entry it runs (its writers ran: the caller
+    // waited for them) and the front waits for that download's tick only.
+    struct Job {
+        VideoCommon::V2::WordReadback slot;
+        VideoCore::RasterizerInterface* rasterizer{};
+        DAddr address{};
+        u64 size{};
+    };
+    static Job job; // The front thread's only one in flight
+    job.rasterizer = rasterizer;
+    job.address = device;
+    job.size = bytes;
+    split.RequestBackJob(
+        [](void* argument) {
+            auto& self = *static_cast<Job*>(argument);
+            self.slot.Run(*self.rasterizer, self.address, self.size);
+        },
+        &job);
+    VideoCommon::Nx2Profile::Scope scope{VideoCommon::Nx2Profile::Zone::WriterWait};
+    while (!job.slot.Ready()) {
+        std::this_thread::yield();
+    }
+    job.slot.Land();
 }
 
 void Maxwell3D::FrontVerify(VideoCommon::GpuSplit& split, FrontState& fs) {

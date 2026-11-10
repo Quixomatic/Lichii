@@ -95,6 +95,9 @@ enum class Reason : u8 {
 };
 
 void NoteDecision(DrainSite site, Decision decision, Reason reason = Reason::None);
+/// A targeted wait at `site` for the producers in `producers` (V2::ProducerBit): which writers
+/// the front's narrowed waits wait for.
+void NoteNarrowedBy(DrainSite site, u32 producers);
 /// Verify: the new decision disagreed with the old path at `site`. `benign`: the new path waits
 /// where the old one went on (it costs time, never ordering); counted apart.
 void NoteMismatch(DrainSite site, bool benign = false);

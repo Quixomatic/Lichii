@@ -362,6 +362,20 @@ public:
         cpu_lane_hook = hook;
         cpu_lane_argument = argument;
     }
+    /// Front: runs `job(argument)` on the back after the entry it runs now (at once if it waits
+    /// for work, or here when the back doesn't run): work on back-owned caches whose inputs the
+    /// back already consumed (class C readbacks behind their writers, MASTER_PLAN §6). The
+    /// caller watches its own completion flag; one job at a time.
+    void RequestBackJob(void (*job)(void*), void* argument) {
+        if (!BackRunning()) {
+            job(argument);
+            return;
+        }
+        back_job = job;
+        back_job_argument = argument;
+        back_job_requested.store(true, std::memory_order_seq_cst);
+        WakeBackForHook();
+    }
     /// Serving a lane request runs no idle hook (no deferred submit): a request that needs the
     /// GPU submits or waits for its own tick (WaitSubmitted asks for the idle hook).
     void RequestCpuLane() {
@@ -785,8 +799,13 @@ private:
             idle_hook(idle_argument);
         }
     }
-    /// Back: runs the CPU lane hook if one was asked for (EDEN_NX2_V2_CPULANE).
+    /// Back: runs a front job (RequestBackJob) and the CPU lane hook if one was asked for
+    /// (EDEN_NX2_V2_CPULANE).
     void ServeCpuLane() {
+        if (back_job_requested.load(std::memory_order_relaxed) &&
+            back_job_requested.exchange(false, std::memory_order_seq_cst)) {
+            back_job(back_job_argument);
+        }
         if (cpu_lane_requested.load(std::memory_order_relaxed) &&
             cpu_lane_requested.exchange(false, std::memory_order_seq_cst) &&
             cpu_lane_hook != nullptr) {
@@ -900,6 +919,9 @@ private:
     void (*cpu_lane_hook)(void*){};
     void* cpu_lane_argument{};
     std::atomic<bool> cpu_lane_requested{};
+    void (*back_job)(void*){};  ///< RequestBackJob, published by back_job_requested
+    void* back_job_argument{};
+    std::atomic<bool> back_job_requested{};
     alignas(64) std::atomic<bool> hook_requested{};
     std::atomic<bool> idle_hook_requested{};
     std::atomic<bool> back_running{};
