@@ -2642,8 +2642,9 @@ TEST_CASE("V2 landing: one write table, tickets without IR cuts, ordered landing
         CHECK(pending.untracked);
         CHECK(pending.position == 200);
         CHECK(split.FindWrites(word_b, 4, reads).kind == Kind::Clear); // another word
-        // The back is idle: it serves front requests, and the operation lands only once a
-        // submit was asked for (the idle hook).
+        // The back is idle: it serves front requests. SYNC_SUBMIT_SPEC §11 (invariant S): the
+        // back's sleep point fenced and submitted the operation itself, so it lands without any
+        // front ask, and the waiter asks for nothing while no fence tick is known (F3).
         struct Hook {
             std::atomic<bool> asked{false};
         } hook;
@@ -2657,18 +2658,14 @@ TEST_CASE("V2 landing: one write table, tickets without IR cuts, ordered landing
             }
         });
         std::jthread fencing([&] {
-            while (!hook.asked.load() && !stop.load()) {
-                std::this_thread::yield();
-            }
             std::this_thread::sleep_for(std::chrono::milliseconds{2});
-            Landing::NoteUntracked(ticket);
+            Landing::NoteUntracked(ticket); // S submitted it; the fencing thread pops it
         });
         u64 settled = 0;
         const auto begin = std::chrono::steady_clock::now();
         CHECK(split.CompleteLanding(
             0, VideoCommon::DrainSite::MacroDmaRead, [](void*) -> u64 { return 0; }, nullptr,
             pending.position, word_a, 16, &settled));
-        CHECK(hook.asked.load());
         CHECK(Landing::untracked_landed.load() >= ticket); // returned only once it landed
         CHECK(settled >= 200);
         CHECK(std::chrono::steady_clock::now() - begin < std::chrono::seconds{1});
@@ -2696,9 +2693,6 @@ TEST_CASE("V2 landing: one write table, tickets without IR cuts, ordered landing
         CHECK(unbounded.position == 300);
         hook.asked.store(false);
         std::jthread fencing_b([&] {
-            while (!hook.asked.load() && !stop.load()) {
-                std::this_thread::yield();
-            }
             std::this_thread::sleep_for(std::chrono::milliseconds{2});
             Landing::NoteUntracked(other);
         });
@@ -2706,7 +2700,6 @@ TEST_CASE("V2 landing: one write table, tickets without IR cuts, ordered landing
         CHECK(split.CompleteLanding(
             0, VideoCommon::DrainSite::MacroDmaRead, [](void*) -> u64 { return 0; }, nullptr,
             unbounded.position, word_b, 4, &settled));
-        CHECK(hook.asked.load()); // the idle back was asked for the submit
         CHECK(Landing::untracked_landed.load() >= other);
         fencing_b.join();
         CHECK(split.FindQueuedWrites(word_b, 4, reads, nullptr, settled).kind == Kind::Clear);

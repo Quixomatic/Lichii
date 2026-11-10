@@ -530,7 +530,6 @@ bool GpuSplit::WaitUntrackedLanded(u64 ticket, DrainSite site, u64 timeout_us) {
     const u64 start = Nx2Profile::Enabled() || v2_stats ? Nx2Profile::Ticks() : 0;
     const auto begin = std::chrono::steady_clock::now();
     u64 requested_tick = 0;
-    bool asked = false;
     for (u32 spins = 0; !landed(); ++spins) {
         const auto now = std::chrono::steady_clock::now();
         if (now - begin >= std::chrono::microseconds{timeout_us} || !BackRunning()) {
@@ -538,12 +537,10 @@ bool GpuSplit::WaitUntrackedLanded(u64 ticket, DrainSite site, u64 timeout_us) {
         }
         // Its fence may sit in the open submission (F4-02): never drain. SYNC_SUBMIT_SPEC §2.3
         // (rule W): one request per change of the fence's tick, served at the back's next entry
-        // boundary or at once if idle; no timed re-ask. The first ask wakes the idle hook even
-        // while no lazy fence names the tick (a delayed fence's deferred flush is the hook's).
+        // boundary or at once if idle; no timed re-ask. §11.4 F3: no ask without a tick (b00363's
+        // first ask is gone): an operation with no fence yet is fenced and submitted by the
+        // back's sleep point (invariant S) or rides the busy back's next submission.
         const u64 fence_tick = V2::LandingFence::TickFor(0, ticket);
-        if (!std::exchange(asked, true) && fence_tick <= requested_tick) {
-            RequestIdleHook();
-        }
         if (fence_tick > requested_tick) {
             V2::LandingFence::Request(fence_tick);
             requested_tick = fence_tick;
@@ -574,19 +571,15 @@ bool GpuSplit::WaitLanded(u64 ticket, DrainSite site, u64 timeout_us) {
     const u64 start = Nx2Profile::Enabled() || v2_stats ? Nx2Profile::Ticks() : 0;
     const auto begin = std::chrono::steady_clock::now();
     u64 requested_tick = 0;
-    bool asked = false;
     for (u32 spins = 0; V2::Landing::landed.load(std::memory_order_acquire) < ticket; ++spins) {
         const auto now = std::chrono::steady_clock::now();
         if (now - begin >= std::chrono::microseconds{timeout_us} || !BackRunning()) {
             return V2::Landing::landed.load(std::memory_order_acquire) >= ticket;
         }
         // The operation's fence may sit in the open submission: ask for it (no drain).
-        // SYNC_SUBMIT_SPEC §2.3 (rule W): one request per change of the fence's tick; the first
-        // ask wakes the idle hook even while no lazy fence names the tick.
+        // SYNC_SUBMIT_SPEC §2.3 (rule W): one request per change of the fence's tick; no ask
+        // without a tick (§11.4 F3, invariant S covers an operation with no fence yet).
         const u64 fence_tick = V2::LandingFence::TickFor(ticket, 0);
-        if (!std::exchange(asked, true) && fence_tick <= requested_tick) {
-            RequestIdleHook();
-        }
         if (fence_tick > requested_tick) {
             V2::LandingFence::Request(fence_tick);
             requested_tick = fence_tick;
