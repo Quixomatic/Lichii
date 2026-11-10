@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <limits>
 #include <optional>
@@ -29,6 +30,34 @@
 
 namespace Vulkan {
 namespace {
+
+#ifndef NDEBUG
+/// X-03 (debug builds): an externally synchronized VMA allocator (Device::IsAllocatorShared
+/// false) must never be entered by two threads at once; the c876 crash was such a race.
+class ExclusiveVmaUse {
+public:
+    explicit ExclusiveVmaUse(bool shared) : active{!shared} {
+        if (active && users.fetch_add(1, std::memory_order_acq_rel) != 0) {
+            LOG_CRITICAL(Render_Vulkan,
+                         "VMA allocator (externally synchronized) entered by two threads at once");
+        }
+    }
+    ~ExclusiveVmaUse() {
+        if (active) {
+            users.fetch_sub(1, std::memory_order_acq_rel);
+        }
+    }
+    ExclusiveVmaUse(const ExclusiveVmaUse&) = delete;
+    ExclusiveVmaUse& operator=(const ExclusiveVmaUse&) = delete;
+
+private:
+    static inline std::atomic<u32> users{0};
+    bool active;
+};
+#define VMA_EXCLUSIVE_USE() const ExclusiveVmaUse vma_exclusive_use{device.IsAllocatorShared()}
+#else
+#define VMA_EXCLUSIVE_USE() static_cast<void>(0)
+#endif
 
 // Helpers translating MemoryUsage to flags/usage
 
@@ -225,6 +254,7 @@ vk::Image MemoryAllocator::TryCreateImage(const VkImageCreateInfo &ci, bool dedi
 
 VkResult MemoryAllocator::AllocateImage(const VkImageCreateInfo &ci, bool dedicated, bool may_fail,
                                         vk::Image &image) const {
+    VMA_EXCLUSIVE_USE();
     const VmaAllocationCreateInfo alloc_ci = {
             // Best fit: images freed by the thousand leave holes in the blocks, which new ones
             // should fill before VMA takes another block.
@@ -347,6 +377,7 @@ vk::Image MemoryAllocator::CreateUnbackedImage(const VkImageCreateInfo &ci, bool
 VmaAllocation MemoryAllocator::AllocateSparseMemory(const VkMemoryRequirements &requirements,
                                                    VkDeviceMemory &memory,
                                                    VkDeviceSize &offset) const {
+    VMA_EXCLUSIVE_USE();
     const VmaAllocationCreateInfo alloc_ci{
         .flags = 0,
         .usage = VMA_MEMORY_USAGE_UNKNOWN,
@@ -386,6 +417,7 @@ VmaAllocation MemoryAllocator::AllocateSparseMemory(const VkMemoryRequirements &
 }
 
 void MemoryAllocator::FreeSparseMemory(VmaAllocation allocation) const {
+    VMA_EXCLUSIVE_USE();
     if (allocation != VK_NULL_HANDLE) {
         vmaFreeMemory(allocator, allocation);
     }
@@ -425,6 +457,7 @@ bool MemoryAllocator::CreateBufferInSeparatePool(const VkBufferCreateInfo& ci, M
 }
 
 vk::Buffer MemoryAllocator::CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsage usage) const {
+    VMA_EXCLUSIVE_USE();
     // MESA will do memcpy() if not marked as host cached, so just force mark it for most buffers
     auto const anv_flags = (usage == MemoryUsage::Stream
         && device.GetDriverID() == VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA)
@@ -478,6 +511,7 @@ vk::Buffer MemoryAllocator::CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsa
     if (min_alignment <= 1) {
         return CreateBuffer(ci, usage);
     }
+    VMA_EXCLUSIVE_USE();
     VkMemoryPropertyFlags anv_flags = 0;
     if (usage == MemoryUsage::Stream &&
         device.GetDriverID() == VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA) {
@@ -525,6 +559,7 @@ vk::Buffer MemoryAllocator::CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsa
 
 MemoryCommit MemoryAllocator::Commit(const VkMemoryRequirements &reqs, MemoryUsage usage)
 {
+    VMA_EXCLUSIVE_USE();
     const auto vma_usage = MemoryUsageVma(usage);
     VmaAllocationCreateInfo ci{};
     ci.flags = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT | MemoryUsageVmaFlags(usage);
@@ -557,6 +592,7 @@ MemoryCommit MemoryAllocator::Commit(const VkMemoryRequirements &reqs, MemoryUsa
 }
 
 MemoryCommit MemoryAllocator::Commit(const vk::Buffer &buffer, MemoryUsage usage) {
+    VMA_EXCLUSIVE_USE();
     // Allocate memory appropriate for this buffer automatically
     const auto vma_usage = MemoryUsageVma(usage);
 

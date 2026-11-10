@@ -832,7 +832,20 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
     functions.vkGetInstanceProcAddr = dld.vkGetInstanceProcAddr;
     functions.vkGetDeviceProcAddr = dld.vkGetDeviceProcAddr;
 
-    VmaAllocatorCreateFlags flags = VMA_ALLOCATOR_CREATE_EXTERNALLY_SYNCHRONIZED_BIT;
+    // X-03 (the c876 crash: VMA metadata corrupted in VmaBlockMetadata_TLSF::Alloc): with
+    // EDEN_NX2_V2_SUBMITTHREAD the finish thread destroys retired images (F4-09, MASTER_PLAN
+    // §5.5: S6 owns lifetimes) while the back allocates, and the transfer-queue readbacks and the
+    // lock-free commit run allocator calls on other threads too. Then the allocator takes VMA's
+    // own mutex; v1 keeps the externally synchronized allocator.
+    namespace V2 = VideoCommon::V2;
+    vma_shared = V2::On(V2::Switch::SubmitThread) || V2::On(V2::Switch::XReadback) ||
+                 V2::On(V2::Switch::XferQ) || V2::On(V2::Switch::Commit);
+    VmaAllocatorCreateFlags flags =
+        vma_shared ? VmaAllocatorCreateFlags{0} : VMA_ALLOCATOR_CREATE_EXTERNALLY_SYNCHRONIZED_BIT;
+    if (vma_shared) {
+        LOG_INFO(Render_Vulkan, "VMA allocator internally synchronized (v2 threads allocate or "
+                                "free memory off the GPU thread)");
+    }
     if (extensions.memory_budget) {
         flags |= VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT;
     }

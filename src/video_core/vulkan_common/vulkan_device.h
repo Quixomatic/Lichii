@@ -277,6 +277,12 @@ public:
         return allocator;
     }
 
+    /// X-03: whether the VMA allocator is created without EXTERNALLY_SYNCHRONIZED (v2 threads use
+    /// it concurrently); false means every call must come from one thread at a time.
+    [[nodiscard]] bool IsAllocatorShared() const noexcept {
+        return vma_shared;
+    }
+
     /// Allocations kept out of the default blocks, which then hold images only: churned buffers
     /// and long-lived sparse pages left holes the texture cache's collector couldn't drain.
     enum class SeparatePool : u32 {
@@ -1329,6 +1335,7 @@ private:
 private:
     VkInstance instance;         ///< Vulkan instance.
     VmaAllocator allocator{};    ///< VMA allocator.
+    bool vma_shared{};           ///< X-03: IsAllocatorShared
     mutable std::mutex separate_pools_mutex;
     mutable std::array<std::array<VmaPool, VK_MAX_MEMORY_TYPES>, 2> separate_pools{};
     vk::DeviceDispatch dld;      ///< Device function pointers.
