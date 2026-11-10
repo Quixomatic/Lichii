@@ -264,6 +264,19 @@ ViewCheck CheckWithView(DmaPusher& dma_pusher, GPUVAddr address, u32 value, V2::
         return {decision.verdict, Reason::None, false, word.landing ? word.position : 0,
                 V2::RingPositionOf(word), qmd_target};
     case V2::AcquireVerdict::NotMet:
+        if (word.kind == V2::HazardResult::Kind::Clear && op == V2::SemaphoreOp::Gequal &&
+            !split.UnknownQmdMayWrite(*device, sizeof(u32))) {
+            // Fix F3h (U-02, R2-F3-05, class A): QMD ADD reductions the front's model saw to
+            // the word, queued ahead on the in-order back: memory plus their operands is what
+            // the word holds once they ran (at least), before the acquire's channel goes on.
+            const auto adds = split.QueuedQmdAdds(*device);
+            const u64 reached = u64{memory_word} + adds.sum;
+            if (adds.known && reached <= 0xffffffffULL &&
+                V2::SemaphoreMet(op, static_cast<u32>(reached), value)) {
+                return {V2::AcquireVerdict::MetByQueued, Reason::None, false, 0, adds.position,
+                        qmd_target};
+            }
+        }
         return {decision.verdict,
                 word.kind == V2::HazardResult::Kind::Forward ? Reason::QueuedNotMet
                                                               : Reason::NotMet,

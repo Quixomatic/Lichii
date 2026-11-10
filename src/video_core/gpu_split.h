@@ -442,11 +442,52 @@ public:
         QmdPayload,   ///< A QMD release's payload
         QmdReduction, ///< A QMD reduction release (`value`: its operand, `op`: its operation)
         QmdMax,       ///< A QMD max release (`value`: its operand)
+        QmdUnknown,   ///< A QMD release whose payload the front can't tell (Fix F3h)
     };
     [[nodiscard]] static constexpr const char* ReleaseKindName(ReleaseKind kind) {
-        constexpr const char* names[] = {"release", "report", "qmd payload", "qmd reduction",
-                                         "qmd max"};
+        constexpr const char* names[] = {"release",       "report",  "qmd payload",
+                                         "qmd reduction", "qmd max", "qmd unknown"};
         return names[static_cast<size_t>(kind)];
+    }
+    /// Front (Fix F3h, U-02 / R2-F3-05, MASTER_PLAN §6 class A): the QMD ADD reductions the
+    /// front's model saw to the word at `device_address` that memory may not hold yet. Known when
+    /// every remembered QMD release to the word not yet in memory for sure is still queued (the
+    /// back applies it after the acquire's position is passed, in order) and an ADD of less than
+    /// 2^31: memory plus `sum` is then a lower bound of the word once they ran. Not known when one
+    /// may already be in memory but isn't settled, or is another kind. Remembered releases that
+    /// fell out of the ring only make the bound lower.
+    struct QueuedAdds {
+        bool known = false;
+        u64 sum = 0;
+        u64 position = 0; ///< The newest one's ring position
+    };
+    [[nodiscard]] QueuedAdds QueuedQmdAdds(u64 device_address) const {
+        const u64 done = ConsumedNow();
+        const u64 settled = V2::Landing::UntrackedSettled(done);
+        QueuedAdds adds;
+        for (const RecentRelease& entry : recent_releases) {
+            if (entry.address != device_address || entry.position == 0 || entry.landing ||
+                entry.kind == ReleaseKind::Release || entry.kind == ReleaseKind::Report ||
+                entry.position <= settled) {
+                continue;
+            }
+            if (entry.position <= done || entry.kind != ReleaseKind::QmdReduction ||
+                (entry.op & 7) != 0 || entry.value >= 0x80000000U) {
+                return {};
+            }
+            adds.known = true;
+            adds.sum += entry.value;
+            adds.position = std::max(adds.position, entry.position);
+        }
+        return adds;
+    }
+    /// Front (Fix F3h): an unknown QMD (an unbounded QmdRelease note) may write the range: still
+    /// queued, or run with an operation over the range still to land.
+    [[nodiscard]] bool UnknownQmdMayWrite(u64 device_address, u64 size) {
+        V2::HazardFilter filter;
+        filter.ranged = 0;
+        filter.unbounded = V2::ProducerBit(V2::Producer::QmdRelease);
+        return FindWrites(device_address, size, filter).kind != V2::HazardResult::Kind::Clear;
     }
     /// Front (Fix F3d, F3-X1): a QMD release the front's QMD model read (Fix F3e: reductions
     /// and max releases too, by kind). The release lands at its dispatch's fence without a

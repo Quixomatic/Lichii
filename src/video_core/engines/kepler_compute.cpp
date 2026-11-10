@@ -2248,6 +2248,16 @@ void KeplerCompute::FrontNoteWrites(VideoCommon::GpuSplit& split, FrontState& fs
                 }
                 // F3-X1 (971d resume lines: the satisfying release was in no front note): the
                 // releases' values, for the poll's deferral and its resume line.
+                if (signal.uncertain_payloads) {
+                    // Which payload the back writes depends on a landing (F3h): known to be a
+                    // write, of unknown value (class A sums must not count on these words).
+                    for (const auto& [address, size] : signal.releases) {
+                        if (const auto device = memory_manager.GpuToCpuAddress(address)) {
+                            split.RememberQmdRelease(
+                                *device, 0, VideoCommon::GpuSplit::ReleaseKind::QmdUnknown);
+                        }
+                    }
+                }
                 for (const auto& release : signal.payloads) {
                     if (signal.uncertain_payloads) {
                         break;

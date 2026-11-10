@@ -2755,6 +2755,48 @@ TEST_CASE("V2 landing: one write table, tickets without IR cuts, ordered landing
         Landing::ResetUntracked();
     }
 
+    SECTION("R2-F3-05: queued QMD ADD reductions answer a Gequal acquire (class A)") {
+        namespace Landing = V2::Landing;
+        using ReleaseKind = VideoCommon::GpuSplit::ReleaseKind;
+        Landing::ResetUntracked();
+        Access::SetBack(split, 100, true);
+        Access::SetEnd(split, 200);
+        split.RememberQmdRelease(word_a, 3, ReleaseKind::QmdReduction, 0); // ADD 3
+        Access::SetEnd(split, 210);
+        split.RememberQmdRelease(word_a, 2, ReleaseKind::QmdReduction, 0); // ADD 2
+        split.RememberQmdRelease(word_b, 7, ReleaseKind::QmdPayload);
+        auto adds = split.QueuedQmdAdds(word_a);
+        CHECK(adds.known);
+        CHECK(adds.sum == 5);
+        CHECK(adds.position == 210);
+        // The back ran entry 200 (applied at once, nothing to land): only 210's is queued.
+        Access::SetBack(split, 205, true);
+        adds = split.QueuedQmdAdds(word_a);
+        CHECK(adds.known);
+        CHECK(adds.sum == 2);
+        // A payload release may move the word back: not known.
+        CHECK(!split.QueuedQmdAdds(word_b).known);
+        // An operation of a consumed entry still to land: memory may or may not hold it.
+        Landing::tag = 210;
+        {
+            const Landing::Untracked untracked;
+            (void)Landing::CaptureUntracked(word_a, 4);
+        }
+        Landing::tag = 0;
+        Access::SetBack(split, 215, true);
+        CHECK(!split.QueuedQmdAdds(word_a).known);
+        Landing::ResetUntracked();
+        // A release whose payload the front can't tell: not known.
+        Access::SetEnd(split, 230);
+        split.RememberQmdRelease(word_a, 0, ReleaseKind::QmdUnknown);
+        CHECK(!split.QueuedQmdAdds(word_a).known);
+        // An unknown QMD that may write the word decides against it too.
+        CHECK(!split.UnknownQmdMayWrite(word_a, 4));
+        split.NoteUnboundedWrite(V2::Producer::QmdRelease);
+        CHECK(split.UnknownQmdMayWrite(word_a, 4));
+        Access::SetBack(split, 230, false);
+    }
+
     SECTION("R2-F3-03: an unmapped acquire word waits only for a map still queued") {
         // 0fe4: unmapped words took the v1 drain and forced fences (50/s). Now the view decides
         // on the guest's read unless a Map record the back hasn't run may map the word.
