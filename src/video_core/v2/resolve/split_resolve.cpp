@@ -471,8 +471,21 @@ SerialReason SplitTraits::Resolve(Shard& shard, const Input& input, std::vector<
             pre.has_key = key.has_key;
             pre.has_full = key.has_full;
         }
-        records.push_back(std::move(pre));
+        if (input.progress == nullptr) {
+            records.push_back(pre);
+            return;
+        }
+        // F1-36 (R0-d): streamed to the commit record by record, in storage that never moves.
+        if (records.size() == records.capacity()) {
+            return; // the reserve is used up: the commit resolves the rest live
+        }
+        records.push_back(pre);
+        input.progress->ready.store(static_cast<u32>(records.size()), std::memory_order_release);
     };
+    if (input.progress != nullptr) {
+        records.reserve(StreamRecords);
+        input.progress->records.store(records.data(), std::memory_order_release);
+    }
     // S1 classified runs (§5.6 step 2): plain stores of the front's deltas, its groups, its
     // draws; no second run of the register semantics.
     constexpr u32 cb_data = static_cast<u32>(offsetof(MaxwellRegs, const_buffer) / 4) + 4;
@@ -523,6 +536,10 @@ SerialReason SplitTraits::Resolve(Shard& shard, const Input& input, std::vector<
                 return static_cast<SerialReason>(
                     input.progress->serial.load(std::memory_order_acquire));
             }
+        }
+        if (input.progress != nullptr && input.progress->abandon.load(std::memory_order_relaxed)) {
+            // The commit is done with the segment (FinishStream): what was resolved stands.
+            return records.empty() ? SerialReason::Stolen : SerialReason::None;
         }
         const size_t index = static_cast<size_t>(position & (RingWords - 1));
         const u64 head = input.ring[index];
@@ -723,6 +740,9 @@ SplitResolve::SplitResolve(GpuSplit& split_, const u64* ring_, const Ir::Payload
 SplitResolve::~SplitResolve() {
     if (last_early != nullptr) {
         last_early->abandon.store(true, std::memory_order_release); // its end may never publish
+    }
+    if (stream != nullptr) {
+        stream->abandon.store(true, std::memory_order_release); // the streamed one's neither
     }
     resolver.reset(); // joins the shards before the ring goes away
 }
@@ -944,7 +964,21 @@ void SplitResolve::OnSegment(const Ir::SegmentBody& body, const u32* back_regs,
                              const u32* back_shadow, const CbufTable* back_cbufs) {
     t_commit = this;
     const u64 start = NowNs();
+    taken = nullptr;
+    record_taken = nullptr; // it pointed into the released segment's records
+    NotePredicatedOff();
     if (holding) {
+        // A streamed segment's shard stops first (its end is published: the commit is past it);
+        // then the segment's stats and the adaptive size, from its whole time on the commit.
+        resolver->FinishStream(held_id);
+        stream = nullptr;
+        resolver->NoteCommitted(*current, 0);
+        const u32 size = adaptive.Note(current->wait_ns, start - held_start_ns, current->stolen,
+                                       adaptive_size.load(std::memory_order_relaxed));
+        if (size != 0) {
+            adaptive_size.store(size, std::memory_order_relaxed);
+            GetStats().segment_size.store(size, std::memory_order_relaxed);
+        }
         resolver->Release(held_id);
         holding = false;
         current = nullptr;
@@ -952,9 +986,6 @@ void SplitResolve::OnSegment(const Ir::SegmentBody& body, const u32* back_regs,
         // publish (a front waiting on this thread publishes nothing meanwhile).
         DrainClosed(split.published.load(std::memory_order_acquire));
     }
-    taken = nullptr;
-    record_taken = nullptr; // it pointed into the released segment's records
-    NotePredicatedOff();
     // F6-01: the ordered merge (§5.6.3): in order, the segment's requests applied before any of
     // its draws, its records' proxies patched; the draws then take their records one at a time.
     // A stolen segment's draws decide on the commit thread live (no fallback resolve).
@@ -970,25 +1001,26 @@ void SplitResolve::OnSegment(const Ir::SegmentBody& body, const u32* back_regs,
     if (body.id > 1) {
         released.store(body.id - 1, std::memory_order_release);
     }
+    // A streamed result still belongs to its shard: only its input and progress are read here.
+    const bool streamed = resolver->Streaming(body.id);
+    const bool has_input = streamed || result.has_input;
     segment_engine = 0;
-    if (result.has_input) {
+    if (has_input) {
         const SegmentInput& input = resolver->InputOf(body.id);
         in_flight_draws.fetch_sub(input.draws, std::memory_order_acq_rel);
         segment_engine = input.snapshot != nullptr ? input.snapshot->engine : 0;
+        stream = streamed ? input.progress : nullptr;
     }
     next_ordinal = 0;
     holding = true;
     held_id = body.id;
+    held_start_ns = start;
     current = &result;
     cursor = 0;
-    resolver->NoteCommitted(result, start);
-    const u32 size = adaptive.Note(result.waited, result.stolen,
-                                   adaptive_size.load(std::memory_order_relaxed));
-    if (size != 0) {
-        adaptive_size.store(size, std::memory_order_relaxed);
-        GetStats().segment_size.store(size, std::memory_order_relaxed);
+    if (stats) {
+        Count(GetStats().commit_ns, NowNs() - start);
     }
-    if (verify && back_regs != nullptr && result.has_input) {
+    if (verify && back_regs != nullptr && has_input) {
         // The snapshot at the segment start must equal the back's registers here (but the write
         // the snapshot already holds that follows the record).
         const SegmentInput& input = resolver->InputOf(body.id);
@@ -1094,7 +1126,16 @@ void SplitResolve::NotePredicatedOff() {
 }
 
 const PreDraw* SplitResolve::TakeDraw(u64 fingerprint, bool indexed) {
-    if (current == nullptr || !current->by_shard) {
+    const PreDraw* records = nullptr;
+    size_t count = 0;
+    if (stream != nullptr) {
+        // F1-36 (R0-d): the records the shard finished so far (it may still be resolving).
+        count = stream->ready.load(std::memory_order_acquire);
+        records = stream->records.load(std::memory_order_acquire);
+    } else if (current != nullptr && current->by_shard) {
+        records = current->records.data();
+        count = current->records.size();
+    } else {
         return nullptr;
     }
     if (record_used >= record_count) {
@@ -1103,11 +1144,15 @@ const PreDraw* SplitResolve::TakeDraw(u64 fingerprint, bool indexed) {
         return nullptr;
     }
     const u32 ordinal = record_base + record_used++;
-    const auto& records = current->records;
-    while (cursor < records.size() && records[cursor].ordinal < ordinal) {
+    while (cursor < count && records[cursor].ordinal < ordinal) {
         ++cursor;
     }
-    if (cursor == records.size() || records[cursor].ordinal != ordinal) {
+    if (cursor == count) {
+        // Streamed and not resolved yet: the draw resolves live, no wait.
+        Count(stream != nullptr ? GetStats().draws_not_ready : GetStats().draws_unmatched);
+        return nullptr;
+    }
+    if (records[cursor].ordinal != ordinal) {
         Count(GetStats().draws_unmatched); // the shard kept no record for it
         return nullptr;
     }

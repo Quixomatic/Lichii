@@ -78,7 +78,9 @@ struct Stats {
     std::atomic<u64> stolen_queued{};      ///< the commit took a submitted segment no shard began
     std::atomic<u64> early_submits{};   ///< segments submitted before their end was published
     std::atomic<u64> front_snapshot_ns{}; ///< the front's snapshot time at cuts (R0 gate)
-    std::atomic<u64> early_abandoned{}; ///< ...whose shard the commit stopped waiting for
+    std::atomic<u64> early_streamed{}; ///< ...whose records the commit took as they came (R0-d)
+    std::atomic<u64> stream_finish_ns{}; ///< commit waiting for a streamed segment's shard to stop
+    std::atomic<u64> draws_not_ready{}; ///< streamed draws whose record was not ready yet (live)
     std::atomic<u64> verify_segments{};
     std::atomic<u64> verify_mismatches{};
     std::atomic<u64> verify_dependent{}; ///< request differences an earlier commit explains
@@ -275,6 +277,7 @@ public:
         bool by_shard = false; ///< the records came from a shard
         bool resolved = false; ///< records and requests are filled (else the caller resolves)
         bool waited = false;   ///< the commit waited for the running shard
+        u64 wait_ns = 0;       ///< how long (F1-36: the adaptive size weighs it)
         bool stolen = false;   ///< no shard had started it
         bool has_input = false;
     };
@@ -390,27 +393,33 @@ public:
                 return result;
             }
             case State::Running: {
+                if constexpr (requires { slot.input.progress->ready; }) {
+                    if (slot.input.progress != nullptr) {
+                        // F1-36 (R0-d): an early-submitted segment's shard publishes its records
+                        // one at a time; the commit takes each draw's record once it is ready
+                        // and resolves the draw live otherwise, never waiting here. (This
+                        // replaces abandoning a shard that waits for the front: that valve kept
+                        // the back from waiting on a shard waiting on the front, and the commit
+                        // now waits on no early segment until FinishStream, when the segment's
+                        // end is published.) The result belongs to the shard until then.
+                        streaming_id = id;
+                        Count(GetStats().early_streamed);
+                        return result;
+                    }
+                }
                 const u64 start = NowNs();
                 while (StateOf(slot.word.load(std::memory_order_acquire)) == State::Running) {
-                    if constexpr (requires { slot.input.progress->abandon; }) {
-                        // An early-submitted segment whose shard waits for the front to publish
-                        // more: the commit is here, so it resolves the segment itself.
-                        const auto& progress = slot.input.progress;
-                        if (progress != nullptr &&
-                            progress->waiting.load(std::memory_order_acquire) &&
-                            !progress->abandon.exchange(true, std::memory_order_acq_rel)) {
-                            Count(GetStats().early_abandoned);
-                        }
-                    }
                     if (++spins < 4096) {
                         CpuRelax();
                     } else {
                         std::this_thread::yield();
                     }
                 }
+                const u64 waited = NowNs() - start;
                 result.waited = true;
+                result.wait_ns += waited;
                 if (config.stats) {
-                    Count(GetStats().merge_wait_ns, NowNs() - start);
+                    Count(GetStats().merge_wait_ns, waited);
                     Count(GetStats().merge_waits);
                 }
                 continue;
@@ -452,6 +461,11 @@ public:
     Result& Merge(u64 id, Fallback&& fallback, Apply&& apply) {
         Result& result = Take(id);
         NoteOrder(id);
+        if (streaming_id == id) {
+            // The shard still writes the result: the caller reads its records through the
+            // segment's progress until FinishStream (they carry no requests before R4).
+            return result;
+        }
         if (!result.resolved) {
             fallback(result);
             result.resolved = true;
@@ -463,8 +477,49 @@ public:
         return result;
     }
 
+    /// Commit thread: whether Take streams segment `id` (its shard still running).
+    [[nodiscard]] bool Streaming(u64 id) const {
+        return streaming_id == id;
+    }
+
+    /// Commit thread, before a streamed segment's result is read or released: stops its shard
+    /// and waits until it has left (its end is published by then: the commit is past it, so the
+    /// shard waits for no front). Verify compares what the shard resolved with a serial resolve.
+    /// Returns the time waited (0 when `id` is not streamed).
+    u64 FinishStream(u64 id) {
+        if (streaming_id != id) {
+            return 0;
+        }
+        streaming_id = 0;
+        Slot& slot = slots[id & mask];
+        const u64 start = NowNs();
+        if constexpr (requires { slot.input.progress->abandon; }) {
+            slot.input.progress->abandon.store(true, std::memory_order_release);
+        }
+        for (u32 spins = 0;
+             StateOf(slot.word.load(std::memory_order_acquire)) == State::Running; ++spins) {
+            if (spins < 4096) {
+                CpuRelax();
+            } else {
+                std::this_thread::yield();
+            }
+        }
+        const u64 waited = NowNs() - start;
+        Result& result = slot.result;
+        result.has_input = true;
+        result.wait_ns += waited;
+        if (config.stats) {
+            Count(GetStats().stream_finish_ns, waited);
+        }
+        if (config.verify && result.serial == SerialReason::None) {
+            VerifyHere(slot);
+        }
+        return waited;
+    }
+
     /// Commit thread: the segment is consumed; its slot goes to segment id + depth.
     void Release(u64 id) {
+        FinishStream(id);
         Slot& slot = slots[id & mask];
         slot.input = Input{};
         slot.word.store(Pack(id + slots.size(), State::Free), std::memory_order_release);
@@ -548,6 +603,7 @@ private:
         result.by_shard = false;
         result.resolved = false;
         result.waited = false;
+        result.wait_ns = 0;
         result.stolen = false;
         result.has_input = false;
     }
@@ -747,6 +803,7 @@ private:
     Commit::Stage stage;
     u64 next_commit = 0;
     bool committed_any = false; ///< The first commit starts the order (segment ids start at 1)
+    u64 streaming_id = 0;       ///< F1-36: the segment Take streams (0: none; ids start at 1)
     std::vector<Record> verify_records;
     Commit::RequestList verify_requests;
     Arena verify_arena;

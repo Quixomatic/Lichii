@@ -246,36 +246,45 @@ class AdaptiveSize {
 public:
     static constexpr u32 Window = 256;
 
-    /// One committed segment: `waited` if the commit had to wait for a running shard, `stolen` if
-    /// no shard had started it, `utilisation` of the shards in percent over the window so far.
-    /// Returns the new size at the end of a window, else 0.
-    u32 Note(bool waited, bool stolen, u32 current) {
-        waits += waited ? 1 : 0;
+    /// Wait share of the commit's time above which segments shrink, and below which they grow.
+    static constexpr u64 ShrinkPercent = 5;
+    static constexpr u64 GrowPercent = 1;
+
+    /// One committed segment: `wait_ns` the commit waited for the shard running it, `commit_ns`
+    /// the commit thread's time since the previous segment (its draws included), `stolen` if no
+    /// shard had started it. Returns the new size at the end of a window, else 0.
+    /// F1-36 (R2-F6-03): weighed by wait time, not by how many segments waited: ~1.5 us waits
+    /// on a fifth of the segments cost <0.1% of the commit and pinned K at MinK.
+    u32 Note(u64 wait_ns, u64 commit_ns, bool stolen, u32 current) {
+        waited_ns += wait_ns;
+        total_ns += commit_ns;
         steals += stolen ? 1 : 0;
         if (++count < Window) {
             return 0;
         }
         u32 size = current;
-        if (waits * 10 > count) {
-            // More than 10% of segments made the commit wait: shorter segments finish sooner.
+        if (waited_ns * 100 > total_ns * ShrinkPercent) {
+            // The commit spends a real share waiting: shorter segments finish sooner.
             size = (std::max)(SegmentPolicy::MinK, current * 3 / 4);
         } else if (steals * 2 > count) {
             // Most segments are reached before a shard starts them: the producer lags, and
             // shorter segments would only add per-segment cost (AP6 §1.3(e)). Keep the size.
-        } else if (waits == 0 && steals * 10 < count) {
-            // Shards are ahead and the commit never waits: longer segments cost less overhead.
+        } else if (waited_ns * 100 <= total_ns * GrowPercent && steals * 10 < count) {
+            // Shards are ahead and the commit hardly waits: longer segments cost less overhead.
             size = (std::min)(SegmentPolicy::MaxK, current * 5 / 4 + 1);
         }
         count = 0;
-        waits = 0;
         steals = 0;
+        waited_ns = 0;
+        total_ns = 0;
         return size;
     }
 
 private:
     u32 count = 0;
-    u32 waits = 0;
     u32 steals = 0;
+    u64 waited_ns = 0;
+    u64 total_ns = 0;
 };
 
 } // namespace VideoCommon::V2::Resolve

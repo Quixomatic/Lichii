@@ -148,7 +148,9 @@ void ReportStats(const char* thread_name, u64 window_ns) {
         "shards "
         "{:.1f}%, serial {:.1f}% ({}) | cuts: {} | size {} | shards {} ({:.1f}% busy overall): {} | "
         "commit {:.2f} ms/s, merge wait {:.2f} ms/s ({} waits), serial resolve on commit {:.2f} "
-        "ms/s | refused {}, stolen before submit {}, while queued {}, early submits {} (abandoned {}) | front snapshot {:.2f} ms/s, blocks copied {:.0f}/s, shared {:.1f}% | pre-resolved draws "
+        "ms/s | refused {}, stolen before submit {}, while queued {}, early submits {} (streamed "
+        "{}, stream end wait {:.2f} ms/s, draws not ready {:.0f}/s) | front snapshot {:.2f} ms/s, "
+        "blocks copied {:.0f}/s, shared {:.1f}% | pre-resolved draws "
         "{:.0f}/s, unmatched {:.0f}/s, misfit {:.0f}/s, drift {}, no shape {:.0f}/s | verify: {} "
         "segments, {} "
         "mismatches ({} dependent); {} draws, {} mismatches; {} snapshots, {} mismatches | determinism: {} "
@@ -169,7 +171,8 @@ void ReportStats(const char* thread_name, u64 window_ns) {
         static_cast<double>(wait_ns) / 1e6 / seconds, waits,
         static_cast<double>(stolen_ns) / 1e6 / seconds, Take(stats.refused),
         Take(stats.stolen_unsubmitted), Take(stats.stolen_queued), Take(stats.early_submits),
-        Take(stats.early_abandoned),
+        Take(stats.early_streamed), static_cast<double>(Take(stats.stream_finish_ns)) / 1e6 / seconds,
+        static_cast<double>(Take(stats.draws_not_ready)) / seconds,
         static_cast<double>(Take(stats.front_snapshot_ns)) / 1e6 / seconds, static_cast<double>(copied) / seconds,
         copied + shared != 0 ? 100.0 * static_cast<double>(shared) /
                                    static_cast<double>(copied + shared)

@@ -108,13 +108,24 @@ TEST_CASE("V2 P6: segmenter cuts at render passes, sizes and engine switches", "
         Resolve::AdaptiveSize adaptive;
         u32 size = 0;
         for (u32 i = 0; i < Resolve::AdaptiveSize::Window; ++i) {
-            size = adaptive.Note(i % 4 == 0, false, 100); // 25% waits
+            // 25% of segments wait, 40 us of 100 us: 10% of the commit's time.
+            size = adaptive.Note(i % 4 == 0 ? 40'000 : 0, 100'000, false, 100);
         }
         CHECK(size == 75);
         for (u32 i = 0; i < Resolve::AdaptiveSize::Window; ++i) {
-            size = adaptive.Note(false, false, 100); // shards ahead, never waited
+            size = adaptive.Note(0, 100'000, false, 100); // shards ahead, never waited
         }
         CHECK(size == 126);
+        for (u32 i = 0; i < Resolve::AdaptiveSize::Window; ++i) {
+            // F1-36: a fifth of the segments wait ~1.5 us each: no reason to shrink.
+            size = adaptive.Note(i % 5 == 0 ? 1'500 : 0, 100'000, false, 100);
+        }
+        CHECK(size == 126);
+        for (u32 i = 0; i < Resolve::AdaptiveSize::Window; ++i) {
+            // Between the thresholds (3% waiting): the size holds.
+            size = adaptive.Note(3'000, 100'000, false, 100);
+        }
+        CHECK(size == 100);
         Resolve::Segmenter fixed{Resolve::SegmentPolicy::Parse("32")};
         fixed.SetSize(100);
         CHECK(fixed.Size() == 32); // only the adaptive policy moves
@@ -1050,6 +1061,83 @@ TEST_CASE("V2 P6: an abandoned early segment keeps the draws its shard resolved 
         INFO("published draws " << published_draws);
         CHECK(records.size() == published_draws);
         CHECK(reason == (published_draws == 0 ? SerialReason::Stolen : SerialReason::None));
+    }
+    Resolve::g_shard_key = saved;
+}
+
+TEST_CASE("V2 P6 F1-36: the commit streams an early segment's records without waiting",
+          "[video_core][v2_p6]") {
+    ScopedSystemTestContext context;
+    Core::System system;
+    Core::DeviceMemory physical;
+    Tegra::MaxwellDeviceMemoryManager device_memory{physical};
+    Tegra::MemoryManager memory{system, device_memory, 32, 1ULL << 31};
+    Tegra::Engines::Maxwell3D engine{memory};
+    auto snapshot = std::make_unique<Resolve::FrontSnapshot>();
+    Resolve::SnapshotBuilder<0xe00> builder;
+    const std::vector<u32> zero(0xe00, 0);
+    snapshot->regs = builder.Take(zero.data());
+    snapshot->engine_ref = 3;
+    const Resolve::ShardKeyFn saved = Resolve::g_shard_key;
+    Resolve::g_shard_key = &FakeShardKey;
+    V2::Ir::DrawBody body{};
+    body.op = V2::Ir::DrawOp::Predicted;
+    body.engine = 3;
+    body.num_draws = 1;
+    body.draws[0].kind = V2::Ir::DrawKind::Array;
+    V2::Ir::DrawBody cut = body;
+    cut.engine = 9; // stands for the next segment's Segment record
+    RingBuilder ring;
+    std::atomic<u64> published{0};
+    Resolve::SegmentProgress progress;
+    progress.Reset();
+    for (u32 draw = 0; draw < 5; ++draw) {
+        ring.Draw(body);
+    }
+    published.store(ring.position);
+    Resolve::SegmentInput input;
+    input.id = 1;
+    input.snapshot = snapshot.get();
+    input.ring = ring.ring.data();
+    input.arena = &ring.arena;
+    input.progress = &progress;
+    input.published = &published;
+    const auto wait_ready = [&](u32 count) {
+        while (progress.ready.load(std::memory_order_acquire) < count) {
+            std::this_thread::yield();
+        }
+    };
+    {
+        using Resolver = Resolve::ParallelResolver<Resolve::SplitTraits>;
+        Resolver::Config config;
+        config.shards = 1;
+        config.depth = 2;
+        config.resolve_stolen = false;
+        Resolver resolver{config, [](u32) { return Resolve::SplitTraits::Shard{}; }};
+        REQUIRE(resolver.Submit(1, Resolve::SegmentInput{input}));
+        wait_ready(5); // the shard runs and waits for the front: Take must not wait
+        resolver.Take(1);
+        CHECK(resolver.Streaming(1));
+        const Resolve::PreDraw* const records = progress.records.load(std::memory_order_acquire);
+        REQUIRE(records != nullptr);
+        for (u32 draw = 0; draw < 5; ++draw) {
+            CHECK(records[draw].ordinal == draw);
+        }
+        // The front publishes more: the records come as the shard resolves them, in place.
+        for (u32 draw = 0; draw < 3; ++draw) {
+            ring.Draw(body);
+        }
+        published.store(ring.position);
+        wait_ready(8);
+        CHECK(progress.records.load() == records);
+        CHECK(records[7].ordinal == 7);
+        // The cut: the commit is past the segment's end, the shard stops, the result is whole.
+        ring.Draw(cut);
+        progress.end.store(ring.position, std::memory_order_release);
+        published.store(ring.position);
+        resolver.FinishStream(1);
+        CHECK(!resolver.Streaming(1));
+        resolver.Release(1);
     }
     Resolve::g_shard_key = saved;
 }

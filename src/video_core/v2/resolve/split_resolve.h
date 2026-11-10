@@ -222,15 +222,24 @@ struct SegmentProgress {
     std::atomic<u64> end{~u64{0}};
     std::atomic<u8> serial{0};        ///< SerialReason found after submission (set before end)
     std::atomic<bool> waiting{false}; ///< the shard waits for the front to publish more
-    std::atomic<bool> abandon{false}; ///< the commit reached the segment, or the split stops
+    std::atomic<bool> abandon{false}; ///< the commit is done with the segment, or the split stops
+    /// F1-36 (R0-d): the shard's records as it resolves them: `records` (its reserved storage,
+    /// which never moves while streaming) holds `ready` finished ones (release per record).
+    std::atomic<const PreDraw*> records{nullptr};
+    std::atomic<u32> ready{0};
 
     void Reset() {
         end.store(~u64{0}, std::memory_order_relaxed);
         serial.store(0, std::memory_order_relaxed);
         waiting.store(false, std::memory_order_relaxed);
         abandon.store(false, std::memory_order_relaxed);
+        records.store(nullptr, std::memory_order_relaxed);
+        ready.store(0, std::memory_order_relaxed);
     }
 };
+/// Records an early segment's shard streams at most (the storage is reserved up front; draws
+/// past it resolve on the commit).
+inline constexpr size_t StreamRecords = 2 * SegmentPolicy::MaxK;
 
 struct SegmentInput {
     u64 id = 0;
@@ -432,7 +441,10 @@ private:
     // Back.
     bool holding = false;
     u64 held_id = 0;
+    u64 held_start_ns = 0; ///< when the commit took the held segment (the adaptive size)
     Resolver::Result* current = nullptr;
+    /// F1-36: the held segment's progress while its shard streams records (null otherwise).
+    SegmentProgress* stream = nullptr;
     size_t cursor = 0;
     /// F6-01: ordinals of the current segment's draws as the back reaches them (NoteDraws).
     uintptr_t segment_engine = 0;
