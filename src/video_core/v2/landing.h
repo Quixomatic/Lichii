@@ -150,6 +150,8 @@ inline void Note(u64 ticket) {
            !landed.compare_exchange_weak(current, ticket, std::memory_order_release,
                                          std::memory_order_relaxed)) {
     }
+    // SYNC_SUBMIT_SPEC §2.2 "landing" wake class: a suspended acquire may wait for this one.
+    FrontWake::Ring();
 }
 
 /// Back: inside an Untracked scope, the ring position its writes would have been tagged with.

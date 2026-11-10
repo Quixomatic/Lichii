@@ -140,6 +140,8 @@ void NoteForcedLanding(u64 ns);
 /// evictions.
 void NoteSemRow(u8 row);
 void NoteSemEvictions(u64 count);
+/// SYNC Step 5: a pending-channel sleep of the front ended (V2::FrontWake::SleepEnd).
+void NoteFrontSleep(u8 end);
 
 /// Attributes the waits for the back made while it lives (acquire sites) to `sync_class`.
 class AcquireContext {

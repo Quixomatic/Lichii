@@ -59,6 +59,8 @@ DmaPusher::~DmaPusher() = default;
 
 bool DmaPusher::CanResumeAcquire() {
     if (pending_list_tick) {
+        // GPU progress rings only with the finish thread: keep the front's sleep at one tick.
+        VideoCommon::V2::FrontWake::NoteTickWaiter();
         return rasterizer->IsGpuTickDone(*pending_list_tick);
     }
     return puller.CanResumeAcquire(*this);

@@ -104,6 +104,7 @@ struct FrontData {
     u64 forced_landing_ns{};
     std::array<u64, 8> sem_rows{};
     u64 sem_evictions{};
+    std::array<u64, 3> front_sleeps{}; ///< By V2::FrontWake::SleepEnd
 };
 
 constexpr std::array<const char*, 7> sem_row_names{
@@ -388,12 +389,19 @@ void ReportSync(const FrontData& data, const char* thread_name, u64 window_ns) {
         sem_any += data.sem_rows[r];
         rows += fmt::format(" {} {:.0f},", sem_row_names[r], PerSecond(data.sem_rows[r], window_ns));
     }
+    for (const u64 sleeps : data.front_sleeps) {
+        sem_any += sleeps;
+    }
     if (sem_any != 0) {
         rows.pop_back();
         LOG_INFO(HW_GPU,
                  "V2 stats {} SYNC semaphore view decisions by row (per s):{} | slot evictions "
-                 "{:.0f}/s",
-                 thread_name, rows, PerSecond(data.sem_evictions, window_ns));
+                 "{:.0f}/s | front sleeps ended by (per s): ring {:.0f}, tick {:.0f}, liveness "
+                 "bound {:.0f}",
+                 thread_name, rows, PerSecond(data.sem_evictions, window_ns),
+                 PerSecond(data.front_sleeps[0], window_ns),
+                 PerSecond(data.front_sleeps[1], window_ns),
+                 PerSecond(data.front_sleeps[2], window_ns));
     }
     u64 any = data.forced_landings;
     std::string wakes;
@@ -679,6 +687,13 @@ void NoteSemRow(u8 row) {
         return;
     }
     ++Front().data.sem_rows[std::min<size_t>(row, 7)];
+}
+
+void NoteFrontSleep(u8 end) {
+    if (!Enabled()) [[likely]] {
+        return;
+    }
+    ++Front().data.front_sleeps[std::min<size_t>(end, 2)];
 }
 
 void NoteSemEvictions(u64 count) {

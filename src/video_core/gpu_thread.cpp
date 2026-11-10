@@ -82,6 +82,9 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
             if (scheduler.HasPendingChannels()) {
                 // Suspended channels wait on semaphores the CPU releases: poll them meanwhile.
                 bool resumed = false;
+                // SYNC Step 5: rings after this point end the sleep below (or skip it).
+                const u64 ring_epoch = V2::FrontWake::Epoch();
+                static_cast<void>(V2::FrontWake::TakeTickWaiter());
                 {
                     Profile::Scope scope{Profile::Zone::ResumePending};
                     resumed = scheduler.ResumePending(system.GPU());
@@ -110,8 +113,16 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                         std::this_thread::yield();
                     } else if (view && waited < std::chrono::seconds{2}) [[unlikely]] {
                         // W-01b: a release latching a waiter, the back's progress, a readback
-                        // or a new command ends the tick at once (v2/front_wake.h).
-                        V2::FrontWake::Sleep();
+                        // or a new command ends the tick at once (v2/front_wake.h). SYNC Step 5
+                        // (spec §2.2): one tick only while a guest CPU waiter polls memory;
+                        // otherwise every wake source rings, so sleep until one does.
+                        if (V2::FrontWake::TakeTickWaiter()) {
+                            V2::FrontWake::Sleep();
+                            V2::Stats::NoteFrontSleep(static_cast<u8>(V2::FrontWake::SleepEnd::Tick));
+                        } else {
+                            V2::Stats::NoteFrontSleep(
+                                static_cast<u8>(V2::FrontWake::SleepUntilRing(ring_epoch)));
+                        }
                     } else if (waited < std::chrono::seconds{2}) {
 #ifdef _WIN32
                         // sleep_for(50us) rounds up to Sleep(1) (>= 1 ms) on Windows;

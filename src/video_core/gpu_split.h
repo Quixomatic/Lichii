@@ -352,6 +352,8 @@ public:
     /// translations (FlushCbWriteSlow) are checked against it, maps without a drain included.
     static void NoteMapExecuted() {
         maps_executed.fetch_add(1, std::memory_order_release);
+        // SYNC_SUBMIT_SPEC §2.2 "map" wake class: an acquire on an unmapped word waits for it.
+        V2::FrontWake::Ring();
     }
     [[nodiscard]] static u64 MapsExecuted() {
         return maps_executed.load(std::memory_order_acquire);

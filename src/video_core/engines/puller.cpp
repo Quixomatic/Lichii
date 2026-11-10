@@ -531,6 +531,10 @@ bool Puller::PollAcquireView(DmaPusher& dma_pusher) {
         // request per change of its fence's tick, or, while no fence carries it and the back
         // idles, one fence job per back position. No forced landing, no timed re-ask, no drain.
         acquire.wake_bits = check.decision.wake;
+        if ((acquire.wake_bits & V2::SemWake::Cpu) != 0) {
+            // Nothing rings for a guest CPU store: the front sleeps one tick at most (Step 5).
+            V2::FrontWake::NoteTickWaiter();
+        }
         if (V2Stats::Enabled()) [[unlikely]] {
             using Wake = V2Stats::WakeClass;
             const u8 bits = check.decision.wake;
@@ -605,6 +609,8 @@ bool Puller::PollAcquireView(DmaPusher& dma_pusher) {
     // The settings fallback and ACQUIRE=verify take the old (drained) poll. SYNC Step 4: the
     // view's own memory read replaces the old OldRead path's drain (DG 2.2 "no drain").
     if (!decided || verify) {
+        // The old poll reads memory each pass: keep the front's sleep at one tick.
+        V2::FrontWake::NoteTickWaiter();
         const bool old_passed = PollAcquire(dma_pusher);
         if (verify && decided) {
             ReportViewMismatch(dma_pusher, address, value, operation, passes, old_passed,

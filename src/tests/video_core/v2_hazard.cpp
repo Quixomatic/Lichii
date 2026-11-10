@@ -14,6 +14,7 @@
 #include <exception>
 
 #include "shader_recompiler/shader_info.h"
+#include "video_core/gpu_split.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/v2/front_wake.h"
 #include "video_core/v2/front_writes.h"
@@ -1083,4 +1084,43 @@ TEST_CASE("V2 front wake: a ring ends the suspended front's sleep", "[video_core
     }
     CHECK(std::chrono::steady_clock::now() - begin < std::chrono::seconds{2});
     stop.store(true);
+}
+
+TEST_CASE("SYNC step 5: each wake source rings the front's sleep until a ring",
+          "[video_core][v2_hazard]") {
+    namespace FrontWake = VideoCommon::V2::FrontWake;
+    FrontWake::RegisterFrontThread();
+    // A ring between the epoch and the sleep is never lost: the sleep doesn't start.
+    u64 seen = FrontWake::Epoch();
+    FrontWake::Ring();
+    CHECK(FrontWake::SleepUntilRing(seen) == FrontWake::SleepEnd::Ring);
+    // Each source the spec's wake table names rings from another thread and ends the sleep.
+    const auto ring_from = [&](auto&& source) {
+        seen = FrontWake::Epoch();
+        std::atomic<bool> go{false};
+        std::jthread other([&] {
+            while (!go.load()) {
+                std::this_thread::yield();
+            }
+            source();
+        });
+        go.store(true);
+        // Either the ring arrives first (no sleep) or it ends the sleep; never the bound alone,
+        // unless the scheduler delayed the other thread past it (then it rings at once after).
+        const auto end = FrontWake::SleepUntilRing(seen);
+        other.join();
+        return end == FrontWake::SleepEnd::Ring || FrontWake::Epoch() != seen;
+    };
+    // Landing (a ticketed write's operation ran).
+    CHECK(ring_from([] { Landing::Note(Landing::landed.load()); }));
+    // Untracked landing (a QMD write's operation ran).
+    CHECK(ring_from([] { Landing::NoteUntracked(Landing::untracked_landed.load()); }));
+    // Map executed.
+    CHECK(ring_from([] { VideoCommon::GpuSplit::NoteMapExecuted(); }));
+    // Consumed / readback / new work / GPU progress all call Ring directly.
+    CHECK(ring_from([] { FrontWake::Ring(); }));
+    // A guest CPU waiter keeps the tick sleep (nothing rings for a CPU store).
+    FrontWake::NoteTickWaiter();
+    CHECK(FrontWake::TakeTickWaiter());
+    CHECK_FALSE(FrontWake::TakeTickWaiter());
 }
