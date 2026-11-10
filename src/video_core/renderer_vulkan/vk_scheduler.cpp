@@ -200,8 +200,13 @@ Scheduler::~Scheduler() {
 
 u64 Scheduler::Flush(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
                      std::source_location location) {
-    // EDEN_NX2_V2_DRAWCACHE: a submit is an ordering point (collect epoch).
-    VideoCommon::V2::Versions::HookEpoch(VideoCommon::V2::Versions::EpochReason::Submit);
+    // EDEN_NX2_V2_DRAWCACHE: a submit is an ordering point (collect epoch). F4-08 (§8): with
+    // lazy fences, only a submission carrying something the guest observes is one (a fence, a
+    // waiter's request, deferred or wanted work); a heuristic submit orders nothing.
+    if (!lazy_fences || flush_pending || submit_wanted || SubmitRequested() ||
+        lazy_outstanding_tick == CurrentTick()) {
+        VideoCommon::V2::Versions::HookEpoch(VideoCommon::V2::Versions::EpochReason::Submit);
+    }
     if (state.renderpass) {
         CountRenderPassEnd(location.file_name(), location.line());
     }
