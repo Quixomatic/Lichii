@@ -10,8 +10,10 @@
 #include <array>
 #include <cstddef>
 #include <cstring>
+#include <memory>
 #include <vector>
 #include <optional>
+#include <utility>
 
 #include <boost/container/small_vector.hpp>
 
@@ -666,6 +668,137 @@ inline void PushImageDescriptors(TextureCache& texture_cache,
             is_rescaled |= element_rescaled;
         }
         rescaling.PushImage(is_rescaled);
+    }
+}
+
+/// Pipeline v2 P6 Step 0 (EDEN_NX2_V2_DRAWREC): what ApplyDraw derives from a record for its
+/// encode, in PushImageDescriptors' order: host handles of the descriptors outside the heap,
+/// the heap words, the rescaling words. Not relocatable (host handles, heap slots).
+struct DrawApplyOut {
+    boost::container::small_vector<std::pair<VkImageView, VkSampler>, 96> sampled;
+    boost::container::small_vector<VkImageView, 32> storage;
+    std::vector<u32> heap_words;
+    RescalingPushConstant rescaling; ///< its Push* cursors point into itself: never assigned
+    bool heap_replayed{};
+
+    void Clear() {
+        sampled.clear();
+        storage.clear();
+        heap_words.clear();
+        std::destroy_at(&rescaling);
+        std::construct_at(&rescaling);
+        heap_replayed = false;
+    }
+};
+
+/// Where EmitImageDescriptors is in a DrawApplyOut across stages.
+struct ImageDescriptorCursor {
+    size_t sampled{};
+    size_t storage{};
+};
+
+/// PushImageDescriptors' derivation for one stage, without the descriptor queue: handles (made
+/// on first use), heap slots (reserved through ImageSlot/SamplerSlot; with `peek`, looked up with
+/// PeekSlot and nothing reserved or marked), MarkModification of written images (not with
+/// `peek`), rescaling bits.
+inline void DeriveImageDescriptors(TextureCache& texture_cache, const Shader::Info& info,
+                                   const VideoCommon::SamplerId*& samplers,
+                                   const VideoCommon::ImageViewInOut*& views, BindlessHeap* heap,
+                                   bool heap_verify, DrawApplyOut& out, bool peek) {
+    views += Shader::NumDescriptors(info.texture_buffer_descriptors);
+    views += Shader::NumDescriptors(info.image_buffer_descriptors);
+    namespace SPIRV = Shader::Backend::SPIRV;
+    for (size_t desc_index = 0; desc_index < info.texture_descriptors.size(); ++desc_index) {
+        const auto& desc{info.texture_descriptors[desc_index]};
+        const bool in_heap{heap != nullptr && SPIRV::UsesHeap(info, desc_index)};
+        bool is_rescaled{};
+        for (u32 index = 0; index < desc.count; ++index) {
+            const VideoCommon::ImageViewId image_view_id{(views++)->id};
+            const VideoCommon::SamplerId sampler_id{*(samplers++)};
+            ImageView& image_view{texture_cache.GetImageView(image_view_id)};
+            VkImageView vk_image_view{image_view.Handle(desc.type)};
+            if (vk_image_view == VK_NULL_HANDLE) {
+                const VkImageView null_image_view{
+                    texture_cache.GetImageView(VideoCommon::NULL_IMAGE_VIEW_ID).Handle(desc.type)};
+                if (null_image_view != VK_NULL_HANDLE) vk_image_view = null_image_view;
+            }
+            Sampler& sampler{texture_cache.GetSampler(sampler_id)};
+            const VkSampler vk_sampler{sampler.HandleFor(image_view, desc.is_depth)};
+            if (in_heap) [[unlikely]] {
+                const u32 binding{
+                    SPIRV::HeapImageBinding(desc.type, desc.is_multisample, desc.is_integer)};
+                const u32 image_slot{peek ? heap->PeekImageSlot(binding, vk_image_view)
+                                          : heap->ImageSlot(binding, vk_image_view)};
+                const u32 sampler_slot{peek ? heap->PeekSamplerSlot(vk_sampler)
+                                            : heap->SamplerSlot(vk_sampler)};
+                out.heap_words.push_back(image_slot | (sampler_slot << 16));
+                if (heap_verify && !peek) {
+                    auto& data = VideoCommon::V2::P3Stats::Get();
+                    ++data.heap_verify;
+                    if (heap->ImageAt(binding, image_slot) != vk_image_view ||
+                        heap->SamplerAt(sampler_slot) != vk_sampler) {
+                        ++data.heap_mismatches;
+                    }
+                }
+            } else {
+                out.sampled.emplace_back(vk_image_view, vk_sampler);
+            }
+            is_rescaled |= texture_cache.IsRescaling(image_view);
+        }
+        out.rescaling.PushTexture(is_rescaled);
+    }
+    for (size_t desc_index = 0; desc_index < info.image_descriptors.size(); ++desc_index) {
+        const auto& desc{info.image_descriptors[desc_index]};
+        const bool in_heap{heap != nullptr && SPIRV::UsesHeapImage(info, desc_index)};
+        bool is_rescaled{};
+        for (u32 index = 0; index < desc.count; ++index) {
+            ImageView& image_view{texture_cache.GetImageView((views++)->id)};
+            const VkImageView vk_image_view{
+                image_view.StorageView(desc.type, desc.format, desc.is_byte_addressed)};
+            if (desc.is_written && !peek) {
+                texture_cache.MarkModification(image_view.image_id);
+            }
+            if (in_heap) [[unlikely]] {
+                const u32 binding{SPIRV::HeapStorageBinding(desc.type, desc.is_integer)};
+                const u32 slot{peek ? heap->PeekImageSlot(binding, vk_image_view)
+                                    : heap->ImageSlot(binding, vk_image_view)};
+                out.heap_words.push_back(slot);
+                if (heap_verify && !peek) {
+                    auto& data = VideoCommon::V2::P3Stats::Get();
+                    ++data.heap_verify;
+                    data.heap_mismatches += heap->ImageAt(binding, slot) != vk_image_view;
+                }
+            } else {
+                out.storage.push_back(vk_image_view);
+            }
+            is_rescaled |= texture_cache.IsRescaling(image_view);
+        }
+        out.rescaling.PushImage(is_rescaled);
+    }
+}
+
+/// PushImageDescriptors' descriptor queue entries for one stage, from DeriveImageDescriptors'
+/// output (`heap`: the pipeline reads the heap, as when PushImageDescriptors got one).
+inline void EmitImageDescriptors(GuestDescriptorQueue& guest_descriptor_queue,
+                                 const Shader::Info& info, bool heap, const DrawApplyOut& out,
+                                 ImageDescriptorCursor& cursor) {
+    namespace SPIRV = Shader::Backend::SPIRV;
+    for (size_t desc_index = 0; desc_index < info.texture_descriptors.size(); ++desc_index) {
+        if (heap && SPIRV::UsesHeap(info, desc_index)) {
+            continue;
+        }
+        for (u32 index = 0; index < info.texture_descriptors[desc_index].count; ++index) {
+            const auto& [view, sampler] = out.sampled[cursor.sampled++];
+            guest_descriptor_queue.AddSampledImage(view, sampler);
+        }
+    }
+    for (size_t desc_index = 0; desc_index < info.image_descriptors.size(); ++desc_index) {
+        if (heap && SPIRV::UsesHeapImage(info, desc_index)) {
+            continue;
+        }
+        for (u32 index = 0; index < info.image_descriptors[desc_index].count; ++index) {
+            guest_descriptor_queue.AddImage(out.storage[cursor.storage++]);
+        }
     }
 }
 

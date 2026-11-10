@@ -100,6 +100,12 @@ public:
     /// P5a: the element of texel buffer `view` in texel binding `binding`, written when new.
     [[nodiscard]] u32 TexelSlot(u32 binding, VkBufferView view);
 
+    /// P6 Step 0: the element Slot would return for `handle` without reserving or marking it
+    /// used (pure); Capacity when it has none yet.
+    [[nodiscard]] u32 PeekSlot(u32 binding, u64 handle) const;
+    [[nodiscard]] u32 PeekImageSlot(u32 binding, VkImageView view) const;
+    [[nodiscard]] u32 PeekSamplerSlot(VkSampler sampler) const;
+
     /// What element `slot` of `binding` holds (verify).
     [[nodiscard]] VkImageView ImageAt(u32 binding, u32 slot) const;
     [[nodiscard]] VkSampler SamplerAt(u32 slot) const;

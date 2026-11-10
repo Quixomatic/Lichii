@@ -280,6 +280,33 @@ u32 BindlessHeap::Slot(u32 binding, u64 handle) {
     return slot;
 }
 
+u32 BindlessHeap::PeekSlot(u32 binding, u64 handle) const {
+    const Space& space = spaces[binding];
+    if (const u32 slot = space.slots->Find(handle, HandleHash(handle));
+        slot != VideoCommon::V2::PublishedMap<u64>::Missing) {
+        return slot;
+    }
+    // Reserved by this thread and not committed yet (Slot's recent list).
+    const u64 current = generation.load(std::memory_order_acquire);
+    for (u32 index = 0; index < t_recent_count; ++index) {
+        const Recent& recent = t_recent[index];
+        if (recent.heap == this && recent.generation == current && recent.binding == binding &&
+            recent.handle == handle) {
+            return recent.slot;
+        }
+    }
+    return Capacity;
+}
+
+u32 BindlessHeap::PeekImageSlot(u32 binding, VkImageView view) const {
+    const u64 handle = ToHandle(view);
+    return handle == 0 ? 0 : PeekSlot(binding, handle);
+}
+
+u32 BindlessHeap::PeekSamplerSlot(VkSampler sampler) const {
+    return PeekSlot(SPIRV::HEAP_SAMPLER_BINDING, ToHandle(sampler));
+}
+
 void BindlessHeap::Touch(u32 binding, u32 slot) {
     if (binding < spaces.size() && slot < Capacity) {
         spaces[binding].last_use[slot].store(scheduler.CurrentTick(), std::memory_order_relaxed);
