@@ -243,13 +243,20 @@ struct CallInfo {
     /// later writes do: none after it is left out.
     u16 barrier_mask = 0;
     const u32* shadow = nullptr;
-    /// Asked before the first write and after each executable one; false sends the remaining
-    /// writes through `write` (a deferred draw makes every write act).
-    bool (*writes_skippable)(const void*) = nullptr;
-    const void* skippable_arg = nullptr;
+    /// Asked before the first write and after each executable one: while the draw model holds a
+    /// deferred draw (`*deferred_mode == 1 && *deferred_count != 0`, DrawModel::HasDeferredDraw)
+    /// the remaining writes go through `write` (a deferred draw makes every write act). Fix F3h
+    /// (R2-F5-05): two loads instead of a call through a pointer per executable write. Null:
+    /// always skippable.
+    const u8* deferred_mode = nullptr;
+    const u32* deferred_count = nullptr;
     /// MACROMEMO=verify (null: not checked): the count `write` raises for each write it drops;
     /// every write the replay would leave out must raise it.
     const u64* dropped_writes = nullptr;
+    /// Fix F3h (R2-F5-01, MASTER_PLAN §5.1/§5.2 "deltas already classified"): per method, 1
+    /// when a replayed write is a plain state write the caller's `store(method, value)` applies
+    /// as its classified result (null: every write goes through `write`).
+    const u8* store_class = nullptr;
     /// `live(read, emit, dram_read, dram_write)` runs the JIT with data RAM hooks, so misses of
     /// code that touches data RAM are recorded by the JIT too.
     bool jit_data_ram = false;
@@ -262,6 +269,11 @@ void LogRecordFailure(u32 start, std::string_view error);
 /// MACROMEMO=verify, Fix F3e: a write the replay would leave out was not dropped by `write`.
 void LogSkipMismatch(u32 start, u32 method, u32 value);
 } // namespace Detail
+
+/// CallInfo::deferred_mode: no deferred draw makes the writes act.
+[[nodiscard]] inline bool WritesSkippable(const CallInfo& call) {
+    return call.deferred_mode == nullptr || *call.deferred_mode != 1 || *call.deferred_count == 0;
+}
 
 /// Fix F3e: whether Write3D would drop this write now (CallInfo::skip_same).
 [[nodiscard]] inline bool SkippableWrite(const CallInfo& call, u32 method, u32 value) {
@@ -404,12 +416,18 @@ Result RecordCall(Memo& memo, Tegra::TuringMacroInterpreter& interpreter, const 
     return result;
 }
 
+/// A hit's plain state writes go through `write` (no CallInfo::store_class).
+struct NoStore {
+    void operator()(u32, u32) const {}
+};
+
 /// A macro call through the memo. `live(read, emit)` runs it the old way (the JIT) with those
 /// callbacks; `read(address)` is the MME STATE read; `write(method, value)` the front's write of
-/// a macro method (false: not one); `dma(method, value)` the MME DMA read that write starts.
-template <typename Live, typename Read, typename Write, typename Dma>
+/// a macro method (false: not one); `dma(method, value)` the MME DMA read that write starts;
+/// `store(method, value)` a hit's write of a CallInfo::store_class method.
+template <typename Live, typename Read, typename Write, typename Dma, typename Store = NoStore>
 Result Call(Memo& memo, Tegra::TuringMacroInterpreter& interpreter, const CallInfo& call,
-            Live&& live, Read&& read, Write&& write, Dma&& dma) {
+            Live&& live, Read&& read, Write&& write, Dma&& dma, Store&& store = {}) {
     std::vector<u32>& fifo = *call.fifo;
     ++memo.statistics.calls;
     const auto live_emit = [&](u32 method, u32 value) {
@@ -434,13 +452,11 @@ Result Call(Memo& memo, Tegra::TuringMacroInterpreter& interpreter, const CallIn
                           write, dma);
     }
     // Fix F3e: the writes a hit leaves out are decided as it goes (SkippableWrite).
-    bool skip = call.skip_same &&
-                (call.writes_skippable == nullptr || call.writes_skippable(call.skippable_arg));
+    bool skip = call.skip_same && WritesSkippable(call);
     u32 skipped = 0;
     // After an executable write made under `skip`.
     const auto keep_skipping = [&call](u32 method) {
-        return (call.flags[method] & call.barrier_mask) == 0 &&
-               (call.writes_skippable == nullptr || call.writes_skippable(call.skippable_arg));
+        return (call.flags[method] & call.barrier_mask) == 0 && WritesSkippable(call);
     };
     if (call.verify) {
         // The JIT makes the writes; the record must have predicted them. Each write the replay
@@ -508,6 +524,8 @@ Result Call(Memo& memo, Tegra::TuringMacroInterpreter& interpreter, const CallIn
     const size_t num_writes = record.writes.size() / 2;
     size_t next_dma = 0;
     size_t word_offset = 0;
+    constexpr bool classified = !std::is_same_v<std::remove_cvref_t<Store>, NoStore>;
+    const u8* const store_class = classified ? call.store_class : nullptr;
     for (size_t i = 0; i < num_writes; ++i) {
         const u32 method = record.writes[i * 2];
         const u32 value = record.writes[i * 2 + 1];
@@ -516,10 +534,17 @@ Result Call(Memo& memo, Tegra::TuringMacroInterpreter& interpreter, const CallIn
                 ++skipped;
                 continue; // never a DMA write (SkippableWrite)
             }
+            if (store_class != nullptr && store_class[method] != 0) {
+                store(method, value); // not executable: `skip` stays
+                continue;             // never a DMA write (not a store-class method)
+            }
             write(method, value);
             if ((call.flags[method] & call.exec_mask) != 0) {
                 skip = keep_skipping(method);
             }
+        } else if (store_class != nullptr && store_class[method] != 0) {
+            store(method, value);
+            continue;
         } else {
             write(method, value);
         }

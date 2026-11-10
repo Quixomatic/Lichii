@@ -138,7 +138,8 @@ public:
         const u64 elapsed = Ticks() - start;
         auto& data = t_data;
         const auto index = static_cast<size_t>(zone);
-        data.exclusive_ns[index] += elapsed - data.child_ns;
+        // Saturated: a SampledScope inside adds its estimate, which may exceed one instance.
+        data.exclusive_ns[index] += elapsed - (std::min)(elapsed, data.child_ns);
         ++data.count[index];
         data.child_ns = parent_child_ns + elapsed;
     }
@@ -149,6 +150,48 @@ public:
 private:
     Zone zone;
     bool enabled;
+    u64 start{};
+    u64 parent_child_ns{};
+};
+
+/// Fix F3h (R2-B-07): a zone entered ~1M times a second (the front's macro calls), where two
+/// time stamp reads per call cost ~0.8 ms per frame and inflated the zone they measure. One call
+/// in Every is timed and stands for Every calls: its exclusive time and count are scaled, and
+/// the enclosing zone is told the others' estimated exclusive time (zones nested in the calls
+/// not timed were already counted by it).
+template <u32 Every>
+class SampledScope {
+public:
+    explicit SampledScope(Zone zone_) : zone{zone_} {
+        if (!Enabled() || (++t_sample % Every) != 0) {
+            return;
+        }
+        enabled = true;
+        parent_child_ns = t_data.child_ns;
+        t_data.child_ns = 0;
+        start = Ticks();
+    }
+
+    ~SampledScope() {
+        if (!enabled) {
+            return;
+        }
+        const u64 elapsed = Ticks() - start;
+        auto& data = t_data;
+        const auto index = static_cast<size_t>(zone);
+        const u64 exclusive = elapsed - (std::min)(elapsed, data.child_ns);
+        data.exclusive_ns[index] += exclusive * Every;
+        data.count[index] += Every;
+        data.child_ns = parent_child_ns + elapsed + exclusive * (Every - 1);
+    }
+
+    SampledScope(const SampledScope&) = delete;
+    SampledScope& operator=(const SampledScope&) = delete;
+
+private:
+    static inline thread_local u32 t_sample = 0;
+    Zone zone;
+    bool enabled{};
     u64 start{};
     u64 parent_child_ns{};
 };

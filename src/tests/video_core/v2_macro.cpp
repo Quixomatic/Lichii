@@ -78,7 +78,12 @@ struct Front {
     std::array<u16, 0x1000> flags{};
     bool track = false;
     std::array<u32, 0x1000> shadow{};
-    bool deferred_draw = false;
+    u8 deferred_mode = 0;    ///< DrawModelState::mode (1: instance) ...
+    u32 deferred_count = 0;  ///< ... with instances: a deferred draw
+    /// Fix F3h (R2-F5-01): methods a hit applies through Store, and what it applied.
+    std::array<u8, 0x1000> store_class{};
+    bool classified = false;
+    Pairs applied;
     u64 dropped = 0;
     bool drop_counted = true;
     bool jit_data_ram = false;
@@ -155,11 +160,16 @@ struct Front {
             .exec_mask = 1,
             .barrier_mask = 4,
             .shadow = track ? shadow.data() : nullptr,
-            .writes_skippable =
-                [](const void* front) { return !static_cast<const Front*>(front)->deferred_draw; },
-            .skippable_arg = this,
+            .deferred_mode = &deferred_mode,
+            .deferred_count = &deferred_count,
             .dropped_writes = &dropped,
+            .store_class = classified ? store_class.data() : nullptr,
             .jit_data_ram = jit_data_ram,
+        };
+        // The classified apply: the same store as Write, and seen apart.
+        const auto store = [&](u32 method, u32 value) {
+            applied.emplace_back(method, value);
+            Write(method, value);
         };
         const auto read = [&](u32 address) { return address < regs.size() ? regs[address] : 0U; };
         const auto write = [&](u32 method, u32 value) { return Write(method, value); };
@@ -185,7 +195,9 @@ struct Front {
             }
 #endif
         };
-        const auto result = MacroMemo::Call(memo, interpreter, call, live, read, write, dma);
+        applied.clear();
+        const auto result =
+            MacroMemo::Call(memo, interpreter, call, live, read, write, dma, store);
         REQUIRE(result.success);
         return writes;
     }
@@ -444,9 +456,28 @@ TEST_CASE("V2 macro memo: hits leave out the writes Write3D would drop",
         CHECK(front.shadow[method] == value);
     }
     SECTION("a deferred draw makes every write") {
-        front.deferred_draw = true;
+        front.deferred_mode = 1;
+        front.deferred_count = 2;
         CHECK(front.Memoised(call) == expected);
         CHECK(front.memo.last_skipped == 0);
+        front.deferred_count = 0; // instance mode without instances: no deferred draw
+        CHECK(front.Memoised(call) == held);
+    }
+    SECTION("R2-F5-01: a hit applies plain state writes classified, the rest through write") {
+        front.classified = true;
+        front.store_class[method] = 1;
+        front.regs[method] = ~value; // made again
+        const Pairs again = sent(front.regs);
+        REQUIRE(!again.empty());
+        CHECK(front.Memoised(call) == again);
+        CHECK(front.applied == Pairs{expected[0]}); // applied, not through the write path
+        // Without compare-on-write every write is made: store-class ones still classified.
+        front.skip_same = false;
+        CHECK(front.Memoised(call) == expected);
+        CHECK(front.applied == Pairs{expected[0]});
+        // Verify runs the JIT: everything through write.
+        CHECK(front.Memoised(call, true) == expected);
+        CHECK(front.applied.empty());
     }
     SECTION("verify: every write the replay would leave out must be dropped") {
         const u64 skipped = front.memo.statistics.skipped_writes;

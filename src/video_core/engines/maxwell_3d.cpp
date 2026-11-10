@@ -1754,6 +1754,13 @@ struct Maxwell3D::FrontState {
     /// S1Hook* bits per register: what FrontS1Hooks does after a write (none: no call). Only the
     /// registers with write notes or stats have any; the profile counts below need none.
     std::array<u8, Regs::NUM_REGS> s1_hooks{};
+    /// Fix F3h (R2-F5-01): 1 for a plain state write a memo hit applies classified (no hooks,
+    /// not executable, not the draw manager): Write3D's store and Classify3D's Delta only.
+    std::array<u8, Regs::NUM_REGS> s1_store_class{};
+    /// Fix F3h (R2-F5-05): the memo call's description, built once; per call only its varying
+    /// fields are set.
+    VideoCommon::V2::MacroMemo::CallInfo v2_memo_call{};
+    bool v2_memo_call_ready{};
     /// S1 with write tracking: the sink notes each constant buffer word's range (Fix F3d).
     bool s1_note_cb{};
     /// Nx2Profile write counters, counted here (no thread-local access per write) and added to
@@ -1921,6 +1928,13 @@ Maxwell3D::FrontState& Maxwell3D::Front(Core::System& system, VideoCommon::GpuSp
                         hooks |= S1HookStats;
                     }
                     front->s1_hooks[method] = hooks;
+                    // R2-F5-01: a plain state write (Write3D's store, Classify3D's Delta) with
+                    // nothing after it: a memo hit applies it without the general write path.
+                    front->s1_store_class[method] =
+                        front->s1_exec && hooks == 0 && method != 0x157 && method != 0x158 &&
+                        table.actions[method] == VideoCommon::V2::RegSem::Action3D::Store &&
+                        (table.flags[method] & (VideoCommon::V2::RegSem::Exec |
+                                                VideoCommon::V2::RegSem::DrawManager)) == 0;
                 }
                 front->s1_note_cb = front->s1_exec && split.TracksWrites();
             }
@@ -2900,7 +2914,9 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
         }
     }
     {
-        VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Macro};
+        // R2-B-07: one call in 16 timed (~1.2M calls/s; timing each inflated the zone).
+        VideoCommon::Nx2Profile::SampledScope<16> profile_scope{
+            VideoCommon::Nx2Profile::Zone::Macro};
         engine.native_interpreter.active_dram = &native_data_ram;
         const auto parameter_count = fs.parameters.size();
         const auto read = [this, &split, &fs](u32 address) {
@@ -2976,50 +2992,82 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
                 MAXWELL3D_REG_INDEX(load_mme.start_address_ptr),
                 MAXWELL3D_REG_INDEX(shadow_scratch),
             };
-            const MacroMemo::CallInfo call{
-                .start = start,
-                .fifo = &fs.parameters,
-                .dram = native_data_ram,
-                .code = engine.native_code,
-                .generation = &engine.native_code_generation,
-                .regs = fs.regs.data(),
-                .num_regs = Regs::NUM_REGS,
-                .side_effects = side_effects,
-                .dma_fifoed = 0x158,
-                .dma_ram = 0x157,
-                .verify = memo == VideoCommon::V2::Mode::Verify,
-                // A record that read the mode the back evaluates isn't checked against the
-                // front's copy until `read` took the back's.
-                .stale_register = fs.v2_render_enable_unknown ||
-                                          fs.regs[RenderEnableMode] == ShadowUnknown
-                                      ? RenderEnableMode
-                                      : ~0U,
-                .key = call_key,
-                // Fix F3e: a replay leaves out the writes Write3D would drop (S1's
-                // FrontWriteS1, skip_same, not under Replay; every write seen when the HLE
-                // checks or the dump observe them).
-                .skip_same = fs.s1_exec && fs.skip_same && !fs.v2_observation &&
-                             fs.control != Regs::ShadowRamControl::Replay,
-                .flags = fs.v2_table->flags.data(),
-                .exec_mask = VideoCommon::V2::RegSem::Exec,
-                .barrier_mask = VideoCommon::V2::RegSem::ShadowControl,
-                .shadow = fs.control == Regs::ShadowRamControl::Track ||
+            MacroMemo::CallInfo& call = fs.v2_memo_call;
+            if (!fs.v2_memo_call_ready || call.code.data() != engine.native_code.data() ||
+                call.generation != &engine.native_code_generation ||
+                call.flags != fs.v2_table->flags.data()) [[unlikely]] {
+                // R2-F5-05: what stays the same from call to call, set once (the code span
+                // and data RAM are the engine's own arrays; the generation is read through).
+                call = MacroMemo::CallInfo{
+                    .fifo = &fs.parameters,
+                    .dram = native_data_ram,
+                    .code = engine.native_code,
+                    .generation = &engine.native_code_generation,
+                    .regs = fs.regs.data(),
+                    .num_regs = Regs::NUM_REGS,
+                    .side_effects = side_effects,
+                    .dma_fifoed = 0x158,
+                    .dma_ram = 0x157,
+                    .flags = fs.v2_table->flags.data(),
+                    .exec_mask = VideoCommon::V2::RegSem::Exec,
+                    .barrier_mask = VideoCommon::V2::RegSem::ShadowControl,
+                    .deferred_mode = &fs.v2_draw_model.state.mode,
+                    .deferred_count = &fs.v2_draw_model.state.instance_count,
+                    .dropped_writes = &fs.s1_same_writes,
+#ifdef ARCHITECTURE_x86_64
+                    .jit_data_ram = true,
+#endif
+                };
+                fs.v2_memo_call_ready = true;
+            }
+            call.start = start;
+            call.verify = memo == VideoCommon::V2::Mode::Verify;
+            // A record that read the mode the back evaluates isn't checked against the front's
+            // copy until `read` took the back's.
+            call.stale_register =
+                fs.v2_render_enable_unknown || fs.regs[RenderEnableMode] == ShadowUnknown
+                    ? RenderEnableMode
+                    : ~0U;
+            call.key = call_key;
+            // Fix F3e: a replay leaves out the writes Write3D would drop (S1's FrontWriteS1,
+            // skip_same, not under Replay; every write seen when the HLE checks or the dump
+            // observe them).
+            call.skip_same = fs.s1_exec && fs.skip_same && !fs.v2_observation &&
+                             fs.control != Regs::ShadowRamControl::Replay;
+            call.shadow = fs.control == Regs::ShadowRamControl::Track ||
                                   fs.control == Regs::ShadowRamControl::TrackWithFilter
                               ? fs.shadow.data()
-                              : nullptr,
-                .writes_skippable =
-                    [](const void* model) {
-                        return !static_cast<const VideoCommon::V2::DrawModel*>(model)
-                                    ->HasDeferredDraw();
-                    },
-                .skippable_arg = &fs.v2_draw_model,
-                .dropped_writes = &fs.s1_same_writes,
-#ifdef ARCHITECTURE_x86_64
-                .jit_data_ram = true,
-#endif
+                              : nullptr;
+            // R2-F5-01: a hit applies a plain state write as its classified result (Write3D's
+            // store and Classify3D's Delta), not through the general write path; never while a
+            // write is observed (HLE check, dump) or a deferred draw makes writes act.
+            call.store_class =
+                fs.s1_exec && !fs.v2_observation ? fs.s1_store_class.data() : nullptr;
+            const auto store = [&](u32 address, u32 value) {
+                namespace RegSem = VideoCommon::V2::RegSem;
+                if (fs.v2_draw_model.HasDeferredDraw()) [[unlikely]] {
+                    FrontWriteS1(split, fs, address, value, true, true);
+                    return;
+                }
+                ++fs.s1_writes;
+                const RegSem::Table3D& table = *fs.v2_table;
+                bool shadow_kept = true;
+                const u32 stored = RegSem::ApplyShadow3D(fs.control, fs.shadow.data(), address,
+                                                         value, &shadow_kept);
+                const u32 old_value = fs.regs[address];
+                if (old_value == stored && shadow_kept && fs.skip_same) {
+                    ++fs.s1_same_writes;
+                    return;
+                }
+                RegSem::Store3D(fs, table, address, stored);
+                fs.sink_pending = false;
+                if (stored != old_value || !fs.back_skip_same) {
+                    split.S1Word(this, VideoCommon::V2::S1::MakeRegister(
+                                           VideoCommon::V2::S1::Tag::Delta, address, stored));
+                }
             };
             result = MacroMemo::Call(*fs.v2_memo, engine.native_interpreter, call, live, read,
-                                     write, dma);
+                                     write, dma, store);
             // The writes a hit left out, counted as FrontWriteS1 counts dropped ones.
             fs.s1_writes += fs.v2_memo->last_skipped;
             fs.s1_same_writes += fs.v2_memo->last_skipped;
