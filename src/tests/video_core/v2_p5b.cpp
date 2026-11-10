@@ -18,6 +18,7 @@
 
 #include "video_core/native_qmd.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
+#include "video_core/v2/after_pass.h"
 #include "video_core/v2/barrier_tracker.h"
 #include "video_core/v2/flush_heuristic.h"
 #include "video_core/v2/frame_pacer.h"
@@ -1007,6 +1008,69 @@ TEST_CASE("V2 P5b the idle hook submits nothing while the GPU is busy and nobody
     REQUIRE(requests.AtIdleHook(true, true, false, 0, open, false) == Action::Deferred);
     // Submitted ticks are no longer urgent.
     REQUIRE_FALSE(blocked.Urgent(open + 1));
+}
+
+TEST_CASE("SYNC step 9: the post-pass list runs in order after the pass, before the submit",
+          "[video_core][v2_p5b]") {
+    // Model of the recording stream: the scheduler runs the list at the pass end (EndRenderPass)
+    // and at the start of a submission (Flush/Finish). Copies recorded after the queries ended,
+    // before the submit; a job deferred twice runs once; a job deferred while the list runs runs
+    // after the others.
+    VideoCommon::V2::AfterPassList list;
+    std::vector<int> stream;
+    struct Ctx {
+        std::vector<int>* stream;
+        VideoCommon::V2::AfterPassList* list;
+        int id;
+    };
+    Ctx presync{&stream, &list, 1};
+    Ctx sync{&stream, &list, 2};
+    const auto record = [](void* argument) {
+        auto& self = *static_cast<Ctx*>(argument);
+        self.stream->push_back(self.id);
+    };
+    stream.push_back(100); // a query ends in the pass
+    list.Defer(record, &presync);
+    list.Defer(record, &sync);
+    list.Defer(record, &presync); // the same WFI again before the pass ended: once
+    stream.push_back(101);        // a later draw in the same pass
+    REQUIRE_FALSE(list.Empty());
+    stream.push_back(200); // the pass ends
+    list.Run();
+    stream.push_back(300); // the submit
+    REQUIRE(stream == std::vector<int>{100, 101, 200, 1, 2, 300});
+    REQUIRE(list.Empty());
+    // A job deferring another runs it in the same Run, after itself.
+    Ctx chained{&stream, &list, 3};
+    list.Defer(
+        [](void* argument) {
+            auto& self = *static_cast<Ctx*>(argument);
+            self.stream->push_back(self.id);
+            static Ctx after{self.stream, self.list, 4};
+            self.list->Defer(
+                [](void* inner) {
+                    auto& next = *static_cast<Ctx*>(inner);
+                    next.stream->push_back(next.id);
+                },
+                &after);
+        },
+        &chained);
+    stream.clear();
+    list.Run();
+    REQUIRE(stream == std::vector<int>{3, 4});
+}
+
+TEST_CASE("SYNC step 9: a buffer copy goes to the upload stream only when hazard-free",
+          "[video_core][v2_p5b]") {
+    // BufferCache::DMACopy's rule: neither the source nor the destination range is used by work
+    // in flight (Buffer::IsRegionUsed: no pending write to read, no read or write to pass).
+    const auto hazard_free = [](bool adaptive, bool source_used, bool destination_used) {
+        return adaptive && !source_used && !destination_used;
+    };
+    REQUIRE(hazard_free(true, false, false));
+    REQUIRE_FALSE(hazard_free(true, true, false));  // the source has a write in flight
+    REQUIRE_FALSE(hazard_free(true, false, true));  // the open submission reads the destination
+    REQUIRE_FALSE(hazard_free(false, false, false)); // v1: in order as before
 }
 
 TEST_CASE("SYNC step 7: the back submits for rules B, C, I and W only", "[video_core][v2_p5b]") {

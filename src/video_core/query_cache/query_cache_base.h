@@ -109,7 +109,12 @@ public:
     void CounterReport(GPUVAddr addr, QueryType counter_type, QueryPropertiesFlags flags,
                        u32 payload, u32 subreport);
 
-    void NotifyWFI();
+    /// `at_pass_end` (SYNC Step 9, the guest's wait for idle): with the range tracker the copies
+    /// may run at the open pass's end. A fence's commit (CommitAsyncFlushes) syncs at once.
+    void NotifyWFI(bool at_pass_end = false);
+    /// NotifyWFI's work: the pending query results copied out (SYNC Step 9: may run at the end of
+    /// the open pass).
+    void SyncQueryWrites();
 
     bool AccelerateHostConditionalRendering();
 

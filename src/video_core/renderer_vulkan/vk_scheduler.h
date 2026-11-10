@@ -31,6 +31,7 @@
 #include "video_core/renderer_vulkan/fragment_barrier_state.h"
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
 #include "video_core/v2/barrier_tracker.h"
+#include "video_core/v2/after_pass.h"
 #include "video_core/v2/submit_requests.h"
 #include "video_core/v2/timeline_join.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
@@ -111,6 +112,18 @@ public:
     void SetPreSubmitHook(void (*hook)(void*), void* argument) {
         pre_submit_hook = hook;
         pre_submit_argument = argument;
+    }
+    /// SYNC_SUBMIT_SPEC Step 9 (MP §6 class D: results land at a host fence, so a copy that waits
+    /// for the pass end changes nothing a guest sees before it): with the range tracker, runs
+    /// `job(argument)` at the open pass's next natural end or at the submission, never ending
+    /// the pass itself. False with no pass open (the caller runs it now). Deferring the same job
+    /// again before it ran adds nothing (it then covers both).
+    bool DeferToPassEnd(void (*job)(void*), void* argument) {
+        if (!track_barriers || !state.renderpass) {
+            return false;
+        }
+        after_pass.Defer(job, argument);
+        return true;
     }
     /// Recording thread: a lazy fence waits for `tick`.
     void NoteLazyFence(u64 tick) {
@@ -639,6 +652,11 @@ private:
     u32 wfi_at_pass_end{};              ///< F4-X3: barrier stages of a WFI in the active pass
     bool submit_wanted{};             ///< F4-02: work waits for the next idle hook or boundary
     u64 lazy_outstanding_tick{};        ///< F4-02: newest lazy fence's tick (recording thread)
+    /// SYNC Step 9: DeferToPassEnd's jobs, in order.
+    VideoCommon::V2::AfterPassList after_pass;
+    void RunAfterPass() {
+        after_pass.Run();
+    }
     void (*pre_submit_hook)(void*){};   ///< SYNC Step 8: SetPreSubmitHook
     void* pre_submit_argument{};
     bool in_pre_submit{};               ///< The hook runs (it may record, never resubmit)

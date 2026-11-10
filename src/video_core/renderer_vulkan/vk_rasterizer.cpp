@@ -4050,7 +4050,7 @@ void RasterizerVulkan::WaitForIdle() {
         flags |= VK_PIPELINE_STAGE_TRANSFORM_FEEDBACK_BIT_EXT;
     }
 
-    query_cache.NotifyWFI();
+    query_cache.NotifyWFI(true); // SYNC Step 9: copies at the pass end (with DYNRENDER)
 
     if (device.IsMoltenVK() && scheduler.IsRenderPassActive()) {
         scheduler.DeferFragmentBarrier();

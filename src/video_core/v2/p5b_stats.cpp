@@ -190,7 +190,8 @@ void Report(const char* thread_name, u64 window_ns) {
              "pass {:.1f} (kept the open pass {:.1f}), blit {:.1f}; passes ended by clears {:.1f} "
              "(full clears of other attachments {:.1f}, partial {:.1f}; then deferred as load ops "
              "{:.1f}), begun {:.1f}, barriers {:.1f} | passes restarted for a pipeline's colour "
-             "count {:.1f}/frame",
+             "count {:.1f}/frame | SYNC step 9: buffer copies in the upload stream {:.1f}/frame, "
+             "query result copies after the pass {:.1f}/frame",
              thread_name, per_frame(passes), 100.0 * Ratio(at(Counter::DynamicPasses), passes),
              Ratio(at(Counter::PassDraws), passes), per_frame(at(Counter::PassEndBarriers)),
              per_frame(at(Counter::TargetedBarriers)), per_frame(at(Counter::FullBarriers)),
@@ -203,7 +204,8 @@ void Report(const char* thread_name, u64 window_ns) {
              per_frame(at(Counter::ClearPassEnds)), per_frame(at(Counter::ClearPassEndsFull)),
              per_frame(at(Counter::ClearPassEndsPartial)),
              per_frame(at(Counter::ClearsDeferredEnded)), per_frame(at(Counter::ClearPassBegins)),
-             per_frame(at(Counter::ClearBarriers)), per_frame(at(Counter::PassColorRestarts)));
+             per_frame(at(Counter::ClearBarriers)), per_frame(at(Counter::PassColorRestarts)),
+             per_frame(at(Counter::HoistedCopies)), per_frame(at(Counter::QueryWfiAfterPass)));
     LOG_INFO(HW_GPU,
              "V2 stats {} P5b transfer queue | batches {:.0f}/s, buffer copies {:.0f}/s ({:.0f} "
              "KiB/s), image uploads {:.0f}/s, kept in order {:.0f}/s, acquire joins {:.0f}/s | "

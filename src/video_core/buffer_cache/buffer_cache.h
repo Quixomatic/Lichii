@@ -831,9 +831,22 @@ bool BufferCache<P>::DMACopy(GPUVAddr src_address, GPUVAddr dest_address, u64 am
         }
     }
     const auto& copy = copies[0];
+    // SYNC_SUBMIT_SPEC Step 9 (MP §5.4 "staging uploads into the upload stream", the hazard-free
+    // subset of F4-05): a copy whose source and destination no work in flight uses (no pending
+    // write to read, no read or write to pass) goes to the submission's upload command buffer,
+    // which runs before its main stream: it ends no pass. Others keep their place.
+    [[maybe_unused]] bool hazard_free = false;
+    if constexpr (!IS_OPENGL) {
+        hazard_free = v2_producer_reads && !src_buffer.IsRegionUsed(copy.src_offset, copy.size) &&
+                      !dest_buffer.IsRegionUsed(copy.dst_offset, copy.size);
+    }
     src_buffer.MarkUsage(copy.src_offset, copy.size);
     dest_buffer.MarkUsage(copy.dst_offset, copy.size);
-    runtime.CopyBuffer(dest_buffer, src_buffer, copies, true);
+    if constexpr (!IS_OPENGL) {
+        runtime.CopyBuffer(dest_buffer, src_buffer, copies, true, false, hazard_free);
+    } else {
+        runtime.CopyBuffer(dest_buffer, src_buffer, copies, true);
+    }
     if (has_new_downloads) {
         if constexpr (!IS_OPENGL) {
             if (v2_producer_reads) [[unlikely]] {

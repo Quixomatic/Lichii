@@ -28,6 +28,7 @@
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
+#include "video_core/v2/p5b_stats.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_memory_allocator.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
@@ -1662,6 +1663,14 @@ VideoCommon::StreamerInterface* QueryCacheRuntime::GetStreamerInterface(QueryTyp
     default:
         return nullptr;
     }
+}
+
+bool QueryCacheRuntime::DeferToPassEnd(void (*job)(void*), void* argument) {
+    if (!impl->scheduler.DeferToPassEnd(job, argument)) {
+        return false;
+    }
+    VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::QueryWfiAfterPass);
+    return true;
 }
 
 void QueryCacheRuntime::Barriers(bool is_prebarrier) {

@@ -443,14 +443,33 @@ void QueryCacheBase<Traits>::UnregisterPending() {
 }
 
 template <typename Traits>
-void QueryCacheBase<Traits>::NotifyWFI() {
+void QueryCacheBase<Traits>::NotifyWFI(bool at_pass_end) {
     bool should_sync = false;
     impl->ForEachStreamer(
         [&should_sync](StreamerInterface* streamer) { should_sync |= streamer->HasPendingSync(); });
     if (!should_sync) {
         return;
     }
+    // SYNC_SUBMIT_SPEC Step 9: the query result copies (class D: they reach the guest at a host
+    // fence) run at the open pass's end instead of ending it (26 pass ends/f at eefa).
+    if constexpr (requires { impl->runtime.DeferToPassEnd(nullptr, nullptr); }) {
+        if (at_pass_end && impl->runtime.DeferToPassEnd(
+                [](void* self) { static_cast<QueryCacheBase*>(self)->SyncQueryWrites(); },
+                this)) {
+            return;
+        }
+    }
+    SyncQueryWrites();
+}
 
+template <typename Traits>
+void QueryCacheBase<Traits>::SyncQueryWrites() {
+    bool should_sync = false;
+    impl->ForEachStreamer(
+        [&should_sync](StreamerInterface* streamer) { should_sync |= streamer->HasPendingSync(); });
+    if (!should_sync) {
+        return;
+    }
     impl->ForEachStreamer([](StreamerInterface* streamer) { streamer->PresyncWrites(); });
     impl->runtime.Barriers(true);
     impl->ForEachStreamer([](StreamerInterface* streamer) { streamer->SyncWrites(); });

@@ -124,6 +124,8 @@ enum class Counter : u32 {
     DmaReadsSemForwarded, ///< SYNC Step 6: macro DMA reads forwarded from the semaphore view
     DmaReadsSemWaited,    ///< ... after waiting for an unknown at-execute writer's position
     DmaReadsSemClear,     ///< ... nothing pending: memory
+    HoistedCopies,        ///< SYNC Step 9: hazard-free buffer copies in the upload command buffer
+    QueryWfiAfterPass,    ///< SYNC Step 9: query result copies deferred to the pass end
     Count,
 };
 

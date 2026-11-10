@@ -834,7 +834,7 @@ bool BufferCacheRuntime::CanReorderUpload(const Buffer& buffer,
 
 void BufferCacheRuntime::CopyBuffer(VkBuffer dst_buffer, VkBuffer src_buffer,
                                     std::span<const VideoCommon::BufferCopy> copies, bool barrier,
-                                    bool can_reorder_upload) {
+                                    bool can_reorder_upload, bool hazard_free) {
     if (dst_buffer == VK_NULL_HANDLE || src_buffer == VK_NULL_HANDLE) {
         return;
     }
@@ -873,6 +873,16 @@ void BufferCacheRuntime::CopyBuffer(VkBuffer dst_buffer, VkBuffer src_buffer,
         // barriers/f at 8d31).
         scheduler.RecordUpload([src_buffer, dst_buffer, vk_copies](
                                              vk::CommandBuffer, vk::CommandBuffer upload_cmdbuf) {
+            upload_cmdbuf.CopyBuffer(src_buffer, dst_buffer, vk_copies);
+        });
+        return;
+    }
+    if (hazard_free) {
+        // SYNC Step 9: a buffer-to-buffer copy the caller found hazard-free (neither range used
+        // by work in flight) runs in the upload command buffer, as uploads do: no pass ends.
+        VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::HoistedCopies);
+        scheduler.RecordUpload([src_buffer, dst_buffer, vk_copies](
+                                   vk::CommandBuffer, vk::CommandBuffer upload_cmdbuf) {
             upload_cmdbuf.CopyBuffer(src_buffer, dst_buffer, vk_copies);
         });
         return;
