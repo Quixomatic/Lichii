@@ -1011,7 +1011,7 @@ TEST_CASE("V2 NVN2 macro identification and HLE entries", "[video_core][v2_hazar
     CHECK(entry->hash == 0x0123456789abcdefULL);
     CHECK(entry->kind == VideoCommon::V2::MacroHle::Kind::DrawIndexedIndirect);
     const std::array<u32, 4> parameters{4, 3, 0x12, 0x3400};
-    const Draw draw = Resolve(*entry, parameters);
+    const Draw draw = VideoCommon::V2::MacroHle::Resolve(*entry, parameters);
     CHECK(draw.topology == 4);
     CHECK(draw.address == 0x12'0000'3400ULL);
     CHECK(draw.max_draws == 3);
