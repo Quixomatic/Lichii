@@ -739,6 +739,18 @@ void BufferCacheRuntime::FinishForHostRead() {
     scheduler.Finish();
 }
 
+void BufferCacheRuntime::NoteMappedGpuWrite() {
+    scheduler.WantHostReadBarrier();
+}
+
+bool BufferCacheRuntime::WaitForProducerHostRead(u64 producer) {
+    if (!scheduler.IsSubmitted(producer) || !scheduler.HostVisibleThrough(producer)) {
+        return false;
+    }
+    scheduler.GetMasterSemaphore().Wait(producer);
+    return true;
+}
+
 u64 BufferCacheRuntime::SubmitForHostRead() {
     scheduler.RecordBufferOperation(HostReadBarrier);
     const u64 tick = scheduler.CurrentTick();

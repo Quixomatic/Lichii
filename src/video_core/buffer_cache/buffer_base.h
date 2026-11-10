@@ -132,6 +132,9 @@ public:
     /// Pipeline v2 P5a (EDEN_NX2_V2_COMMIT, commit owner only): the last submission (scheduler
     /// tick) that used the buffer (DXVK's track id).
     u64 v2_track_id = 0;
+    /// Pipeline v2 R2-F4-07 (EDEN_NX2_V2_ADAPTSUBMIT): the submission (scheduler tick) of the
+    /// newest GPU write, the producer a host read waits for.
+    u64 v2_gpu_write_tick = 0;
 
 private:
     VAddr cpu_addr = 0;

@@ -805,6 +805,16 @@ public:
     /// EDEN_NX2_V2_XREADBACK: records the queued fence downloads right behind their writers.
     void RecordWriterDownloads();
     bool v2_writer_downloads = false;
+    /// R2-F4-07 (EDEN_NX2_V2_ADAPTSUBMIT): reads of mapped buffers wait for their producer's
+    /// submission, not a Finish.
+    bool v2_producer_reads = V2::On(V2::Switch::AdaptSubmit);
+
+private:
+    /// R2-F4-07: waits for the mapped buffers' newest GPU writes (`producer`, a scheduler tick)
+    /// to be host-visible: the producer's submission only, else FinishForHostRead.
+    void WaitMappedHostRead(u64 producer);
+
+public:
 
 private:
     struct PreparedDownload {

@@ -181,6 +181,11 @@ public:
     void Finish();
 
     void FinishForHostRead();
+    /// R2-F4-07: a mapped buffer was written by the GPU in the open submission.
+    void NoteMappedGpuWrite();
+    /// R2-F4-07, recording thread: waits for `producer` (a scheduler tick) when it is submitted
+    /// and its writes are host-visible. False: the caller takes FinishForHostRead.
+    [[nodiscard]] bool WaitForProducerHostRead(u64 producer);
     /// As FinishForHostRead without waiting: submits and returns the tick to wait for.
     [[nodiscard]] u64 SubmitForHostRead();
     /// Any thread: waits until the GPU passed `tick` (SubmitForHostRead).

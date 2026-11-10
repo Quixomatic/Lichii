@@ -1469,6 +1469,25 @@ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_se
     }
     EndPendingOperations();
     InvalidateState();
+    if (host_read_wanted) [[unlikely]] {
+        // R2-F4-07 (MASTER_PLAN §6 class C): a mapped buffer was written in this submission;
+        // its end makes the writes host-visible, so a reader waits for this tick only
+        // (HostVisibleThrough) instead of a Finish of whatever is open then.
+        host_read_wanted = false;
+        host_visible_tick = master_semaphore->CurrentTick();
+        const bool saved = std::exchange(auto_flush, false);
+        Record([](vk::CommandBuffer cmdbuf) {
+            static constexpr VkMemoryBarrier HOST_READ_BARRIER{
+                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                .pNext = nullptr,
+                .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+                .dstAccessMask = VK_ACCESS_HOST_READ_BIT,
+            };
+            cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+                                   0, HOST_READ_BARRIER);
+        });
+        auto_flush = saved;
+    }
 
     const u64 signal_value = master_semaphore->NextTick();
     if (VideoCommon::V2::P5bStats::Enabled()) {

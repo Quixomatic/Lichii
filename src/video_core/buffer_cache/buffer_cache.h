@@ -639,6 +639,19 @@ void BufferCache<P>::NoteLearnedWrite(DAddr device_addr, u64 size) {
 }
 
 template <class P>
+void BufferCache<P>::WaitMappedHostRead(u64 producer) {
+    // R2-F4-07 (MASTER_PLAN §6 class C: a targeted wait on the producer, never a drain): a
+    // producer already submitted and host-visible is all the read waits for; Finish submitted
+    // whatever was open and waited for the whole queue on the recording thread.
+    if constexpr (requires { runtime.WaitForProducerHostRead(producer); }) {
+        if (runtime.WaitForProducerHostRead(producer)) {
+            return;
+        }
+    }
+    runtime.FinishForHostRead();
+}
+
+template <class P>
 void BufferCache<P>::DownloadRangesMemory(std::span<const std::pair<DAddr, u64>> ranges) {
     constexpr bool has_mapped = requires(Buffer& buffer) { buffer.Mapped(); };
     if constexpr (!USE_MEMORY_MAPS) {
@@ -692,7 +705,16 @@ void BufferCache<P>::DownloadRangesMemory(std::span<const std::pair<DAddr, u64>>
         const Common::RangeSet<DAddr> cpu_written = PendingCpuWriteRanges();
         if (staged.empty()) {
             if constexpr (has_mapped) {
-                runtime.FinishForHostRead();
+                if (v2_producer_reads) [[unlikely]] {
+                    u64 producer = 0;
+                    for (const Download& download : mapped) {
+                        producer = (std::max)(producer,
+                                              slot_buffers[download.buffer_id].v2_gpu_write_tick);
+                    }
+                    WaitMappedHostRead(producer);
+                } else {
+                    runtime.FinishForHostRead();
+                }
             }
         } else {
             auto staging = runtime.DownloadStagingBuffer(total_size_bytes);
@@ -798,6 +820,17 @@ bool BufferCache<P>::DMACopy(GPUVAddr src_address, GPUVAddr dest_address, u64 am
     dest_buffer.MarkUsage(copy.dst_offset, copy.size);
     runtime.CopyBuffer(dest_buffer, src_buffer, copies, true);
     if (has_new_downloads) {
+        if constexpr (!IS_OPENGL) {
+            if (v2_producer_reads) [[unlikely]] {
+                // R2-F4-07: GPU data copied here is produced by this submission.
+                dest_buffer.v2_gpu_write_tick = runtime.CurrentTick();
+                if constexpr (requires { dest_buffer.Mapped(); runtime.NoteMappedGpuWrite(); }) {
+                    if (!dest_buffer.Mapped().empty()) {
+                        runtime.NoteMappedGpuWrite();
+                    }
+                }
+            }
+        }
         memory_tracker.MarkRegionAsGpuModified(*cpu_dest_address, amount);
         const bool should_sync = Settings::IsGPUFenceBehaviorBalanced() || Settings::IsGPUFenceBehaviorAccurate();
         if (should_sync) {
@@ -4111,6 +4144,17 @@ void BufferCache<P>::MarkWrittenBuffer(BufferId buffer_id, DAddr device_addr, u3
             Buffer& buffer = slot_buffers[buffer_id];
             buffer.setWriteTick(runtime.CurrentTick());
         }
+        if (v2_producer_reads && buffer_id) [[unlikely]] {
+            // R2-F4-07: the producer a host read of this buffer waits for; a mapped buffer's
+            // submission ends with the host-read barrier.
+            Buffer& buffer = slot_buffers[buffer_id];
+            buffer.v2_gpu_write_tick = runtime.CurrentTick();
+            if constexpr (requires { buffer.Mapped(); runtime.NoteMappedGpuWrite(); }) {
+                if (!buffer.Mapped().empty()) {
+                    runtime.NoteMappedGpuWrite();
+                }
+            }
+        }
     }
     // The downloads already taken over this range hold older bytes: when their fences pop
     // they must not write them over this write's result in guest memory, nor drop the range
@@ -5084,7 +5128,11 @@ void BufferCache<P>::DownloadBufferMemory(Buffer& buffer, DAddr device_addr, u64
 
     if constexpr (requires { buffer.Mapped(); }) {
         if (const auto mapped = buffer.Mapped(); !mapped.empty()) {
-            runtime.FinishForHostRead();
+            if (v2_producer_reads) [[unlikely]] {
+                WaitMappedHostRead(buffer.v2_gpu_write_tick);
+            } else {
+                runtime.FinishForHostRead();
+            }
             for (const BufferCopy& copy : copies) {
                 WriteDownloadedMemory(cpu_written, buffer.CpuAddr() + copy.src_offset,
                                       mapped.data() + copy.src_offset, copy.size);

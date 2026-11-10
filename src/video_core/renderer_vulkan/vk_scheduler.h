@@ -139,6 +139,17 @@ public:
         return tick < master_semaphore->CurrentTick();
     }
 
+    /// R2-F4-07, recording thread: a mapped (host-coherent) buffer was written by the GPU in the
+    /// open submission; it ends with a host-read barrier.
+    void WantHostReadBarrier() noexcept {
+        host_read_wanted = true;
+    }
+    /// R2-F4-07: whether GPU writes recorded up to `tick` are host-visible once it completes (a
+    /// later submission ended with the host-read barrier).
+    [[nodiscard]] bool HostVisibleThrough(u64 tick) const noexcept {
+        return tick != 0 && tick <= host_visible_tick;
+    }
+
     /// Waits for the worker thread to finish executing everything. After this function returns it's
     /// safe to touch worker resources.
     void WaitWorker();
@@ -577,6 +588,8 @@ private:
     VideoCommon::V2::SubmitRequests submit_requests; ///< RequestLazyFlush
     std::atomic<u64> blocked_since_us{}; ///< F4-X2: first urgent request since the last submit
     std::atomic<u64> blocked_wait_us{};  ///< F4-X2: TakeBlockedWaitUs
+    bool host_read_wanted{};             ///< R2-F4-07: WantHostReadBarrier
+    u64 host_visible_tick{};             ///< R2-F4-07: HostVisibleThrough
     bool lazy_fences{};                 ///< F4-02: SetLazyFences
     bool finish_publishes_tick{};       ///< F4-12: FinishThreadPublishesTick
     bool pass_transform_feedback{};     ///< F4-07: NoteTransformFeedback
