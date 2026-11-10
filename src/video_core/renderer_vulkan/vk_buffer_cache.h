@@ -8,6 +8,7 @@
 
 #include <bit>
 #include <limits>
+#include <source_location>
 #include <span>
 #include <utility>
 
@@ -178,9 +179,10 @@ public:
     /// Waits for a submitted tick without flushing: safe on threads other than the GPU thread.
     void WaitSubmittedTick(u64 tick);
 
-    void Finish();
+    /// SYNC Step 8: `location` names the buffer cache's caller in the STATS "finishes by site".
+    void Finish(std::source_location location = std::source_location::current());
 
-    void FinishForHostRead();
+    void FinishForHostRead(std::source_location location = std::source_location::current());
     /// R2-F4-07: a mapped buffer was written by the GPU in the open submission.
     void NoteMappedGpuWrite();
     /// R2-F4-07, recording thread: waits for `producer` (a scheduler tick) when it is submitted

@@ -842,6 +842,21 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
     }
     // EDEN_NX2_V2_XREADBACK: learned downloads recorded right behind their writers.
     buffer_cache.v2_writer_downloads = VideoCommon::V2::On(VideoCommon::V2::Switch::XReadback);
+    if (buffer_cache.v2_writer_downloads &&
+        VideoCommon::V2::On(VideoCommon::V2::Switch::AdaptSubmit)) {
+        // SYNC Step 8 (U-01): the learned pages' downloads go with their producer's submission
+        // (recorded at its start), not only at the next fence; they still land at that fence.
+        scheduler.SetPreSubmitHook(
+            [](void* argument) {
+                if (!VideoCommon::GpuSplit::OnBackThread()) {
+                    return; // Only the recording thread owns the buffer cache's open work
+                }
+                auto& self = *static_cast<RasterizerVulkan*>(argument);
+                std::scoped_lock lock{self.buffer_cache.mutex};
+                self.buffer_cache.RecordWriterDownloads();
+            },
+            this);
+    }
     // EDEN_NX2_V2_ADAPTSUBMIT: adaptive submission for native titles (FlushWork).
     adapt_submit = VideoCommon::V2::On(VideoCommon::V2::Switch::AdaptSubmit);
     if (adapt_submit) {

@@ -105,6 +105,13 @@ public:
     }
     /// Whether a fence queued here now is lazy (F4-02 mode on the split's back).
     [[nodiscard]] bool LazyFencesHere() const;
+    /// SYNC_SUBMIT_SPEC Step 8 (U-01, MASTER_PLAN §6 "both started early"): runs on the recording
+    /// thread at the start of every submission, so early downloads of the work in it are issued
+    /// with the producer's submit rather than at the next fence.
+    void SetPreSubmitHook(void (*hook)(void*), void* argument) {
+        pre_submit_hook = hook;
+        pre_submit_argument = argument;
+    }
     /// Recording thread: a lazy fence waits for `tick`.
     void NoteLazyFence(u64 tick) {
         lazy_outstanding_tick = tick;
@@ -632,6 +639,16 @@ private:
     u32 wfi_at_pass_end{};              ///< F4-X3: barrier stages of a WFI in the active pass
     bool submit_wanted{};             ///< F4-02: work waits for the next idle hook or boundary
     u64 lazy_outstanding_tick{};        ///< F4-02: newest lazy fence's tick (recording thread)
+    void (*pre_submit_hook)(void*){};   ///< SYNC Step 8: SetPreSubmitHook
+    void* pre_submit_argument{};
+    bool in_pre_submit{};               ///< The hook runs (it may record, never resubmit)
+    void RunPreSubmitHook() {
+        if (pre_submit_hook != nullptr && !in_pre_submit) [[unlikely]] {
+            in_pre_submit = true;
+            pre_submit_hook(pre_submit_argument);
+            in_pre_submit = false;
+        }
+    }
 
     class Command {
     public:

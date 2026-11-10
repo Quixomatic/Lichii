@@ -205,6 +205,7 @@ Scheduler::~Scheduler() {
 
 u64 Scheduler::Flush(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
                      std::source_location location) {
+    RunPreSubmitHook();
     // EDEN_NX2_V2_DRAWCACHE: a submit is an ordering point (collect epoch). F4-08 (§8): with
     // lazy fences, only a submission carrying something the guest observes is one (a fence, a
     // waiter's request, deferred or wanted work); a heuristic submit orders nothing.
@@ -429,6 +430,7 @@ void Scheduler::Finish(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
     if (VideoCommon::GpuSplit::check_owner) [[unlikely]] {
         VideoCommon::GpuSplit::CheckOwner("Scheduler::Finish");
     }
+    RunPreSubmitHook();
     // When finishing, we need to wait for the submission to have executed on the device.
     const u64 presubmit_tick = CurrentTick();
     const bool p5b_stats = VideoCommon::V2::P5bStats::Enabled();

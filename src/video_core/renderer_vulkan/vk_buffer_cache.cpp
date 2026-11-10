@@ -729,14 +729,15 @@ void BufferCacheRuntime::WaitSubmittedTick(u64 tick) {
     master.Wait(tick);
 }
 
-void BufferCacheRuntime::Finish() {
-    scheduler.Finish();
+void BufferCacheRuntime::Finish(std::source_location location) {
+    scheduler.Finish({}, {}, location);
 }
 
-void BufferCacheRuntime::FinishForHostRead() {
+void BufferCacheRuntime::FinishForHostRead(std::source_location location) {
     // F4-06: the host reads buffers only; pending attachment writes stay pending for graphics.
     scheduler.RecordBufferOperation(HostReadBarrier);
-    scheduler.Finish();
+    // SYNC Step 8: a synchronous download (class C residual, MP §11): counted by its caller.
+    scheduler.Finish({}, {}, location);
 }
 
 void BufferCacheRuntime::NoteMappedGpuWrite() {
