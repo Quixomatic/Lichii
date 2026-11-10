@@ -765,13 +765,10 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
                                VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME);
     }
     // EDEN_NX2_V2_CBUFBDA reads constant buffers through device addresses: keep them for it.
+    // Buffer device address is core since Vulkan 1.2 (`extensions.buffer_device_address` is
+    // set only for the extension on older instances): the device's feature decides.
     const bool cbuf_bda = VideoCommon::V2::On(VideoCommon::V2::Switch::CbufBda) &&
-                          extensions.buffer_device_address &&
                           features.buffer_device_address.bufferDeviceAddress;
-    if (VideoCommon::V2::On(VideoCommon::V2::Switch::CbufBda)) {
-        LOG_INFO(Render_Vulkan, "EDEN_NX2_V2_CBUFBDA: buffer device address {}",
-                 cbuf_bda ? "kept" : "not supported by the device");
-    }
 #ifdef EGLANTINE_STREAMLINE
     // NVIDIA's DLSS needs buffer device addresses: keep the feature enabled for
     // it, but leave Eglantine's own buffers as they are without descriptor buffers.
@@ -784,6 +781,10 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
     if (!extensions.descriptor_buffer && !cbuf_bda) {
         RemoveExtensionFeature(extensions.buffer_device_address, features.buffer_device_address,
                                VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME);
+    }
+    if (cbuf_bda) {
+        // What IsBufferDeviceAddressSupported reads: buffer usage bits, addresses, the VMA flag.
+        extensions.buffer_device_address = true;
     }
 
     // The float16 workarounds above keep shaders from doing float16 arithmetic. Cooperative
@@ -837,6 +838,16 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
     }
     if (extensions.buffer_device_address) {
         flags |= VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT;
+    }
+    if (VideoCommon::V2::On(VideoCommon::V2::Switch::CbufBda)) {
+        LOG_INFO(Render_Vulkan,
+                 "EDEN_NX2_V2_CBUFBDA: buffer device address usable {} (device feature {}, "
+                 "extension loaded {}, VMA flag {}, instance 1.2+ {})",
+                 extensions.buffer_device_address,
+                 features.buffer_device_address.bufferDeviceAddress != VK_FALSE,
+                 loaded_extensions.contains(VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME),
+                 (flags & VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT) != 0,
+                 instance_version >= VK_API_VERSION_1_2);
     }
     // EDEN_NX2_VRAM_LIMIT_MIB: VMA fails allocations past the limit, like a smaller card.
     std::array<VkDeviceSize, VK_MAX_MEMORY_HEAPS> heap_size_limits;
