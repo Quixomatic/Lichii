@@ -84,6 +84,14 @@ namespace {
     return {image.Handle(), image.gpu_addr, image.gpu_addr + image.guest_size_bytes};
 }
 
+/// The same for a view, its guest range estimated as the framebuffer estimates attachments'.
+[[nodiscard]] Scheduler::TrackedImage TrackedView(const ImageView& view) {
+    return {view.ImageHandle(), view.gpu_addr,
+            view.gpu_addr + u64{view.size.width} * view.size.height *
+                                VideoCore::Surface::BytesPerBlock(view.format) *
+                                (std::max<s32>)(view.range.extent.layers, 1)};
+}
+
 [[nodiscard]] u32 HostMipCount(const VideoCommon::ImageInfo& info) {
     if (info.num_samples > 1)
         return 1;
@@ -2552,7 +2560,12 @@ void TextureCacheRuntime::BlitImage(Framebuffer* dst_framebuffer, ImageView& dst
     const VkImage src_image = src.ImageHandle();
     const VkImageSubresourceLayers dst_layers = MakeSubresourceLayers(&dst);
     const VkImageSubresourceLayers src_layers = MakeSubresourceLayers(&src);
-    scheduler.RequestOutsideRenderPassOperationContext();
+    // F4-06: pending attachment writes elsewhere stay pending.
+    const bool scope =
+        scheduler.RequestOutsideRenderPassForImages({TrackedView(dst), TrackedView(src)});
+    SCOPE_EXIT {
+        scheduler.EndImageOperation(scope);
+    };
     scheduler.Record([filter, dst_region, src_region, dst_image, src_image, dst_layers, src_layers,
                       aspect_mask, is_resolve](vk::CommandBuffer cmdbuf) {
         const std::array read_barriers{
