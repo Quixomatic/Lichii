@@ -1377,7 +1377,9 @@ TEST_CASE("V2 P6 R5: a shard's dynamic state equals ComputeDynamic on the same v
     a.dynamic_generation = first;
     Resolve::PreDraw b = a;
     CHECK(Resolve::SplitTraits::Compare(a, b) == nullptr);
-    b.dynamic = again;
+    auto changed = std::make_shared<Resolve::DynamicState>(*dynamic);
+    changed->values.line_width += 1.0f;
+    b.dynamic = changed;
     CHECK(Resolve::SplitTraits::Compare(a, b) != nullptr);
     b.dynamic_generation = second;
     CHECK(Resolve::SplitTraits::Compare(a, b) == nullptr);
