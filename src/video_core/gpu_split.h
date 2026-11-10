@@ -359,9 +359,16 @@ public:
     /// §6: a targeted wait makes its producer complete). Once the back ran the write, `complete`
     /// runs on the back after its current entry (RequestBackJob): it writes the write's bytes to
     /// memory itself, submitting and waiting for the GPU as it needs to (a counter report's
-    /// operation otherwise waits for the next fence, which an idle back never makes). Returns
-    /// once the ticket landed or `complete` ran; memory then holds the bytes.
-    void CompleteLanding(u64 ticket, DrainSite site, void (*complete)(void*), void* argument);
+    /// operation otherwise waits for the next fence, which an idle back never makes). `complete`
+    /// returns the back's newest landing ticket when operations it captured are still to land
+    /// (the bytes only an operation writes: a report's timestamp; V2::IrExec::LandCaptured
+    /// signals their fence), 0 when memory holds everything; the front then waits for that
+    /// ticket, asking for the deferred submit (no drain). False when it did not land within
+    /// `LandingBound` or the back stopped: the caller takes its residual drain.
+    bool CompleteLanding(u64 ticket, DrainSite site, u64 (*complete)(void*), void* argument);
+    /// Liveness bound of a landing wait that made its fence (a fence completes in GPU time; a
+    /// longer wait means something else is stuck, and the old path's drain decides).
+    static constexpr u64 LandingBoundUs = 2'000'000;
     /// Front: FindWrites over the queued writes only (after CompleteLanding wrote the landing
     /// writes of a range to memory).
     [[nodiscard]] V2::HazardResult FindQueuedWrites(u64 device_address, u64 size,
@@ -950,8 +957,9 @@ private:
     void* cpu_lane_argument{};
     std::atomic<bool> cpu_lane_requested{};
     struct LandingJob {
-        void (*complete)(void*);
+        u64 (*complete)(void*);
         void* argument;
+        u64 target; ///< What `complete` returned
         std::atomic<bool> done;
     };
     LandingJob landing_job{}; ///< CompleteLanding (front, one at a time)

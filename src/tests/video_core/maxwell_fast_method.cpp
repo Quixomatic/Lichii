@@ -2340,9 +2340,13 @@ TEST_CASE("V2 landing: one write table, tickets without IR cuts, ordered landing
             }
         });
         const auto begin = std::chrono::steady_clock::now();
-        split.CompleteLanding(
+        CHECK(split.CompleteLanding(
             ticket, VideoCommon::DrainSite::MacroDmaRead,
-            [](void* argument) { static_cast<Flush*>(argument)->ran.store(true); }, &flush);
+            [](void* argument) -> u64 {
+                static_cast<Flush*>(argument)->ran.store(true);
+                return 0;
+            },
+            &flush));
         CHECK(flush.ran.load());
         CHECK(V2::Landing::landed.load() < ticket); // completed by the flush, not by a landing
         CHECK(std::chrono::steady_clock::now() - begin < std::chrono::seconds{1});
@@ -2351,11 +2355,75 @@ TEST_CASE("V2 landing: one write table, tickets without IR cuts, ordered landing
         // Already landed: nothing to run.
         V2::Landing::Note(ticket);
         Flush unused;
-        split.CompleteLanding(
+        CHECK(split.CompleteLanding(
             ticket, VideoCommon::DrainSite::MacroDmaRead,
-            [](void* argument) { static_cast<Flush*>(argument)->ran.store(true); }, &unused);
+            [](void* argument) -> u64 {
+                static_cast<Flush*>(argument)->ran.store(true);
+                return 0;
+            },
+            &unused));
         CHECK(!unused.ran.load());
         Access::SetBack(split, 0, false);
+    }
+
+    SECTION("a landing whose bytes only its operation writes waits for that operation (F3F5b-1)") {
+        // HAZARD=verify's ~4,900 macro DMA mismatches: a 16-byte report whose final value the
+        // query cache writes early (semi-flush) but whose timestamp (word 2) only its operation
+        // writes. The job returns the back's newest ticket; the front waits for it to land.
+        Access::SetEnd(split, 200);
+        Access::SetBack(split, 200, true);
+        const u64 ticket = V2::Landing::Ticket(200, 0);
+        const u64 back_ticket = V2::Landing::Ticket(200, 0);
+        std::atomic<bool> stop{false};
+        std::atomic<bool> fence_signalled{false};
+        std::jthread back([&] {
+            while (!stop.load()) {
+                Access::ServeHookRequests(split);
+                std::this_thread::yield();
+            }
+        });
+        // The fencing thread: the signalled fence completes a little later, then its operation
+        // writes the timestamp and reports the landing.
+        std::jthread fencing([&] {
+            while (!fence_signalled.load() && !stop.load()) {
+                std::this_thread::yield();
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds{5});
+            V2::Landing::Note(back_ticket);
+        });
+        struct Job {
+            std::atomic<bool>* signalled;
+            u64 target;
+        } job{&fence_signalled, back_ticket};
+        CHECK(split.CompleteLanding(
+            ticket, VideoCommon::DrainSite::MacroDmaRead,
+            [](void* argument) -> u64 {
+                auto& self = *static_cast<Job*>(argument);
+                self.signalled->store(true);
+                return self.target;
+            },
+            &job));
+        CHECK(V2::Landing::landed.load() >= back_ticket); // returned only once it landed
+        fencing.join();
+        // A stopped back: no wait for a landing that can't come, the caller drains.
+        const u64 later = V2::Landing::Ticket(300, 0);
+        Access::SetEnd(split, 300);
+        Access::SetBack(split, 300, true);
+        struct Never {
+            u64 target;
+        } never{V2::Landing::Ticket(300, 1)};
+        std::jthread stopper([&] {
+            std::this_thread::sleep_for(std::chrono::milliseconds{20});
+            stop.store(true);
+            back.join();
+            Access::SetBack(split, 300, false);
+        });
+        const auto begin = std::chrono::steady_clock::now();
+        CHECK(!split.CompleteLanding(
+            later, VideoCommon::DrainSite::MacroDmaRead,
+            [](void* argument) -> u64 { return static_cast<Never*>(argument)->target; }, &never));
+        CHECK(std::chrono::steady_clock::now() - begin < std::chrono::seconds{1});
+        stopper.join();
     }
 
     SECTION("class C readback: a front job runs on the back after its current entry") {

@@ -473,37 +473,51 @@ bool GpuSplit::WaitLanded(u64 ticket, DrainSite site, u64 timeout_us) {
     return V2::Landing::landed.load(std::memory_order_acquire) >= ticket;
 }
 
-void GpuSplit::CompleteLanding(u64 ticket, DrainSite site, void (*complete)(void*),
+bool GpuSplit::CompleteLanding(u64 ticket, DrainSite site, u64 (*complete)(void*),
                                void* argument) {
     if (V2::Landing::landed.load(std::memory_order_acquire) >= ticket) {
-        return;
+        return true;
     }
     // The back must have run the write before anything can complete it.
     WaitForPosition(V2::Landing::RingPosition(ticket), site);
     if (V2::Landing::landed.load(std::memory_order_acquire) >= ticket) {
-        return;
+        return true;
     }
-    Nx2Profile::Scope scope{Nx2Profile::Zone::WriterWait};
-    const bool v2_stats = V2::Stats::Enabled();
-    const u64 start = Nx2Profile::Enabled() || v2_stats ? Nx2Profile::Ticks() : 0;
-    landing_job.complete = complete;
-    landing_job.argument = argument;
-    landing_job.done.store(false, std::memory_order_relaxed);
-    RequestBackJob(
-        [](void* job_argument) {
-            auto& job = *static_cast<LandingJob*>(job_argument);
-            job.complete(job.argument);
-            job.done.store(true, std::memory_order_release);
-        },
-        &landing_job);
-    // The job reads `landing_job` until it stores `done`: wait for it, not only for the landing.
-    while (!landing_job.done.load(std::memory_order_acquire) && BackRunning()) {
-        std::this_thread::yield();
+    u64 target = 0;
+    {
+        Nx2Profile::Scope scope{Nx2Profile::Zone::WriterWait};
+        const bool v2_stats = V2::Stats::Enabled();
+        const u64 start = Nx2Profile::Enabled() || v2_stats ? Nx2Profile::Ticks() : 0;
+        landing_job.complete = complete;
+        landing_job.argument = argument;
+        landing_job.target = 0;
+        landing_job.done.store(false, std::memory_order_relaxed);
+        RequestBackJob(
+            [](void* job_argument) {
+                auto& job = *static_cast<LandingJob*>(job_argument);
+                job.target = job.complete(job.argument);
+                job.done.store(true, std::memory_order_release);
+            },
+            &landing_job);
+        // The job reads `landing_job` until it stores `done`: wait for it, not only for the
+        // landing.
+        while (!landing_job.done.load(std::memory_order_acquire) && BackRunning()) {
+            std::this_thread::yield();
+        }
+        if (!landing_job.done.load(std::memory_order_acquire)) {
+            return false; // The back stopped
+        }
+        target = landing_job.target;
+        Nx2Profile::AddDrain(site, start);
+        if (v2_stats) [[unlikely]] {
+            V2::Stats::NoteDrain(site, start);
+        }
     }
-    Nx2Profile::AddDrain(site, start);
-    if (v2_stats) [[unlikely]] {
-        V2::Stats::NoteDrain(site, start);
-    }
+    // Bytes only the operations write (a report's timestamp: the query cache's early write of
+    // a final value leaves it out): the job signalled their fence; its operations run in order,
+    // so once the back's newest ticket landed every one the back made before the job did.
+    // WaitLanded asks for the deferred submit while it waits (SESSION_HANDOFF §5g).
+    return target == 0 || WaitLanded(target, site, LandingBoundUs);
 }
 
 void GpuSplit::Drain(DrainSite site) {

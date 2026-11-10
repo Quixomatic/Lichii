@@ -40,4 +40,9 @@ bool Execute(const Ir::RecordView& record, const Context& context);
 void MacroDmaFlush(Tegra::MemoryManager& memory, VideoCore::RasterizerInterface& rasterizer,
                    u64 address, u64 bytes);
 
+/// Back (a front job between entries): when operations this thread gave landing tickets are
+/// still to land, signals a fence behind them (never skipped as empty) and submits it; returns
+/// the newest such ticket for the front to wait for (GpuSplit::CompleteLanding), else 0.
+[[nodiscard]] u64 LandCaptured(VideoCore::RasterizerInterface& rasterizer);
+
 } // namespace VideoCommon::V2::IrExec

@@ -3438,7 +3438,9 @@ bool Maxwell3D::FrontDmaReadHazard(VideoCommon::GpuSplit& split, GPUVAddr source
             // fence an idle back never makes (SESSION_HANDOFF §5g): as the old path's deferred
             // QueryFlush (Perf fix A item 9), the back writes the range's reports out itself,
             // after the entry it runs, submitting and waiting as it needs to.
-            FrontFlushReports(split, source, bytes, result.position);
+            if (!FrontFlushReports(split, source, bytes, result.position)) {
+                return fall_back(Reason::Unlanded);
+            }
             reports_flushed = true;
             narrowed = true;
             continue;
@@ -3470,7 +3472,7 @@ bool Maxwell3D::FrontDmaReadHazard(VideoCommon::GpuSplit& split, GPUVAddr source
     return fall_back(Reason::Overflow);
 }
 
-void Maxwell3D::FrontFlushReports(VideoCommon::GpuSplit& split, GPUVAddr source, size_t bytes,
+bool Maxwell3D::FrontFlushReports(VideoCommon::GpuSplit& split, GPUVAddr source, size_t bytes,
                                   u64 ticket) {
     struct Job {
         Tegra::MemoryManager* memory{};
@@ -3480,12 +3482,15 @@ void Maxwell3D::FrontFlushReports(VideoCommon::GpuSplit& split, GPUVAddr source,
     };
     static Job job; // Front thread only, one at a time (CompleteLanding waits for it)
     job = {&memory_manager, rasterizer, source, bytes};
-    split.CompleteLanding(
+    return split.CompleteLanding(
         ticket, VideoCommon::DrainSite::MacroDmaRead,
-        [](void* argument) {
+        [](void* argument) -> u64 {
             const auto& self = *static_cast<const Job*>(argument);
             VideoCommon::QueryDma::FlushPending(*self.memory, *self.rasterizer, self.source,
                                                 self.bytes);
+            // F3F5b-1: the early write of a final value leaves a 16-byte report's timestamp
+            // (words 2-3) to its operation; the read must see it as the drained path does.
+            return VideoCommon::V2::IrExec::LandCaptured(*self.rasterizer);
         },
         &job);
 }

@@ -18,6 +18,7 @@
 #include "video_core/rasterizer_interface.h"
 #include "video_core/v2/ir_check.h"
 #include "video_core/v2/ir_exec.h"
+#include "video_core/v2/landing.h"
 #include "video_core/v2/macro_hle.h"
 #include "video_core/v2/word_readback.h"
 
@@ -191,6 +192,21 @@ void MacroDmaFlush(Tegra::MemoryManager& memory, VideoCore::RasterizerInterface&
         memory.FlushRegion(address, bytes, VideoCommon::CacheType::BufferCache);
     }
     QueryDma::FlushPending(memory, rasterizer, address, bytes);
+}
+
+u64 LandCaptured(VideoCore::RasterizerInterface& rasterizer) {
+    const u64 target = Landing::pending;
+    if (target <= Landing::landed.load(std::memory_order_acquire)) {
+        return 0;
+    }
+    // As QueryCacheBase::CounterReport signals a report's fence: delayed, so it is not run at
+    // once as an empty one. Counter operations queued by SyncOperation ride on it; fence-flagged
+    // ones have their own fence before it.
+    VideoCore::g_signaling_query_report_fence = true;
+    rasterizer.SignalFence([] {});
+    VideoCore::g_signaling_query_report_fence = false;
+    rasterizer.FlushCommands();
+    return target;
 }
 
 bool Execute(const Ir::RecordView& record, const Context& context) {
