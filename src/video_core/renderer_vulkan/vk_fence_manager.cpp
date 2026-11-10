@@ -25,6 +25,17 @@ InnerFence::~InnerFence() = default;
 
 void InnerFence::Queue(bool lazy_) {
     if (is_stubbed) {
+        if (scheduler.LazyFencesHere()) [[unlikely]] {
+            // F4-X2 (chunk B2): a stubbed fence (a delayed fence with nothing to flush: tracked
+            // QMD reductions and max releases, d5e451eebf) needs no GPU work of its own, but its
+            // operations land only after every earlier fence popped, i.e. once the newest lazy
+            // fence's tick is done. A waiter's Want reaches them through that tick, at once.
+            const u64 tick = scheduler.LazyOutstandingTick();
+            if (tick != 0 && VideoCommon::V2::LandingFence::NoteFence(tick) &&
+                !scheduler.IsSubmitted(tick)) {
+                scheduler.RequestLazyFlush(tick, true);
+            }
+        }
         return;
     }
     // Get the current tick so we can wait for it

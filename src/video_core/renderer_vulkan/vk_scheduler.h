@@ -108,6 +108,10 @@ public:
     void NoteLazyFence(u64 tick) {
         lazy_outstanding_tick = tick;
     }
+    /// Recording thread: the newest lazy fence's tick (0: none yet).
+    [[nodiscard]] u64 LazyOutstandingTick() const noexcept {
+        return lazy_outstanding_tick;
+    }
     /// F4-02, recording thread: work the guest may wait on was recorded (a fence's downloads or
     /// queries, a command list end); it goes out at the next idle hook or heuristic submission
     /// instead of a submission of its own.

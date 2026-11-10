@@ -1124,6 +1124,17 @@ TEST_CASE("V2 P5b a landing wait asks for its fence's tick and an idle back subm
     Landing::issued.store(Landing::Ticket(3000, 0)); // after the ask only
     REQUIRE_FALSE(LandingFence::NoteFence(11));
     REQUIRE_FALSE(LandingFence::NoteFence(12)); // nothing new captured
+    // Chunk B2: a tracked QMD reduction's fence is stubbed (no GPU work of its own); it is noted
+    // with the newest lazy fence's tick, whose pop it waits behind. The waiter's want makes that
+    // tick urgent and TickFor names it; an idle back's hook then submits it (Urgent).
+    LandingFence::Want(3500);
+    const u64 reduction = Landing::Ticket(3400, 0);
+    Landing::issued.store(reduction);
+    REQUIRE(LandingFence::NoteFence(11)); // the newest lazy fence is in tick 11
+    REQUIRE(LandingFence::TickFor(reduction, 0) == 11);
+    SubmitRequests stubbed;
+    stubbed.Request(11, true);
+    REQUIRE(stubbed.AtIdleHook(false, true, false, 11, 11, false) == Action::Urgent);
     LandingFence::wanted_position.store(0);
 
     LandingFence::request_hook = nullptr;
