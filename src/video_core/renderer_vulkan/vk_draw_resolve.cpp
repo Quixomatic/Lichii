@@ -905,6 +905,26 @@ void GraphicsPipeline::VerifyDrawApply(R::ResolvedDraw& record, C::Stage& stage)
     }
 }
 
+void GraphicsPipeline::NoteRecordDelta(const DrawApplyOut& out) {
+    // ConfigureImpl's CaptureNextDelta block, for a draw the record path resolved.
+    if (!std::exchange(capture_delta, false) || delta_blocker != DeltaBlocker::None) {
+        return;
+    }
+    const auto same_view = [](const VideoCommon::ImageViewInOut& lhs,
+                              const VideoCommon::ImageViewInOut& rhs) {
+        return lhs.index == rhs.index && lhs.id == rhs.id;
+    };
+    if (std::exchange(verify_delta, false)) {
+        delta_mismatch = !delta_views_valid || !std::ranges::equal(out.views, delta_views, same_view) ||
+                         !std::ranges::equal(out.samplers, delta_samplers);
+    }
+    delta_views.assign(out.views.begin(), out.views.end());
+    delta_samplers.assign(out.samplers.begin(), out.samplers.end());
+    delta_recipe = nullptr;
+    configured_stages = recipe_stages;
+    delta_views_valid = true;
+}
+
 // ENCODE: the draw recorded from its record.
 
 bool GraphicsPipeline::EncodeDraw(const R::ResolvedDraw& record, const DrawApplyOut& out,

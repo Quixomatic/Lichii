@@ -201,6 +201,12 @@ private:
     VideoCommon::V2::Commit::RequestList drawrec_buffers;
     u64 drawrec_ordinal{};
     GraphicsPipeline::DrawRecObserver drawrec_observer_state;
+    DrawApplyOut drawrec_apply;
+    /// DRAWREC=1 (step 14): resolve, apply and encode the draw from its record in place of
+    /// pipeline.Configure; a CommitOnly draw runs Configure. `recorded`: the record path drew
+    /// it (its dynamic state is the record's). False: the draw can't be recorded.
+    [[nodiscard]] bool PrepareDrawRecord(GraphicsPipeline& pipeline, bool is_indexed,
+                                         bool is_indirect, bool& recorded);
     /// DRAWREC=verify (step 10): what a cache mutation moves, around a pure resolve.
     struct DrawRecPurity {
         u64 flags{};

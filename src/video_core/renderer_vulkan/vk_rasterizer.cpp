@@ -1777,6 +1777,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
             }
         }
     }
+    bool drawrec_drawn = false; ///< DRAWREC=1: the record path recorded this draw
     GraphicsPipeline* drawrec_observed = nullptr;
     SCOPE_EXIT {
         if (drawrec_observed != nullptr) [[unlikely]] {
@@ -1857,8 +1858,20 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         bool configured;
         {
             Profile::Scope scope{Profile::Zone::Configure};
-            configured = recipe_capture != nullptr ? pipeline->ConfigureCapture(is_indexed)
-                                                   : pipeline->Configure(is_indexed);
+            if (recipe_capture != nullptr) {
+                // A recipe capture stays the old configure until recipes come from records
+                // (step 15).
+                if (drawrec == VideoCommon::V2::Mode::On) [[unlikely]] {
+                    VideoCommon::V2::Resolve::CountRecordStat(
+                        VideoCommon::V2::Resolve::GetRecordStats().commit_only[static_cast<size_t>(
+                            VideoCommon::V2::Resolve::CommitOnlyReason::Capture)]);
+                }
+                configured = pipeline->ConfigureCapture(is_indexed);
+            } else if (drawrec == VideoCommon::V2::Mode::On) [[unlikely]] {
+                configured = PrepareDrawRecord(*pipeline, is_indexed, is_indirect, drawrec_drawn);
+            } else {
+                configured = pipeline->Configure(is_indexed);
+            }
         }
         if (recipe_capture != nullptr) [[unlikely]] {
             pipeline->SetRecipeCapture(nullptr);
@@ -1949,7 +1962,11 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
 
     {
         Profile::Scope scope{Profile::Zone::DynamicState};
-        UpdateDynamicStates(pipeline);
+        if (drawrec_drawn) [[unlikely]] {
+            EncodeDynamic(drawrec_record.h.dynamic, pipeline);
+        } else {
+            UpdateDynamicStates(pipeline);
+        }
     }
 
     query_cache.NotifySegment(true);
@@ -5421,6 +5438,31 @@ VideoCommon::V2::Resolve::ResolveStatus RasterizerVulkan::ResolveDrawRecord(
         R::CountRecordStat(stats.commit_only[static_cast<size_t>(drawrec_record.h.reason)]);
     }
     return status;
+}
+
+bool RasterizerVulkan::PrepareDrawRecord(GraphicsPipeline& pipeline, bool is_indexed,
+                                         bool is_indirect, bool& recorded) {
+    namespace R = VideoCommon::V2::Resolve;
+    recorded = false;
+    if (ResolveDrawRecord(pipeline, is_indexed, is_indirect, false) != R::ResolveStatus::Ready) {
+        // D3: what Step 0 doesn't resolve takes the old configure (counted by reason).
+        return pipeline.Configure(is_indexed);
+    }
+    R::RecordStats& stats = R::GetRecordStats();
+    R::CountRecordStat(stats.drawrec_draws);
+    R::CountRecordStat(stats.by_path[0]);
+    if (!pipeline.ApplyDraw(drawrec_record, drawrec_textures, drawrec_buffers, drawrec_apply,
+                            GraphicsPipeline::ApplyMode::Normal, commit->stage)) {
+        return false;
+    }
+    pipeline.NoteRecordDelta(drawrec_apply);
+    if (!pipeline.EncodeDraw(drawrec_record, drawrec_apply, nullptr,
+                             GraphicsPipeline::EncodeMode::Normal)) {
+        return false;
+    }
+    pipeline.StoreLastRecord(drawrec_record);
+    recorded = true;
+    return true;
 }
 
 void RasterizerVulkan::HandleTransformFeedback() {

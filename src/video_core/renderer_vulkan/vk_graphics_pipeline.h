@@ -479,6 +479,17 @@ public:
                                   VideoCommon::V2::DrawCache::Recipe* recipe = nullptr);
     /// DRAWREC=verify (step 13): EncodeDraw(PayloadOnly) after the observed configure.
     void VerifyDrawEncode(const VideoCommon::V2::Resolve::ResolvedDraw& record);
+    /// DRAWREC=1 (step 14): what ConfigureImpl keeps for delta draws after a resolve, from a
+    /// record's applied views and samplers (CaptureNextDelta), and the record kept as the
+    /// pipeline's last one.
+    void NoteRecordDelta(const DrawApplyOut& out);
+    void StoreLastRecord(const VideoCommon::V2::Resolve::ResolvedDraw& record) {
+        last_record.h = record.h;
+        last_record.arena.assign(record.arena.begin(), record.arena.end());
+    }
+    [[nodiscard]] const VideoCommon::V2::Resolve::ResolvedDraw& LastRecord() const noexcept {
+        return last_record;
+    }
     /// DRAWREC=verify (step 12): ApplyDraw(DeriveOnly) on the observed draw's record, its heap and
     /// rescaling words compared with the ones the configure used.
     void VerifyDrawApply(VideoCommon::V2::Resolve::ResolvedDraw& record,
@@ -495,6 +506,8 @@ private:
                            const RescalingPushConstant& rescaling,
                            const RenderAreaPushConstant& render_area);
     DrawRecObserver* drawrec_observer{};
+    /// DRAWREC: the record of the pipeline's last draw (the base of a continued draw, step 17).
+    VideoCommon::V2::Resolve::ResolvedDraw last_record;
     /// ApplyDraw's pieces: record proxies patched from a list (or looked up again), bindings
     /// peeked again after a deletion, texture buffers from the views again.
     void PatchRecordViews(VideoCommon::V2::Resolve::ResolvedDraw& record,
