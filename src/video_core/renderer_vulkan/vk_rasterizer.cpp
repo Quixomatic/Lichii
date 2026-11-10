@@ -1809,16 +1809,42 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     const bool delta_holds =
         delta_pipeline != nullptr && DeltaStillHolds(draw_serial, draw_map_serial);
     const DrawPath path = delta_holds && !verify_pipeline ? DrawPath::Delta : DrawPath::Full;
+    // S0-G16: DRAWREC=1's ladder in one decision, counted by why a hit or continued draw did not
+    // take its record path (steps 16/17).
+    VideoCommon::V2::Resolve::RecordRoute record_route = VideoCommon::V2::Resolve::RecordRoute::Full;
+    if (drawrec == VideoCommon::V2::Mode::On) [[unlikely]] {
+        namespace R = VideoCommon::V2::Resolve;
+        const bool hit = cache_decision.path == VideoCommon::V2::DrawCache::Path::Replay &&
+                         cache_decision.recipe != nullptr;
+        const R::RecordRouteDecision decision = R::ChooseRecordRoute({
+            .hit = hit,
+            .hit_verify = hit && cache_decision.verify,
+            .has_template = hit && cache_decision.recipe->record.Valid(),
+            .continued = delta_holds,
+            .continued_verify = verify_pipeline != nullptr,
+            .last_drawn = drawrec_last_drawn,
+            .last_same_pipeline = pipeline->LastRecord().h.pipeline == pipeline,
+        });
+        record_route = decision.route;
+        if (decision.why != R::RecordRouteWhy::None) {
+            R::CountRecordStat(R::GetRecordStats().route_whys[static_cast<size_t>(decision.why)]);
+        }
+    }
     bool replayed = false;
     if (replay_pipeline != nullptr) [[unlikely]] {
         Profile::Scope scope{Profile::Zone::Configure};
         GraphicsPipeline::BufferReplay buffers{};
+        const bool from_template = record_route == VideoCommon::V2::Resolve::RecordRoute::Template;
         const GraphicsPipeline::RecipeResult recipe_result =
-            drawrec == VideoCommon::V2::Mode::On && cache_decision.recipe->record.Valid()
-                ? PrepareTemplateRecord(*pipeline, is_indexed, *cache_decision.recipe, buffers,
-                                        drawrec_drawn)
-                : pipeline->ConfigureRecipe(is_indexed, *cache_decision.recipe, nullptr,
-                                            &DrawCache().Memo(), &buffers);
+            from_template ? PrepareTemplateRecord(*pipeline, is_indexed, *cache_decision.recipe,
+                                                  buffers, drawrec_drawn)
+                          : pipeline->ConfigureRecipe(is_indexed, *cache_decision.recipe, nullptr,
+                                                      &DrawCache().Memo(), &buffers);
+        if (from_template && recipe_result == GraphicsPipeline::RecipeResult::Rebuild)
+            [[unlikely]] {
+            VideoCommon::V2::Resolve::CountRecordStat(
+                VideoCommon::V2::Resolve::GetRecordStats().template_fallbacks);
+        }
         switch (recipe_result) {
         case GraphicsPipeline::RecipeResult::Recorded:
             replayed = true;
@@ -1840,9 +1866,12 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     } else if (path == DrawPath::Delta) {
         Profile::Scope scope{Profile::Zone::Configure};
         bool configured = false;
-        if (drawrec == VideoCommon::V2::Mode::On && drawrec_last_drawn &&
-            pipeline->LastRecord().h.pipeline == pipeline) [[unlikely]] {
+        if (record_route == VideoCommon::V2::Resolve::RecordRoute::Delta) [[unlikely]] {
             configured = PrepareDeltaRecord(*pipeline, is_indexed, drawrec_drawn);
+            if (!drawrec_drawn) {
+                VideoCommon::V2::Resolve::CountRecordStat(
+                    VideoCommon::V2::Resolve::GetRecordStats().delta_fallbacks);
+            }
         }
         if (!drawrec_drawn) {
             configured = pipeline->ConfigureDelta(is_indexed);

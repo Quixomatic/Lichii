@@ -434,8 +434,73 @@ struct ResolveContext {
 /// Returns how many were replaced.
 u32 PredictKnownViewProxies(ResolvedDraw& record, std::span<const Commit::Request> textures);
 
+/// DRAWREC=1: which path a draw takes (S0-G16). Template and Delta are steps 16 and 17; a hit or
+/// continued draw that can't take them goes to the old recipe / delta configure, and a draw the
+/// verify modes resolve in full is a full record draw.
+enum class RecordRoute : u8 { Full, Delta, Template, OldRecipe, OldDelta };
+/// Why a hit or continued draw did not take its record path.
+enum class RecordRouteWhy : u8 {
+    None,
+    ContinuedVerify, ///< CONTDRAW=verify / FAST_DRAW_VERIFY resolved the continued draw in full
+    HitVerify,       ///< DRAWCACHE=verify resolved the sampled hit in full
+    NoTemplate,      ///< the hit's recipe has no record template (built by the old capture)
+    NotAfterRecord,  ///< the previous draw was not recorded by the record path
+    OtherPipeline,   ///< the pipeline's last record is another pipeline's (or none)
+    Count,
+};
+constexpr size_t NumRecordRouteWhys = static_cast<size_t>(RecordRouteWhy::Count);
+inline constexpr std::array<const char*, NumRecordRouteWhys> record_route_why_names{
+    "none", "continued verify", "hit verify", "no template", "not after a record draw",
+    "other pipeline",
+};
+
+struct RecordRouteInputs {
+    bool hit = false;              ///< the draw cache decided a replay
+    bool hit_verify = false;       ///< ...sampled for DRAWCACHE=verify
+    bool has_template = false;     ///< the hit's recipe holds a record template
+    bool continued = false;        ///< TakeReusableDraw took the draw (and it still holds)
+    bool continued_verify = false; ///< ...but the verify modes resolve it in full
+    bool last_drawn = false;       ///< the previous draw went through the record path
+    bool last_same_pipeline = false; ///< the pipeline's last record is this pipeline's
+};
+struct RecordRouteDecision {
+    RecordRoute route = RecordRoute::Full;
+    RecordRouteWhy why = RecordRouteWhy::None;
+};
+
+/// The rasterizer's DRAWREC=1 ladder: a hit (template, else the old recipe path), a continued draw
+/// (record diff after a record draw of the same pipeline, else the old delta), else full.
+[[nodiscard]] constexpr RecordRouteDecision ChooseRecordRoute(const RecordRouteInputs& in) {
+    if (in.hit) {
+        if (in.hit_verify) {
+            return {RecordRoute::Full, RecordRouteWhy::HitVerify};
+        }
+        return in.has_template ? RecordRouteDecision{RecordRoute::Template, RecordRouteWhy::None}
+                               : RecordRouteDecision{RecordRoute::OldRecipe,
+                                                     RecordRouteWhy::NoTemplate};
+    }
+    if (in.continued) {
+        if (in.continued_verify) {
+            return {RecordRoute::Full, RecordRouteWhy::ContinuedVerify};
+        }
+        if (!in.last_drawn) {
+            return {RecordRoute::OldDelta, RecordRouteWhy::NotAfterRecord};
+        }
+        return in.last_same_pipeline
+                   ? RecordRouteDecision{RecordRoute::Delta, RecordRouteWhy::None}
+                   : RecordRouteDecision{RecordRoute::OldDelta, RecordRouteWhy::OtherPipeline};
+    }
+    return {RecordRoute::Full, RecordRouteWhy::None};
+}
+
 struct RecordStats {
     std::atomic<u64> drawrec_draws{};
+    /// S0-G16: hits and continued draws that did not take their record path, by reason.
+    std::array<std::atomic<u64>, NumRecordRouteWhys> route_whys{};
+    /// Record-path attempts that fell back: a template the apply sent back to resolve (Rebuild)
+    /// or whose resolve was not Ready, and a record diff that was not Ready (old delta then).
+    std::atomic<u64> template_fallbacks{};
+    std::atomic<u64> delta_fallbacks{};
     std::array<std::atomic<u64>, 3> by_path{}; ///< full, delta, template
     std::array<std::atomic<u64>, NumCommitOnlyReasons> commit_only{};
     std::atomic<u64> stale{};

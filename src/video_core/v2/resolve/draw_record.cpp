@@ -383,6 +383,9 @@ std::string TakeRecordStatsText(double seconds) {
     for (const auto& counter : stats.commit_only) {
         any += counter.load(std::memory_order_relaxed);
     }
+    for (const auto& counter : stats.route_whys) {
+        any += counter.load(std::memory_order_relaxed);
+    }
     if (any == 0) {
         return {}; // another thread's window took them, or the path did not run
     }
@@ -441,11 +444,32 @@ std::string TakeRecordStatsText(double seconds) {
             us(path_ticks[1], paths[1]), us(resolve_ticks[1], paths[1]),
             us(path_ticks[2], paths[2]), us(resolve_ticks[2], paths[2]));
     }
+    // S0-G16: each path's share of the record draws, and why hits / continued draws went
+    // elsewhere (the verify modes resolve theirs in full by design).
+    const u64 path_total = paths[0] + paths[1] + paths[2];
+    const auto path_share = [&](u64 value) {
+        return path_total != 0
+                   ? 100.0 * static_cast<double>(value) / static_cast<double>(path_total)
+                   : 0.0;
+    };
+    std::string routes = fmt::format(", share full {:.1f}% delta {:.1f}% template {:.1f}%",
+                                     path_share(paths[0]), path_share(paths[1]),
+                                     path_share(paths[2]));
+    std::string whys;
+    for (size_t i = 1; i < NumRecordRouteWhys; ++i) {
+        if (const u64 value = take(stats.route_whys[i]); value != 0) {
+            whys += fmt::format(" {} {:.0f}", record_route_why_names[i], rate(value));
+        }
+    }
+    routes += fmt::format(", not on the record path/s:{}, fallbacks/s template {:.0f} delta {:.0f}",
+                          whys.empty() ? std::string{" none"} : whys,
+                          rate(take(stats.template_fallbacks)),
+                          rate(take(stats.delta_fallbacks)));
     return fmt::format(
-        "drawrec {:.0f}/s (full {:.0f}, delta {:.0f}, template {:.0f}){}, reused ubo {:.0f}/s tbo "
+        "drawrec {:.0f}/s (full {:.0f}, delta {:.0f}, template {:.0f}){}{}, reused ubo {:.0f}/s tbo "
         "{:.0f}/s, nearest bases {:.0f}/s, commit-only/s:{}, stale {:.0f}/s, deleted loops "
         "{:.0f}/s, verify {} draws, mismatches:{}, dependent {}, purity violations {}",
-        rate(draws), rate(paths[0]), rate(paths[1]), rate(paths[2]), timing,
+        rate(draws), rate(paths[0]), rate(paths[1]), rate(paths[2]), timing, routes,
         rate(take(stats.reused_ubos)), rate(take(stats.reused_tbos)),
         rate(take(stats.nearest_bases)),
         commit_only.empty() ? std::string{" none"} : commit_only, rate(take(stats.stale)),

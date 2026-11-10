@@ -168,6 +168,56 @@ TEST_CASE("V2 DRAWREC: the stats line reports reuse and time per path",
     REQUIRE(R::ResolvedUbo{}.gpu_addr == 0);
 }
 
+TEST_CASE("V2 DRAWREC: hits and continued draws take the template and record diff paths",
+          "[video_core][v2_drawrec]") {
+    // S0-G16: the rasterizer's DRAWREC=1 ladder. A hit with a template and a continued draw after
+    // a record draw of the same pipeline take steps 16 and 17; the verify modes resolve theirs in
+    // full, and each other case is counted by its reason.
+    using R::RecordRoute;
+    using R::RecordRouteWhy;
+    const auto route = [](R::RecordRouteInputs in) { return R::ChooseRecordRoute(in); };
+    R::RecordRouteDecision d = route({.hit = true, .has_template = true});
+    REQUIRE(d.route == RecordRoute::Template);
+    REQUIRE(d.why == RecordRouteWhy::None);
+    d = route({.hit = true, .hit_verify = true, .has_template = true});
+    REQUIRE(d.route == RecordRoute::Full);
+    REQUIRE(d.why == RecordRouteWhy::HitVerify);
+    d = route({.hit = true});
+    REQUIRE(d.route == RecordRoute::OldRecipe);
+    REQUIRE(d.why == RecordRouteWhy::NoTemplate);
+    d = route({.continued = true, .last_drawn = true, .last_same_pipeline = true});
+    REQUIRE(d.route == RecordRoute::Delta);
+    REQUIRE(d.why == RecordRouteWhy::None);
+    d = route({.continued = true, .continued_verify = true, .last_drawn = true,
+               .last_same_pipeline = true});
+    REQUIRE(d.route == RecordRoute::Full);
+    REQUIRE(d.why == RecordRouteWhy::ContinuedVerify);
+    d = route({.continued = true, .last_same_pipeline = true});
+    REQUIRE(d.route == RecordRoute::OldDelta);
+    REQUIRE(d.why == RecordRouteWhy::NotAfterRecord);
+    d = route({.continued = true, .last_drawn = true});
+    REQUIRE(d.route == RecordRoute::OldDelta);
+    REQUIRE(d.why == RecordRouteWhy::OtherPipeline);
+    d = route({});
+    REQUIRE(d.route == RecordRoute::Full);
+    REQUIRE(d.why == RecordRouteWhy::None);
+
+    // The stats line gives each path's share and the reasons per second.
+    R::RecordStats& stats = R::GetRecordStats();
+    static_cast<void>(R::TakeRecordStatsText(1.0));
+    R::CountRecordStat(stats.drawrec_draws, 4);
+    R::CountRecordStat(stats.by_path[0], 2);
+    R::CountRecordStat(stats.by_path[1], 1);
+    R::CountRecordStat(stats.by_path[2], 1);
+    R::CountRecordStat(stats.route_whys[static_cast<size_t>(RecordRouteWhy::HitVerify)], 5);
+    R::CountRecordStat(stats.delta_fallbacks, 2);
+    const std::string text = R::TakeRecordStatsText(1.0);
+    REQUIRE(text.find("share full 50.0% delta 25.0% template 25.0%") != std::string::npos);
+    REQUIRE(text.find("not on the record path/s: hit verify 5") != std::string::npos);
+    REQUIRE(text.find("fallbacks/s template 0 delta 2") != std::string::npos);
+    REQUIRE(stats.route_whys[static_cast<size_t>(RecordRouteWhy::HitVerify)].load() == 0);
+}
+
 TEST_CASE("V2 DRAWREC: record compare names the differing groups", "[video_core][v2_drawrec]") {
     const R::ResolvedDraw resolved = SampleRecord();
     std::string reasons;
