@@ -1783,6 +1783,9 @@ struct KeplerCompute::FrontState {
             u32 flags;
         };
         std::vector<Payload> payloads;
+        /// Fix F3h: a QMD's release words may be patched by a release still to land; the
+        /// back writes either payload (they are not remembered).
+        bool uncertain_payloads{};
     };
     std::deque<QmdSignal> qmd_signals; ///< this write's signals, consumed by the notes
     /// S1 single owner (GpuSplit::S1Exec, REGSEM=1, the native class): classified entries
@@ -2220,6 +2223,10 @@ void KeplerCompute::FrontNoteWrites(VideoCommon::GpuSplit& split, FrontState& fs
     case 0xb0: {
         const bool runs = !(method == 0xae || (method == 0xaf && !(argument & 2)) ||
                             (method == 0xb0 && ((argument & 15) == 0 || (argument & 15) == 1)));
+        if (runs && fs.qmd_model != VideoCommon::V2::Mode::Off) [[unlikely]] {
+            // The model's resync without a drain waits for the back to run this one (F3h).
+            VideoCommon::V2::QmdFront::NoteSignalSent(split.WritePosition());
+        }
         if (runs && fs.qmd_model == VideoCommon::V2::Mode::On && !fs.qmd_signals.empty())
             [[unlikely]] {
             // EDEN_NX2_V2_QMDSCHED: the QMDs this signal launches, as the front's model knows
@@ -2242,6 +2249,9 @@ void KeplerCompute::FrontNoteWrites(VideoCommon::GpuSplit& split, FrontState& fs
                 // F3-X1 (971d resume lines: the satisfying release was in no front note): the
                 // releases' values, for the poll's deferral and its resume line.
                 for (const auto& release : signal.payloads) {
+                    if (signal.uncertain_payloads) {
+                        break;
+                    }
                     RememberQmdRelease(split, memory_manager, release.address, release.payload,
                                        release.flags);
                 }
@@ -2288,6 +2298,14 @@ void KeplerCompute::FrontModelQmd(VideoCommon::GpuSplit& split, FrontState& fs, 
     }
     fs.qmd_signals.clear();
     auto& model = QmdFront::FrontModel();
+    if (!model.Valid() && split.BackRunning()) {
+        // Fix F3h (W-01c, R2-F3-02): once the back ran every signal the model saw (none of
+        // this write's is sent yet), its table is what the model should hold: copy it in a back
+        // job after the back's current entry, no drain (the unmapped-acquire drain used to do it).
+        if (QmdFront::ResyncByJob(split) && P5b::Enabled()) {
+            P5b::Add(P5b::Counter::QmdResyncs);
+        }
+    }
     for (u32 i = 0; i < amount; ++i) {
         const u32 argument = arguments[i];
         if (method == 0xae || (method == 0xaf && !(argument & 2)) ||
@@ -2310,14 +2328,30 @@ void KeplerCompute::FrontModelQmd(VideoCommon::GpuSplit& split, FrontState& fs, 
                 return QmdFront::ReadResult::Unknown;
             }
             memory_manager.ReadBlockUnsafe(address, descriptor.data(), sizeof(descriptor));
+            const Descriptor in_memory = descriptor;
             // Queued writes (copies, uploads, dispatches) that may change these words: unknown.
             const auto pending =
                 split.FindWrites(*device, sizeof(descriptor), VideoCommon::V2::HazardFilter{},
                                  reinterpret_cast<u8*>(descriptor.data()));
-            // A release still to land: the back reads memory, which doesn't hold it yet.
-            return pending.kind == VideoCommon::V2::HazardResult::Kind::Wait || pending.landing
-                       ? QmdFront::ReadResult::Unknown
-                       : QmdFront::ReadResult::Ok;
+            if (pending.kind == VideoCommon::V2::HazardResult::Kind::Wait) {
+                return QmdFront::ReadResult::Unknown;
+            }
+            if (!pending.landing) {
+                return QmdFront::ReadResult::Ok;
+            }
+            // A release of known bytes still to land: the back reads memory, which may or may
+            // not hold it by then. Fix F3h (W-01c, R2-F3-02): NVN2 patches release payloads into
+            // scheduled QMDs; when only release words differ, the scheduling (dependencies,
+            // chain, program, constant buffers) is the same either way: the model stays exact on
+            // memory's words, and the signal notes the patched releases too (their payloads are
+            // not remembered: which of the two the back writes depends on the landing).
+            if (!QmdFront::OnlyReleaseWordsDiffer(in_memory, descriptor)) {
+                return QmdFront::ReadResult::Unknown;
+            }
+            QmdFront::NoteBothReleases(descriptor, signal.releases);
+            signal.uncertain_payloads = true;
+            descriptor = in_memory;
+            return QmdFront::ReadResult::Ok;
         };
         const auto mapped = [&](u64 address, u64 size) {
             return memory_manager.IsFullyMappedRange(address, size);

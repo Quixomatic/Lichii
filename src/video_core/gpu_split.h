@@ -326,6 +326,14 @@ public:
     [[nodiscard]] u32 MapEpoch() const {
         return map_epoch;
     }
+    /// Front (Fix F3h, R2-F3-03): a Map record was just sent; MapQueued until the back ran it
+    /// (an unmapped semaphore word may be mapped by it).
+    void NoteMapSent() {
+        last_map_position = write_position;
+    }
+    [[nodiscard]] bool MapQueued() const {
+        return last_map_position > ConsumedNow();
+    }
     /// Any thread: a GPU memory map, unmap or remap ran (GPU::ExecuteMap). Cached front
     /// translations (FlushCbWriteSlow) are checked against it, maps without a drain included.
     static void NoteMapExecuted() {
@@ -1137,6 +1145,7 @@ private:
     u64 ticket_sub{};
     u64 last_ticket{};
     u64 last_qmd_release{}; ///< Front: write position of the last QmdRelease note
+    u64 last_map_position{}; ///< Front: write position of the last Map record (NoteMapSent)
     /// Front (Fix F3f): QmdRelease notes by ring position, live until their entry's untracked
     /// operations ran (V2::Landing::UntrackedSettled), not only until the back consumed them.
     V2::HazardTable qmd_release_notes;

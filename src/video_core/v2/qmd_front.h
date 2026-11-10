@@ -4,7 +4,10 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <cstddef>
+#include <thread>
+#include <utility>
 
 #include "common/common_types.h"
 #include "video_core/native_qmd.h"
@@ -90,6 +93,20 @@ public:
         valid = true;
         ++resyncs;
     }
+    /// Takes a copy of the back's table made when the back had run every signal the model saw
+    /// (Fix F3h: a back job, no drain).
+    void ResyncFrom(Scheduler::Table&& back) {
+        table = std::move(back);
+        valid = true;
+        ++resyncs;
+    }
+    /// Front: the ring position after the newest signal the model saw was sent.
+    void NoteSignalSent(u64 position) noexcept {
+        last_signal_sent = position;
+    }
+    [[nodiscard]] u64 LastSignalSent() const noexcept {
+        return last_signal_sent;
+    }
 
     [[nodiscard]] bool Valid() const noexcept {
         return valid;
@@ -110,7 +127,41 @@ private:
     bool valid = true;
     u64 invalidations = 0;
     u64 resyncs = 0;
+    u64 last_signal_sent = 0;
 };
+
+/// Fix F3h (W-01c, R2-F3-02): whether a QMD read with a release still to land forwarded in
+/// (`forwarded`) differs from memory's words (`memory`) only in the release slots (NVN2 patches
+/// release payloads into scheduled QMDs): the scheduling is then the same for either.
+[[nodiscard]] inline bool OnlyReleaseWordsDiffer(const Scheduler::Descriptor& memory,
+                                                 const Scheduler::Descriptor& forwarded) {
+    for (size_t word = 0; word < memory.size(); ++word) {
+        if (memory[word] == forwarded[word]) {
+            continue;
+        }
+        bool release_word = false;
+        for (const auto base : Scheduler::ReleaseSlots) {
+            release_word = release_word || (word >= base && word < base + 4);
+        }
+        if (!release_word) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// The release words `descriptor` names (GPU address and size), as the scheduler writes them.
+template <typename Ranges>
+inline void NoteBothReleases(const Scheduler::Descriptor& descriptor, Ranges& releases) {
+    for (const auto base : Scheduler::ReleaseSlots) {
+        const auto flags = descriptor[base + 1];
+        if (!(flags & (1U << 23)) || !Scheduler::IsDecodableRelease(flags)) {
+            continue;
+        }
+        const u64 destination = (u64{flags & 0xff} << 32) | descriptor[base];
+        releases.emplace_back(destination, (flags >> 30) == 0 ? 16U : 4U);
+    }
+}
 
 /// Inline QMDs (method 0x107) the front sent but the back may not have stored yet: the front
 /// forwards their words to its own reads (store forwarding for 256-byte QMDs).
@@ -172,6 +223,48 @@ inline void OnDrain() {
         FrontModel().Resync(Scheduler::BackTable());
     }
     FrontInline().Clear();
+}
+
+/// Front, between QMD writes (none of the current write's signals sent yet): the signals the
+/// model saw were sent up to NoteSignalSent's position. `NoteSignalSent` via the model.
+inline void NoteSignalSent(u64 position) {
+    FrontModel().NoteSignalSent(position);
+}
+
+/// Front: an unknown model resyncs without a drain (the unmapped-acquire drain used to do it):
+/// once the back consumed every signal the model saw, a back job (GpuSplit::RequestBackJob)
+/// copies the back's table after the back's current entry. No signal is sent meanwhile (the
+/// caller's aren't yet), so the copy is the table the model would hold. The front waits for the
+/// job only (one entry at most), not for the queue. Split: GpuSplit.
+template <typename Split>
+inline bool ResyncByJob(Split& split) {
+    Model& model = FrontModel();
+    if (model.Valid() || split.ConsumedNow() < model.LastSignalSent()) {
+        return false;
+    }
+    struct Job {
+        Scheduler::Table table;
+        std::atomic<bool> done{false};
+    };
+    // Static: a job a stopping back never ran must not point at a dead frame.
+    static Job job;
+    job.done.store(false, std::memory_order_relaxed);
+    split.RequestBackJob(
+        [](void* argument) {
+            auto& self = *static_cast<Job*>(argument);
+            self.table = Scheduler::BackTable();
+            self.done.store(true, std::memory_order_release);
+        },
+        &job);
+    while (!job.done.load(std::memory_order_acquire) && split.BackRunning()) {
+        std::this_thread::yield();
+    }
+    if (!job.done.load(std::memory_order_acquire)) {
+        return false;
+    }
+    model.ResyncFrom(std::move(job.table));
+    job.table.clear();
+    return true;
 }
 
 } // namespace VideoCommon::V2::QmdFront

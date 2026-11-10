@@ -21,6 +21,7 @@
 #include "video_core/v2/ir_exec.h"
 #include "video_core/v2/landing.h"
 #include "video_core/v2/macro_hle.h"
+#include "video_core/v2/qmd_front.h"
 #include "video_core/v2/shader_writes.h"
 
 namespace {
@@ -548,7 +549,9 @@ TEST_CASE("V2 acquire decisions", "[video_core][v2_hazard]") {
 // whose release the view never recorded; nothing resumed them once the valve was gone.
 TEST_CASE("V2 acquire: a suspended acquire whose release the view never records progresses",
           "[video_core][v2_hazard]") {
-    SECTION("an unmapped word takes the old path at once, it never suspends") {
+    SECTION("what the view can't decide (settings it doesn't model) takes the old path at once") {
+        // Fix F3h (R2-F3-03): an unmapped word is decided on the guest's read (gequal 0 passes
+        // at once) and suspends when not met, waiting only for a queued map.
         CHECK(!ViewSuspends(AcquireVerdict::Fallback, true));
         CHECK(ViewSuspends(AcquireVerdict::Fallback, false));
         CHECK(ViewSuspends(AcquireVerdict::NotMet, false));
@@ -729,6 +732,79 @@ TEST_CASE("V2 landing: the back obeys the front's landing verdict", "[video_core
     Landing::pending = saved_pending;
     Landing::landed.store(saved_landed);
     Landing::ResetVerdicts();
+}
+
+// Fix F3h (W-01c, R2-F3-02): one release patched into a scheduled QMD (NVN2), still to land,
+// made the front's QMD model unknown until the next drain (~23 unknown signals each); and the
+// model's resync rode the unmapped-acquire drain, which is gone.
+TEST_CASE("V2 QMD model: patched release words keep it exact; it resyncs without a drain",
+          "[video_core][v2_hazard]") {
+    namespace QmdFront = VideoCommon::V2::QmdFront;
+    using Descriptor = Tegra::NativeQmdScheduler::Descriptor;
+    SECTION("only release words differ: the scheduling is the same for either") {
+        Descriptor memory{};
+        memory[4] = 1U << 14; // one dependency
+        memory[24] = 0x1000;
+        memory[25] = (1U << 23) | (1U << 30); // one-word release, enabled
+        memory[26] = 5;
+        Descriptor patched = memory;
+        patched[26] = 6; // the payload
+        patched[24] = 0x2000; // and the address
+        CHECK(QmdFront::OnlyReleaseWordsDiffer(memory, patched));
+        std::vector<std::pair<u64, u64>> releases;
+        QmdFront::NoteBothReleases(patched, releases);
+        QmdFront::NoteBothReleases(memory, releases);
+        CHECK(releases == std::vector<std::pair<u64, u64>>{{0x2000, 4}, {0x1000, 4}});
+        patched[4] = 2U << 14; // a dependency count: the model can't know which the back sees
+        CHECK(!QmdFront::OnlyReleaseWordsDiffer(memory, patched));
+    }
+    SECTION("an unknown model resyncs by a back job once the back ran its signals (idle back)") {
+        struct FakeSplit {
+            std::atomic<u64> consumed{0};
+            std::atomic<bool> running{true};
+            void (*job)(void*) = nullptr;
+            void* argument = nullptr;
+            std::atomic<bool> requested{false};
+            u64 ConsumedNow() const {
+                return consumed.load();
+            }
+            bool BackRunning() const {
+                return running.load();
+            }
+            void RequestBackJob(void (*new_job)(void*), void* new_argument) {
+                job = new_job;
+                argument = new_argument;
+                requested.store(true);
+            }
+        } split;
+        auto& model = QmdFront::FrontModel();
+        model.Invalidate();
+        model.NoteSignalSent(500);
+        // The back hasn't run the newest signal the model saw: no copy (it would lack it).
+        split.consumed.store(400);
+        CHECK(!QmdFront::ResyncByJob(split));
+        CHECK(!split.requested.load());
+        CHECK(!model.Valid());
+        // It has: an idle back serves the job after its current entry, the front takes the copy.
+        split.consumed.store(500);
+        std::jthread back([&] {
+            while (!split.requested.load()) {
+                std::this_thread::yield();
+            }
+            split.job(split.argument);
+        });
+        CHECK(QmdFront::ResyncByJob(split));
+        CHECK(model.Valid());
+        back.join();
+        // A back that stops before running it: no copy, no hang.
+        model.Invalidate();
+        split.requested.store(false);
+        split.running.store(false);
+        CHECK(!QmdFront::ResyncByJob(split));
+        CHECK(!model.Valid());
+        model.Resync(Tegra::NativeQmdScheduler::BackTable());
+        model.NoteSignalSent(0);
+    }
 }
 
 // F3F5b-1/-2: a wait that must see what a report's operation writes (its timestamp, or a release

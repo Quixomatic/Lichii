@@ -304,6 +304,8 @@ void GpuSplit::Stop() {
     ticket_position = 0;
     ticket_sub = 0;
     last_ticket = 0;
+    last_qmd_release = 0;
+    last_map_position = 0;
     if (V2::Landing::verify) {
         LOG_INFO(HW_GPU,
                  "V2 landing verify: {} tickets landed out of order; front landing verdicts "

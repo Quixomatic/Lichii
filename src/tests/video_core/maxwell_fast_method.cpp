@@ -2755,6 +2755,22 @@ TEST_CASE("V2 landing: one write table, tickets without IR cuts, ordered landing
         Landing::ResetUntracked();
     }
 
+    SECTION("R2-F3-03: an unmapped acquire word waits only for a map still queued") {
+        // 0fe4: unmapped words took the v1 drain and forced fences (50/s). Now the view decides
+        // on the guest's read unless a Map record the back hasn't run may map the word.
+        Access::SetEnd(split, 100);
+        Access::SetBack(split, 100, false);
+        CHECK(!split.MapQueued());
+        Access::SetEnd(split, 120);
+        split.NoteMapSent();
+        CHECK(split.MapQueued());
+        Access::SetBack(split, 110, false);
+        CHECK(split.MapQueued());
+        // The back ran it: its `consumed` store is the progress path (it rings the front).
+        Access::SetBack(split, 120, false);
+        CHECK(!split.MapQueued());
+    }
+
     SECTION("F3-X1: an Equal acquire's QMD producer is fixed at the acquire and settles on an idle "
             "back") {
         // 0fe4: Equal/Mask acquires compared against the newest unknown QMD release the front

@@ -221,7 +221,16 @@ ViewCheck CheckWithView(DmaPusher& dma_pusher, GPUVAddr address, u32 value, V2::
     auto& memory = dma_pusher.memory_manager;
     const auto device = memory.GpuToCpuAddress(address);
     if (!device) {
-        return {V2::AcquireVerdict::Fallback, Reason::Unmapped, false};
+        // Fix F3h (R2-F3-03): an unmapped word. A map the back hasn't run yet may map it: wait
+        // for it (suspended; the back's `consumed` store rings the front). Otherwise nothing can
+        // write it: decide on the word as the guest reads it (the old path's read, 84de5dbac4:
+        // gequal 0 passes at once), without the old path's drain and forced fences.
+        if (split.MapQueued()) {
+            return {V2::AcquireVerdict::NotMet, Reason::Unmapped, false};
+        }
+        const bool met = V2::SemaphoreMet(op, memory.Read<u32>(address), value);
+        return {met ? V2::AcquireVerdict::Met : V2::AcquireVerdict::NotMet, Reason::Unmapped,
+                false};
     }
     if (qmd_target == SnapshotQmdTarget) {
         qmd_target =
@@ -290,11 +299,10 @@ bool Passes(const ViewCheck& check) {
 
 // EDEN_NX2_V2_ACQUIRE=1 (MASTER_PLAN §6, Fix F3-05): an acquire the view doesn't pass suspends
 // the channel; no drain, no forced fence. Settings the view doesn't model (accurate GPU, delayed
-// fences, macros on the back) and unmapped words (the old path reads them as the guest would)
-// take the old path.
+// fences, macros on the back) take the old path; unmapped words suspend too (Fix F3h, R2-F3-03:
+// the view reads them as the guest would, CheckWithView).
 bool SuspendsOnView(const ViewCheck& check) {
-    return V2::ViewSuspends(check.verdict,
-                            check.reason == Reason::Settings || check.reason == Reason::Unmapped);
+    return V2::ViewSuspends(check.verdict, check.reason == Reason::Settings);
 }
 
 void NoteViewDecision(const ViewCheck& check) {

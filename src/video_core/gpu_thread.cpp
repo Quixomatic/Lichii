@@ -220,6 +220,7 @@ void ThreadManager::SendToBack(CpuRecord& record, VideoCore::RasterizerInterface
         body.object2 = split.Ref(reinterpret_cast<const void*>(record.map.object2));
         split.Emit(V2::Ir::Kind::Map, body,
                    [gpu = &system.GPU(), map = record.map] { gpu->ExecuteMap(map); });
+        split.NoteMapSent();
         if ((record.map.flags & V2::Ir::MapBeforeLaterReads) != 0) {
             // The front reads later command lists through the GPU page table it changes.
             split.Drain(VideoCommon::DrainSite::Map);
