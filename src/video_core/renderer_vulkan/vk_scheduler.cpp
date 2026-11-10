@@ -603,6 +603,11 @@ void Scheduler::BeginRenderPassImpl(const Framebuffer* framebuffer, VkRenderPass
     state.framebuffer = framebuffer_handle;
     state.render_area = render_area;
     state.dynamic = next_pass_dynamic;
+    if (track_barriers) [[unlikely]] {
+        active_color_views = framebuffer->ColorViews();
+        active_depth_view = framebuffer->DepthView();
+        active_layers = framebuffer->Layers();
+    }
     auto_flush = false;
 
     if (GPU::Logging::IsActive() && Settings::values.gpu_log_vulkan_calls.GetValue()) {
@@ -710,6 +715,32 @@ bool Scheduler::DeferDepthStencilClear(const Framebuffer* framebuffer, const VkC
     deferred_clear.depth_stencil = true;
     deferred_clear.depth_stencil_value = value;
     return true;
+}
+
+bool Scheduler::CanClearInPass(const Framebuffer* framebuffer, std::optional<u32> color_slot,
+                               bool depth_stencil, const VkClearRect& rect) const {
+    if (!track_barriers || state.renderpass == VK_NULL_HANDLE) {
+        return false;
+    }
+    if (color_slot) {
+        if (*color_slot >= active_color_views.size() ||
+            (state.dynamic && *color_slot >= dynamic_color_count)) {
+            return false; // A dynamic pass may attach fewer colours than its framebuffer
+        }
+        const VkImageView view = framebuffer->ColorViews()[*color_slot];
+        if (view == VK_NULL_HANDLE || view != active_color_views[*color_slot]) {
+            return false;
+        }
+    }
+    if (depth_stencil && (framebuffer->DepthView() == VK_NULL_HANDLE ||
+                          framebuffer->DepthView() != active_depth_view)) {
+        return false;
+    }
+    const u64 right = u64{static_cast<u32>(rect.rect.offset.x)} + rect.rect.extent.width;
+    const u64 bottom = u64{static_cast<u32>(rect.rect.offset.y)} + rect.rect.extent.height;
+    return rect.rect.offset.x >= 0 && rect.rect.offset.y >= 0 &&
+           right <= state.render_area.width && bottom <= state.render_area.height &&
+           u64{rect.baseArrayLayer} + rect.layerCount <= active_layers;
 }
 
 void Scheduler::FlushDeferredClear() {

@@ -13,6 +13,7 @@
 #include <cstddef>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <thread>
 #include <utility>
 #include <queue>
@@ -315,6 +316,13 @@ public:
         return state.renderpass != VK_NULL_HANDLE;
     }
 
+    /// Chunk B2 (EDEN_NX2_V2_DYNRENDER): whether a clear of `framebuffer`'s colour slot and/or
+    /// depth-stencil can be a vkCmdClearAttachments in the active pass: those views are the
+    /// pass's own attachments at the same slots and the rect and layers lie inside it.
+    [[nodiscard]] bool CanClearInPass(const Framebuffer* framebuffer,
+                                      std::optional<u32> color_slot, bool depth_stencil,
+                                      const VkClearRect& rect) const;
+
     /// Changes whenever a render pass begins or ends.
     u64 RenderPassSerial() const {
         return render_pass_serial;
@@ -610,6 +618,9 @@ private:
     std::atomic<u64> blocked_since_us{}; ///< F4-X2: first urgent request since the last submit
     std::atomic<u64> blocked_wait_us{};  ///< F4-X2: TakeBlockedWaitUs
     bool host_read_wanted{};             ///< R2-F4-07: WantHostReadBarrier
+    std::array<VkImageView, 8> active_color_views{}; ///< CanClearInPass: the open pass's views
+    VkImageView active_depth_view{};
+    u32 active_layers{};
     u64 host_visible_tick{};             ///< R2-F4-07: HostVisibleThrough
     bool lazy_fences{};                 ///< F4-02: SetLazyFences
     bool finish_publishes_tick{};       ///< F4-12: FinishThreadPublishesTick

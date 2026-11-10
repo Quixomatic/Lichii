@@ -104,6 +104,9 @@ enum class Counter : u32 {
     ClearPassEnds,      ///< passes a clear ended
     ClearPassBegins,    ///< passes a clear began
     ClearBarriers,      ///< targeted barriers recorded inside a clear
+    ClearsKeptPass,     ///< chunk B2: clears recorded in the open pass of another framebuffer key
+    ClearPassEndsFull,  ///< passes ended by a full clear of attachments the pass does not hold
+    ClearPassEndsPartial, ///< passes ended by a partial or blit clear
     Count,
 };
 

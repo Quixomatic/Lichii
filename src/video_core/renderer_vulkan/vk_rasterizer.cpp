@@ -2931,7 +2931,20 @@ void RasterizerVulkan::Clear(u32 layer_count) {
     // Record's auto flush (a full barrier) once F4-X3 left tracked writes pending across WFIs;
     // dynamic state now records without it (Scheduler::RecordState).
     const bool can_defer_clear = deferrable_shape && !pass_was_active;
-    if (!can_defer_clear) {
+    // Chunk B2 (d5e4: clears ended 35.1 passes/f): a clear whose attachments are the open pass's
+    // own (a framebuffer object of another key over the same views) is a vkCmdClearAttachments
+    // in that pass; only the blit clears (partial channels, stencil masks) need their own.
+    const u32 clear_slot = regs.clear_surface.RT;
+    const bool clears_color = use_color && framebuffer->HasAspectColorBit(clear_slot);
+    const bool clears_depth_stencil = (use_depth && framebuffer->HasAspectDepthBit()) ||
+                                      (use_stencil && framebuffer->HasAspectStencilBit());
+    const bool clear_in_open_pass =
+        !can_defer_clear && pass_was_active && (clears_color || clears_depth_stencil) &&
+        (!clears_color || color_full_channels) && !stencil_partial &&
+        scheduler.CanClearInPass(framebuffer,
+                                 clears_color ? std::optional<u32>{clear_slot} : std::nullopt,
+                                 clears_depth_stencil, clear_rect);
+    if (!can_defer_clear && !clear_in_open_pass) {
         scheduler.RequestRendering(framebuffer);
     }
     if (clear_stats) [[unlikely]] {
@@ -2943,9 +2956,16 @@ void RasterizerVulkan::Clear(u32 layer_count) {
         } else {
             P5b::Add(P5b::Counter::ClearsInPass);
         }
+        if (clear_in_open_pass) {
+            P5b::Add(P5b::Counter::ClearsKeptPass);
+        }
         if (scheduler.RenderPassSerial() != pass_serial) {
             if (pass_was_active) {
                 P5b::Add(P5b::Counter::ClearPassEnds);
+                // Why: a full clear of other attachments (it would be a load op with no pass
+                // open) or a blit/partial clear.
+                P5b::Add(deferrable_shape ? P5b::Counter::ClearPassEndsFull
+                                          : P5b::Counter::ClearPassEndsPartial);
             }
             if (scheduler.IsRenderPassActive()) {
                 P5b::Add(P5b::Counter::ClearPassBegins);
