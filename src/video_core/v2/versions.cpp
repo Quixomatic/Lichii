@@ -193,6 +193,53 @@ std::array<u64, NumEpochReasons> CollectEpoch::TakeCounts() {
     return result;
 }
 
+void CollectEpoch::AdvanceAt(EpochReason reason, u64 position) {
+    counts[static_cast<size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
+    if (position == last_note) {
+        return; // no entry between the two points
+    }
+    last_note = position;
+    const u64 head = note_head.load(std::memory_order_relaxed);
+    if (head - note_tail.load(std::memory_order_acquire) >= NumNotes) {
+        u64 over = overflow_until.load(std::memory_order_relaxed);
+        while (over < position && !overflow_until.compare_exchange_weak(
+                                      over, position, std::memory_order_release)) {
+        }
+        return;
+    }
+    notes[head % NumNotes] = position;
+    note_head.store(head + 1, std::memory_order_release);
+}
+
+void CollectEpoch::ReachSlow(u64 position) {
+    bool move = false;
+    const u64 head = note_head.load(std::memory_order_acquire);
+    u64 tail = note_tail.load(std::memory_order_relaxed);
+    while (tail != head && notes[tail % NumNotes] <= position) {
+        ++tail;
+        move = true;
+    }
+    note_tail.store(tail, std::memory_order_release);
+    u64 over = overflow_until.load(std::memory_order_acquire);
+    if (over != 0) {
+        // Notes were dropped up to `over`: every entry up to it moves the epoch.
+        move = true;
+        if (position >= over) {
+            overflow_until.compare_exchange_strong(over, 0, std::memory_order_acq_rel);
+        }
+    }
+    if (move) {
+        epoch.fetch_add(1, std::memory_order_acq_rel);
+    }
+}
+
+void CollectEpoch::ResetStream() {
+    note_tail.store(note_head.load(std::memory_order_acquire), std::memory_order_release);
+    overflow_until.store(0, std::memory_order_relaxed);
+    last_note = ~u64{0};
+    epoch.fetch_add(1, std::memory_order_acq_rel);
+}
+
 bool EpochMemo::Unchanged(DAddr address, u64 size, u64 since) {
     ++counters.queries;
     const DAddr end = address + size;

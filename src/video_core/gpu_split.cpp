@@ -84,6 +84,17 @@ u64 OldIdleSpinNs() {
 
 } // Anonymous namespace
 
+// S0-G19: the front's ordering points move the back's collect epoch where the back's stream
+// reaches them (the open StateRun is cut, so the work after the point starts a new entry).
+void V2::Versions::NoteOrderingPoint(EpochReason reason) {
+    GpuSplit& split = GpuSplit::Get();
+    if (reason != EpochReason::Submit && split.Active() && !GpuSplit::OnBackThread()) {
+        Epochs().AdvanceAt(reason, split.CutPosition());
+        return;
+    }
+    Epochs().Advance(reason);
+}
+
 void GpuSplit::CheckOwner(const char* where) {
 #ifdef _WIN32
     // Also while the back is idle: its idle hook submits (Scheduler::FlushDeferred).
@@ -248,6 +259,7 @@ void GpuSplit::Stop() {
     // never ran, it waited on its syncpoint forever), and the engines it held were freed.
     ring.reset();
     write_position = 0;
+    V2::Versions::Epochs().ResetStream(); // S0-G19: notes name positions of this ring
     last_writer_position = 0;
     last_sync_position = 0;
     published_local = 0;
@@ -1414,6 +1426,7 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
     g_back_thread_id.store(GetCurrentThreadId(), std::memory_order_relaxed);
 #endif
     u64 read_position = 0;
+    const bool epoch_stream = V2::Versions::Active() || V2::On(V2::Switch::CbufRing);
     while (!stop_token.stop_requested()) {
         Nx2Profile::Report("GPU back thread");
         V2::Stats::Report("GPU back thread");
@@ -1492,6 +1505,9 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
             if (tracks_writes) [[unlikely]] {
                 back_entry_position = read_position;
                 V2::Landing::tag = read_position + EntryWords(&ring[index]);
+            }
+            if (epoch_stream) [[unlikely]] {
+                V2::Versions::Epochs().Reach(read_position); // S0-G19: the front's ordering points
             }
             const size_t size =
                 Execute(&ring[index], std::min<u64>(available - read_position, RingWords - index));

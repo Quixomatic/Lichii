@@ -3062,7 +3062,7 @@ void BufferCache<P>::V2RingVerifyLog(size_t stage, u32 index, DAddr device_addr,
                 "V2 cbuf ring verify ({} of them): stage {} cbuf {} at {:#x}+{:#x}: the {} "
                 "version at {:#x} differs from guest memory | trusted {} words {:#x} now {:#x} "
                 "page armed {} owed {} queued {} | decoder epoch {} now {} decoders {} | memo "
-                "epoch {} now {} | backoff {} | overlap patches {} cow {}",
+                "epoch {} now {} | backoff {} | overlap patches {} cow {} | last writer {}",
                 n + 1, stage, index, device_addr, size, path, entry.position, entry.trusted,
                 entry.words, words_now, (word & V2::CbufWatch::ArmedBit) != 0,
                 (word & V2::CbufWatch::OwedBit) != 0, (word & V2::CbufWatch::QueuedBit) != 0,
@@ -3070,7 +3070,8 @@ void BufferCache<P>::V2RingVerifyLog(size_t stage, u32 index, DAddr device_addr,
                 shared.decoders.load(std::memory_order_relaxed), entry.checked_epoch, epoch_now,
                 v2_cbuf_arming ? v2_cbuf_arming->Backoff(page) : 0,
                 shared.overlap_patches.load(std::memory_order_relaxed),
-                shared.cow_versions.load(std::memory_order_relaxed));
+                shared.cow_versions.load(std::memory_order_relaxed),
+                V2::CbufWatch::WriterName(V2::CbufWatch::Get().LastWriter(page)));
 }
 
 template <class P>

@@ -445,6 +445,52 @@ TEST_CASE("V2 F2-03: constant buffer data through one window reaches every windo
     }
 }
 
+TEST_CASE("V2 F2-03 (R2-F2-03): windows of one address and three sizes see each other's data, "
+          "across unrelated maps",
+          "[video_core][v2_cbufwatch]") {
+    static V2::CbufRing::Shared shared;
+    std::vector<u8> mapped(V2::CbufRing::Shared::Capacity);
+    shared.Init(mapped.data(), 256);
+    auto decode = std::make_unique<V2::CbufRing::Decode>(shared, true);
+    WatchEnv env;
+    constexpr u32 cbuf_bit = V2::ProducerBit(V2::Producer::CbData);
+    constexpr u64 va = 0x4000;
+    // The 0x40f4000 family of the 0fe4 verify log: one address bound with 0x210, 0x550, 0x790.
+    decode->Bind(va, 0x210, cbuf_bit, env);
+    decode->Bind(va, 0x550, cbuf_bit, env);
+    decode->Bind(va, 0x790, cbuf_bit, env);
+    REQUIRE(PublishAll(*decode).size() == 3);
+    const u64 patches = shared.overlap_patches.load();
+    env.maps = 1; // a map elsewhere: every window still at the same device address
+    const u32 x = 0xaaaa0001;
+    decode->Write(va, 0x210, 0x10, &x, 1, cbuf_bit, env);
+    REQUIRE(shared.overlap_patches.load() == patches + 2);
+    env.writers = cbuf_bit;
+    const u32 y = 0xaaaa0002;
+    decode->Write(va, 0x550, 0x500, &y, 1, cbuf_bit, env); // past 0x210: the largest only
+    REQUIRE(shared.overlap_patches.load() == patches + 3);
+    const u32 z = 0xaaaa0003;
+    decode->Write(va, 0x790, 0x700, &z, 1, cbuf_bit, env); // past 0x550: nobody else
+    REQUIRE(shared.overlap_patches.load() == patches + 3);
+    const u32 w = 0xaaaa0004;
+    decode->Write(va, 0x790, 0x20, &w, 1, cbuf_bit, env); // inside all three
+    REQUIRE(shared.overlap_patches.load() == patches + 5);
+    std::vector<V2::CbufRing::Published> versions;
+    decode->Publish([&](const V2::CbufRing::Published& version) { versions.push_back(version); });
+    REQUIRE(versions.size() == 3);
+    for (const auto& version : versions) {
+        REQUIRE(version.position != V2::CbufRing::NoPosition);
+        REQUIRE(WordAt(mapped, shared, version.position, 0x10) == x);
+        REQUIRE(WordAt(mapped, shared, version.position, 0x20) == w);
+        if (version.size >= 0x550) {
+            REQUIRE(WordAt(mapped, shared, version.position, 0x500) == y);
+        }
+        if (version.size == 0x790) {
+            REQUIRE(WordAt(mapped, shared, version.position, 0x700) == z);
+        }
+    }
+}
+
 TEST_CASE("V2 F2-03: a version on armed pages is trusted until its pages see a write",
           "[video_core][v2_cbufwatch]") {
     static V2::CbufRing::Shared shared;
@@ -645,6 +691,57 @@ TEST_CASE("V2 F2-03: the collect epoch moves with the ring on and the draw cache
     Versions::HookEpoch(Versions::EpochReason::Submit);
     REQUIRE(Versions::Epochs().Current() == before + 2);
     modes = saved;
+}
+
+TEST_CASE("V2 S0-G19: the back's collect epoch moves where its stream reaches the front's "
+          "ordering points",
+          "[video_core][v2_cbufwatch]") {
+    namespace Versions = V2::Versions;
+    auto epochs = std::make_unique<Versions::CollectEpoch>();
+    const u64 start = epochs->Current();
+    // The front noted points before ring positions 100 and 300 (two at 300: one move).
+    epochs->AdvanceAt(Versions::EpochReason::Entry, 100);
+    epochs->AdvanceAt(Versions::EpochReason::Acquire, 300);
+    epochs->AdvanceAt(Versions::EpochReason::Wait, 300);
+    REQUIRE(epochs->Current() == start); // the back has not reached them
+    epochs->Reach(0);
+    epochs->Reach(40);
+    REQUIRE(epochs->Current() == start); // every encode of these entries: one epoch
+    epochs->Reach(100);
+    REQUIRE(epochs->Current() == start + 1);
+    epochs->Reach(180);
+    epochs->Reach(299);
+    REQUIRE(epochs->Current() == start + 1);
+    epochs->Reach(320); // past 300 without an entry at it
+    REQUIRE(epochs->Current() == start + 2);
+    epochs->Advance(Versions::EpochReason::Submit); // the back's own point
+    REQUIRE(epochs->Current() == start + 3);
+    // A full queue: dropped notes move the epoch at every entry up to the newest of them.
+    for (u64 i = 0; i < Versions::CollectEpoch::NumNotes + 8; ++i) {
+        epochs->AdvanceAt(Versions::EpochReason::Entry, 1000 + i * 10);
+    }
+    const u64 newest = 1000 + (Versions::CollectEpoch::NumNotes + 7) * 10;
+    u64 now = epochs->Current();
+    epochs->Reach(1000);
+    REQUIRE(epochs->Current() == now + 1);
+    for (u64 position = 1001; position < newest; position += 7) {
+        now = epochs->Current();
+        epochs->Reach(position);
+        REQUIRE(epochs->Current() == now + 1); // never fewer moves than the notes asked
+    }
+    epochs->Reach(newest);
+    now = epochs->Current();
+    epochs->Reach(newest + 5);
+    REQUIRE(epochs->Current() == now); // drained
+    // The split stops: positions start over.
+    epochs->AdvanceAt(Versions::EpochReason::Entry, newest + 100);
+    epochs->ResetStream();
+    now = epochs->Current();
+    epochs->Reach(newest + 200);
+    REQUIRE(epochs->Current() == now);
+    epochs->AdvanceAt(Versions::EpochReason::Entry, 4);
+    epochs->Reach(4);
+    REQUIRE(epochs->Current() == now + 1);
 }
 
 TEST_CASE("V2 F2-03: a page the watch alone holds traps only writes", "[video_core][v2_cbufwatch]") {

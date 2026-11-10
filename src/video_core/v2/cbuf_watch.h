@@ -68,6 +68,26 @@ enum class Protection : u8 {
                                       : Protection::Cached;
 }
 
+/// CBUFRING=verify: the last writer of a page the verify log names (R2-F2-03).
+enum class Writer : u8 {
+    None,
+    CpuTrap, ///< a guest CPU store through the trap
+    Foreign, ///< NoteForeign (host, DMA, GPU, downloads, unmaps, semaphore words)
+    Cached,  ///< constant buffer data applied by the back (no word moves: the front patched)
+};
+[[nodiscard]] constexpr const char* WriterName(Writer writer) {
+    switch (writer) {
+    case Writer::CpuTrap:
+        return "cpu trap";
+    case Writer::Foreign:
+        return "foreign";
+    case Writer::Cached:
+        return "constant buffer data";
+    default:
+        return "none seen";
+    }
+}
+
 /// The words of a window's pages (second page 0 for one-page windows) and whether all were armed.
 struct Snap {
     u64 words{};
@@ -145,6 +165,9 @@ public:
     void OnCpuWrite(u64 addr, u64 size, Release&& release) {
         if (size == 0) {
             return;
+        }
+        if (track_writers.load(std::memory_order_relaxed)) [[unlikely]] {
+            NoteWriter(addr, size, Writer::CpuTrap);
         }
         const u64 last = (addr + size - 1) >> PageBits;
         for (u64 page = addr >> PageBits; page <= last; ++page) {
@@ -238,12 +261,19 @@ public:
         words.Clear();
     }
 
+    /// CBUFRING=verify (`track_writers`): the pages' last writer, for the verify log.
+    void NoteWriter(u64 addr, u64 size, Writer writer);
+    [[nodiscard]] Writer LastWriter(u64 page_address);
+
     PageWords words;
     Stats stats;
+    std::atomic<bool> track_writers{}; ///< set once when the ring starts (CBUFRING=verify)
 
 private:
     std::mutex queue_mutex;
     std::vector<u32> queue; ///< page numbers (36-bit device addresses: 24-bit pages)
+    std::mutex writers_mutex;
+    std::unordered_map<u32, Writer> writers;
 };
 
 [[nodiscard]] Watch& Get();

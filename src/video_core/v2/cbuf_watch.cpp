@@ -45,9 +45,29 @@ void PageWords::Clear() {
     std::atomic_thread_fence(std::memory_order_release);
 }
 
+void Watch::NoteWriter(u64 addr, u64 size, Writer writer) {
+    if (size == 0) {
+        return;
+    }
+    const u64 last = (addr + size - 1) >> PageBits;
+    std::scoped_lock lock{writers_mutex};
+    for (u64 page = addr >> PageBits; page <= last && page < (addr >> PageBits) + 64; ++page) {
+        writers[static_cast<u32>(page)] = writer;
+    }
+}
+
+Writer Watch::LastWriter(u64 page_address) {
+    std::scoped_lock lock{writers_mutex};
+    const auto it = writers.find(static_cast<u32>(page_address >> PageBits));
+    return it == writers.end() ? Writer::None : it->second;
+}
+
 void Watch::NoteForeign(u64 addr, u64 size) {
     if (size == 0) {
         return;
+    }
+    if (track_writers.load(std::memory_order_relaxed)) [[unlikely]] {
+        NoteWriter(addr, size, Writer::Foreign);
     }
     const u64 last = (addr + size - 1) >> PageBits;
     bool bumped = false;

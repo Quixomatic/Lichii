@@ -160,8 +160,11 @@ bool DmaPusher::Step() {
 
     auto& current_command = command_list.command_lists[dma_pushbuffer_subindex];
     const CommandListHeader& header = current_command;
-    // EDEN_NX2_V2_DRAWCACHE: a GP entry boundary orders the guest's earlier CPU writes.
-    VideoCommon::V2::Versions::HookEpoch(VideoCommon::V2::Versions::EpochReason::Entry);
+    // EDEN_NX2_V2_DRAWCACHE: a kickoff orders the guest's earlier CPU writes (its later GP
+    // entries were all submitted with it: S0-G19, MASTER_PLAN §8).
+    if (dma_pushbuffer_subindex == 0) {
+        VideoCommon::V2::Versions::HookEpoch(VideoCommon::V2::Versions::EpochReason::Entry);
+    }
     dma_state.dma_get = header.addr;
 
     if (signal_sync && !synced) {

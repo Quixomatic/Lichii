@@ -674,8 +674,13 @@ private:
                 continue;
             }
             if (other.maps != maps) {
-                Invalidate(other); // located under older mappings: its next use locates it
-                continue;
+                // Located under older mappings (Switch 2 titles map often): locate it again; it
+                // keeps its version only while its bytes stay at the same device address.
+                Locate(other, env);
+                if (!other.valid || other.device == NoPosition || other.device >= device + size ||
+                    other.device + other.size <= device) {
+                    continue;
+                }
             }
             if (other.published) {
                 const std::optional<u64> position = ring.Allocate(other.size, shared->align);

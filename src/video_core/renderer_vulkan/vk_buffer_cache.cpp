@@ -618,6 +618,10 @@ BufferCacheRuntime::BufferCacheRuntime(const Device& device_, MemoryAllocator& m
         const std::span<u8> mapped = cbuf_ring_buffer.Mapped();
         if (!mapped.empty()) {
             VideoCommon::V2::CbufRing::Get().Init(mapped.data(), GetUniformBufferAlignment());
+            // R2-F2-03: the verify log names each page's last writer.
+            VideoCommon::V2::CbufWatch::Get().track_writers.store(
+                VideoCommon::V2::Verify(VideoCommon::V2::Switch::CbufRing),
+                std::memory_order_relaxed);
         }
         LOG_INFO(Render_Vulkan, "V2 F2-02 constant buffer version ring: {} MiB, {}",
                  VideoCommon::V2::CbufRing::Shared::Capacity >> 20,

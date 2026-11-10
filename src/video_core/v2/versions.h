@@ -30,7 +30,9 @@
 //     first write since a sync, storage buffers, copies) and inline uploads (cbuf data, I2M).
 //
 // Collect epochs. The epoch moves at ordering points: submits, semaphore acquires, the split's
-// drains and targeted waits, and GP entry boundaries (statistics; recipes may key on it).
+// drains and targeted waits, and guest kickoffs. With the split, the front's ordering points
+// travel in the stream (the ring position after them) and the back's epoch moves when it reaches
+// that position, so every encode of one draw validates at the same, stream-ordered epoch.
 // "Unchanged since V" answers for a range are memoised (EpochMemo): every write that raises a
 // version, guest CPU writes included, also marks its write buckets with a sequence number, and a
 // memo entry is reused while none of the range's own buckets moved: a repeat check costs a probe
@@ -62,7 +64,7 @@ enum class EpochReason : u8 {
     Submit,
     Acquire,
     Wait,  ///< a drain or a targeted wait of the split
-    Entry, ///< a GP entry boundary
+    Entry, ///< a guest kickoff (the first GP entry of a submission)
     Count,
 };
 inline constexpr size_t NumEpochReasons = static_cast<size_t>(EpochReason::Count);
@@ -181,21 +183,48 @@ private:
     std::unique_ptr<std::atomic<u64>[]> coarse_long; ///< Long writes, per 4 MiB
 };
 
-/// The collect epoch: moved at ordering points (any thread).
+/// The collect epoch the binding thread validates at (the split's back, or the GPU thread).
 class CollectEpoch {
 public:
+    static constexpr size_t NumNotes = 1024;
+
+    /// An ordering point on the binding thread itself: moves now.
     void Advance(EpochReason reason) {
         epoch.fetch_add(1, std::memory_order_acq_rel);
         counts[static_cast<size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
     }
+    /// Split front: an ordering point before the work sent from ring `position` on (the front's
+    /// write position after a cut). The back moves when its entry reaches it (Reach).
+    void AdvanceAt(EpochReason reason, u64 position);
+    /// Split back: the entry at ring `position` runs.
+    void Reach(u64 position) {
+        if (note_tail.load(std::memory_order_relaxed) ==
+                note_head.load(std::memory_order_acquire) &&
+            overflow_until.load(std::memory_order_relaxed) == 0) {
+            return;
+        }
+        ReachSlow(position);
+    }
+    /// The split stopped (ring positions start over): pending notes move the epoch now.
+    void ResetStream();
     [[nodiscard]] u64 Current() const {
         return epoch.load(std::memory_order_acquire);
     }
     [[nodiscard]] std::array<u64, NumEpochReasons> TakeCounts();
 
 private:
+    void ReachSlow(u64 position);
+
     std::atomic<u64> epoch{1};
     std::array<std::atomic<u64>, NumEpochReasons> counts{};
+    // Front → back notes: ring positions in order (single producer, single consumer). A full
+    // queue moves the back's epoch at every entry up to the newest dropped note (never fewer
+    // moves than the notes asked for).
+    std::array<u64, NumNotes> notes{};
+    std::atomic<u64> note_head{}; ///< front
+    std::atomic<u64> note_tail{}; ///< back
+    u64 last_note{~u64{0}};       ///< front: the newest note's position
+    std::atomic<u64> overflow_until{};
 };
 
 /// "Unchanged since V" answers memoised per range (owned by one thread). An entry holds the newest
@@ -364,10 +393,13 @@ inline void HookCpuWrite(DAddr address, u64 size) {
         Pages().NoteCpuWrite(address, size);
     }
 }
+/// An ordering point (gpu_split.cpp): on the split's front it travels in the stream, elsewhere
+/// (the back's submits, no split) it moves the epoch now.
+void NoteOrderingPoint(EpochReason reason);
 /// Also with EDEN_NX2_V2_CBUFRING: F2-03's compare memo keys on the collect epoch.
 inline void HookEpoch(EpochReason reason) {
     if (Active() || On(Switch::CbufRing)) [[unlikely]] {
-        Epochs().Advance(reason);
+        NoteOrderingPoint(reason);
     }
 }
 inline void HookBump(Kind kind, u32 id) {

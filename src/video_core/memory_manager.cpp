@@ -327,17 +327,33 @@ T MemoryManager::Read(GPUVAddr addr) const {
     return {};
 }
 
+namespace {
+/// EDEN_NX2_V2_CBUFRING (F2-03): a guest word the GPU side wrote, noted after it landed.
+void NoteRingWrite(const MemoryManager& memory, GPUVAddr addr, std::size_t size) {
+    if (const auto device = memory.GpuToCpuAddress(addr)) {
+        VideoCommon::V2::CbufWatch::Get().NoteForeign(*device, size);
+    }
+}
+} // Anonymous namespace
+
 template <typename T>
 void MemoryManager::Write(GPUVAddr addr, T data) {
     if (auto page_pointer{GetPointer(addr)}; page_pointer) {
         // NOTE: Avoid adding any extra logic to this fast-path block
         std::memcpy(page_pointer, &data, sizeof(T));
+        // F2-03 (R2-F2-03): semaphore, report and query words move the watch's page words.
+        if (VideoCommon::V2::On(VideoCommon::V2::Switch::CbufRing)) [[unlikely]] {
+            NoteRingWrite(*this, addr, sizeof(T));
+        }
         return;
     }
     // A Switch 2 sparse block nobody wrote yet gets its memory now.
     Tegra::Nx2BackSparseWrite(addr, sizeof(T), &data);
     if (auto page_pointer{GetPointer(addr)}; page_pointer) {
         std::memcpy(page_pointer, &data, sizeof(T));
+        if (VideoCommon::V2::On(VideoCommon::V2::Switch::CbufRing)) [[unlikely]] {
+            NoteRingWrite(*this, addr, sizeof(T));
+        }
         return;
     }
 
@@ -529,6 +545,10 @@ void MemoryManager::WriteBlockImpl(GPUVAddr gpu_dest_addr, const void* src_buffe
     Tegra::Nx2BackSparseWrite(gpu_dest_addr, size, src_buffer);
     // F2-03: noted after each copy (a version snapshot in between sees the page disarmed).
     const bool foreign = !cached && VideoCommon::V2::On(VideoCommon::V2::Switch::CbufRing);
+    // CBUFRING=verify: constant buffer data the back applies is named as the page's last writer.
+    const bool note_cached = cached && VideoCommon::V2::On(VideoCommon::V2::Switch::CbufRing) &&
+                             VideoCommon::V2::CbufWatch::Get().track_writers.load(
+                                 std::memory_order_relaxed);
     auto just_advance = [&]([[maybe_unused]] std::size_t page_index, [[maybe_unused]] std::size_t offset, std::size_t copy_amount) {
         src_buffer = static_cast<const u8*>(src_buffer) + copy_amount;
     };
@@ -542,6 +562,9 @@ void MemoryManager::WriteBlockImpl(GPUVAddr gpu_dest_addr, const void* src_buffe
         }
         if (foreign) [[unlikely]] {
             VideoCommon::V2::CbufWatch::Get().NoteForeign(dev_addr_base, copy_amount);
+        } else if (note_cached) [[unlikely]] {
+            VideoCommon::V2::CbufWatch::Get().NoteWriter(dev_addr_base, copy_amount,
+                                                         VideoCommon::V2::CbufWatch::Writer::Cached);
         }
         // After the copy: the buffer cache may upload the written bytes from guest memory.
         if (!unsafe) {
@@ -563,6 +586,9 @@ void MemoryManager::WriteBlockImpl(GPUVAddr gpu_dest_addr, const void* src_buffe
         }
         if (foreign) [[unlikely]] {
             VideoCommon::V2::CbufWatch::Get().NoteForeign(dev_addr_base, copy_amount);
+        } else if (note_cached) [[unlikely]] {
+            VideoCommon::V2::CbufWatch::Get().NoteWriter(dev_addr_base, copy_amount,
+                                                         VideoCommon::V2::CbufWatch::Writer::Cached);
         }
         if (!unsafe) {
             rasterizer->InvalidateRegion(dev_addr_base, copy_amount, which);
