@@ -163,7 +163,8 @@ public:
     /// [begin, end)): pending attachment writes it overlaps get a barrier before its pass or
     /// dispatch.
     void NoteImageRead(VkImage image, u64 begin, u64 end) {
-        if (track_barriers) [[unlikely]] {
+        // F4-12: nothing pending (the common case) needs no scan.
+        if (track_barriers && !barrier_tracker.Empty()) [[unlikely]] {
             NoteImageReadTracked(image, begin, end);
         }
     }
@@ -385,6 +386,12 @@ public:
         return submit_engine.get();
     }
 
+    /// F4-12: the finish thread (EDEN_NX2_V2_SUBMITTHREAD) publishes GPU progress as it sees
+    /// it, so KnownGpuTick is current without asking the driver (MasterSemaphore::Refresh).
+    [[nodiscard]] bool FinishThreadPublishesTick() const noexcept {
+        return finish_publishes_tick;
+    }
+
     /// EDEN_NX2_V2_XREADBACK: readbacks on the transfer queue (null when off or unavailable).
     [[nodiscard]] BackgroundReadback* GetBackgroundReadback() const noexcept {
         return background_readback.get();
@@ -506,6 +513,7 @@ private:
     bool flush_pending{};
     std::atomic<u64> lazy_flush_tick{}; ///< RequestLazyFlush
     bool lazy_fences{};                 ///< F4-02: SetLazyFences
+    bool finish_publishes_tick{};       ///< F4-12: FinishThreadPublishesTick
     bool submit_wanted{};               ///< F4-02: work waits for the next idle hook or boundary
     u64 lazy_outstanding_tick{};        ///< F4-02: newest lazy fence's tick (recording thread)
 

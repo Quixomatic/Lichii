@@ -4829,7 +4829,9 @@ void RasterizerVulkan::AdaptiveFlushWork(u32 cost) {
         // the split's ring) means the GPU starves because of the CPU, not for lack of submits.
         VideoCommon::V2::FlushState state{};
         auto& master = scheduler.GetMasterSemaphore();
-        master.Refresh();
+        if (!scheduler.FinishThreadPublishesTick()) {
+            master.Refresh();
+        }
         const u64 current = master.CurrentTick();
         const u64 done = master.KnownGpuTick();
         state.pending = static_cast<u32>(current > done + 1 ? current - done - 1 : 0);

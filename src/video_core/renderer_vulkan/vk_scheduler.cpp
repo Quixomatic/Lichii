@@ -172,6 +172,7 @@ Scheduler::Scheduler(const Device& device_, StateTracker& state_tracker_)
     if (submit_thread || transfer_queue) {
         submit_engine = std::make_unique<SubmitEngine>(device, *master_semaphore, submit_mutex,
                                                        submit_thread, transfer_queue.get());
+        finish_publishes_tick = submit_thread;
     }
 
     if (transfer_queue && VideoCommon::V2::On(VideoCommon::V2::Switch::XReadback)) {
