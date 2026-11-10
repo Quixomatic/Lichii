@@ -296,6 +296,13 @@ public:
         return state.renderpass != VK_NULL_HANDLE;
     }
 
+    /// R2-F4-06: whether the active pass renders to `framebuffer` (handle and area).
+    bool IsRenderPassFor(const Framebuffer* framebuffer) const;
+
+    /// R2-F4-06: a full clear of another framebuffer ends the active pass (as its own pass begin
+    /// would) so that the clear becomes the next pass's load op.
+    void EndRenderPassForClear(std::source_location location = std::source_location::current());
+
     /// Changes whenever a render pass begins or ends.
     u64 RenderPassSerial() const {
         return render_pass_serial;

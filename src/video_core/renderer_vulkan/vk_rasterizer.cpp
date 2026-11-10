@@ -2911,12 +2911,55 @@ void RasterizerVulkan::Clear(u32 layer_count) {
         clear_rect.rect.offset.x == 0 && clear_rect.rect.offset.y == 0 &&
         clear_rect.rect.extent.width >= render_area.width &&
         clear_rect.rect.extent.height >= render_area.height;
-    const bool can_defer_clear = ENABLE_DEFERRED_CLEAR && (!regs.clear_control.use_scissor || clear_covers_render_area) &&
-                                 clear_layers.covers_all_layers &&
-                                 !scheduler.IsRenderPassActive() &&
-                                 (!use_color || color_full_channels) && ds_deferrable;
+    const bool deferrable_shape = ENABLE_DEFERRED_CLEAR &&
+                                  (!regs.clear_control.use_scissor || clear_covers_render_area) &&
+                                  clear_layers.covers_all_layers &&
+                                  (!use_color || color_full_channels) && ds_deferrable;
+    namespace P5b = VideoCommon::V2::P5bStats;
+    const bool clear_stats = P5b::Enabled();
+    const u64 barriers_before =
+        clear_stats ? P5b::Get()
+                          .values[static_cast<size_t>(P5b::Counter::TargetedBarriers)]
+                          .load(std::memory_order_relaxed)
+                    : 0;
+    const bool pass_was_active = scheduler.IsRenderPassActive();
+    const u64 pass_serial = scheduler.RenderPassSerial();
+    if (deferrable_shape && pass_was_active && scheduler.TracksBarriers() &&
+        !scheduler.IsRenderPassFor(framebuffer)) [[unlikely]] {
+        // R2-F4-06 (the clear zone x4 at 0fe4): F4-X3 keeps passes open across wait-for-idles, so
+        // a full clear now often finds another framebuffer's pass still open, where it used to
+        // find none. Its own pass begin would end that pass anyway: end it here, and the clear
+        // becomes the next pass's load op again instead of a pass begin plus
+        // vkCmdClearAttachments.
+        scheduler.EndRenderPassForClear();
+    }
+    const bool can_defer_clear = deferrable_shape && !scheduler.IsRenderPassActive();
     if (!can_defer_clear) {
         scheduler.RequestRendering(framebuffer);
+    }
+    if (clear_stats) [[unlikely]] {
+        P5b::Add(P5b::Counter::Clears);
+        if (can_defer_clear) {
+            P5b::Add(P5b::Counter::ClearsDeferred);
+        } else if (use_color && !color_full_channels) {
+            P5b::Add(P5b::Counter::ClearsBlit);
+        } else {
+            P5b::Add(P5b::Counter::ClearsInPass);
+        }
+        if (scheduler.RenderPassSerial() != pass_serial) {
+            if (pass_was_active) {
+                P5b::Add(P5b::Counter::ClearPassEnds);
+            }
+            if (scheduler.IsRenderPassActive()) {
+                P5b::Add(P5b::Counter::ClearPassBegins);
+            }
+        }
+        const u64 barriers_after = P5b::Get()
+                                       .values[static_cast<size_t>(P5b::Counter::TargetedBarriers)]
+                                       .load(std::memory_order_relaxed);
+        // A report in between resets the counter.
+        P5b::Add(P5b::Counter::ClearBarriers,
+                 barriers_after >= barriers_before ? barriers_after - barriers_before : 0);
     }
 
     query_cache.NotifySegment(true);
