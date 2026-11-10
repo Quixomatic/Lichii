@@ -21,9 +21,6 @@ HazardTable::~HazardTable() = default;
 void HazardTable::Clear() {
     head = 0;
     count = 0;
-    if (report_pages) {
-        report_pages->fill(0);
-    }
     if (slots) {
         slots->fill(Link{});
     }
@@ -57,8 +54,6 @@ HazardTable::Entry& HazardTable::Push(u64 address, u64 end, u64 position, Produc
         entries = std::make_unique<Entry[]>(Capacity);
         slots = std::make_unique<std::array<Link, PageSlots>>();
         slots->fill(Link{});
-        report_pages = std::make_unique<std::array<u64, ReportPageBits / 64>>();
-        report_pages->fill(0);
     }
     if (count == Capacity) {
         // The oldest entry may still be queued: whatever it wrote now waits for its position.
@@ -78,24 +73,6 @@ HazardTable::Entry& HazardTable::Push(u64 address, u64 end, u64 position, Produc
     entry.known = 0;
     Insert(entry, index);
     return entry;
-}
-
-size_t HazardTable::ReportBit(u64 page) {
-    return static_cast<size_t>((page * 0x9e3779b97f4a7c15ULL) >> 40) & (ReportPageBits - 1);
-}
-
-bool HazardTable::MayHoldReports(u64 address, u64 size) const {
-    if (!report_pages || size == 0) {
-        return false;
-    }
-    const u64 last = (address + size - 1) >> PageBits;
-    for (u64 page = address >> PageBits; page <= last; ++page) {
-        const size_t bit = ReportBit(page);
-        if (((*report_pages)[bit / 64] >> (bit % 64)) & 1) {
-            return true;
-        }
-    }
-    return false;
 }
 
 void HazardTable::Insert(Entry& entry, u32 index) {
@@ -162,13 +139,6 @@ void HazardTable::NoteRange(u64 address, u64 size, u64 position, Producer produc
         }
     }
     Push(address, end, position, producer);
-    if (producer == Producer::Release || producer == Producer::Report) {
-        // A counter report or reduction: its value reaches memory at a point the front can't see.
-        for (u64 page = address >> PageBits; page <= (end - 1) >> PageBits; ++page) {
-            const size_t bit = ReportBit(page);
-            (*report_pages)[bit / 64] |= u64{1} << (bit % 64);
-        }
-    }
 }
 
 void HazardTable::NoteUnbounded(Producer producer, u64 position) {

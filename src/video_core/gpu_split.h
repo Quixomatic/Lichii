@@ -304,9 +304,6 @@ public:
     [[nodiscard]] u64 SyncPosition() const {
         return std::min(last_sync_position, write_position);
     }
-    [[nodiscard]] bool MayHoldReports(u64 device_address, u64 size) const {
-        return hazards.MayHoldReports(device_address, size);
-    }
     /// Front: a fence-flagged release of known bytes was just sent. It is in memory only once
     /// its fence ran (v2/landing.h); until then FindUnlanded forwards it.
     void NoteUnlandedWrite(u64 device_address, const void* bytes, u32 size) {
