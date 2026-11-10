@@ -459,7 +459,26 @@ public:
         std::vector<u32> heap_words;
         std::array<u32, Shader::Backend::SPIRV::NUM_TEXTURE_AND_IMAGE_SCALING_WORDS> rescaling{};
         DrawApplyOut derived;
+        bool derived_ok{};
+        // Step 13: the configure's descriptor payload and render area; whether the record's
+        // buffer groups matched (a second encode only rewrites equal bindings then).
+        std::vector<DescriptorUpdateEntry> payload;
+        std::array<f32, 4> render_area{};
+        bool uses_render_area{};
+        bool buffers_match{};
     };
+    /// The encode of a record (spec §3): channel state bindings, host geometry binds, the
+    /// descriptor payload (stage buffers and image descriptors), heap words, the deferred bind
+    /// commit, the fragment barrier decision, ConfigureDraw. PayloadOnly (verify) stops before
+    /// ConfigureDraw and compares the payload with the observed configure's.
+    enum class EncodeMode : u8 { Normal, Replay, PayloadOnly };
+    [[nodiscard]] bool EncodeDraw(const VideoCommon::V2::Resolve::ResolvedDraw& record,
+                                  const DrawApplyOut& out,
+                                  const VideoCommon::V2::Resolve::ResolvedDraw* previous,
+                                  EncodeMode mode,
+                                  VideoCommon::V2::DrawCache::Recipe* recipe = nullptr);
+    /// DRAWREC=verify (step 13): EncodeDraw(PayloadOnly) after the observed configure.
+    void VerifyDrawEncode(const VideoCommon::V2::Resolve::ResolvedDraw& record);
     /// DRAWREC=verify (step 12): ApplyDraw(DeriveOnly) on the observed draw's record, its heap and
     /// rescaling words compared with the ones the configure used.
     void VerifyDrawApply(VideoCommon::V2::Resolve::ResolvedDraw& record,

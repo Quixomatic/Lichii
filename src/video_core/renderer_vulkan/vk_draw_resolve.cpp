@@ -18,9 +18,12 @@
 #include <boost/container/small_vector.hpp>
 
 #include "common/logging.h"
+#include "video_core/buffer_cache/uniform_stream_reuse.h"
+#include "video_core/nx2_profile.h"
 #include "video_core/renderer_vulkan/pipeline_helper.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
+#include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
 #include "video_core/shader_handle_program.h"
 #include "video_core/texture_cache/texture_cache.h"
@@ -494,6 +497,13 @@ void GraphicsPipeline::ObserveDrawRecord(std::span<const VideoCommon::ImageViewI
     observer.done = true;
     observer.heap_words = heap_push.words;
     observer.rescaling = rescaling.Data();
+    observer.payload.assign(guest_descriptor_queue.UpdateData(),
+                            guest_descriptor_queue.UpdateData() +
+                                guest_descriptor_queue.UpdateCount());
+    observer.uses_render_area = render_area.uses_render_area;
+    observer.render_area = render_area.words;
+    observer.buffers_match = false;
+    observer.derived_ok = false;
     const R::ResolvedDraw& resolved = *observer.resolved;
     if (resolved.h.status != R::ResolveStatus::Ready) {
         return;
@@ -584,7 +594,16 @@ void GraphicsPipeline::ObserveDrawRecord(std::span<const VideoCommon::ImageViewI
     std::string reasons;
     u32 groups = 0;
     u32 dependent = 0;
-    if (!R::CompareRecords(resolved, observed, created, reasons, &groups, &dependent)) {
+    const bool equal = R::CompareRecords(resolved, observed, created, reasons, &groups, &dependent);
+    constexpr u32 encoded_groups = (1U << static_cast<u32>(R::RecordGroup::Views)) |
+                                   (1U << static_cast<u32>(R::RecordGroup::Samplers)) |
+                                   (1U << static_cast<u32>(R::RecordGroup::Vertex)) |
+                                   (1U << static_cast<u32>(R::RecordGroup::Index)) |
+                                   (1U << static_cast<u32>(R::RecordGroup::Ubo)) |
+                                   (1U << static_cast<u32>(R::RecordGroup::Ssbo)) |
+                                   (1U << static_cast<u32>(R::RecordGroup::Tbo));
+    observer.buffers_match = (groups & encoded_groups) == 0;
+    if (!equal) {
         for (size_t group = 0; group < R::NumRecordGroups; ++group) {
             if ((groups >> group) & 1) {
                 R::CountRecordStat(stats.mismatches[group]);
@@ -856,6 +875,7 @@ void GraphicsPipeline::VerifyDrawApply(R::ResolvedDraw& record, C::Stage& stage)
     if (!ApplyDraw(record, unused, unused, out, ApplyMode::DeriveOnly, stage)) {
         return;
     }
+    observer->derived_ok = true;
     R::RecordStats& stats = R::GetRecordStats();
     const bool rescaling_equal = out.rescaling.Data() == observer->rescaling;
     // The configure's heap words interleave each stage's texel buffer words (pushed by its buffer
@@ -881,6 +901,132 @@ void GraphicsPipeline::VerifyDrawApply(R::ResolvedDraw& record, C::Stage& stage)
                         : !rescaling_equal              ? "rescaling words"
                                                         : "heap words",
                         out.heap_words.size(), observer->heap_words.size());
+        }
+    }
+}
+
+// ENCODE: the draw recorded from its record.
+
+bool GraphicsPipeline::EncodeDraw(const R::ResolvedDraw& record, const DrawApplyOut& out,
+                                  const R::ResolvedDraw* previous, EncodeMode mode,
+                                  VideoCommon::V2::DrawCache::Recipe* recipe) {
+    static_cast<void>(previous);
+    static_cast<void>(recipe);
+    namespace Profile = VideoCommon::Nx2Profile;
+    const R::DrawHeader& h = record.h;
+    // 1-2. The channel state as the update passes leave it, then the bind scope they open.
+    buffer_cache.SetUniformBuffersState(enabled_uniform_buffer_masks, &uniform_buffer_sizes);
+    {
+        Profile::Scope scope{Profile::Zone::UpdateBuffers};
+        buffer_cache.EncodeGraphicsBindings(record);
+        buffer_cache.BeginBindScope();
+        // 3.
+        buffer_cache.BindHostGeometryBuffers(h.indexed);
+    }
+    // 4.
+    {
+        Profile::Scope scope{Profile::Zone::DescriptorAcquire};
+        guest_descriptor_queue.Acquire(scheduler, num_descriptor_entries, uses_descriptor_buffer);
+    }
+    // 5. Per stage: its buffers (heap texel words first), then its image descriptors.
+    heap_push.words.clear();
+    ImageDescriptorCursor cursor{};
+    size_t heap_cursor = 0;
+    for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
+        if (!recipe_stages[stage]) {
+            continue;
+        }
+        {
+            Profile::Scope scope{Profile::Zone::BindStageBuffers};
+            WithHeapTexels(stage, [&] { buffer_cache.BindHostStageBuffers(stage); });
+        }
+        if (!out.heap_replayed) {
+            const size_t words = out.heap_stage_words[stage];
+            heap_push.words.insert(heap_push.words.end(), out.heap_words.begin() + heap_cursor,
+                                   out.heap_words.begin() + heap_cursor + words);
+            heap_cursor += words;
+        }
+        Profile::Scope scope{Profile::Zone::PushDescriptors};
+        EmitImageDescriptors(guest_descriptor_queue, stage_infos[stage], heap_pipeline, out,
+                             cursor);
+    }
+    if (out.heap_replayed) {
+        heap_push.words.assign(out.heap_words.begin(), out.heap_words.end());
+    }
+    // 6.
+    if (heap_pipeline) {
+        AddHeapWords();
+    }
+    buffer_cache.CommitBinds();
+    if (buffer_cache.any_buffer_uploaded) {
+        buffer_cache.runtime.PostCopyBarrier();
+        buffer_cache.any_buffer_uploaded = false;
+    }
+    if (mode == EncodeMode::PayloadOnly) {
+        // Verify: the old configure's draw is already set up (its render pass included).
+        return true;
+    }
+    // 7. The fragment barrier decision, last before the draw (as in the old order).
+    const std::span<const VideoCommon::ImageViewInOut> view_span{out.views.data(),
+                                                                 out.views.size()};
+    if (scheduler.HasFragmentBarrier() &&
+        (scheduler.RenderPassHasStores() || texture_cache.SamplesRenderTarget(view_span))) {
+        scheduler.RequestOutsideRenderPassOperationContext();
+    }
+    RenderAreaPushConstant render_area;
+    render_area.uses_render_area = h.render_area.uses;
+    if (h.render_area.uses) {
+        render_area.words = {h.render_area.w, h.render_area.h};
+    }
+    // 8.
+    Profile::Scope scope{Profile::Zone::ConfigureDraw};
+    return ConfigureDraw(out.rescaling, render_area);
+}
+
+void GraphicsPipeline::VerifyDrawEncode(const R::ResolvedDraw& record) {
+    DrawRecObserver* const observer = drawrec_observer;
+    if (observer == nullptr || !observer->done || !observer->derived_ok ||
+        !observer->buffers_match || record.h.status != R::ResolveStatus::Ready) {
+        return;
+    }
+    // R-8: a second encode of equal bindings: the vertex and index binds repeat (harmless), its
+    // CommitBinds finds clean ranges, its stage buffers reference the same constant buffer
+    // versions (CBUFVER) or stream allocations (UBOREUSE); without either the stream offsets
+    // differ and only the entry count is compared.
+    if (!EncodeDraw(record, observer->derived, nullptr, EncodeMode::PayloadOnly)) {
+        return;
+    }
+    R::RecordStats& stats = R::GetRecordStats();
+    const size_t count = guest_descriptor_queue.UpdateCount();
+    const bool exact = VideoCommon::V2::On(VideoCommon::V2::Switch::CbufVer) ||
+                       VideoCommon::UniformStreamReuseEnabled();
+    const bool payload_equal =
+        count == observer->payload.size() &&
+        (!exact || std::memcmp(guest_descriptor_queue.UpdateData(), observer->payload.data(),
+                               count * sizeof(DescriptorUpdateEntry)) == 0);
+    // The heap words as the encode interleaves them (texel words, then image words, per stage).
+    const bool push_equal =
+        observer->derived.rescaling.Data() == observer->rescaling &&
+        observer->uses_render_area == record.h.render_area.uses &&
+        (!record.h.render_area.uses ||
+         (observer->render_area[0] == record.h.render_area.w &&
+          observer->render_area[1] == record.h.render_area.h)) &&
+        heap_push.words == observer->heap_words;
+    if (!payload_equal) {
+        R::CountRecordStat(stats.mismatches[static_cast<size_t>(R::RecordGroup::Payload)]);
+    }
+    if (!push_equal) {
+        R::CountRecordStat(stats.mismatches[static_cast<size_t>(R::RecordGroup::Push)]);
+    }
+    if (!payload_equal || !push_equal) {
+        static std::atomic<u32> logged{};
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+            LOG_WARNING(Render_Vulkan,
+                        "V2 draw record verify: draw {} pipeline {:016x}: the encode's {} differ "
+                        "from the old configure's ({} payload entries vs {})",
+                        record.h.ordinal, state_hash,
+                        !payload_equal ? "descriptor payload" : "push words", count,
+                        observer->payload.size());
         }
     }
 }

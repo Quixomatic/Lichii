@@ -1897,6 +1897,8 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         // Step 12: what ApplyDraw derives from the record (DeriveOnly) against what the
         // configure just used.
         pipeline->VerifyDrawApply(drawrec_record, commit->stage);
+        // Step 13: the encode's payload and push words against the configure's.
+        pipeline->VerifyDrawEncode(drawrec_record);
     }
 
 #ifdef EGLANTINE_STREAMLINE

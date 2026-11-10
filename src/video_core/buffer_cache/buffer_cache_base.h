@@ -627,9 +627,11 @@ public:
     [[nodiscard]] bool TakeDeletedBuffers() noexcept {
         return std::exchange(channel_state->has_deleted_buffers, false);
     }
-    /// Opens a deferred bind scope as DoUpdateGraphicsBuffers leaves one.
+    /// Opens a deferred bind scope as DoUpdateGraphicsBuffers leaves one (with COMMIT=1).
     void BeginBindScope() {
-        V2BeginBindScope();
+        if (V2Defers()) {
+            V2BeginBindScope();
+        }
     }
     /// Writes the graphics bindings of a record into the channel state as the Update* calls
     /// leave them (in BufferOperations, as DoUpdateGraphicsBuffers runs).

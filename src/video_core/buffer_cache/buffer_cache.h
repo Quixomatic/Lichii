@@ -1875,6 +1875,9 @@ void BufferCache<P>::EncodeGraphicsBindings(const V2::Resolve::ResolvedDraw& rec
             .buffer_id = BufferId{buffer.id},
         };
     };
+    if (V2Defers()) {
+        CommitBinds(); // a previous scope a failed configure left open (DoUpdateGraphicsBuffers)
+    }
     BufferOperations([&]() {
         graphics_segments.clear();
         const R::DrawHeader& h = record.h;
