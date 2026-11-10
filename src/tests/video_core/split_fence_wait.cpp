@@ -93,6 +93,24 @@ protected:
     }
 
     void SubmitDeferredWork() override {
+        if (lazy_backend) {
+            // F4-02: fences ride the open submission; nothing was deferred for them.
+            ++deferred_calls;
+            return;
+        }
+        Submit();
+    }
+
+    void SubmitBeforeWait() override {
+        Submit();
+    }
+
+public:
+    bool lazy_backend{};
+    u32 deferred_calls{};
+
+private:
+    void Submit() {
         std::scoped_lock lock{submission.mutex};
         submission.wrong_owner |= std::this_thread::get_id() != submission.owner;
         submission.submitted = queued;
@@ -167,6 +185,40 @@ TEST_CASE("Immediate fence waits still submit outstanding work", "[video_core][s
         REQUIRE_FALSE(submission.wrong_owner);
     }
     REQUIRE(callback.load());
+}
+
+TEST_CASE("Fences riding submissions: the owner's wait submits them",
+          "[video_core][split_fence_wait]") {
+    ScopedSystemTestContext context;
+    Core::System system;
+    Tegra::GPU gpu{system, false, false};
+    Null::RasterizerNull rasterizer{gpu};
+    Cache texture, buffer, query;
+    Submission submission;
+    const auto previous = Settings::values.gpu_fence_behavior.GetValue();
+    SCOPE_EXIT { Settings::values.gpu_fence_behavior.SetValue(previous); };
+    Settings::values.gpu_fence_behavior.SetValue(Settings::GpuFenceBehavior::Accurate);
+    std::vector<u32> callbacks;
+    {
+        FenceManager manager{rasterizer, gpu, texture, buffer, query, submission};
+        manager.lazy_backend = true;
+        for (u32 i = 0; i < 64; ++i) {
+            manager.SyncOperation([&, i] { callbacks.push_back(i * 2); });
+            manager.SignalFence([&, i] { callbacks.push_back(i * 2 + 1); });
+        }
+        // Delayed fences no longer submit one by one (F4-02).
+        REQUIRE(manager.submissions == 0);
+        REQUIRE(manager.deferred_calls == 64);
+        // Blocking on a fence submits everything it waits for (SubmitBeforeWait): no deadlock.
+        manager.WaitPendingFences(true);
+        REQUIRE(manager.submissions == 1);
+        REQUIRE_FALSE(submission.timed_out.load());
+        REQUIRE_FALSE(submission.wrong_owner);
+    }
+    REQUIRE(callbacks.size() == 128);
+    for (u32 i = 0; i < callbacks.size(); ++i) {
+        REQUIRE(callbacks[i] == i);
+    }
 }
 
 TEST_CASE("Early downloads alone make a lazy fence that submits nothing",

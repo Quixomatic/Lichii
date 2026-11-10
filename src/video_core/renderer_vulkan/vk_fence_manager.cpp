@@ -27,6 +27,15 @@ void InnerFence::Queue(bool lazy_) {
     }
     // Get the current tick so we can wait for it
     wait_tick = scheduler.CurrentTick();
+    if (scheduler.LazyFencesHere()) [[unlikely]] {
+        // F4-02: every fence rides the open submission; a waiter asks for it (Wait below), the
+        // back's idle hook or the next heuristic submission takes it.
+        lazy = true;
+        adaptive = true;
+        queued_at = std::chrono::steady_clock::now();
+        scheduler.NoteLazyFence(wait_tick);
+        return;
+    }
     if (lazy_) {
         lazy = true;
         queued_at = std::chrono::steady_clock::now();
@@ -68,7 +77,44 @@ void InnerFence::Wait() {
     // A deferred fence flush (Scheduler::DeferFlush) may not be submitted yet. Only the
     // split's back may submit; other threads (the fencing thread) ask it to and wait. If the back
     // has stopped, nothing else uses the scheduler and Wait below submits it.
-    if (lazy && !scheduler.IsSubmitted(wait_tick) && VideoCommon::GpuSplit::Get().Active() &&
+    if (adaptive && !scheduler.IsSubmitted(wait_tick) && VideoCommon::GpuSplit::Get().Active() &&
+        !VideoCommon::GpuSplit::OnBackThread()) [[unlikely]] {
+        // F4-02: the request is made at once while the guest waits, after LazyWindow otherwise;
+        // the back serves it at its next pass boundary, chunk (RequestGap after its last
+        // submission) or idle hook, so requests made close together share one submission. Past
+        // RequestGap (guest waiting) or EscalateWindow it is forced through the idle hook below.
+        constexpr auto LazyWindow = std::chrono::milliseconds{1};
+        constexpr auto RequestGap = std::chrono::microseconds{500};
+        constexpr auto EscalateWindow = std::chrono::milliseconds{4};
+        std::chrono::steady_clock::time_point guest_since{};
+        bool requested = false;
+        for (u32 spins = 0; !scheduler.IsSubmitted(wait_tick); ++spins) {
+            const auto now = std::chrono::steady_clock::now();
+            if (!VideoCommon::GpuSplit::Get().BackRunning() || now - queued_at >= EscalateWindow) {
+                break;
+            }
+            const bool guest = Core::g_nx2_guest_sync_waiters.load(std::memory_order_relaxed) != 0;
+            if (!requested && (guest || now - queued_at >= LazyWindow)) {
+                scheduler.RequestLazyFlush(wait_tick);
+                requested = true;
+            }
+            if (guest) {
+                if (guest_since == std::chrono::steady_clock::time_point{}) {
+                    guest_since = now;
+                } else if (now - guest_since >= RequestGap) {
+                    break;
+                }
+            }
+            if (spins < 16) {
+                std::this_thread::yield();
+            } else {
+                std::this_thread::sleep_for(std::chrono::microseconds{50});
+            }
+        }
+        if (!requested) {
+            scheduler.RequestLazyFlush(wait_tick);
+        }
+    } else if (lazy && !scheduler.IsSubmitted(wait_tick) && VideoCommon::GpuSplit::Get().Active() &&
         !VideoCommon::GpuSplit::OnBackThread()) {
         // A lazy fence (early downloads) goes with the next submission the back makes anyway
         // (~1 per ms in heavy scenes). Only if none came within LazyWindow, or the guest is
@@ -123,6 +169,12 @@ void FenceManager::WaitFence(Fence& fence) {
 void FenceManager::SubmitDeferredWork() {
     if (VideoCommon::GpuSplit::OnBackThread()) {
         scheduler.FlushDeferred();
+    }
+}
+
+void FenceManager::SubmitBeforeWait() {
+    if (VideoCommon::GpuSplit::OnBackThread()) {
+        scheduler.ServeIdleHook();
     }
 }
 

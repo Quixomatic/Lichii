@@ -240,6 +240,12 @@ public:
     /// Notify the rasterizer to send all written commands to the host GPU.
     virtual void FlushCommands() = 0;
 
+    /// A fence with work to flush was queued; `downloads`: data the guest reads back (class C).
+    /// Backends that let fences ride submissions (Vulkan, F4-02) only hint; others flush.
+    virtual void FlushCommandsForFence([[maybe_unused]] bool downloads) {
+        FlushCommands();
+    }
+
     /// Notify rasterizer that a frame is about to finish
     virtual void TickFrame() = 0;
 

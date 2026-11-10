@@ -82,6 +82,34 @@ public:
                !lazy_flush_tick.compare_exchange_weak(current, tick, std::memory_order_relaxed)) {
         }
     }
+
+    /// F4-02 (EDEN_NX2_V2_ADAPTSUBMIT, MASTER_PLAN §6 classes A/B, Ryujinx SyncManager non-strict
+    /// syncs): fences queued on the split's back ride the open submission instead of submitting
+    /// within DeferFlush's window. Their tick goes out with the next heuristic submission (pass
+    /// boundaries), a waiter's request (RequestLazyFlush), or the back's idle hook.
+    void SetLazyFences(bool on) {
+        lazy_fences = on;
+    }
+    /// Whether a fence queued here now is lazy (F4-02 mode on the split's back).
+    [[nodiscard]] bool LazyFencesHere() const;
+    /// Recording thread: a lazy fence waits for `tick`.
+    void NoteLazyFence(u64 tick) {
+        lazy_outstanding_tick = tick;
+    }
+    /// F4-02, recording thread: work the guest may wait on was recorded (a fence's downloads or
+    /// queries, a command list end); it goes out at the next idle hook or heuristic submission
+    /// instead of a submission of its own.
+    void WantSubmit() {
+        submit_wanted = true;
+    }
+    /// The idle hook (the back goes idle, or another thread asked with RequestIdleHook): what
+    /// FlushDeferred submits, plus with lazy fences any work they or WantSubmit wait for.
+    void ServeIdleHook();
+    /// Recording thread, F4-02: a thread asked for a tick that is still open.
+    [[nodiscard]] bool SubmitRequested() const noexcept {
+        const u64 lazy = lazy_flush_tick.load(std::memory_order_relaxed);
+        return lazy != 0 && !IsSubmitted(lazy);
+    }
     /// Threads other than the split's back: waits until tick is submitted, asking the back to
     /// submit deferred work (logged every 2 s while it waits). False only when the back thread
     /// is not running, so nothing will submit it: the caller then submits it itself.
@@ -473,6 +501,9 @@ private:
     std::chrono::steady_clock::time_point last_flush{};
     bool flush_pending{};
     std::atomic<u64> lazy_flush_tick{}; ///< RequestLazyFlush
+    bool lazy_fences{};                 ///< F4-02: SetLazyFences
+    bool submit_wanted{};               ///< F4-02: work waits for the next idle hook or boundary
+    u64 lazy_outstanding_tick{};        ///< F4-02: newest lazy fence's tick (recording thread)
 
     class Command {
     public:

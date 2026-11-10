@@ -215,7 +215,25 @@ u64 Scheduler::Flush(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
     AllocateNewContext();
     last_flush = std::chrono::steady_clock::now();
     flush_pending = false;
+    submit_wanted = false;
     return signal_value;
+}
+
+bool Scheduler::LazyFencesHere() const {
+    return lazy_fences && VideoCommon::GpuSplit::OnBackThread();
+}
+
+void Scheduler::ServeIdleHook() {
+    FlushDeferred();
+    if (!lazy_fences) {
+        return;
+    }
+    // F4-02: the back is going idle (nothing else will submit) or a waiter asked. Replaces
+    // DeferFlush's own submit for lazy fences and command list ends.
+    if (submit_wanted || (lazy_outstanding_tick != 0 && !IsSubmitted(lazy_outstanding_tick))) {
+        VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::FlushLazy);
+        Flush();
+    }
 }
 
 bool Scheduler::DeferFlush() {
@@ -302,6 +320,7 @@ void Scheduler::Finish(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
     AllocateNewContext();
     last_flush = std::chrono::steady_clock::now();
     flush_pending = false;
+    submit_wanted = false;
     if (profile) {
         g_profile_finishes.fetch_add(1, std::memory_order_relaxed);
         g_profile_finish_ns.fetch_add(VideoCommon::Nx2Profile::Now() - start,

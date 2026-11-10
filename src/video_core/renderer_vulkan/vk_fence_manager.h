@@ -40,6 +40,7 @@ private:
     Scheduler& scheduler;
     u64 wait_tick = 0;
     bool lazy = false;
+    bool adaptive = false; ///< F4-02: lazy because fences ride submissions (Scheduler::SetLazyFences)
     std::chrono::steady_clock::time_point queued_at{};
 };
 using Fence = std::shared_ptr<InnerFence>;
@@ -67,6 +68,7 @@ protected:
     bool IsFenceSignaled(Fence& fence) const override;
     void WaitFence(Fence& fence) override;
     void SubmitDeferredWork() override;
+    void SubmitBeforeWait() override;
 
 private:
     Scheduler& scheduler;

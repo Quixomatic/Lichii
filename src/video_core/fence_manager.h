@@ -127,6 +127,7 @@ public:
             return;
         }
         skipped_fences = 0;
+        const bool downloads = should_flush;
         should_flush |= query_cache.HasUncommittedFlushes();
         query_cache.CommitAsyncFlushes();
         // EDEN_NX2_V2_READBACK early downloads alone (MASTER_PLAN §6 class C): recorded now,
@@ -154,7 +155,7 @@ public:
         }
         fences.push(std::move(new_fence));
         if (should_flush) {
-            rasterizer.FlushCommands();
+            rasterizer.FlushCommandsForFence(downloads);
         }
         if constexpr (can_async_check) {
             guard.unlock();
@@ -250,7 +251,7 @@ public:
             // The fence's commands can be held back by a deferred flush that only this thread
             // submits. The fencing thread waits for that submission before releasing the fence,
             // so waiting here without submitting deadlocks (Ocarina of Time entering gameplay).
-            SubmitDeferredWork();
+            SubmitBeforeWait();
             std::unique_lock lk(wait_mutex);
             if (commit_backlog) [[unlikely]] {
                 // The fencing thread may be waiting for this owner to land a fence's downloads
@@ -304,6 +305,11 @@ protected:
     virtual void WaitFence(TFence& fence) = 0;
     /// Submits work whose submission the backend deferred (called before blocking on a fence).
     virtual void SubmitDeferredWork() {}
+    /// This thread is about to block until the fence just signalled runs: submits everything it
+    /// waits for, lazy fences included (F4-02). Defaults to SubmitDeferredWork.
+    virtual void SubmitBeforeWait() {
+        SubmitDeferredWork();
+    }
 
     VideoCore::RasterizerInterface& rasterizer;
     Tegra::GPU& gpu;

@@ -824,7 +824,7 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
             gpu.ForEachPendingCpuWrite(callback);
         });
     VideoCommon::GpuSplit::Get().SetIdleHook(
-        [](void* argument) { static_cast<Scheduler*>(argument)->FlushDeferred(); },
+        [](void* argument) { static_cast<Scheduler*>(argument)->ServeIdleHook(); },
         &scheduler);
     if (scheduler.HasTransferQueue()) {
         // EDEN_NX2_V2_XFERQ: host-level sync positions become timeline joins on the back.
@@ -835,6 +835,13 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
     buffer_cache.v2_writer_downloads = VideoCommon::V2::On(VideoCommon::V2::Switch::XReadback);
     // EDEN_NX2_V2_ADAPTSUBMIT: adaptive submission for native titles (FlushWork).
     adapt_submit = VideoCommon::V2::On(VideoCommon::V2::Switch::AdaptSubmit);
+    if (adapt_submit) {
+        // F4-02/F4-03: fences ride the open submission; flushes are decided at pass boundaries.
+        scheduler.SetLazyFences(true);
+        VideoCommon::V2::FlushParams params{};
+        params.pass_boundaries = true;
+        flush_heuristic = VideoCommon::V2::FlushHeuristic{params};
+    }
     if (VideoCommon::V2::On(VideoCommon::V2::Switch::Bindless)) [[unlikely]] {
         bindless_heap = BindlessHeap::Create(device, scheduler);
     }
@@ -3902,7 +3909,7 @@ void RasterizerVulkan::FlushQueryResults(DAddr addr, u64 size) {
         wait_cv.notify_all();
     });
     fence_manager.SignalFence([] {});
-    scheduler.FlushDeferred();
+    scheduler.ServeIdleHook();
     std::unique_lock lock{wait_mutex};
     wait_cv.wait(lock, [&written] { return written; });
 }
@@ -3965,10 +3972,32 @@ void RasterizerVulkan::FlushCommands() {
     }
     draw_counter = 0;
     pending_native_work = false;
+    if (scheduler.LazyFencesHere()) [[unlikely]] {
+        // F4-02: a command list end orders nothing the host must submit for; the work goes out
+        // at the next heuristic submission, a waiter's request or the idle hook.
+        scheduler.WantSubmit();
+        return;
+    }
     // Fences with downloads or queries come here right after queueing: ~9,400 a second in
     // Hyrule Warriors: Age of Imprisonment fights. Batched like the fences themselves.
     if (!scheduler.DeferFlush()) {
         scheduler.Flush();
+    }
+}
+
+void RasterizerVulkan::FlushCommandsForFence(bool downloads) {
+    if (!scheduler.LazyFencesHere()) {
+        FlushCommands();
+        return;
+    }
+    // F4-02: the fence rides the open submission (InnerFence::Queue). Downloads the guest reads
+    // back (class C) are a strong hint (DXVK): submitted at once if enough work is recorded.
+    if (draw_counter == 0 && !pending_native_work) {
+        return;
+    }
+    scheduler.WantSubmit();
+    if (downloads) {
+        FlushHint(VideoCommon::V2::FlushHint::Strong);
     }
 }
 
@@ -4791,16 +4820,14 @@ void RasterizerVulkan::AdaptiveFlushWork(u32 cost) {
     // P5b: DXVK's GpuFlushTracker + Ryujinx's AutoFlushCounter in place of 128 draws per submit.
     // The clock and the GPU progress are read only at chunk boundaries (and in fast-flush mode).
     namespace P5b = VideoCommon::V2::P5bStats;
+    using H = VideoCommon::V2::FlushHeuristic;
     const auto& params = flush_heuristic.Params();
     SyncAdaptiveTick();
-    const u32 next = flush_heuristic.Draws() + 1;
-    u64 now_us = 0;
-    VideoCommon::V2::FlushState state{};
-    if (next % params.chunk_draws == 0) {
+    const auto read_state = [this] {
         // Real GPU progress: the timeline's value against what was handed off. Pending 0 means
         // the GPU finished every submission; the recorder being behind (more published work in
         // the split's ring) means the GPU starves because of the CPU, not for lack of submits.
-        now_us = AdaptNowUs();
+        VideoCommon::V2::FlushState state{};
         auto& master = scheduler.GetMasterSemaphore();
         master.Refresh();
         const u64 current = master.CurrentTick();
@@ -4808,6 +4835,49 @@ void RasterizerVulkan::AdaptiveFlushWork(u32 cost) {
         state.pending = static_cast<u32>(current > done + 1 ? current - done - 1 : 0);
         state.back_behind = VideoCommon::GpuSplit::OnBackThread() &&
                             VideoCommon::GpuSplit::Get().BackBehind();
+        state.requested = scheduler.SubmitRequested();
+        return state;
+    };
+    const auto count_reason = [](u8 reason) {
+        if (P5b::Enabled()) {
+            static constexpr std::array<P5b::Counter, H::ReasonCount> counters{
+                P5b::Counter::FlushOther,    P5b::Counter::FlushMax,    P5b::Counter::FlushCost,
+                P5b::Counter::FlushIdle,     P5b::Counter::FlushPending, P5b::Counter::FlushStrong,
+                P5b::Counter::FlushWeak,     P5b::Counter::FlushInterval, P5b::Counter::FlushFast,
+                P5b::Counter::FlushPass,     P5b::Counter::FlushLazy,
+            };
+            P5b::Add(counters[reason < counters.size() ? reason : 0]);
+        }
+    };
+    if (params.pass_boundaries && flush_heuristic.Draws() != 0 &&
+        scheduler.IsRenderPassActive()) {
+        // F4-03: this item ends the active pass (a dispatch, or a draw whose render targets
+        // changed): decide here, before it is recorded, so a submission cuts no pass.
+        VideoCommon::V2::FlushHint level = VideoCommon::V2::FlushHint::None;
+        if (cost == 4) {
+            level = VideoCommon::V2::FlushHint::Weak;
+        } else if (maxwell3d != nullptr &&
+                   maxwell3d->dirty.flags[VideoCommon::Dirty::RenderTargets]) {
+            level = maxwell3d->dirty.flags[VideoCommon::Dirty::ColorBuffer0]
+                        ? VideoCommon::V2::FlushHint::Strong
+                        : VideoCommon::V2::FlushHint::Weak;
+        }
+        if (level != VideoCommon::V2::FlushHint::None) {
+            const auto boundary = flush_heuristic.AtPassBoundary(level, read_state(), AdaptNowUs());
+            if (boundary.action == VideoCommon::V2::FlushAction::Flush) {
+                scheduler.Flush();
+                pending_native_work = false;
+                adapt_tick = scheduler.GetMasterSemaphore().CurrentTick();
+                count_reason(boundary.reason);
+            }
+        }
+    }
+    const u32 next = flush_heuristic.Draws() + 1;
+    u64 now_us = 0;
+    VideoCommon::V2::FlushState state{};
+    if (next % params.chunk_draws == 0) {
+        now_us = AdaptNowUs();
+        state = read_state();
     }
     const auto decision = flush_heuristic.Advance(cost, state, now_us);
     P5b::Add(P5b::Counter::SubmitDraws);
@@ -4820,15 +4890,8 @@ void RasterizerVulkan::AdaptiveFlushWork(u32 cost) {
     case VideoCommon::V2::FlushAction::Flush:
         scheduler.Flush();
         pending_native_work = false;
-        if (P5b::Enabled()) {
-            using H = VideoCommon::V2::FlushHeuristic;
-            static constexpr std::array<P5b::Counter, H::ReasonCount> counters{
-                P5b::Counter::FlushOther,    P5b::Counter::FlushMax,    P5b::Counter::FlushCost,
-                P5b::Counter::FlushIdle,     P5b::Counter::FlushPending, P5b::Counter::FlushStrong,
-                P5b::Counter::FlushWeak,     P5b::Counter::FlushInterval, P5b::Counter::FlushFast,
-            };
-            P5b::Add(counters[decision.reason < counters.size() ? decision.reason : 0]);
-        }
+        adapt_tick = scheduler.GetMasterSemaphore().CurrentTick();
+        count_reason(decision.reason);
         return;
     }
     pending_native_work = true;

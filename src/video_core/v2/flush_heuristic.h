@@ -49,12 +49,25 @@ struct FlushParams {
     /// enters fast-flush mode, and leaves it.
     u64 fast_enter_wait_us = 1500;
     u64 fast_exit_wait_us = 100;
+
+    /// F4-03 (MASTER_PLAN §5.5, P5b-F1): decide at hint events, i.e. pass boundaries (render
+    /// target changes, a dispatch ending a pass), instead of at every chunk. Chunk boundaries then
+    /// keep only the safety nets: max draws, the cost cap, strong hints, a waiter's request and a
+    /// long mid-pass interval.
+    bool pass_boundaries = false;
+    u32 pass_min_draws = 10;          ///< Ryujinx ShouldFlushAttachmentChange: at least 10 draws
+    u64 pass_interval_us = 2000;      ///< ... and this long since the last submission
+    u64 request_gap_us = 500;         ///< a waiter's request mid-pass, no sooner than this
+    u64 mid_pass_interval_us = 8000;  ///< safety net for passes that never end
 };
 
 /// What the heuristic knows about the GPU and the recording thread at a decision.
 struct FlushState {
     u32 pending = 1;           ///< handed-off submissions the GPU has not finished
     bool back_behind = false;  ///< the recording thread has more work queued (CPU-bound)
+    /// F4-02: a thread waits for work recorded in the open submission (a lazy fence whose window
+    /// ran out, a guest wait): the next pass boundary serves it, mid-pass after request_gap_us.
+    bool requested = false;
 };
 
 class FlushHeuristic {
@@ -73,6 +86,8 @@ public:
         ReasonWeak,
         ReasonInterval,
         ReasonFast,
+        ReasonPass,    ///< F4-03: a pass boundary after enough draws and time (Ryujinx)
+        ReasonRequest, ///< F4-02: a waiter's request
         ReasonCount,
     };
 
@@ -106,6 +121,46 @@ public:
     }
     Decision Advance(u32 cost, u32 pending, u64 now_us) noexcept {
         return Advance(cost, FlushState{pending, false}, now_us);
+    }
+
+    /// F4-03: the next item ends the active pass (`level`: Weak for a render target change,
+    /// Strong for RT0, DXVK's D3D9 rule). Called before that item is recorded, so a submission here
+    /// cuts no pass. Ryujinx: at least pass_min_draws and pass_interval_us since the last
+    /// submission; DXVK: the pending rule and the idle rule; any waiter's request.
+    Decision AtPassBoundary(FlushHint level, const FlushState& state, u64 now_us) noexcept {
+        hint = (std::max)(hint, level);
+        if (draws == 0) {
+            return {};
+        }
+        if (last_submit_us == 0) {
+            last_submit_us = now_us;
+        }
+        const u64 since = now_us - last_submit_us;
+        const u32 chunks = draws / params.chunk_draws;
+        Decision decision{};
+        if (state.requested) {
+            decision = {FlushAction::Flush, ReasonRequest};
+        } else if (hint >= FlushHint::Strong && chunks >= params.strong_chunks) {
+            decision = {FlushAction::Flush, ReasonStrong};
+        } else if (fast_mode && !state.back_behind && since >= params.fast_interval_us) {
+            decision = {FlushAction::Flush, ReasonFast};
+        } else if (draws >= params.pass_min_draws && since >= params.pass_interval_us) {
+            decision = {FlushAction::Flush, ReasonPass};
+        } else if (draws >= params.min_draws) {
+            if (hint >= FlushHint::Weak && chunks >= params.weak_chunks) {
+                decision = {FlushAction::Flush, ReasonWeak};
+            } else if (state.pending >= params.busy_pending &&
+                       chunks >= (std::min)(params.max_chunk_threshold, state.pending * 3)) {
+                decision = {FlushAction::Flush, ReasonPending};
+            } else if (state.pending == 0 && !state.back_behind &&
+                       since >= params.idle_min_interval_us) {
+                decision = {FlushAction::Flush, ReasonIdle};
+            }
+        }
+        if (decision.action == FlushAction::Flush) {
+            NoteSubmit(now_us);
+        }
+        return decision;
     }
 
     /// A hint from the work just recorded; it is weighed at the next chunk boundary (or now for
@@ -159,6 +214,16 @@ private:
         const u64 since = now_us - last_submit_us;
         if (hint >= FlushHint::Strong && chunks >= params.strong_chunks) {
             return {FlushAction::Flush, ReasonStrong};
+        }
+        if (params.pass_boundaries) {
+            // F4-03: mid-pass only the safety nets (max draws and cost are checked by Advance).
+            if (state.requested && since >= params.request_gap_us) {
+                return {FlushAction::Flush, ReasonRequest};
+            }
+            if (since >= params.mid_pass_interval_us) {
+                return {FlushAction::Flush, ReasonInterval};
+            }
+            return {};
         }
         // Ryujinx: the guest is waiting on unsubmitted work. Not while the recorder is behind:
         // then the wait is the recorder's speed, and more submits only slow it further.
