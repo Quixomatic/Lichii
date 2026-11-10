@@ -5026,6 +5026,7 @@ void BufferCache<P>::DeleteBuffer(BufferId buffer_id, bool do_not_mark) {
 
     slot_buffers.erase(buffer_id);
     V2::Versions::HookBump(V2::Versions::Kind::Buffer, buffer_id.Value());
+    V2::P5bStats::Add(V2::P5bStats::Counter::BufferCacheDeletes);
 
     if constexpr (HAS_PERSISTENT_UNIFORM_BUFFER_BINDINGS) {
         channel_state->dirty_uniform_buffers.fill(~u32{0});

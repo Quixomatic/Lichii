@@ -11,6 +11,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include "video_core/native_qmd.h"
+#include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 #include "video_core/v2/barrier_tracker.h"
 #include "video_core/v2/flush_heuristic.h"
 #include "video_core/v2/frame_pacer.h"
@@ -803,4 +804,22 @@ TEST_CASE("V2 P5b flush decisions at pass boundaries", "[video_core][v2_p5b]") {
         REQUIRE(decision.action == FlushAction::Flush);
         REQUIRE(decision.reason == FlushHeuristic::ReasonPending);
     }
+}
+
+TEST_CASE("V2 P5b staging buffers in recurring use are not released", "[video_core][v2_p5b]") {
+    // P-01 (eac4735c2b: 93 stutters vs v1's 18, driver frees up): a level is swept once per 64
+    // frames, and the sweep used to free the idle buffers a recurring burst takes again.
+    using Retention = Vulkan::StagingBufferPool::StagingRetention;
+    constexpr u64 recent = Retention::RetainFrames - 1;
+    constexpr u64 old = Retention::RetainFrames;
+    // Taken within the last RetainFrames: kept.
+    REQUIRE_FALSE(Retention::Releasable(3, 0, recent, 0, 16));
+    // Unused for RetainFrames: released.
+    REQUIRE(Retention::Releasable(3, 0, old, 0, 16));
+    // The upload levels keep their first idle buffers whatever their age.
+    REQUIRE_FALSE(Retention::Releasable(1, 2, old, 0, 16));
+    REQUIRE_FALSE(Retention::Releasable(2, 2, old, 0, 16));
+    REQUIRE(Retention::Releasable(3, 2, old, 0, 16));
+    // At most max_released per sweep.
+    REQUIRE_FALSE(Retention::Releasable(20, 0, old, 16, 16));
 }

@@ -162,7 +162,8 @@ void Report(const char* thread_name, u64 window_ns) {
              "{:.2f} at composite, pace waits {:.1f}/s ({:.2f} ms each), retired by present wait "
              "{:.0f}/s | QMD front model: signals {:.0f}/s, exact {:.1f}%, unknown {:.0f}/s, "
              "dispatches {:.0f}/s, bounded writes {:.0f}/s, invalidations {:.0f}/s, resyncs "
-             "{:.0f}/s",
+             "{:.0f}/s | GPU allocations: staging buffers created {:.1f}/s ({:.0f} KiB/s), freed "
+             "{:.1f}/s, buffer cache buffers deleted {:.1f}/s",
              thread_name, PerSecond(at(Counter::GpuDecodes), seconds),
              100.0 * Ratio(gpu_bytes, gpu_bytes + cpu_bytes),
              PerSecond(at(Counter::CpuDecodes), seconds),
@@ -177,7 +178,11 @@ void Report(const char* thread_name, u64 window_ns) {
              PerSecond(at(Counter::QmdDispatches), seconds),
              PerSecond(at(Counter::QmdBoundedWrites), seconds),
              PerSecond(at(Counter::QmdInvalidations), seconds),
-             PerSecond(at(Counter::QmdResyncs), seconds));
+             PerSecond(at(Counter::QmdResyncs), seconds),
+             PerSecond(at(Counter::StagingCreates), seconds),
+             PerSecond(at(Counter::StagingCreateBytes), seconds) / 1024.0,
+             PerSecond(at(Counter::StagingFrees), seconds),
+             PerSecond(at(Counter::BufferCacheDeletes), seconds));
 }
 
 } // namespace VideoCommon::V2::P5bStats

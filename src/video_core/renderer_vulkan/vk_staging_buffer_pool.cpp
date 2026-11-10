@@ -17,6 +17,8 @@
 #include "common/literals.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
+#include "video_core/v2/p5b_stats.h"
+#include "video_core/v2/v2_switches.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
@@ -117,6 +119,13 @@ StagingBufferPool::StagingBufferPool(const Device& device_, MemoryAllocator& mem
     }
     stream_pointer = stream_buffer.Mapped();
     ASSERT_MSG(!stream_pointer.empty(), "Stream buffer must be host visible!");
+    // P-01: with any Pipeline v2 switch on (stats and the macro dump aside); v1 keeps its sweep.
+    for (size_t index = 0; index < VideoCommon::V2::g_modes.size(); ++index) {
+        const auto name = static_cast<VideoCommon::V2::Switch>(index);
+        retain_recent |= name != VideoCommon::V2::Switch::Stats &&
+                         name != VideoCommon::V2::Switch::MacroDump &&
+                         VideoCommon::V2::On(name);
+    }
 }
 
 StagingBufferPool::~StagingBufferPool() = default;
@@ -142,6 +151,7 @@ void StagingBufferPool::FreeDeferred(StagingBufferRef& ref) {
 
 void StagingBufferPool::TickFrame() {
     current_delete_level = (current_delete_level + 1) % NUM_LEVELS;
+    ++frame_index;
 
     ReleaseCache(MemoryUsage::DeviceLocal);
     ReleaseCache(MemoryUsage::Upload);
@@ -218,6 +228,7 @@ std::optional<StagingBufferRef> StagingBufferPool::TryGetReservedBuffer(size_t s
     }
     cache_level.iterate_index = std::distance(entries.begin(), it) + 1;
     it->tick = deferred ? (std::numeric_limits<u64>::max)() : scheduler.CurrentTick();
+    it->last_frame = frame_index;
     ASSERT(!it->deferred);
     it->deferred = deferred;
     return it->Ref();
@@ -263,8 +274,12 @@ StagingBufferRef StagingBufferPool::CreateStagingBuffer(size_t size, MemoryUsage
         .log2_level = log2_size,
         .index = unique_ids++,
         .tick = deferred ? (std::numeric_limits<u64>::max)() : scheduler.CurrentTick(),
+        .last_frame = frame_index,
         .deferred = deferred,
     });
+    VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::StagingCreates);
+    VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::StagingCreateBytes,
+                                   u64{1} << log2_size);
     return entry.Ref();
 }
 
@@ -298,6 +313,33 @@ void StagingBufferPool::ReleaseLevel(StagingBuffersCache& cache, size_t log2) {
     // RTX 4080, idle system: 0.4 ms to create, 1.2 ms more for the first write).
     constexpr size_t KeepMaxLog2 = 25;
     constexpr size_t KeepPerLevel = 2;
+    // P-01 (v2): a level is swept once per 64 frames, so a sweep freed buffers a recurring
+    // burst (stream buffer regions still in flight, readbacks, decodes) took again within the
+    // next frames, as new driver allocations each time (StagingRetention).
+    if (retain_recent && log2 <= StagingRetention::MaxLog2) {
+        const size_t keep_idle =
+            &cache == &upload_cache && log2 <= KeepMaxLog2 ? KeepPerLevel : 0;
+        size_t idle = 0;
+        size_t released = 0;
+        std::erase_if(entries, [&](const StagingBuffer& entry) {
+            if (entry.deferred || !scheduler.IsFree(entry.tick)) {
+                return false;
+            }
+            if (!StagingRetention::Releasable(++idle, keep_idle, frame_index - entry.last_frame,
+                                              released, deletions_per_tick)) {
+                return false;
+            }
+            ++released;
+            return true;
+        });
+        VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::StagingFrees,
+                                       released);
+        staging.delete_index = 0;
+        if (staging.iterate_index > entries.size()) {
+            staging.iterate_index = 0;
+        }
+        return;
+    }
     if (&cache == &upload_cache && log2 <= KeepMaxLog2) {
         size_t idle = 0;
         std::erase_if(entries, [this, &idle](const StagingBuffer& entry) {

@@ -81,6 +81,10 @@ enum class Counter : u32 {
     QmdInvalidations,
     QmdResyncs,
     QmdBoundedWrites,
+    StagingCreates,     ///< P-01: staging buffers allocated (StagingBufferPool)
+    StagingCreateBytes,
+    StagingFrees,       ///< staging buffers released to the driver
+    BufferCacheDeletes, ///< buffer cache buffers deleted (joins, GC)
     Count,
 };
 

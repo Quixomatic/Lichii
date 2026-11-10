@@ -50,6 +50,22 @@ public:
 
     void TickFrame();
 
+    /// P-01 (Pipeline v2): the sweep's release rule for idle staging buffers.
+    struct StagingRetention {
+        /// Released only when no request took the buffer for this many frames (~8 s at 30 fps).
+        static constexpr u64 RetainFrames = 256;
+        /// Levels above 256 MiB keep the old sweep.
+        static constexpr size_t MaxLog2 = 28;
+        /// `idle_seen`: idle buffers of the level so far, this one included; the first
+        /// `keep_idle` stay. At most `max_released` per sweep.
+        [[nodiscard]] static constexpr bool Releasable(size_t idle_seen, size_t keep_idle,
+                                                       u64 frames_unused, size_t released,
+                                                       size_t max_released) noexcept {
+            return idle_seen > keep_idle && frames_unused >= RetainFrames &&
+                   released < max_released;
+        }
+    };
+
 private:
     struct StreamBufferCommit {
         size_t upper_bound;
@@ -64,6 +80,7 @@ private:
         u32 log2_level;
         u64 index;
         u64 tick = 0;
+        u64 last_frame = 0; ///< frame_index of the last request that took it
         bool deferred{};
 
         StagingBufferRef Ref() const noexcept {
@@ -130,6 +147,10 @@ private:
     size_t current_delete_level = 0;
     u64 buffer_index = 0;
     u64 unique_ids{};
+    /// P-01 (Pipeline v2 on): idle buffers are released only after RetainFrames without a
+    /// request, so a level in recurring use is not freed and allocated again at every sweep.
+    bool retain_recent = false;
+    u64 frame_index = 0;
 };
 
 } // namespace Vulkan
