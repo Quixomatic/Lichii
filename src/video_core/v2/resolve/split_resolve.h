@@ -287,6 +287,20 @@ struct SplitTraits {
     };
     static SerialReason Resolve(Shard& shard, const Input& input, std::vector<Record>& records,
                                 Commit::RequestList& requests, Arena& arena);
+    /// Verify's serial resolve of a segment: an early segment whose end the front set reads as a
+    /// closed one (its progress stays the shard's).
+    static Input VerifyInput(const Input& input) {
+        Input copy = input;
+        if (input.progress != nullptr) {
+            const u64 end = input.progress->end.load(std::memory_order_acquire);
+            if (end != ~u64{0}) {
+                copy.end = end;
+                copy.progress = nullptr;
+                copy.published = nullptr;
+            }
+        }
+        return copy;
+    }
     static void Patch(Record&, const Commit::RequestList&) {}
     static const char* Compare(const Record& a, const Record& b);
 };

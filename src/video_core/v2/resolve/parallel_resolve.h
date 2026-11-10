@@ -650,7 +650,14 @@ private:
         verify_records.clear();
         verify_requests.Reset(result.id);
         verify_arena.Clear();
-        RunResolve(commit_shard, slot.input, verify_records, verify_requests, verify_arena);
+        if constexpr (requires { Traits::VerifyInput(slot.input); }) {
+            // F1-36: the serial resolve reads a closed copy (an early segment's progress is the
+            // shard's: its stop flag and its streamed records).
+            RunResolve(commit_shard, Traits::VerifyInput(slot.input), verify_records,
+                       verify_requests, verify_arena);
+        } else {
+            RunResolve(commit_shard, slot.input, verify_records, verify_requests, verify_arena);
+        }
         Count(GetStats().verify_segments);
         const RequestCompare requests =
             CompareRequests(result.requests.Requests(), verify_requests.Requests());

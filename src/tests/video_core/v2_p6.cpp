@@ -561,8 +561,8 @@ TEST_CASE("V2 P6: the ordered merge commits in segment order whatever order shar
     CHECK(Resolve::GetStats().determinism_failures.load(std::memory_order_relaxed) ==
           failures_before);
     // Serial-up-front segments were resolved on the commit thread.
-    CHECK(std::ranges::find(serial_segments, 5) != serial_segments.end());
-    CHECK(std::ranges::find(serial_segments, 18) != serial_segments.end());
+    CHECK(std::ranges::find(serial_segments, u64{5}) != serial_segments.end());
+    CHECK(std::ranges::find(serial_segments, u64{18}) != serial_segments.end());
 }
 
 TEST_CASE("V2 P6: stress: parallel resolve equals serial resolve on synthetic streams",
