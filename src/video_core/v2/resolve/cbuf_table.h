@@ -29,6 +29,9 @@ struct CbufTable {
     std::array<std::array<CbufBinding, CbufSlots>, CbufStages> stages{};
     /// Bumped by every bind (BindCbuf3D) and resync: snapshots compare this, not the table.
     u64 changes = 0;
+    /// Slots bound per stage since their reader cleared them (EDEN_NX2_V2_CBUFRING's bind
+    /// versions); not part of the bindings' identity.
+    std::array<u32, CbufStages> bound{};
 
     bool operator==(const CbufTable& other) const {
         return stages == other.stages;

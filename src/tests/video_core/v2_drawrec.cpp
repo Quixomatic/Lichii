@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <span>
 #include <string>
 #include <string_view>
@@ -422,6 +423,9 @@ struct DecodeEnv {
         std::memcpy(dst, memory.data() + va, size);
         return true;
     }
+    bool Same(u64 va, u32 size, const u8* bytes) {
+        return std::memcmp(memory.data() + va, bytes, size) == 0;
+    }
 };
 
 struct Published {
@@ -496,6 +500,46 @@ TEST_CASE("V2 F2-02: constant buffer versions are made at decode", "[video_core]
     REQUIRE(published.size() == 2);
     REQUIRE(published[0].position == V2::CbufRing::NoPosition);
     REQUIRE(published[1].position == V2::CbufRing::NoPosition);
+}
+
+TEST_CASE("V2 F2-02: binds make versions of windows constant buffer data never wrote",
+          "[video_core][v2_drawrec]") {
+    static V2::CbufRing::Shared shared;
+    std::vector<u8> mapped(V2::CbufRing::Shared::Capacity);
+    shared.Init(mapped.data(), 256);
+    auto decode = std::make_unique<V2::CbufRing::Decode>(shared);
+    DecodeEnv env;
+    constexpr u32 cbuf_bit = V2::ProducerBit(V2::Producer::CbData);
+    env.memory[0x4000] = 0x5a;
+    // A bind of a window with no version: one from guest memory, published before the draw.
+    decode->Bind(0x4000, 0x100, cbuf_bit, env);
+    auto published = PublishAll(*decode);
+    REQUIRE(published.size() == 1);
+    REQUIRE(published[0].va == 0x4000);
+    REQUIRE(published[0].position != V2::CbufRing::NoPosition);
+    const u64 first = published[0].position;
+    REQUIRE(mapped[shared.ring.Offset(first)] == 0x5a);
+    // Bound again with guest memory unchanged: nothing new.
+    decode->Bind(0x4000, 0x100, cbuf_bit, env);
+    REQUIRE(PublishAll(*decode).empty());
+    // A guest CPU write: the next bind takes it again.
+    env.memory[0x4000] = 0x77;
+    decode->Bind(0x4000, 0x100, cbuf_bit, env);
+    published = PublishAll(*decode);
+    REQUIRE(published.size() == 1);
+    REQUIRE(published[0].position != first);
+    REQUIRE(mapped[shared.ring.Offset(published[0].position)] == 0x77);
+    // A window without a version whose own data is in flight: guest memory is the base (the
+    // back's compare decides), not "no version".
+    env.writers = cbuf_bit;
+    const u32 word = 0x01020304;
+    decode->Write(0x5000, 0x100, 0, &word, 1, cbuf_bit, env);
+    published = PublishAll(*decode);
+    REQUIRE(published.size() == 1);
+    REQUIRE(published[0].position != V2::CbufRing::NoPosition);
+    // Too large for the stream path: no version at a bind.
+    decode->Bind(0x6000, 0x10000, cbuf_bit, env);
+    REQUIRE(PublishAll(*decode).empty());
 }
 
 TEST_CASE("V2 F2-02: the back table maps versions by device address", "[video_core][v2_drawrec]") {

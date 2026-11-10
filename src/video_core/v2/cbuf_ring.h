@@ -142,7 +142,9 @@ private:
 /// The back's versions by device address (direct mapped), set by the S1 CbufVersion entries.
 class BackTable {
 public:
-    static constexpr size_t NumEntries = 1024;
+    /// Above the windows a frame binds (OoT: ~2-4k), so a version bound again later in the frame
+    /// (another pass) is still found.
+    static constexpr size_t NumEntries = 16384;
 
     struct Entry {
         u64 device_addr{};
@@ -167,6 +169,15 @@ public:
             return nullptr;
         }
         return &entry;
+    }
+    /// Why Find found nothing (the stats line's no-version split).
+    enum class Miss : u8 { Absent, Dropped, Small };
+    [[nodiscard]] Miss WhyMissed(u64 device_addr, u32 size) const {
+        const Entry& entry = entries[Slot(device_addr)];
+        if (entry.device_addr != device_addr) {
+            return Miss::Absent;
+        }
+        return entry.position == NoPosition ? Miss::Dropped : Miss::Small;
     }
     void Clear() {
         entries.fill(Entry{});
@@ -216,6 +227,9 @@ struct Shared {
     std::atomic<u64> guest_bases{};
     std::atomic<u64> kept_bases{};
     std::atomic<u64> no_version{};
+    std::atomic<u64> bind_versions{};   ///< made at a bind (no constant buffer data written)
+    std::atomic<u64> in_flight_bases{}; ///< guest bytes taken while writers were in flight
+    std::atomic<u64> refused{};         ///< no ring space
 };
 
 [[nodiscard]] inline Shared& Get() {
@@ -228,13 +242,18 @@ struct Shared {
 /// A new version's bytes come from guest memory when nothing writes the range in flight (the
 /// front's hazard table, in-flight constant buffer data included, so guest memory is current);
 /// from the window's previous version when only constant buffer data is in flight over it and
-/// that version is not retired; otherwise there is no version. Either way the back binds a
-/// version only while its bytes equal guest memory at the bind, so a write neither saw (a guest
-/// CPU write) costs a fallback, never a wrong bind.
+/// that version is not retired; from guest memory too when only constant buffer data is in
+/// flight and the window has no version to copy (its earlier words may be rewritten before the
+/// draw); otherwise there is no version. A bind of a window with no current version (one the
+/// guest CPU fills) makes one from guest memory, and takes it again when guest memory no longer
+/// holds its bytes. Either way the back binds a version only while its bytes equal guest memory
+/// at the bind, so a write neither saw (a guest CPU write) costs a fallback, never a wrong bind.
 class Decode {
 public:
     static constexpr u32 MaxWindow = 4096; ///< DEFAULT_SKIP_CACHE_SIZE: larger ones bind cached
-    static constexpr size_t NumWindows = 64;
+    /// Above the windows a frame writes (OoT: ~2-4k), so a window keeps its version between
+    /// frames and its next write copies it instead of finding its own data in flight.
+    static constexpr size_t NumWindows = 4096;
     /// Env::Writers result when the range's in-flight writers are unknown.
     static constexpr u32 UnknownWriters = ~0U;
 
@@ -261,6 +280,36 @@ public:
         }
         std::memcpy(shared->shadow.get() + ring.Offset(window.position) + offset, words,
                     size_t{count} * 4);
+        window.written = true;
+        MarkDirty(window);
+    }
+
+    /// A bind of the window {va, size} (the const_buffer registers at a bind_groups write).
+    /// A window without a current version gets one from guest memory, published before the
+    /// next draw; one that constant buffer data never wrote is taken again when guest memory no
+    /// longer holds its bytes (a guest CPU write). Env as Write's, plus
+    /// `bool Same(u64 va, u32 size, const u8* bytes)` (guest memory holds `bytes`).
+    template <typename Env>
+    void Bind(u64 va, u32 size, u32 cbuf_bit, Env& env) {
+        if (size == 0 || size > MaxWindow) {
+            return;
+        }
+        Window& window = Lookup(va, size);
+        if (window.dirty) {
+            return; // written since the last draw: its version is published with the draw
+        }
+        Ring& ring = shared->ring;
+        if (window.valid && window.position >= ring.Retired()) {
+            if (window.written ||
+                env.Same(va, size, shared->shadow.get() + ring.Offset(window.position))) {
+                return;
+            }
+        }
+        if (!NewVersion(window, cbuf_bit, env, false)) {
+            return; // the back keeps the old one; its compare decides
+        }
+        shared->bind_versions.fetch_add(1, std::memory_order_relaxed);
+        window.written = false;
         MarkDirty(window);
     }
 
@@ -311,6 +360,7 @@ private:
         bool valid{};
         bool published{};
         bool dirty{};
+        bool written{}; ///< constant buffer data made or patched the version
     };
     struct Dropped {
         u64 va;
@@ -335,22 +385,28 @@ private:
         return window;
     }
 
+    /// `may_keep`: the previous version may be the base (constant buffer data); a bind takes
+    /// guest memory.
     template <typename Env>
-    bool NewVersion(Window& window, u32 cbuf_bit, Env& env) {
+    bool NewVersion(Window& window, u32 cbuf_bit, Env& env, bool may_keep = true) {
         Ring& ring = shared->ring;
         // Nothing in flight: guest memory is current (a guest CPU write since included).
-        // Only this window's own data in flight: the previous version holds it.
+        // Only this window's own data in flight: the previous version holds it; without one,
+        // guest memory (the words in flight may be written again before the draw; the back's
+        // compare drops the version if not).
         const u32 writers = env.Writers(window.va, window.size);
-        const bool kept = writers != 0 && writers != UnknownWriters &&
-                          (writers & ~cbuf_bit) == 0 && window.valid &&
+        const bool only_cbuf =
+            writers != 0 && writers != UnknownWriters && (writers & ~cbuf_bit) == 0;
+        const bool kept = may_keep && only_cbuf && window.valid &&
                           window.position >= ring.Retired();
-        if (!kept && writers != 0) {
+        if (!kept && writers != 0 && !only_cbuf) {
             shared->no_version.fetch_add(1, std::memory_order_relaxed);
             return false;
         }
         const std::optional<u64> position = ring.Allocate(window.size, shared->align);
         if (!position) {
             shared->no_version.fetch_add(1, std::memory_order_relaxed);
+            shared->refused.fetch_add(1, std::memory_order_relaxed);
             return false;
         }
         u8* const bytes = shared->shadow.get() + ring.Offset(*position);
@@ -360,6 +416,9 @@ private:
             shared->kept_bases.fetch_add(1, std::memory_order_relaxed);
         } else if (env.Read(window.va, window.size, bytes)) {
             shared->guest_bases.fetch_add(1, std::memory_order_relaxed);
+            if (writers != 0) {
+                shared->in_flight_bases.fetch_add(1, std::memory_order_relaxed);
+            }
         } else {
             shared->no_version.fetch_add(1, std::memory_order_relaxed);
             return false;

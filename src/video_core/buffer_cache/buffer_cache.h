@@ -3000,6 +3000,13 @@ bool BufferCache<P>::BindRingVersion(size_t stage, u32 index, DAddr device_addr,
         if (entry == nullptr || !ring.Usable(entry->position)) {
             if (stats) {
                 ++(entry == nullptr ? data.ring_none : data.ring_old);
+                if (entry == nullptr) {
+                    using Miss = V2::CbufRing::BackTable::Miss;
+                    const Miss miss = shared.table.WhyMissed(device_addr, size);
+                    ++(miss == Miss::Absent    ? data.ring_none_absent
+                       : miss == Miss::Dropped ? data.ring_none_dropped
+                                               : data.ring_none_small);
+                }
             }
             return false;
         }

@@ -62,6 +62,9 @@ struct Data {
     u64 ring_binds{};
     u64 ring_hits{};
     u64 ring_none{};       ///< no version of the range
+    u64 ring_none_absent{};  ///< ... no entry for the address (never published, or replaced)
+    u64 ring_none_dropped{}; ///< ... the front dropped it (no version of its last writes)
+    u64 ring_none_small{};   ///< ... the version is shorter than the bind
     u64 ring_old{};        ///< below the bind floor
     u64 ring_mismatches{}; ///< the version's bytes differ from guest memory
     // EDEN_NX2_V2_BINDLESS

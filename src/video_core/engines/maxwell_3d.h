@@ -3565,6 +3565,8 @@ private:
     void FrontCbufVersion(VideoCommon::GpuSplit& split, FrontState& state, u64 buffer,
                           u32 offset, const u32* words, u32 count);
     void FrontPublishCbufVersions(VideoCommon::GpuSplit& split, FrontState& state);
+    /// Before a draw: versions for the windows bound since the last one (Decode::Bind).
+    void FrontCbufBindVersions(VideoCommon::GpuSplit& split, FrontState& state);
     /// The end of a front macro: sends what the back does there (a deferred instanced batch the
     /// macro left) when it can do anything. Returns whether it did.
     bool FrontEndMacro(Core::System& system, VideoCommon::GpuSplit& split, FrontState& state);
