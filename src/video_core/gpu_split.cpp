@@ -1535,7 +1535,7 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
             read_position += size != 0 ? size : RingWords - index;
             if (hook_requested.load(std::memory_order_relaxed)) [[unlikely]] {
                 // EDEN_NX2_V2_CPULANE: a guest CPU flush runs here, after the current entry.
-                ServeHookRequests();
+                ServeHookRequests(read_position != available);
             }
             // Hand ring space back now and then while working through a long batch, and at once
             // when the front waits for this position (WaitForWriters).

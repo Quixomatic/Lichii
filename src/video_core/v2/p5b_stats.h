@@ -90,6 +90,9 @@ enum class Counter : u32 {
     WfiDeferred,        ///< F4-X3: wait-for-idles inside a pass, barrier at its end
     WfiPassEnds,        ///< F4-X3: wait-for-idles that ended a pass (stores or XFB in it)
     IdleUrgent,         ///< F4-X2: idle-hook submits for a thread blocking on the open tick
+    IdleUrgentCoalesced,///< F4-X2: urgent requests left to the next boundary (GPU busy, back busy)
+    FlushRequestChunk,  ///< F4-X2: mid-pass chunk submits for an urgent request
+    FlushRequestPass,   ///< F4-X2: pass-boundary submits for a waiter's request
     IdleDeferredWork,   ///< F4-X2: idle-hook submits of DeferFlush's work
     IdleSync,           ///< F4-X2: idle-hook submits by DXVK's synchronization rule
     IdleLeft,           ///< F4-X2: idle hooks that left open work for the next boundary

@@ -130,6 +130,10 @@ public:
     [[nodiscard]] bool SubmitRequested() const noexcept {
         return submit_requests.Open(master_semaphore->CurrentTick());
     }
+    /// Recording thread, F4-X2: a thread blocks on the open tick (urgent request).
+    [[nodiscard]] bool SubmitUrgent() const noexcept {
+        return submit_requests.Urgent(master_semaphore->CurrentTick());
+    }
     /// Threads other than the split's back: waits until tick is submitted, asking the back to
     /// submit deferred work (logged every 2 s while it waits). False only when the back thread
     /// is not running, so nothing will submit it: the caller then submits it itself.

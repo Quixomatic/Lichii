@@ -294,6 +294,15 @@ void Scheduler::ServeSplitIdleHook(bool (*sync_due)(void*), void* argument) {
         P5b::Add(P5b::Counter::IdleDeferredWork);
         break;
     case IdleAction::Urgent:
+        if (VideoCommon::GpuSplit::Get().HookBetweenEntries() &&
+            master_semaphore->CurrentTick() >= master_semaphore->KnownGpuTick() + 3) {
+            // Coalesced (§5.5): a waiter asked between two entries while two submissions are
+            // still in flight. Its tick can't start before they finish; the back keeps recording
+            // and its next pass boundary, chunk (request gap) or idle hook submits it together
+            // with every other request made meanwhile.
+            P5b::Add(P5b::Counter::IdleUrgentCoalesced);
+            return;
+        }
         P5b::Add(P5b::Counter::IdleUrgent);
         break;
     case IdleAction::Sync:

@@ -861,14 +861,20 @@ TEST_CASE("V2 P5b flush decisions at pass boundaries", "[video_core][v2_p5b]") {
         auto boundary = heuristic.AtPassBoundary(FlushHint::Weak, requested, 1001);
         REQUIRE(boundary.action == FlushAction::Flush);
         REQUIRE(boundary.reason == FlushHeuristic::ReasonRequest);
-        // Mid-pass: the chunk boundary right after the submit waits for the gap.
+        // Mid-pass: only an urgent request (a thread blocks), and not before the gap.
+        const FlushState urgent{.pending = 1, .back_behind = true, .requested = true,
+                                .urgent = true};
         FlushHeuristic::Decision decision{};
         for (u32 i = 1; i <= params.chunk_draws; ++i) {
-            decision = heuristic.Advance(1, requested, 1001 + params.request_gap_us / 2);
+            decision = heuristic.Advance(1, urgent, 1001 + params.request_gap_us / 2);
         }
         REQUIRE(decision.action == FlushAction::Dispatch);
         for (u32 i = 1; i <= params.chunk_draws; ++i) {
             decision = heuristic.Advance(1, requested, 1001 + params.request_gap_us);
+        }
+        REQUIRE(decision.action == FlushAction::Dispatch); // a lazy fence's window request
+        for (u32 i = 1; i <= params.chunk_draws; ++i) {
+            decision = heuristic.Advance(1, urgent, 1001 + params.request_gap_us);
         }
         REQUIRE(decision.action == FlushAction::Flush);
         REQUIRE(decision.reason == FlushHeuristic::ReasonRequest);

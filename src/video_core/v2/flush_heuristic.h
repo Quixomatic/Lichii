@@ -68,6 +68,10 @@ struct FlushState {
     /// F4-02: a thread waits for work recorded in the open submission (a lazy fence whose window
     /// ran out, a guest wait): the next pass boundary serves it, mid-pass after request_gap_us.
     bool requested = false;
+    /// F4-X2: a thread blocks on the open tick (an urgent request). Only this cuts a pass
+    /// mid-chunk; a lazy fence's bounded-time request waits for the pass boundary (019d:
+    /// 18.7 chunk submits/f).
+    bool urgent = false;
 };
 
 class FlushHeuristic {
@@ -237,7 +241,7 @@ private:
         }
         if (params.pass_boundaries) {
             // F4-03: mid-pass only the safety nets (max draws and cost are checked by Advance).
-            if (state.requested && since >= params.request_gap_us) {
+            if (state.urgent && since >= params.request_gap_us) {
                 return {FlushAction::Flush, ReasonRequest};
             }
             if (since >= params.mid_pass_interval_us) {

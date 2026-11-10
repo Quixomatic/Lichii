@@ -1058,15 +1058,27 @@ private:
     }
     /// Back, hook_requested seen: serves the CPU lane, and runs the idle hook only if it was
     /// asked for (RequestIdleHook), not for a lane request alone.
-    void ServeHookRequests() {
+    /// `between_entries`: the back has more entries of its batch to run after this one.
+    void ServeHookRequests(bool between_entries = false) {
         hook_requested.store(false, std::memory_order_seq_cst);
         ServeCpuLane();
         if (idle_hook_requested.load(std::memory_order_relaxed) &&
             idle_hook_requested.exchange(false, std::memory_order_seq_cst) &&
             idle_hook != nullptr) {
+            hook_between_entries = between_entries;
             idle_hook(idle_argument);
+            hook_between_entries = false;
         }
     }
+
+public:
+    /// Back, inside the idle hook (F4-X2): it runs between two entries of a batch, so the back
+    /// keeps recording and its next pass boundary or chunk can take an urgent request.
+    [[nodiscard]] bool HookBetweenEntries() const noexcept {
+        return hook_between_entries;
+    }
+
+private:
     /// Back: runs a front job (RequestBackJob) and the CPU lane hook if one was asked for
     /// (EDEN_NX2_V2_CPULANE).
     void ServeCpuLane() {
@@ -1203,6 +1215,7 @@ private:
     static inline thread_local bool on_back_thread{};
     void (*idle_hook)(void*){};
     void* idle_argument{};
+    bool hook_between_entries{}; ///< Back: HookBetweenEntries
     void (*cpu_lane_hook)(void*){};
     void* cpu_lane_argument{};
     std::atomic<bool> cpu_lane_requested{};

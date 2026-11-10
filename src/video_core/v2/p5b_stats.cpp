@@ -90,8 +90,9 @@ void Report(const char* thread_name, u64 window_ns) {
              "draws per submit {:.1f} | flush reasons (per s): idle {:.0f}, pending {:.0f}, "
              "strong {:.0f}, weak {:.0f}, interval {:.0f}, fast {:.0f}, max draws {:.0f}, cost "
              "{:.0f}, other {:.0f}, pass {:.0f}, deferred {:.0f}, lazy/requested {:.0f} | idle "
-             "hook (per s): urgent {:.0f}, deferred work {:.0f}, sync rule {:.0f}, left {:.0f}; "
-             "list copies riding {:.0f} | submit "
+             "hook (per s): urgent {:.0f}, urgent coalesced {:.0f}, deferred work {:.0f}, sync "
+             "rule {:.0f}, left {:.0f}; requests served at a chunk {:.0f}, at a pass boundary "
+             "{:.0f}; list copies riding {:.0f} | submit "
              "thread {:.0f}/s, hand-off {:.1f} us, finish {:.0f}/s ({:.1f} us after submit), "
              "recycled contexts {:.0f}/s",
              thread_name, PerSecond(frames, seconds), per_frame(submits),
@@ -106,9 +107,12 @@ void Report(const char* thread_name, u64 window_ns) {
              PerSecond(at(Counter::FlushDeferred), seconds),
              PerSecond(at(Counter::FlushLazy), seconds),
              PerSecond(at(Counter::IdleUrgent), seconds),
+             PerSecond(at(Counter::IdleUrgentCoalesced), seconds),
              PerSecond(at(Counter::IdleDeferredWork), seconds),
              PerSecond(at(Counter::IdleSync), seconds),
              PerSecond(at(Counter::IdleLeft), seconds),
+             PerSecond(at(Counter::FlushRequestChunk), seconds),
+             PerSecond(at(Counter::FlushRequestPass), seconds),
              PerSecond(at(Counter::ListCopiesRiding), seconds),
              PerSecond(at(Counter::SubmitThreadSubmits), seconds),
              Ratio(at(Counter::SubmitLatencyUs), at(Counter::SubmitThreadSubmits)),

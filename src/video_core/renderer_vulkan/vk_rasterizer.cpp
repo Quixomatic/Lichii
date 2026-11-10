@@ -4930,6 +4930,7 @@ VideoCommon::V2::FlushState RasterizerVulkan::ReadFlushState() {
     state.back_behind =
         VideoCommon::GpuSplit::OnBackThread() && VideoCommon::GpuSplit::Get().BackBehind();
     state.requested = scheduler.SubmitRequested();
+    state.urgent = state.requested && scheduler.SubmitUrgent();
     return state;
 }
 
@@ -4973,6 +4974,9 @@ void RasterizerVulkan::AdaptiveFlushWork(u32 cost) {
                 pending_native_work = false;
                 adapt_tick = scheduler.GetMasterSemaphore().CurrentTick();
                 count_reason(boundary.reason);
+                if (boundary.reason == H::ReasonRequest) {
+                    P5b::Add(P5b::Counter::FlushRequestPass);
+                }
             }
         }
     }
@@ -4996,6 +5000,9 @@ void RasterizerVulkan::AdaptiveFlushWork(u32 cost) {
         pending_native_work = false;
         adapt_tick = scheduler.GetMasterSemaphore().CurrentTick();
         count_reason(decision.reason);
+        if (decision.reason == H::ReasonRequest) {
+            P5b::Add(P5b::Counter::FlushRequestChunk);
+        }
         return;
     }
     pending_native_work = true;
