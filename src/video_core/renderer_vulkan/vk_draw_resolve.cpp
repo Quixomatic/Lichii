@@ -18,6 +18,7 @@
 #include <boost/container/small_vector.hpp>
 
 #include "common/logging.h"
+#include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/buffer_cache/uniform_stream_reuse.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/renderer_vulkan/pipeline_helper.h"
