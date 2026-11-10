@@ -109,8 +109,12 @@ public:
     /// A write the front can't bound.
     void NoteUnbounded(Producer producer, u64 position);
     /// A host-level wait was sent at `position`: the unbounded writes before it are complete
-    /// before what the front fetches after it (HazardFilter::unbounded_synced).
+    /// before what the front fetches after it (HazardFilter::unbounded_synced). `position` may
+    /// be older than the newest write noted (an acquire met by a queued release orders only the
+    /// work before that release): the newest unbounded write at or before it counts, or, past
+    /// what UnboundedHistory keeps, the oldest one kept (later, so the wait covers it).
     void NoteSync(u64 position);
+    static constexpr size_t UnboundedHistory = 8;
     /// Drops entries the back consumed.
     void Retire(u64 consumed);
 
@@ -177,6 +181,10 @@ private:
     std::array<u64, static_cast<size_t>(Producer::Count)> wide{};
     std::array<u64, static_cast<size_t>(Producer::Count)> unbounded{};
     std::array<u64, static_cast<size_t>(Producer::Count)> unbounded_synced{};
+    /// Per producer: the last UnboundedHistory distinct positions of its unbounded writes.
+    std::array<std::array<u64, UnboundedHistory>, static_cast<size_t>(Producer::Count)>
+        unbounded_history{};
+    std::array<u64, static_cast<size_t>(Producer::Count)> unbounded_noted{};
     u64 overflow_position = 0; ///< Pending entries that no longer fit
     u64 overflows = 0;
 };

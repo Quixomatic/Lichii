@@ -175,6 +175,34 @@ TEST_CASE("V2 hazard table: overlap, forwarding and retirement", "[video_core][v
         CHECK(table.PendingUnbounded(Producer::Dispatch, 30) == 0);
     }
 
+    SECTION("a sync at an older position orders the unbounded writes before it only") {
+        HazardFilter synced;
+        synced.ranged = 0;
+        synced.unbounded_synced = ProducerBit(Producer::Copy);
+        table.NoteUnbounded(Producer::Copy, 20);
+        table.NoteUnbounded(Producer::Copy, 30);
+        table.NoteUnbounded(Producer::Copy, 40);
+        // An acquire met by a release at 25, decided after the copy at 40 was sent.
+        table.NoteSync(25);
+        CHECK(table.Find(0x9000, 4, 0, synced).position == 20);
+        CHECK(table.Find(0x9000, 4, 20, synced).kind == Kind::Clear);
+        // Nothing before an older sync: still the newer sync's, never less.
+        table.NoteSync(10);
+        CHECK(table.Find(0x9000, 4, 0, synced).position == 20);
+        table.NoteSync(40);
+        CHECK(table.Find(0x9000, 4, 0, synced).position == 40);
+        // Past the history: the oldest kept one, later than the true one (waits longer).
+        for (u64 position = 100; position < 100 + 10 * HazardTable::UnboundedHistory;
+             position += 10) {
+            table.NoteUnbounded(Producer::Copy, position);
+        }
+        table.NoteSync(95);
+        CHECK(table.Find(0x9000, 4, 0, synced).position == 100);
+        table.NoteUnbounded(Producer::Copy, 200);
+        table.NoteSync(105);
+        CHECK(table.Find(0x9000, 4, 0, synced).position == 110);
+    }
+
     SECTION("constant buffer words grow one write within a page") {
         for (u32 i = 0; i < 64; ++i) {
             table.NoteRange(0x8000 + i * 4, 4, 100 + i, Producer::CbData);
@@ -715,4 +743,42 @@ TEST_CASE("V2 NVN2 macro identification and HLE entries", "[video_core][v2_hazar
     CHECK(!ParseLine("1234 draw_arrays_indirect address=p1,p2")); // no topology
     CHECK(!ParseLine("1234 multi_draw_indexed_indirect_count topology=1 address=p1,p2"));
     CHECK(ParseLine("1234 draw_arrays_indirect topology=5 address=p1,p2"));
+}
+
+TEST_CASE("V2 front writes: block linear copies and 2D blits are bounded by their surfaces",
+          "[video_core][v2_hazard]") {
+    SECTION("copy engine block linear destination") {
+        DmaWriteTracker tracker;
+        // 256 x 64 bytes, block height 2^4 GOBs: 256 bytes x 128 rows (aligned) x 1.
+        tracker.dst_params = {4U << 4, 256, 64, 1, 0, 0};
+        const auto bytes = tracker.BlockLinearBytes(false);
+        REQUIRE(bytes);
+        CHECK(*bytes == 256U * 128U);
+        // With remapping, 4 components of 4 bytes per pixel.
+        tracker.remap_components = (3U << 16) | (3U << 24);
+        CHECK(tracker.BlockLinearBytes(true) == 256U * 16U * 128U);
+        // Layers and block widths the copies don't handle: not bounded.
+        tracker.dst_params[4] = 1;
+        CHECK(!tracker.BlockLinearBytes(false));
+        tracker.dst_params[4] = 0;
+        tracker.dst_params[0] |= 1;
+        CHECK(!tracker.BlockLinearBytes(false));
+    }
+    SECTION("2D destination surface") {
+        BlitWriteTracker tracker;
+        // A8B8G8R8_UNORM (0xd5), pitch linear, pitch 1024, 100 rows.
+        tracker.dst = {0xd5, 1, 0, 1, 0, 1024, 256, 100, 0x1, 0x2000};
+        auto range = tracker.DestinationRange();
+        REQUIRE(range);
+        CHECK(range->first == 0x1'0000'2000);
+        CHECK(range->second == 1024U * 100U);
+        // Block linear: 256 pixels x 4 bytes, 100 rows aligned to 8 << 2 = 32.
+        tracker.dst[1] = 0;
+        tracker.dst[2] = 2U << 4;
+        range = tracker.DestinationRange();
+        REQUIRE(range);
+        CHECK(range->second == 1024U * 128U);
+        tracker.macros = true; // registers a 2D macro set are not tracked
+        CHECK(!tracker.DestinationRange());
+    }
 }

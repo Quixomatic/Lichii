@@ -11,6 +11,7 @@
 #include "video_core/engines/maxwell_dma.h"
 #include "video_core/gpu_split.h"
 #include "video_core/memory_manager.h"
+#include "video_core/surface.h"
 #include "video_core/textures/decoders.h"
 #include "video_core/v2/front_writes.h"
 
@@ -233,6 +234,9 @@ void DmaWriteTracker::Note(GpuSplit& split, const Tegra::MemoryManager& memory, 
     case LaunchMethod:
         break;
     default:
+        if (method >= DstParamsMethod && method < DstParamsMethod + dst_params.size()) {
+            dst_params[method - DstParamsMethod] = argument;
+        }
         return;
     }
     MaxwellDMA::LaunchDMA launch;
@@ -240,20 +244,32 @@ void DmaWriteTracker::Note(GpuSplit& split, const Tegra::MemoryManager& memory, 
     std::memcpy(&launch, &argument, sizeof(launch));
     using LaunchDMA = MaxwellDMA::LaunchDMA;
     if (launch.data_transfer_type.Value() != LaunchDMA::DataTransferType::NONE) {
-        // A pitch destination's bytes are bounded; block linear ones (swizzled) are not here.
-        if (launch.dst_memory_layout.Value() == LaunchDMA::MemoryLayout::PITCH && pitch_out >= 0) {
-            u64 line_bytes = line_length_in;
-            if (launch.remap_enable != 0) {
-                const u64 component_size = ((remap_components >> 16) & 3) + 1;
-                const u64 components = ((remap_components >> 24) & 3) + 1;
-                line_bytes *= component_size * components;
-            }
-            const u64 lines = launch.multi_line_enable != 0 ? std::max<u32>(line_count, 1) : 1;
-            const GPUVAddr destination =
-                MaxwellDMA::PackedGPUVAddr{offset_out_high, offset_out_low};
+        u64 line_bytes = line_length_in;
+        if (launch.remap_enable != 0) {
+            const u64 component_size = ((remap_components >> 16) & 3) + 1;
+            const u64 components = ((remap_components >> 24) & 3) + 1;
+            line_bytes *= component_size * components;
+        }
+        const GPUVAddr destination = MaxwellDMA::PackedGPUVAddr{offset_out_high, offset_out_low};
+        const bool pitch = launch.dst_memory_layout.Value() == LaunchDMA::MemoryLayout::PITCH;
+        if (macros) {
+            split.NoteUnboundedWrite(Producer::Copy);
+        } else if (launch.multi_line_enable == 0) {
+            // A one-line copy (MaxwellDMA::Launch) writes its line, moved in 16-byte pieces
+            // within the line's 512-byte GOBs when the destination pages are block linear,
+            // whatever the launch says (F3-X5: bounded either way).
+            const GPUVAddr begin = destination & ~GPUVAddr{0x1ff};
+            const GPUVAddr end = (destination + line_bytes + 0x1ff) & ~GPUVAddr{0x1ff};
+            NoteRangeWriteGpu(split, memory, begin, end - begin, Producer::Copy);
+        } else if (pitch && pitch_out >= 0) {
             NoteRangeWriteGpu(split, memory, destination,
-                              (lines - 1) * static_cast<u64>(pitch_out) + line_bytes,
+                              (std::max<u32>(line_count, 1) - 1) * static_cast<u64>(pitch_out) +
+                                  line_bytes,
                               Producer::Copy);
+        } else if (const auto bytes =
+                       pitch ? std::nullopt : BlockLinearBytes(launch.remap_enable != 0)) {
+            // F3-X5: a block linear destination rewrites its swizzled surface, no more.
+            NoteRangeWriteGpu(split, memory, destination, *bytes, Producer::Copy);
         } else {
             split.NoteUnboundedWrite(Producer::Copy);
         }
@@ -267,6 +283,60 @@ void DmaWriteTracker::Note(GpuSplit& split, const Tegra::MemoryManager& memory, 
                          type == LaunchDMA::SemaphoreType::RELEASE_ONE_WORD_SEMAPHORE ? 4 : 16,
                          true, Producer::Release, true);
     }
+}
+
+std::optional<u64> DmaWriteTracker::BlockLinearBytes(bool remap) const {
+    const u32 block = dst_params[0];
+    const u32 width = dst_params[1];
+    const u32 height = dst_params[2];
+    const u32 depth = dst_params[3];
+    const u32 layer = dst_params[4];
+    if ((block & 0xf) != 0 || layer != 0 || width == 0 || height == 0) {
+        return std::nullopt; // As the copies assume (block width one, layer 0)
+    }
+    // width * bytes per pixel is the same for every bpp_shift the copies pick.
+    const u32 bytes_per_pixel =
+        remap ? (((remap_components >> 16) & 3) + 1) * (((remap_components >> 24) & 3) + 1) : 1;
+    return Tegra::Texture::CalculateSize(true, bytes_per_pixel, width, height,
+                                         std::max<u32>(depth, 1), (block >> 4) & 0xf,
+                                         (block >> 8) & 0xf);
+}
+
+void BlitWriteTracker::Note(GpuSplit& split, const Tegra::MemoryManager& memory, u32 method,
+                            u32 argument, bool exec) {
+    if (method >= DstMethod && method < DstMethod + dst.size()) {
+        dst[method - DstMethod] = argument;
+        return;
+    }
+    if (!exec) {
+        return;
+    }
+    if (const auto range = DestinationRange()) {
+        NoteRangeWriteGpu(split, memory, range->first, range->second, Producer::Copy);
+    } else {
+        split.NoteUnboundedWrite(Producer::Copy);
+    }
+}
+
+std::optional<GpuRange> BlitWriteTracker::DestinationRange() const {
+    using Tegra::Engines::Fermi2D;
+    const auto format = VideoCore::Surface::TryPixelFormatFromRenderTargetFormat(
+        static_cast<Tegra::RenderTargetFormat>(dst[0]));
+    const u32 layer = dst[4];
+    const GPUVAddr address = (GPUVAddr{dst[8]} << 32) | dst[9];
+    if (macros || !format || layer != 0 || address == 0) {
+        return std::nullopt;
+    }
+    const u32 block = dst[2];
+    const u32 width = dst[6];
+    const u32 height = dst[7];
+    if (static_cast<Fermi2D::MemoryLayout>(dst[1]) == Fermi2D::MemoryLayout::BlockLinear) {
+        return GpuRange{address, Tegra::Texture::CalculateSize(
+                                     true, VideoCore::Surface::BytesPerBlock(*format), width,
+                                     height, std::max<u32>(dst[3], 1), (block >> 4) & 0xf,
+                                     (block >> 8) & 0xf)};
+    }
+    return GpuRange{address, u64{dst[5]} * height};
 }
 
 bool CopyRecordTracker::NoteDma(u32 method, u32 argument, Ir::CopyBody& body) {

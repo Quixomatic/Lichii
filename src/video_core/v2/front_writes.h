@@ -96,12 +96,40 @@ struct DmaWriteTracker {
     u32 line_length_in{};
     u32 line_count{};
     u32 remap_components{};
+    /// dst_params (methods 0x1c3-0x1c8): block size, width, height, depth, layer, origin.
+    std::array<u32, 6> dst_params{};
+    /// A copy engine macro ran: registers it set are not tracked, so launches stay unbounded.
+    bool macros = false;
 
     /// MaxwellDMA's launch_dma method.
     static constexpr u32 LaunchMethod = 0xc0;
+    static constexpr u32 DstParamsMethod = 0x1c3;
+
+    /// The bytes a copy into block linear memory rewrites (MaxwellDMA's CopyPitchToBlockLinear
+    /// and CopyBlockLinearToBlockLinear: the whole swizzled surface at offset_out), or nothing
+    /// when the front can't bound it (layers, block width).
+    [[nodiscard]] std::optional<u64> BlockLinearBytes(bool remap) const;
 
     /// A copy engine method was sent.
     void Note(GpuSplit& split, const Tegra::MemoryManager& memory, u32 method, u32 argument);
+};
+
+/// The 2D engine's destination surface as the front sends it (F3-X5): a blit rewrites at most
+/// that surface (SoftwareBlitEngine::Blit's size; the accelerated blit writes the same image).
+struct BlitWriteTracker {
+    /// Fermi2D::Regs::dst (methods 0x80-0x89): format, layout, block, depth, layer, pitch,
+    /// width, height, address high, low.
+    std::array<u32, 10> dst{};
+    /// A 2D macro ran: registers it set are not in `dst`, so blits stay unbounded.
+    bool macros = false;
+
+    static constexpr u32 DstMethod = 0x80;
+
+    /// A 2D engine method was sent (`exec`: the blit's launch method).
+    void Note(GpuSplit& split, const Tegra::MemoryManager& memory, u32 method, u32 argument,
+              bool exec);
+    /// The destination surface's bytes, or nothing when the front can't bound them.
+    [[nodiscard]] std::optional<GpuRange> DestinationRange() const;
 };
 
 /// EDEN_NX2_V2_IR_DRAWS: Copy records (informational) for copy engine launches and 2D blits,

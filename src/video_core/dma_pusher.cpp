@@ -660,6 +660,7 @@ bool DmaPusher::WaitForListWriters(GPUVAddr address, size_t size, bool cpu_writt
                             V2::ProducerBit(V2::Producer::Upload);
     filter.ranged = writers;
     u64 target = 0;
+    u32 producers = 0;
     if (cpu_written) {
         // Unbounded ones before the last sync (bounded ones only if they overlap).
         filter.unbounded_synced = writers;
@@ -677,6 +678,7 @@ bool DmaPusher::WaitForListWriters(GPUVAddr address, size_t size, bool cpu_writt
         const V2::HazardResult result = split.FindWrites(*device, chunk_end - chunk, filter);
         if (result.kind == V2::HazardResult::Kind::Wait) {
             target = std::max(target, result.position);
+            producers |= result.producers;
         }
         chunk = chunk_end;
     }
@@ -684,6 +686,10 @@ bool DmaPusher::WaitForListWriters(GPUVAddr address, size_t size, bool cpu_writt
     V2::Stats::NoteDecision(site, target <= consumed  ? Decision::Avoided
                                   : target < old_target ? Decision::Narrowed
                                                         : Decision::Waited);
+    if (target > consumed) {
+        // F3-X5: which writers fetches wait for (the stats line's "narrowed by").
+        V2::Stats::NoteNarrowedBy(site, producers);
+    }
     if (mode == V2::Mode::On) {
         return target > consumed && split.WaitForPosition(target, site);
     }
@@ -742,6 +748,7 @@ void DmaPusher::NoteTrackedWrite(Engines::EngineInterface& engine, Engines::Engi
         dma_writes.Note(split, memory_manager, method, argument);
         if (writer && method != VideoCommon::V2::DmaWriteTracker::LaunchMethod) {
             split.NoteUnboundedWrite(Producer::Copy); // A macro or another executed method
+            dma_writes.macros = true;
         }
         break;
     case Engines::EngineTypes::KeplerCompute:
@@ -756,9 +763,14 @@ void DmaPusher::NoteTrackedWrite(Engines::EngineInterface& engine, Engines::Engi
         i2m_writes.Note(split, memory_manager, method, argument);
         break;
     case Engines::EngineTypes::Fermi2D:
-        if (method >= MacroRegistersStart ||
-            (method < engine.execution_mask.size() && engine.execution_mask[method])) {
+        if (method >= MacroRegistersStart) {
+            // A macro: its writes (registers included) are made on the back.
             split.NoteUnboundedWrite(Producer::Copy);
+            blit_writes.macros = true;
+        } else {
+            blit_writes.Note(split, memory_manager, method, argument,
+                             method < engine.execution_mask.size() &&
+                                 engine.execution_mask[method]);
         }
         break;
     default:

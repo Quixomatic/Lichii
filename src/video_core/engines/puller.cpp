@@ -191,6 +191,7 @@ struct ViewCheck {
     Reason reason;
     bool narrowed;  ///< It waited for one producer first
     u64 landing{}; ///< MetByQueued on a release still to land: its landing ticket
+    u64 release{}; ///< MetByQueued: the ring position of the release that decided
 };
 
 // EDEN_NX2_V2_ACQUIRE (MASTER_PLAN.md section 6): decides an acquire from the front's semaphore
@@ -236,7 +237,8 @@ ViewCheck CheckWithView(DmaPusher& dma_pusher, GPUVAddr address, u32 value, V2::
     case V2::AcquireVerdict::Met:
         return {decision.verdict, Reason::None, false};
     case V2::AcquireVerdict::MetByQueued:
-        return {decision.verdict, Reason::None, false, word.landing ? word.position : 0};
+        return {decision.verdict, Reason::None, false, word.landing ? word.position : 0,
+                V2::RingPositionOf(word)};
     case V2::AcquireVerdict::NotMet:
         return {decision.verdict,
                 word.kind == V2::HazardResult::Kind::Forward ? Reason::QueuedNotMet
@@ -529,7 +531,7 @@ bool Puller::PollAcquireView(DmaPusher& dma_pusher) {
     }
     if (passes && check.verdict == V2::AcquireVerdict::MetByQueued) {
         // What the front reads after the acquire waits for the work sent before the release.
-        split.NoteSync();
+        split.NoteSyncAt(check.release);
     }
     return passes;
 }
@@ -826,8 +828,8 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
             if (view_passes && view_mode == V2::Mode::On) {
                 if (view.verdict == V2::AcquireVerdict::MetByQueued) {
                     // What the front reads after the acquire waits for the work sent before
-                    // the release (GpuSplit::NoteSync).
-                    split.NoteSync();
+                    // the release (GpuSplit::NoteSyncAt), not for what was sent after it.
+                    split.NoteSyncAt(view.release);
                 }
                 NoteAcquireRecord(dma_pusher, acquire.address, acquire.value, acquire.operation,
                                   static_cast<u32>(view.verdict));
@@ -1018,7 +1020,7 @@ void Puller::ProcessSemaphoreExecute(DmaPusher& dma_pusher, u32 argument) {
         NoteViewDecision(view);
         if (view_passes && on) {
             if (view.verdict == V2::AcquireVerdict::MetByQueued) {
-                VideoCommon::GpuSplit::Get().NoteSync();
+                VideoCommon::GpuSplit::Get().NoteSyncAt(view.release);
             }
             VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Fence);
     VideoCommon::V2::Versions::HookEpoch(VideoCommon::V2::Versions::EpochReason::Acquire);

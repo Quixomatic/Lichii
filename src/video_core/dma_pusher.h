@@ -319,6 +319,8 @@ public:
     /// The copy engine's registers its launches read, as sent (NoteTrackedWrite).
     VideoCommon::V2::CopyRecordTracker copy_records; ///< EDEN_NX2_V2_IR_DRAWS
     VideoCommon::V2::DmaWriteTracker dma_writes;
+    /// The 2D engine's destination surface, as sent (NoteTrackedWrite).
+    VideoCommon::V2::BlitWriteTracker blit_writes;
     /// The inline-to-memory engine's upload registers, as sent (NoteTrackedWrite).
     VideoCommon::V2::UploadWriteTracker i2m_writes;
     std::array<Engines::EngineTypes, max_subchannels> subchannel_type;

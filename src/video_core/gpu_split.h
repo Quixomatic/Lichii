@@ -669,7 +669,13 @@ public:
     /// bit; semaphore acquires drain): the guest's GPU work before it is complete before the
     /// commands after it are fetched.
     void NoteSync() {
-        last_sync_position = write_position;
+        NoteSyncAt(write_position);
+    }
+    /// A sync that orders only the work sent up to `position` (F3-X5: an acquire met by a
+    /// queued release orders what came before that release, not what the front sent since).
+    void NoteSyncAt(u64 position) {
+        const u64 at = std::min(position, write_position);
+        last_sync_position = std::max(last_sync_position, at);
         if (transfer_join_hook != nullptr) [[unlikely]] {
             // EDEN_NX2_V2_XFERQ (MASTER_PLAN §6, multi-queue caveat): class B ordered work by the
             // one in-order host queue; with a transfer queue the back turns this position into a
@@ -684,7 +690,7 @@ public:
             Defer(Join{transfer_join_hook, transfer_join_argument});
         }
         if (tracks_writes) [[unlikely]] {
-            hazards.NoteSync(write_position);
+            hazards.NoteSync(at);
         }
     }
     /// Waits until the back executed the work sent before the last NoteSync. Returns whether any

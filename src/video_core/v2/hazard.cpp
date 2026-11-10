@@ -30,6 +30,10 @@ void HazardTable::Clear() {
     wide_count = 0;
     unbounded.fill(0);
     unbounded_synced.fill(0);
+    for (auto& history : unbounded_history) {
+        history.fill(0);
+    }
+    unbounded_noted.fill(0);
     overflow_position = 0;
     overflows = 0;
 }
@@ -139,12 +143,37 @@ void HazardTable::NoteRange(u64 address, u64 size, u64 position, Producer produc
 }
 
 void HazardTable::NoteUnbounded(Producer producer, u64 position) {
-    unbounded[static_cast<size_t>(producer)] = position;
+    const auto p = static_cast<size_t>(producer);
+    if (unbounded[p] == position) {
+        return;
+    }
+    unbounded[p] = position;
+    unbounded_history[p][unbounded_noted[p]++ % UnboundedHistory] = position;
 }
 
 void HazardTable::NoteSync(u64 position) {
-    (void)position;
-    unbounded_synced = unbounded;
+    for (size_t p = 0; p < NumProducers; ++p) {
+        u64 synced = unbounded[p];
+        if (synced > position) {
+            u64 oldest = ~u64{0};
+            synced = 0;
+            bool found = false;
+            for (const u64 noted : unbounded_history[p]) {
+                if (noted == 0) {
+                    continue;
+                }
+                oldest = std::min(oldest, noted);
+                if (noted <= position) {
+                    synced = std::max(synced, noted);
+                    found = true;
+                }
+            }
+            if (!found && unbounded_noted[p] > UnboundedHistory) {
+                synced = oldest; // An older one fell out of the history
+            }
+        }
+        unbounded_synced[p] = std::max(unbounded_synced[p], synced);
+    }
 }
 
 void HazardTable::Retire(u64 consumed) {
