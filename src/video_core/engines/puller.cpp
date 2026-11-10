@@ -524,8 +524,12 @@ bool Puller::PollAcquireView(DmaPusher& dma_pusher) {
         passes = true;
     } else if (!verify && SuspendsOnView(check)) {
         decided = true;
-        const auto now = std::chrono::steady_clock::now();
         const bool gpu_written = check.reason == Reason::GpuWritten;
+        // The clock only for the readback pacing and, every 64 polls, the 2 s report (0c86: the
+        // per-poll read was 16% of a front spinning on guest-CPU waiters).
+        const bool timed = gpu_written || (++acquire.polls & 63) == 0;
+        const auto now = timed ? std::chrono::steady_clock::now()
+                               : std::chrono::steady_clock::time_point{};
         // SYNC_SUBMIT_SPEC §2.1/§2.2: re-checked only on its wake classes. Only the at-fence
         // row (class D, or a write the landing rule deferred) asks for anything: one submit
         // request per change of its fence's tick, or, while no fence carries it and the back
@@ -587,11 +591,25 @@ bool Puller::PollAcquireView(DmaPusher& dma_pusher) {
         case V2::SuspendedPoll::Wait:
             break;
         }
+        // The open tick may hold the producer (0c86 livelock: a busy back, no draws, nothing
+        // else submits it): once the waiter stayed unmet for 64 checks, the open work is
+        // submitted once per submission epoch, shared by every waiter (V2::ShouldSubmitOpen), so
+        // a short wait never adds a submission.
+        static u64 open_submits_seen = ~u64{0}; // Front thread only
+        const u64 submits = V2::LandingFence::submits.load(std::memory_order_acquire);
+        // An at-fence producer whose fence tick is known asks per tick above instead.
+        if (acquire.polls >= 64 &&
+            V2::ShouldSubmitOpen(gpu_written, check.decision.request && tick != 0, submits,
+                                 open_submits_seen)) {
+            SignalFenceForCaptures(dma_pusher.rasterizer);
+            open_submits_seen = V2::LandingFence::submits.load(std::memory_order_acquire);
+            V2::P5bStats::Add(V2::P5bStats::Counter::FenceJobsAcquire);
+        }
         if (decided && V2Stats::Enabled()) [[unlikely]] {
             V2Stats::NoteDecision(VideoCommon::DrainSite::Acquire, Decision::Avoided,
                                   Reason::None);
         }
-        if (!acquire.reported && now - acquire.since > std::chrono::seconds{2}) {
+        if (timed && !acquire.reported && now - acquire.since > std::chrono::seconds{2}) {
             acquire.reported = true;
             LOG_WARNING(HW_GPU,
                         "Channel {} waits on semaphore {:#x} (op {}, {:#x}, now {:#x}) for 2 s "

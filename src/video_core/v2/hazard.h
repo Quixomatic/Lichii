@@ -306,6 +306,18 @@ enum class SuspendedPoll : u8 {
 ///   (IrExec::LandCaptured), once per back position (`job_here`). 019d case (b): an operation
 ///   queued without a fence in the open command buffer.
 /// No forced landing (the back never blocks on the GPU for an acquire, §2.7), no drain.
+/// 0c86 livelock (every channel suspended on words 0x13 short, view row "no writer", the back
+/// busy with small non-draw entries, so no pass boundary, chunk or idle hook ever submitted the
+/// open tick holding the producer): MP §6 "an interrupt forces a submit if the sync is not yet
+/// submitted", SESSION_HANDOFF §5 "every wait causes its submit". A suspended, unmet acquire
+/// that is neither at-fence (it asks per tick) nor GPU-written (read back) has the open work
+/// submitted once per submission: `submits` is LandingFence::submits now, `seen` its value after
+/// the waiter's last ask. Bounded by the submission rate: never a storm, never a timer.
+[[nodiscard]] constexpr bool ShouldSubmitOpen(bool gpu_written, bool at_fence, u64 submits,
+                                              u64 seen) {
+    return !gpu_written && !at_fence && submits != seen;
+}
+
 [[nodiscard]] constexpr SuspendedPoll PlanSuspendedPoll(bool gpu_written, bool request, u64 tick,
                                                         u64 requested_tick, bool producer_ran,
                                                         bool back_idle, bool job_here) {

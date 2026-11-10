@@ -99,6 +99,9 @@ public:
         /// had a fence signalled for an uncarried capture (0: never).
         u64 requested_tick{};
         u64 fence_job_at{};
+        /// Unmet checks of this suspension (the 2 s clock read every 64; V2::ShouldSubmitOpen
+        /// asks only after 64).
+        u32 polls{};
         /// SYNC Step 0: what its last poll waited for (V2::Stats::WakeClass), for the STATS line.
         u8 wake{};
         /// SYNC_SUBMIT_SPEC §2.2: the wake classes that can change its answer (V2::SemWake; 0:

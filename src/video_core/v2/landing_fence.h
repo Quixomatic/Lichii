@@ -24,6 +24,10 @@ inline std::atomic<u64> tick{0};
 inline std::atomic<u64> issued{0};
 inline std::atomic<u64> untracked{0};
 
+/// Submissions the recording thread made with lazy fences (any thread reads it): a suspended
+/// acquire asks for the open tick's submission once per value (V2::ShouldSubmitOpen).
+inline std::atomic<u64> submits{0};
+
 /// The renderer's urgent request for a host tick (Scheduler::RequestLazyFlush) and the wake that
 /// runs the back's idle hook (GpuSplit::RequestIdleHook). Set once before the back starts.
 inline void (*request_hook)(void*, u64) = nullptr;

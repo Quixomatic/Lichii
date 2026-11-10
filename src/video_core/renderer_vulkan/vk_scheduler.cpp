@@ -35,6 +35,7 @@
 #include "video_core/renderer_vulkan/vk_submit_engine.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
 #include "video_core/v2/front_wake.h"
+#include "video_core/v2/landing_fence.h"
 #include "video_core/v2/p5b_stats.h"
 #include "video_core/v2/v2_switches.h"
 #include "video_core/vulkan_common/vulkan_device.h"
@@ -225,6 +226,8 @@ u64 Scheduler::Flush(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
     }
     if (lazy_fences) [[unlikely]] {
         NoteBlockedWait();
+        // SYNC (0c86): suspended acquires ask for the open tick once per submission.
+        VideoCommon::V2::LandingFence::submits.fetch_add(1, std::memory_order_release);
     }
     // When flushing, we only send data to the worker thread; no waiting is necessary.
     const u64 signal_value = SubmitExecution(signal_semaphore, wait_semaphore);
@@ -440,6 +443,7 @@ void Scheduler::Finish(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
     const u64 start = profile || p5b_stats ? VideoCommon::Nx2Profile::Now() : 0;
     if (lazy_fences) [[unlikely]] {
         NoteBlockedWait();
+        VideoCommon::V2::LandingFence::submits.fetch_add(1, std::memory_order_release);
     }
     SubmitExecution(signal_semaphore, wait_semaphore);
     Wait(presubmit_tick);
