@@ -239,7 +239,8 @@ public:
         return view_formats[static_cast<std::size_t>(format)];
     }
 
-    void BarrierFeedbackLoop();
+    /// A draw samples the bound depth image `depth` after depth/stencil writes to it.
+    void BarrierFeedbackLoop(Image& depth);
 
     bool IsFormatDitherable(VideoCore::Surface::PixelFormat format);
     bool IsFormatScalable(VideoCore::Surface::PixelFormat format);

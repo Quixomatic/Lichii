@@ -580,9 +580,11 @@ void QueriesPrefixScanPass::Run(VkBuffer accumulation_buffer, VkBuffer dst_buffe
         size_t used_offset = offset;
         offset += runs_to_do;
 
-        scheduler.RequestOutsideRenderPassOperationContext();
-        scheduler.Record([this, descriptor_data, min_accumulation_limit, max_accumulation_limit,
-                          runs_to_do, used_offset, conditional_access](vk::CommandBuffer cmdbuf) {
+        // F4-06: query result buffers only, its own barriers: no pending attachment write is
+        // flushed for it.
+        scheduler.RecordBufferOperation([this, descriptor_data, min_accumulation_limit,
+                                         max_accumulation_limit, runs_to_do, used_offset,
+                                         conditional_access](vk::CommandBuffer cmdbuf) {
             static constexpr VkMemoryBarrier read_barrier{
                 .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
                 .pNext = nullptr,

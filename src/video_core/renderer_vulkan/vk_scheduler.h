@@ -346,14 +346,16 @@ public:
     /// Send work to a separate thread.
     template <typename T>
         requires std::is_invocable_v<T, vk::CommandBuffer, vk::CommandBuffer>
-    void RecordWithUploadBuffer(T&& command) {
+    void RecordWithUploadBuffer(T&& command,
+                                std::source_location location = std::source_location::current()) {
         if (VideoCommon::GpuSplit::check_owner) [[unlikely]] {
             VideoCommon::GpuSplit::CheckOwner("Scheduler::Record");
         }
         if (auto_flush) [[unlikely]] {
             // EDEN_NX2_V2_DYNRENDER: an untracked operation outside a pass sees every pending
-            // attachment write (what the old pass-end barrier gave it).
-            FlushAllPendingWrites();
+            // attachment write (what the old pass-end barrier gave it). F4-06: counted at the
+            // recording call site (STATS full barriers by site).
+            FlushAllPendingWrites(location);
         }
         if (chunk->Record(command)) {
             return;
@@ -364,11 +366,12 @@ public:
 
     template <typename T>
         requires std::is_invocable_v<T, vk::CommandBuffer>
-    void Record(T&& c) {
+    void Record(T&& c, std::source_location location = std::source_location::current()) {
         this->RecordWithUploadBuffer(
             [command = std::move(c)](vk::CommandBuffer cmdbuf, vk::CommandBuffer) {
                 command(cmdbuf);
-            });
+            },
+            location);
     }
 
     /// P6 Step 0 (DRAWREC=verify purity): moves with every recorded command.

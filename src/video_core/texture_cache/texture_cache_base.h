@@ -827,6 +827,9 @@ private:
     u64 last_feedback_texture_serial = 0;
     bool last_feedback_loop_result = false;
     bool feedback_depth_dirty = true;
+    /// F4-06 (EDEN_NX2_V2_DYNRENDER): the feedback barrier is re-armed only by draws that can
+    /// write depth or stencil (not by a stencil test with nothing to write).
+    bool v2_feedback_writes = V2::On(V2::Switch::DynRender);
     FramebufferId last_framebuffer_id{};
     u64 last_framebuffer_serial = 0;
 

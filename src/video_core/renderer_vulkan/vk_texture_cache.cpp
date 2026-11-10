@@ -1684,8 +1684,12 @@ void TextureCacheRuntime::EraseResolveShadow(VkImage msaa_image) {
     resolve_shadows.erase(it);
 }
 
-void TextureCacheRuntime::BarrierFeedbackLoop() {
-    scheduler.RequestOutsideRenderPassOperationContext();
+void TextureCacheRuntime::BarrierFeedbackLoop(Image& depth) {
+    // F4-06 (R2-F4-05, MASTER_PLAN §5.5 targeted barriers): the pass ends, which notes its depth
+    // writes, and only the writes to this image get a barrier before the draw samples it; other
+    // pending writes stay pending. Without the tracker: the old pass end.
+    const bool scope = scheduler.RequestOutsideRenderPassForImages({Tracked(depth)});
+    scheduler.EndImageOperation(scope);
 }
 
 ByteAddressedShadow TextureCacheRuntime::CreateByteAddressedShadow(const ImageView& view) {
@@ -5631,11 +5635,14 @@ void TextureCacheRuntime::TransitionImageLayout(Image& image) {
                 .layerCount = VK_REMAINING_ARRAY_LAYERS,
             },
         };
-        scheduler.RequestOutsideRenderPassOperationContext();
+        // F4-06: the first layout transition touches this image only (pending writes to memory
+        // it aliases get the barrier; the others stay pending).
+        const bool scope = scheduler.RequestOutsideRenderPassForImages({Tracked(image)});
         scheduler.Record([barrier](vk::CommandBuffer cmdbuf) {
             cmdbuf.PipelineBarrier(vk::PIPELINE_STAGE_GRAPHICS_COMPUTE,
                                    vk::PIPELINE_STAGE_GRAPHICS_COMPUTE, 0, barrier);
         });
+        scheduler.EndImageOperation(scope);
     }
 }
 

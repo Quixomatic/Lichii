@@ -934,10 +934,29 @@ void TextureCache<P>::CheckFeedbackLoop(std::span<const ImageViewInOut> views) {
         return;
     }
     const auto& regs = maxwell3d->regs;
-    const bool writes_depth_stencil = regs.depth_write_enabled != 0 || regs.stencil_enable != 0;
+    bool writes_depth_stencil = regs.depth_write_enabled != 0 || regs.stencil_enable != 0;
+    if (v2_feedback_writes) [[unlikely]] {
+        // F4-06 (R2-F4-05): depth is written only with the depth test on; stencil only through
+        // a non-zero write mask with an op other than keep (the back face uses the front's
+        // state unless two-sided). A stencil-tested draw sampling depth no longer re-arms the
+        // barrier for the next one.
+        using StencilOp = std::remove_cvref_t<decltype(regs.stencil_front_op)>;
+        const auto writes = [](const StencilOp& op, u32 mask) {
+            const auto keep = [](StencilOp::Op value) {
+                return value == StencilOp::Op::Keep_D3D || value == StencilOp::Op::Keep_GL;
+            };
+            return mask != 0 && !(keep(op.fail) && keep(op.zfail) && keep(op.zpass));
+        };
+        const bool front = writes(regs.stencil_front_op, regs.stencil_front_mask);
+        const bool back = regs.stencil_two_side_enable != 0
+                              ? writes(regs.stencil_back_op, regs.stencil_back_mask)
+                              : front;
+        writes_depth_stencil = (regs.depth_test_enable != 0 && regs.depth_write_enabled != 0) ||
+                               (regs.stencil_enable != 0 && (front || back));
+    }
     const auto barrier = [&] {
         if (feedback_depth_dirty) {
-            runtime.BarrierFeedbackLoop();
+            runtime.BarrierFeedbackLoop(slot_images[rt_depth_image_id]);
             feedback_depth_dirty = false;
         }
     };
