@@ -149,29 +149,31 @@ public:
     /// (another pass) is still found.
     static constexpr size_t NumEntries = 16384;
 
+    // Ordered so the entry packs into 56 bytes (the table, 16384 entries, also lives on stacks).
     struct Entry {
         u64 device_addr{};
-        u32 size{};
         u64 position{NoPosition};
         // F2-03 (v2/cbuf_watch.h): the version is what the shader reads while `trusted`, its
         // decoder's epoch is current and the watch's page words still equal `words`.
         u64 words{};
-        u32 epoch{};
-        bool trusted{};
         /// The fallback memo: the first `checked_size` bytes equalled guest memory at this
         /// collect epoch, with the pages' words then (a foreign write since moves them).
         mutable u64 checked_epoch{};
         mutable u64 checked_words{};
+        u32 size{};
+        u32 epoch{};
         mutable u32 checked_size{};
+        bool trusted{};
     };
+    static_assert(sizeof(Entry) <= 56);
 
     void Set(u64 device_addr, u32 size, u64 position, u64 words = 0, u32 epoch = 0,
              bool trusted = false) {
         entries[Slot(device_addr)] = Entry{
             .device_addr = device_addr,
-            .size = size,
             .position = position,
             .words = words,
+            .size = size,
             .epoch = epoch,
             .trusted = trusted,
         };
