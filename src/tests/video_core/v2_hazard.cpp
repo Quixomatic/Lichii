@@ -420,6 +420,48 @@ TEST_CASE("V2 acquire decisions", "[video_core][v2_hazard]") {
     }
 }
 
+// 84de5dbac4 regression (Ocarina of Time stuck before its first present): channel 1 suspended on
+// an unmapped word (gequal 0, met by any read) the view can't read, and channels 2/3/5 on a word
+// whose release the view never recorded; nothing resumed them once the valve was gone.
+TEST_CASE("V2 acquire: a suspended acquire whose release the view never records progresses",
+          "[video_core][v2_hazard]") {
+    SECTION("an unmapped word takes the old path at once, it never suspends") {
+        CHECK(!ViewSuspends(AcquireVerdict::Fallback, true));
+        CHECK(ViewSuspends(AcquireVerdict::Fallback, false));
+        CHECK(ViewSuspends(AcquireVerdict::NotMet, false));
+        CHECK(!ViewSuspends(AcquireVerdict::Met, false));
+    }
+    SECTION("a release written where the view doesn't look is found by the old path's poll") {
+        // The model: memory the view reads holds 0; the release (1) sits where only the old
+        // path's drain and flush reach it (a cache the back holds, another channel's queued
+        // work). The view keeps deciding NotMet from what it sees.
+        HazardResult clear;
+        const u32 view_word = 0;
+        const u32 old_path_word = 1;
+        u64 elapsed_us = 0;
+        bool resumed = false;
+        for (int poll = 0; poll < 100 && !resumed; ++poll, elapsed_us += 100) {
+            const AcquireDecision view =
+                DecideAcquire(SemaphoreOp::Equal, 1, clear, view_word, view_word, 0);
+            REQUIRE(view.verdict == AcquireVerdict::NotMet);
+            REQUIRE(ViewSuspends(view.verdict, false));
+            switch (PlanSuspendedPoll(false, elapsed_us)) {
+            case SuspendedPoll::OldPath:
+                resumed = SemaphoreMet(SemaphoreOp::Equal, old_path_word, 1);
+                break;
+            case SuspendedPoll::ReadBack:
+            case SuspendedPoll::Wait:
+                break;
+            }
+        }
+        CHECK(resumed);
+        CHECK(elapsed_us <= OldPathEveryUs + 100);
+        // Before the net's interval only the view (or a read-back) decides.
+        CHECK(PlanSuspendedPoll(false, 0) == SuspendedPoll::Wait);
+        CHECK(PlanSuspendedPoll(true, 0) == SuspendedPoll::ReadBack);
+    }
+}
+
 TEST_CASE("V2 hazard table: wide writes and draw targets", "[video_core][v2_hazard]") {
     HazardTable table;
     const HazardFilter all{};

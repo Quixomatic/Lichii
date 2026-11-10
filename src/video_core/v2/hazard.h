@@ -243,4 +243,32 @@ struct AcquireDecision {
                                             u32 forwarded, u32 memory_word,
                                             u64 pending_dispatch);
 
+/// EDEN_NX2_V2_ACQUIRE=1: whether an acquire the view doesn't pass suspends the channel without a
+/// drain. `old_path_only`: the view can't read the word at all (settings it doesn't model, an
+/// unmapped word): the old path decides at once, as it reads memory as the guest would.
+[[nodiscard]] constexpr bool ViewSuspends(AcquireVerdict verdict, bool old_path_only) {
+    return verdict == AcquireVerdict::NotMet ||
+           (verdict == AcquireVerdict::Fallback && !old_path_only);
+}
+
+/// What a poll of a channel suspended by the view does while the acquire stays unmet.
+enum class SuspendedPoll : u8 {
+    Wait,     ///< Keep waiting (latch, landing, the next poll's memory read)
+    ReadBack, ///< Read the GPU-written word back (class C)
+    OldPath,  ///< Progress net: drain and read the word through the back
+};
+
+/// The view resumes a suspended acquire on what it records: a release landing (latch), a queued
+/// release, memory read at each poll. A release it never records (written through a cache the
+/// back flushes, a path no front note covers) would leave the channel suspended for good, so
+/// every OldPathEvery the old path (drain, flush, read) polls once. Not the old 1 ms valve: class
+/// B passes what the valve used to drain for.
+inline constexpr u64 OldPathEveryUs = 2000;
+[[nodiscard]] constexpr SuspendedPoll PlanSuspendedPoll(bool gpu_written, u64 since_old_poll_us) {
+    if (since_old_poll_us >= OldPathEveryUs) {
+        return SuspendedPoll::OldPath;
+    }
+    return gpu_written ? SuspendedPoll::ReadBack : SuspendedPoll::Wait;
+}
+
 } // namespace VideoCommon::V2

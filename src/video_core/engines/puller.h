@@ -94,6 +94,8 @@ public:
         bool sem_execute{};
         /// A GPU-written word's readback (V2::WordReadback) was sent and not landed yet.
         bool readback_sent{};
+        /// When the old path last polled it (V2::PlanSuspendedPoll's progress net).
+        std::chrono::steady_clock::time_point last_old_poll{};
 
         [[nodiscard]] bool Matches(u32 current) const;
     };

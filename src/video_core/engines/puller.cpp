@@ -263,11 +263,12 @@ bool Passes(const ViewCheck& check) {
 }
 
 // EDEN_NX2_V2_ACQUIRE=1 (MASTER_PLAN §6, Fix F3-05): an acquire the view doesn't pass suspends
-// the channel; no drain, no forced fence. Only settings the view doesn't model (accurate GPU,
-// delayed fences, macros on the back) take the old path.
+// the channel; no drain, no forced fence. Settings the view doesn't model (accurate GPU, delayed
+// fences, macros on the back) and unmapped words (the old path reads them as the guest would)
+// take the old path.
 bool SuspendsOnView(const ViewCheck& check) {
-    return check.verdict == V2::AcquireVerdict::NotMet ||
-           (check.verdict == V2::AcquireVerdict::Fallback && check.reason != Reason::Settings);
+    return V2::ViewSuspends(check.verdict,
+                            check.reason == Reason::Settings || check.reason == Reason::Unmapped);
 }
 
 void NoteViewDecision(const ViewCheck& check) {
@@ -391,21 +392,37 @@ bool Puller::PollAcquireView(DmaPusher& dma_pusher) {
     } else if (!verify && SuspendsOnView(check)) {
         decided = true;
         const auto now = std::chrono::steady_clock::now();
-        if (check.reason == Reason::GpuWritten) {
+        const u64 since_old_poll = static_cast<u64>(
+            std::chrono::duration_cast<std::chrono::microseconds>(now - acquire.last_old_poll)
+                .count());
+        switch (V2::PlanSuspendedPoll(check.reason == Reason::GpuWritten, since_old_poll)) {
+        case V2::SuspendedPoll::OldPath:
+            // Progress net for a release the view never records: the old poll drains, flushes
+            // the word and reads it.
+            acquire.last_old_poll = now;
+            decided = false;
+            break;
+        case V2::SuspendedPoll::ReadBack:
             // Read the word back again once the back ran what was sent since (at most per
             // 200 us): no drain, no synchronous download on the back.
             if (now - acquire.last_request >= std::chrono::microseconds{200}) {
                 acquire.last_request = now;
                 SendWordReadback(dma_pusher);
             }
-        } else if (split.LandingPending() &&
-                   now - acquire.last_request >= std::chrono::milliseconds{1}) {
-            // Releases still to land: their fences may sit in a deferred submission.
-            acquire.last_request = now;
-            split.RequestIdleHook();
+            break;
+        case V2::SuspendedPoll::Wait:
+            if (split.LandingPending() &&
+                now - acquire.last_request >= std::chrono::milliseconds{1}) {
+                // Releases still to land: their fences may sit in a deferred submission.
+                acquire.last_request = now;
+                split.RequestIdleHook();
+            }
+            break;
         }
         if (V2Stats::Enabled()) [[unlikely]] {
-            V2Stats::NoteDecision(VideoCommon::DrainSite::Acquire, Decision::Avoided);
+            V2Stats::NoteDecision(VideoCommon::DrainSite::Acquire,
+                                  decided ? Decision::Avoided : Decision::Waited,
+                                  decided ? Reason::None : Reason::Valve);
         }
         if (!acquire.reported && now - acquire.since > std::chrono::seconds{2}) {
             acquire.reported = true;
@@ -479,6 +496,7 @@ void Puller::SuspendOnView(DmaPusher& dma_pusher, PendingAcquire acquire, bool g
                   [rasterizer = dma_pusher.rasterizer] { rasterizer->ReleaseFences(false); },
                   VideoCommon::V2::Ir::ReleaseFencesUnforced);
     acquire.last_request = std::chrono::steady_clock::now();
+    acquire.last_old_poll = acquire.last_request;
     pending_acquire = acquire;
     if (gpu_written) {
         SendWordReadback(dma_pusher);
