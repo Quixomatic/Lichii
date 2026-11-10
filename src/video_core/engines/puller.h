@@ -96,6 +96,9 @@ public:
         bool readback_sent{};
         /// When the old path last polled it (V2::PlanSuspendedPoll's progress net).
         std::chrono::steady_clock::time_point last_old_poll{};
+        /// Fix F3f (F3-X1b): whether a poll already asked for the submit a release still to
+        /// land needs (the first ask is at once, later ones once per millisecond).
+        bool submit_requested{};
 
         [[nodiscard]] bool Matches(u32 current) const;
     };

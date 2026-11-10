@@ -390,6 +390,15 @@ public:
                V2::Landing::untracked_issued.load(std::memory_order_acquire) >
                    V2::Landing::untracked_landed.load(std::memory_order_acquire);
     }
+    /// Front (Fix F3f, F3-X1b): UntrackedReleasePending for one word: a QMD release that may
+    /// write [device_address, device_address + size) is still queued, or ran but its operation
+    /// hasn't (FindWrites' untracked answer). A placed QMD release elsewhere doesn't count.
+    [[nodiscard]] bool QmdReleaseMayWrite(u64 device_address, u64 size) {
+        V2::HazardFilter filter;
+        filter.ranged = V2::ProducerBit(V2::Producer::QmdRelease);
+        filter.unbounded = V2::ProducerBit(V2::Producer::QmdRelease);
+        return FindWrites(device_address, size, filter).kind != V2::HazardResult::Kind::Clear;
+    }
     /// Front: a release of known bytes just sent that lands at an operation (fence-flagged, at
     /// High accuracy, or deferred behind an earlier one), with its landing ticket. Until it lands
     /// FindWrites forwards it.

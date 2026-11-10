@@ -2689,6 +2689,36 @@ TEST_CASE("V2 landing: one write table, tickets without IR cuts, ordered landing
         Landing::ResetUntracked();
     }
 
+    SECTION("F3-X1b: only a QMD release that may write the word defers its suspended poll") {
+        namespace Landing = V2::Landing;
+        Landing::ResetUntracked();
+        Landing::untracked_captured_tag = 0;
+        Access::SetEnd(split, 200);
+        split.NoteRangeWrite(word_a, 4, V2::Producer::QmdRelease);
+        CHECK(split.QmdReleaseMayWrite(word_a, 4)); // queued
+        CHECK(!split.QmdReleaseMayWrite(word_b, 4)); // placed elsewhere: the net isn't deferred
+        CHECK(split.UntrackedReleasePending());      // the old, global answer deferred both
+        // Run, its operation still to land: still deferred (the latch resumes it).
+        Landing::tag = 200;
+        u64 ticket = 0;
+        {
+            const Landing::Untracked untracked;
+            ticket = Landing::CaptureUntracked(word_a, 4);
+        }
+        Landing::tag = 0;
+        Access::SetBack(split, 200, false);
+        CHECK(split.QmdReleaseMayWrite(word_a, 4));
+        Landing::NoteUntracked(ticket);
+        CHECK(!split.QmdReleaseMayWrite(word_a, 4)); // landed: the net decides again
+        // An unknown QMD may write any word until its entry's operations ran.
+        Access::SetEnd(split, 300);
+        split.NoteUnboundedWrite(V2::Producer::QmdRelease);
+        CHECK(split.QmdReleaseMayWrite(word_b, 4));
+        Access::SetBack(split, 300, false);
+        CHECK(!split.QmdReleaseMayWrite(word_b, 4)); // ran, nothing queued behind a fence
+        Landing::ResetUntracked();
+    }
+
     SECTION("class C readback: a front job runs on the back after its current entry") {
         struct Job {
             bool ran = false;

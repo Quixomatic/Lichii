@@ -8,6 +8,7 @@
 #include <atomic>
 #include <cstdlib>
 #include <optional>
+#include <string>
 
 #include "common/assert.h"
 #include "common/logging.h"
@@ -430,6 +431,8 @@ bool Puller::PollAcquireView(DmaPusher& dma_pusher) {
     bool passes = false;
     bool net = false;
     bool untracked = false; ///< A QMD release was pending when the net was planned
+    V2::HazardResult net_writers{}; ///< The net: the writes the front knew of the word
+    u64 net_consumed = 0;
     if (Passes(check)) {
         decided = true;
         passes = true;
@@ -443,7 +446,10 @@ bool Puller::PollAcquireView(DmaPusher& dma_pusher) {
         const u64 since_old_poll = static_cast<u64>(
             std::chrono::duration_cast<std::chrono::microseconds>(now - acquire.last_old_poll)
                 .count());
-        untracked = split.UntrackedReleasePending() ||
+        // F3-X1b: only a QMD release that may write this word defers the net (any QMD release
+        // anywhere kept every net 20 ms late while unknown QMDs kept coming).
+        const auto device = dma_pusher.memory_manager.GpuToCpuAddress(address);
+        untracked = (device && split.QmdReleaseMayWrite(*device, sizeof(u32))) ||
                     NotedReleaseOnItsWay(dma_pusher, address, value, op);
         switch (V2::PlanSuspendedPoll(check.reason == Reason::GpuWritten, since_old_poll,
                                       untracked)) {
@@ -453,6 +459,16 @@ bool Puller::PollAcquireView(DmaPusher& dma_pusher) {
             acquire.last_old_poll = now;
             decided = false;
             net = true;
+            if (device) {
+                // F3-X1b: what the front knew of the word before the drain (resume line).
+                V2::HazardFilter all;
+                all.unbounded = V2::ProducerBit(V2::Producer::Dispatch) |
+                                V2::ProducerBit(V2::Producer::Copy) |
+                                V2::ProducerBit(V2::Producer::Upload) |
+                                V2::ProducerBit(V2::Producer::QmdRelease);
+                net_writers = split.FindWrites(*device, sizeof(u32), all);
+                net_consumed = split.ConsumedNow();
+            }
             break;
         case V2::SuspendedPoll::ReadBack:
             // Read the word back again once the back ran what was sent since (at most per
@@ -464,8 +480,11 @@ bool Puller::PollAcquireView(DmaPusher& dma_pusher) {
             break;
         case V2::SuspendedPoll::Wait:
             if ((split.LandingPending() || untracked) &&
-                now - acquire.last_request >= std::chrono::milliseconds{1}) {
-                // Releases still to land: their fences may sit in a deferred submission.
+                (!acquire.submit_requested ||
+                 now - acquire.last_request >= std::chrono::milliseconds{1})) {
+                // Releases still to land: their fences may sit in a deferred submission. The
+                // first ask is at once (F3-X1b: it waited a millisecond first).
+                acquire.submit_requested = true;
                 acquire.last_request = now;
                 split.RequestIdleHook();
             }
@@ -498,9 +517,18 @@ bool Puller::PollAcquireView(DmaPusher& dma_pusher) {
         const bool old_passed = PollAcquire(dma_pusher);
         if (net && old_passed) [[unlikely]] {
             // A release the view didn't resolve: which (F3 follow-up, the net's rate).
+            // The first 32, then every 1024th (F3-X1b: the first ones are all from the boot).
             static std::atomic<u32> logged{};
-            if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+            if (const u32 resumed = logged.fetch_add(1, std::memory_order_relaxed);
+                resumed < 32 || resumed % 1024 == 0) {
                 const auto device = dma_pusher.memory_manager.GpuToCpuAddress(address);
+                std::string writers;
+                for (size_t p = 0; p < static_cast<size_t>(V2::Producer::Count); ++p) {
+                    if ((net_writers.producers >> p) & 1) {
+                        writers += writers.empty() ? "" : "|";
+                        writers += V2::producer_names[p];
+                    }
+                }
                 // F3-X1: whether the front noted the release (and how), against the landing state.
                 const auto recent = device ? split.FindRecentRelease(*device)
                                            : std::optional<VideoCommon::GpuSplit::RecentRelease>{};
@@ -510,7 +538,9 @@ bool Puller::PollAcquireView(DmaPusher& dma_pusher) {
                          "{:#x} after, gpu-written page {}, sem_execute {}, QMD release pending "
                          "{}, waited {} us | newest noted release {} (kind {}, op {}, value "
                          "{:#x}, {} {:#x}), landed {:#x}, back issued {:#x}, front ticket {:#x}, "
-                         "consumed {:#x}, write {:#x}, untracked issued {:#x}, landed {:#x}",
+                         "consumed {:#x}, write {:#x}, untracked issued {:#x}, landed {:#x} "
+                         "(entries) | before the drain: consumed {:#x}, writes to the word {} "
+                         "({}, at {:#x}{}{}) [{} so far]",
                          dma_pusher.channel_state.bind_id, address, device.value_or(0),
                          operation, value, static_cast<u32>(check.reason), view_word,
                          dma_pusher.memory_manager.Read<u32>(address),
@@ -527,8 +557,17 @@ bool Puller::PollAcquireView(DmaPusher& dma_pusher) {
                          V2::Landing::landed.load(std::memory_order_acquire),
                          V2::Landing::issued.load(std::memory_order_acquire),
                          split.LastLandingTicket(), split.ConsumedNow(), split.WritePosition(),
-                         V2::Landing::untracked_issued.load(std::memory_order_acquire),
-                         V2::Landing::untracked_landed.load(std::memory_order_acquire));
+                         V2::Landing::UntrackedPosition(
+                             V2::Landing::untracked_issued.load(std::memory_order_acquire)),
+                         V2::Landing::UntrackedPosition(
+                             V2::Landing::untracked_landed.load(std::memory_order_acquire)),
+                         net_consumed,
+                         net_writers.kind == V2::HazardResult::Kind::Clear     ? "none"
+                         : net_writers.kind == V2::HazardResult::Kind::Forward ? "forwarded"
+                                                                               : "pending",
+                         writers.empty() ? "-" : writers, net_writers.position,
+                         net_writers.landing ? ", landing ticket" : "",
+                         net_writers.untracked ? ", qmd operation to land" : "", resumed + 1);
             }
         }
         if (verify && decided) {
