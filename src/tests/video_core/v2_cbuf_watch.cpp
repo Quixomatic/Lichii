@@ -693,6 +693,25 @@ TEST_CASE("V2 F2-03: the collect epoch moves with the ring on and the draw cache
     modes = saved;
 }
 
+TEST_CASE("V2 F2-13: a reader's stamp is kept while no write was logged since",
+          "[video_core][v2_cbufwatch]") {
+    namespace Versions = V2::Versions;
+    auto versions = std::make_unique<Versions::PageVersions>();
+    const u64 first = versions->ReaderStamp();
+    REQUIRE(versions->ReaderStamp() == first); // no write since: no clock move
+    versions->Note(0x1000, 4, Versions::Source::Host);
+    REQUIRE_FALSE(versions->Unchanged(0x1000, 4, first)); // a write after a kept stamp is newer
+    const u64 second = versions->ReaderStamp();
+    REQUIRE(second > first);
+    REQUIRE(versions->Unchanged(0x1000, 4, second));
+    versions->Note(0x1000, 4, Versions::Source::Host);
+    REQUIRE_FALSE(versions->Unchanged(0x1000, 4, second));
+    versions->Reset();
+    const u64 third = versions->ReaderStamp();
+    versions->Note(0x2000, 4, Versions::Source::Host);
+    REQUIRE_FALSE(versions->Unchanged(0x2000, 4, third)); // not a stamp from before the reset
+}
+
 TEST_CASE("V2 S0-G19: the back's collect epoch moves where its stream reaches the front's "
           "ordering points",
           "[video_core][v2_cbufwatch]") {

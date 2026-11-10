@@ -163,6 +163,31 @@ std::array<u64, NumSources> PageVersions::TakeCounts() {
     return result;
 }
 
+u64 PageVersions::ReaderStamp() {
+    struct Kept {
+        const PageVersions* owner{};
+        u64 resets{};
+        u64 sequence{};
+        u64 stamp{};
+    };
+    thread_local Kept kept;
+    // A write that raises a version logs it (sequence, seq_cst) after the raise: none logged
+    // since the kept stamp was taken means every write since read a clock past it.
+    const u64 sequence_now = sequence.load(std::memory_order_seq_cst);
+    const u64 resets_now = resets.load(std::memory_order_acquire);
+    if (kept.owner == this && kept.resets == resets_now && kept.sequence == sequence_now) {
+        return kept.stamp;
+    }
+    const u64 stamp = Stamp();
+    kept = Kept{
+        .owner = this,
+        .resets = resets_now,
+        .sequence = sequence.load(std::memory_order_seq_cst),
+        .stamp = stamp,
+    };
+    return stamp;
+}
+
 void PageVersions::Reset() {
     for (size_t i = 0; i < PageSlots; ++i) {
         pages[i].store(0, std::memory_order_relaxed);
@@ -180,6 +205,9 @@ void PageVersions::Reset() {
     }
     all_written.store(0, std::memory_order_relaxed);
     clock.store(1, std::memory_order_release);
+    // Unique across instances too (a reader's kept stamp names its table by address).
+    static std::atomic<u64> all_resets{};
+    resets.store(all_resets.fetch_add(1, std::memory_order_relaxed) + 1, std::memory_order_release);
     for (auto& count : counts) {
         count.store(0, std::memory_order_relaxed);
     }

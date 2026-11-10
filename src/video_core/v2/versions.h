@@ -88,6 +88,10 @@ public:
     [[nodiscard]] u64 Stamp() {
         return clock.fetch_add(1, std::memory_order_acq_rel);
     }
+    /// F2-13: Stamp() for a thread taking one per draw: its last stamp again while no write was
+    /// logged since that stamp was taken (every write after it already reads a later clock), so
+    /// a hit needs no shared read-modify-write.
+    [[nodiscard]] u64 ReaderStamp();
     /// The clock without moving it (stats).
     [[nodiscard]] u64 Now() const {
         return clock.load(std::memory_order_acquire);
@@ -177,6 +181,7 @@ private:
     std::unique_ptr<std::atomic<u64>[]> regions;
     std::array<std::atomic<u64>, NumSources> counts{};
     std::atomic<u64> sequence{0};
+    std::atomic<u64> resets{0}; ///< Changes at every Reset (a reader's kept stamp predates it)
     std::atomic<u64> all_written{0}; ///< Floor writes
     std::unique_ptr<std::atomic<u64>[]> fine;        ///< Short writes, per 64 KiB
     std::unique_ptr<std::atomic<u64>[]> coarse_all;  ///< Every write, per 4 MiB

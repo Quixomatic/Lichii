@@ -1315,7 +1315,8 @@ bool GraphicsPipeline::EncodeDraw(const R::ResolvedDraw& record, const DrawApply
     const R::DrawHeader& h = record.h;
     const bool try_replay = mode == EncodeMode::Replay && recipe != nullptr && memo != nullptr;
     // A write after this stamp is newer than the buffers recorded again below.
-    const u64 buffer_stamp = try_replay ? VideoCommon::V2::Versions::Pages().Stamp() : 0;
+    const u64 buffer_stamp =
+        try_replay ? VideoCommon::V2::Versions::Pages().ReaderStamp() : 0; // F2-13
     bool buffers_replayed = false;
     // 1-2. The channel state as the update passes leave it, then the bind scope they open.
     buffer_cache.SetUniformBuffersState(enabled_uniform_buffer_masks, &uniform_buffer_sizes);

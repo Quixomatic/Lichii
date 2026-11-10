@@ -1411,7 +1411,8 @@ GraphicsPipeline::RecipeResult GraphicsPipeline::ConfigureRecipe(
     }
     // Buffers: replayed from the recipe where it still holds (stamp first: a write after it is
     // newer than a recipe recorded again below).
-    const u64 buffer_stamp = memo != nullptr ? VideoCommon::V2::Versions::Pages().Stamp() : 0;
+    const u64 buffer_stamp =
+        memo != nullptr ? VideoCommon::V2::Versions::Pages().ReaderStamp() : 0;
     bool buffers_replayed = false;
     {
         Profile::Scope scope{Profile::Zone::UpdateBuffers};
