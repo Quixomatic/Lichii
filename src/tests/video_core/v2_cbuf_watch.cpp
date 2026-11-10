@@ -17,6 +17,8 @@
 #include "video_core/v2/cbuf_ring.h"
 #include "video_core/v2/cbuf_watch.h"
 #include "video_core/v2/hazard.h"
+#include "video_core/v2/v2_switches.h"
+#include "video_core/v2/versions.h"
 
 namespace V2 = VideoCommon::V2;
 namespace W = VideoCommon::V2::CbufWatch;
@@ -571,4 +573,21 @@ TEST_CASE("V2 F2-03: the back binds trusted versions without a compare, others o
     REQUIRE(choose(10) == Path::Compared);
     arming.Tick(2, false, counts);
     REQUIRE(counts.Count(page) == 0);
+}
+
+TEST_CASE("V2 F2-03: the collect epoch moves with the ring on and the draw cache off",
+          "[video_core][v2_cbufwatch]") {
+    namespace Versions = V2::Versions;
+    auto& modes = V2::g_modes;
+    const auto saved = modes;
+    modes[static_cast<size_t>(V2::Switch::DrawCache)] = V2::Mode::Off;
+    modes[static_cast<size_t>(V2::Switch::CbufRing)] = V2::Mode::Off;
+    const u64 before = Versions::Epochs().Current();
+    Versions::HookEpoch(Versions::EpochReason::Entry);
+    REQUIRE(Versions::Epochs().Current() == before); // v1: no epochs
+    modes[static_cast<size_t>(V2::Switch::CbufRing)] = V2::Mode::On;
+    Versions::HookEpoch(Versions::EpochReason::Acquire);
+    Versions::HookEpoch(Versions::EpochReason::Submit);
+    REQUIRE(Versions::Epochs().Current() == before + 2);
+    modes = saved;
 }

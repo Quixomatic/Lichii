@@ -724,6 +724,8 @@ void Puller::ProcessFenceActionMethod(DmaPusher& dma_pusher) {
         OnBackBarrier(dma_pusher, VideoCommon::V2::Ir::BarrierOp::ReleaseFences,
                       [rasterizer = dma_pusher.rasterizer] { rasterizer->ReleaseFences(); });
         VideoCommon::GpuSplit::Get().NoteSync();
+        // A syncpoint wait orders the guest's CPU writes before it, as a semaphore acquire.
+        VideoCommon::V2::Versions::HookEpoch(VideoCommon::V2::Versions::EpochReason::Acquire);
         break;
     case Puller::FenceOperation::Increment:
         if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {

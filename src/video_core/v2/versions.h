@@ -364,8 +364,9 @@ inline void HookCpuWrite(DAddr address, u64 size) {
         Pages().NoteCpuWrite(address, size);
     }
 }
+/// Also with EDEN_NX2_V2_CBUFRING: F2-03's compare memo keys on the collect epoch.
 inline void HookEpoch(EpochReason reason) {
-    if (Active()) [[unlikely]] {
+    if (Active() || On(Switch::CbufRing)) [[unlikely]] {
         Epochs().Advance(reason);
     }
 }
