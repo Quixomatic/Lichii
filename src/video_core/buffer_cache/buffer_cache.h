@@ -1519,6 +1519,22 @@ void BufferCache<P>::ReplayHostStageBuffers(size_t stage,
                     return;
                 }
             }
+            if (path == DC::BufferBind::Kind::Version &&
+                VideoCommon::V2::On(VideoCommon::V2::Switch::CbufRing)) [[unlikely]] {
+                // S0-04: BindHostGraphicsUniformBuffer's fast path up to its ring bind (the kind
+                // ruled out the root and native banks and the cached path): a ring version
+                // survives ticks, where the kept stream version above holds within one only.
+                Buffer& buffer = slot_buffers[binding.buffer_id];
+                TouchBuffer(buffer, binding.buffer_id);
+                channel_state->fast_bound_uniform_buffers[stage] |= 1u << index;
+                channel_state->uniform_buffer_binding_sizes[stage][index] = size;
+                if (BindRingVersion(stage, index, binding.device_addr, size)) {
+                    ++replay_binds_replayed;
+                    return;
+                }
+                // The bind below tries the CBUFVER and stream paths, not the ring again.
+                v2_ring_missed = true;
+            }
             if (kept != nullptr && kept->kind == DC::BufferBind::Kind::Cached &&
                 path == DC::BufferBind::Kind::Cached && replayable(kept, binding, size)) {
                 Buffer& buffer = slot_buffers[binding.buffer_id];
@@ -1532,6 +1548,7 @@ void BufferCache<P>::ReplayHostStageBuffers(size_t stage,
             }
             ++replay_binds_synced;
             BindHostGraphicsUniformBuffer(stage, index, 0, true);
+            v2_ring_missed = false;
         });
         // Storage buffers (BindHostGraphicsStorageBuffers).
         if (channel_state->enabled_storage_buffers[stage] != 0) {
@@ -2943,7 +2960,9 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
         bool streamed = false;
         if constexpr (!IS_OPENGL && VideoCommon::StreamUniformReusable<Runtime>) {
             if (VideoCommon::V2::On(VideoCommon::V2::Switch::CbufRing)) [[unlikely]] {
-                if (BindRingVersion(stage, index, device_addr, size)) {
+                // A replay that just missed the ring for this binding asks no second time.
+                if (!std::exchange(v2_ring_missed, false) &&
+                    BindRingVersion(stage, index, device_addr, size)) {
                     return;
                 }
             }

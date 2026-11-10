@@ -1015,6 +1015,19 @@ TEST_CASE("Draw cache buffer replay binds a uniform on the path its bind takes n
     REQUIRE(f.runtime.uniform_binds == 0);
     REQUIRE(f.cache->TakeReplayCounts() == std::pair<u32, u32>{0, 1});
 
+    // S0-04 with CBUFRING: the replay asks the ring first; on a miss (no ring here) the binding
+    // is bound once through the stream path, as without the ring.
+    {
+        V2::g_modes[static_cast<size_t>(V2::Switch::CbufRing)] = V2::Mode::On;
+        const u32 copies = f.runtime.stream_copies;
+        const u32 rebinds = f.runtime.stream_rebinds;
+        f.cache->ReplayHostStageBuffers(0, recipe, memo);
+        REQUIRE(f.runtime.uniform_binds == 0);
+        REQUIRE(f.runtime.stream_copies + f.runtime.stream_rebinds == copies + rebinds + 1);
+        REQUIRE(f.cache->TakeReplayCounts() == std::pair<u32, u32>{0, 1});
+        V2::g_modes[static_cast<size_t>(V2::Switch::CbufRing)] = V2::Mode::Off;
+    }
+
     // GPU-modified: the host buffer, from the recipe.
     Access::Dirty(*f.cache, 0x20000, 0x100);
     REQUIRE(f.cache->UniformBindKind(0, 0, binding) == Kind::Cached);

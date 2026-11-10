@@ -1101,6 +1101,9 @@ private:
     Common::ScratchBuffer<u8> tmp_buffer;
     std::vector<u8> verify_scratch; ///< EDEN_NX2_V2_CBUFVER=verify
     std::vector<u8> version_scratch; ///< EDEN_NX2_V2_CBUFVER: guest bytes of a bind
+    /// EDEN_NX2_V2_CBUFRING: ReplayHostStageBuffers missed the ring for the binding it now hands
+    /// to BindHostGraphicsUniformBuffer, which then skips its own ring lookup.
+    bool v2_ring_missed = false;
 
     /// A command list page (Nx2CopyListPages): the GPU writes noted to it and the last copy.
     using Nx2Staging = decltype(std::declval<Runtime&>().DownloadStagingBuffer(size_t{}, true));
