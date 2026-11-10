@@ -259,7 +259,13 @@ struct Table3D {
 struct HashLog3D {
     static constexpr u32 Capacity = 256;
 
-    /// `regs[index]` (already stored) changed from `old_value`.
+    /// `regs[index]` (already stored) changed from `old_value`. Inlined into every changed
+    /// write (Fix F3d: MSVC kept it out of line).
+#if defined(_MSC_VER) && !defined(__clang__)
+    __forceinline
+#else
+    inline __attribute__((always_inline))
+#endif
     void Change(GroupTracker& tracker, const Table3D& table, u32 index, u32 old_value,
                 const u32* regs) {
         const u32 bit = GroupBit(table.groups[index]);

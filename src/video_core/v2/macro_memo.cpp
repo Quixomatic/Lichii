@@ -36,6 +36,18 @@ Memo::StartInfo& Memo::Info(u32 start) {
     return starts[start % starts.size()];
 }
 
+u32 Memo::StaticLength(std::span<const u32> code, u32 start) {
+    constexpr u32 MaxInstructions = 4096;
+    bool end_next = false;
+    for (u32 pc = start; pc < start + MaxInstructions && size_t{pc} * 3 + 2 < code.size(); ++pc) {
+        if (end_next) {
+            return pc - start + 1;
+        }
+        end_next = (code[size_t{pc} * 3 + 2] & 1) != 0;
+    }
+    return 0;
+}
+
 bool Memo::MayUseDataRam(std::span<const u32> code, u32 start) {
     // The instructions from `start` through the one after the first end bit (as Identify),
     // with every branch and loop target inside them; else the code it reaches is unknown.
@@ -82,7 +94,10 @@ bool Memo::MayUseDataRam(std::span<const u32> code, u32 start) {
 bool Memo::Wanted(u32 start, std::span<const u32> code) {
     StartInfo& info = Info(start);
     if (info.start != start) [[unlikely]] {
-        info = StartInfo{.start = start, .jit_recordable = !MayUseDataRam(code, start)};
+        const u32 length = StaticLength(code, start);
+        info = StartInfo{.start = start,
+                         .instructions = length != 0 ? length : 64,
+                         .jit_recordable = !MayUseDataRam(code, start)};
     }
     if (info.never) {
         return false;
@@ -101,32 +116,63 @@ size_t Memo::RecordWords(const u32* header) {
            size_t{2} * (header[4] + header[5] + header[6] + header[7]) + header[8];
 }
 
-bool Memo::Match(u32 offset, u32 start, std::span<const u32> parameters, const u32* regs,
-                 size_t num_regs, std::span<const u32> dram, Record& record,
-                 u32 stale_register) const {
-    const u32* const header = arena.data() + offset;
-    if (header[0] != start || header[1] != parameters.size() ||
+bool Memo::Match(u32 offset, const CallInfo& call, Record& record) {
+    const std::span<const u32> parameters = *call.fifo;
+    u32* const header = arena.data() + offset;
+    if (header[0] != call.start || header[1] != parameters.size() ||
         !std::equal(parameters.begin(), parameters.end(), header + HeaderWords)) {
         return false;
     }
     const u32* it = header + HeaderWords + header[1];
     // Each register the call read, once (Store kept those below num_regs: the rest read 0).
     const u32* const guards_end = it + size_t{2} * header[2];
-    for (const u32* guard = it; guard != guards_end; guard += 2) {
-        if (regs[guard[0]] != guard[1] || guard[0] == stale_register) {
+    const auto guards_hold = [&] {
+        for (const u32* guard = it; guard != guards_end; guard += 2) {
+            if (call.regs[guard[0]] != guard[1] || guard[0] == call.stale_register) {
+                return false;
+            }
+        }
+        return true;
+    };
+    // Fix F3d: guards that held at a tick hold while none of their blocks changed after it
+    // (a stale register's block always takes the compare: its copy may not be the value).
+    const u64 guard_mask = Get64(header + GuardMask);
+    const bool fingerprint =
+        call.clock != nullptr && header[2] != 0 &&
+        (call.stale_register == ~0U ||
+         (guard_mask & ChangeClock::Block(call.stale_register)) == 0) &&
+        call.clock->Unchanged(guard_mask, Get64(header + GuardTick));
+    if (fingerprint) {
+        ++statistics.fingerprint_hits;
+        if (call.verify && !guards_hold()) [[unlikely]] {
+            for (const u32* guard = it; guard != guards_end; guard += 2) {
+                if (call.regs[guard[0]] != guard[1]) {
+                    Detail::LogFastPathMismatch(call.start, "register fingerprint", guard[0],
+                                                guard[1], call.regs[guard[0]]);
+                    break;
+                }
+            }
+            ++statistics.verify_mismatches;
             return false;
         }
+    } else if (!guards_hold()) {
+        return false;
     }
     it = guards_end;
     if (header[4] != 0) [[unlikely]] {
         const u32* const dram_reads = it + size_t{3} * header[3];
         for (size_t i = 0; i < size_t{2} * header[4]; i += 2) {
             const u32 index = dram_reads[i];
-            if (index >= dram.size() || dram[index] != dram_reads[i + 1]) {
+            if (index >= call.dram.size() || call.dram[index] != dram_reads[i + 1]) {
                 return false;
             }
         }
     }
+    if (call.clock != nullptr && !fingerprint) {
+        Set64(header + GuardTick, call.clock->Now()); // compared just now
+    }
+    record.offset = offset;
+    record.info = header[InfoWord];
     record.guards = {header + HeaderWords + header[1], size_t{2} * header[2]};
     record.reads = {it, size_t{3} * header[3]};
     it += record.reads.size();
@@ -142,13 +188,10 @@ bool Memo::Match(u32 offset, u32 start, std::span<const u32> parameters, const u
     return true;
 }
 
-bool Memo::Find(u64 key, u32 start, std::span<const u32> parameters, const u32* regs,
-                size_t num_regs, std::span<const u32> dram, Record& record,
-                u32 stale_register) {
-    StartInfo& info = Info(start);
+bool Memo::Find(u64 key, const CallInfo& call, Record& record) {
+    StartInfo& info = Info(call.start);
     // Many calls repeat the macro's previous call: try its record before the table.
-    if (info.last != NoRecord &&
-        Match(info.last, start, parameters, regs, num_regs, dram, record, stale_register)) {
+    if (info.last != NoRecord && Match(info.last, call, record)) {
         ++statistics.slot_hits;
         return true;
     }
@@ -159,9 +202,7 @@ bool Memo::Find(u64 key, u32 start, std::span<const u32> parameters, const u32* 
             continue;
         }
         keyed = true;
-        if (set[way].offset != info.last &&
-            Match(set[way].offset, start, parameters, regs, num_regs, dram, record,
-                  stale_register)) {
+        if (set[way].offset != info.last && Match(set[way].offset, call, record)) {
             info.last = set[way].offset;
             if (way != 0) {
                 std::swap(set[0], set[1]); // way 0: the most recently used
@@ -173,9 +214,11 @@ bool Memo::Find(u64 key, u32 start, std::span<const u32> parameters, const u32* 
     return false;
 }
 
-void Memo::Store(u64 key, u32 start, std::span<const u32> parameters, const Trace& recorded,
-                 std::span<const std::pair<u32, u32>> dram_reads,
-                 std::span<const std::pair<u32, u32>> dram_writes, size_t num_regs) {
+void Memo::Store(u64 key, const CallInfo& call, std::span<const u32> parameters,
+                 const Trace& recorded, std::span<const std::pair<u32, u32>> dram_reads,
+                 std::span<const std::pair<u32, u32>> dram_writes, bool fresh) {
+    const u32 start = call.start;
+    const size_t num_regs = call.num_regs;
     ++statistics.stores;
     // Guards: each register read before any write of the call, once (a read after its own
     // write made the call unmemoisable), within the register file (the rest read as 0).
@@ -189,6 +232,44 @@ void Memo::Store(u64 key, u32 start, std::span<const u32> parameters, const Trac
     }
     // The full read trace only serves an interpreter finish after a refetched DMA read.
     const size_t reads = recorded.dma.empty() ? 0 : recorded.reads.size();
+    // Fix F3d: the blocks the guards and the state writes live in, and what a replay of the
+    // writes can do to them (Idempotent: after any replay each state register holds the one
+    // value the record writes to it; GuardsKeep: no write changes a register the call read).
+    u64 guard_mask = 0;
+    u64 write_mask = 0;
+    u32 info = 0;
+    if (call.clock != nullptr && call.flags != nullptr) {
+        const auto is_side_effect = [&](u32 address) {
+            return std::ranges::find(call.side_effects, address) != call.side_effects.end();
+        };
+        bool idempotent = recorded.dma.empty();
+        bool guards_keep = true;
+        for (const auto& guard : guard_scratch) {
+            guard_mask |= ChangeClock::Block(guard.first);
+            guards_keep = guards_keep && !is_side_effect(guard.first);
+        }
+        for (size_t i = 0; i < recorded.writes.size(); ++i) {
+            const auto [method, value] = recorded.writes[i];
+            guards_keep = guards_keep &&
+                          std::ranges::find(guard_scratch, method, &std::pair<u32, u32>::first) ==
+                              guard_scratch.end();
+            const u16 flags = call.flags[method];
+            if ((flags & call.barrier_mask) != 0) {
+                idempotent = false;
+            }
+            if ((flags & call.exec_mask) != 0 || !idempotent) {
+                continue;
+            }
+            write_mask |= ChangeClock::Block(method);
+            if (is_side_effect(method)) {
+                idempotent = false;
+            }
+            for (size_t j = 0; j < i && idempotent; ++j) {
+                idempotent = recorded.writes[j].first != method || recorded.writes[j].second == value;
+            }
+        }
+        info = (idempotent ? Idempotent : 0) | (guards_keep ? GuardsKeep : 0);
+    }
     const std::array<u32, HeaderWords> header{
         start,
         static_cast<u32>(parameters.size()),
@@ -199,6 +280,16 @@ void Memo::Store(u64 key, u32 start, std::span<const u32> parameters, const Trac
         static_cast<u32>(recorded.writes.size()),
         static_cast<u32>(recorded.dma.size()),
         static_cast<u32>(recorded.dma_words.size()),
+        static_cast<u32>(guard_mask),
+        static_cast<u32>(guard_mask >> 32),
+        0, // guard tick (NoteApplied, below)
+        0,
+        static_cast<u32>(write_mask),
+        static_cast<u32>(write_mask >> 32),
+        0, // write tick
+        0,
+        info,
+        NoContext,
     };
     const size_t words = RecordWords(header.data());
     // The least recently used way takes it (way 0 is the most recently used): a key whose
@@ -250,42 +341,79 @@ void Memo::Store(u64 key, u32 start, std::span<const u32> parameters, const Trac
         *out++ = dma.words;
     }
     std::copy(recorded.dma_words.begin(), recorded.dma_words.end(), out);
-    StartInfo& info = Info(start);
-    if (info.start == start) {
-        info.last = offset;
+    StartInfo& start_info = Info(start);
+    if (start_info.start == start) {
+        start_info.last = offset;
+    }
+    if (fresh && call.clock != nullptr) {
+        // The recording ran the call's writes: they and (GuardsKeep) its reads hold now.
+        Record record{};
+        record.offset = offset;
+        record.info = info;
+        NoteApplied(record, call);
     }
 }
 
-void Memo::NoteOutcome(u32 start, bool hit, bool stored) {
+bool Memo::NoopReplay(const Record& record, const CallInfo& call) const {
+    if (call.clock == nullptr || call.context == NoContext || (record.info & Idempotent) == 0) {
+        return false;
+    }
+    const u32* const header = arena.data() + record.offset;
+    return header[ContextWord] == call.context &&
+           call.clock->Unchanged(Get64(header + WriteMask), Get64(header + WriteTick));
+}
+
+void Memo::NoteApplied(const Record& record, const CallInfo& call) {
+    if (call.clock == nullptr) {
+        return;
+    }
+    u32* const header = arena.data() + record.offset;
+    const u64 now = call.clock->Now();
+    if ((record.info & GuardsKeep) != 0) {
+        Set64(header + GuardTick, now);
+    }
+    if ((record.info & Idempotent) != 0) {
+        // Under another context (or none) the writes don't leave their values: no tick.
+        Set64(header + WriteTick, call.context != NoContext ? now : 0);
+        header[ContextWord] = call.context;
+    }
+}
+
+void Memo::NoteOutcome(u32 start, Outcome outcome, u32 skipped, bool interpreter) {
     StartInfo& info = Info(start);
     if (info.start != start) {
         return; // Wanted sets it up first
     }
     ++info.calls;
-    if (hit) {
-        ++info.hits;
+    if (outcome == Outcome::Hit) {
         ++info.lifetime_hits;
         info.unstored = 0;
+        // A hit saves the JIT run and, as a no-op replay, the writes it left out.
+        info.saved_ns += JitBaseNs + JitInstructionNs * info.instructions +
+                         SkippedWriteNs * skipped - HitNs;
     } else {
-        info.unstored = stored ? 0 : info.unstored + 1;
+        info.unstored = outcome == Outcome::Recorded ? 0 : info.unstored + 1;
         // Calls that can't be stored never pay for their recordings.
         if (info.unstored >= 16 && info.lifetime_hits == 0) {
             info.never = true;
             return;
         }
+        // A miss or guard failure costs the lookup and a recording (the JIT with callbacks, or
+        // the interpreter) on top of the run.
+        info.saved_ns -= HitNs + (interpreter ? InterpreterRecordingNs : JitRecordingNs);
     }
     if (info.calls < Window) {
         return;
     }
-    // A hit saves a JIT run; a miss or guard failure costs a recording (a JIT run with callbacks,
-    // or the interpreter for code that may touch data RAM) and a store. Below the break-even
-    // hit rate the macro runs on the JIT for a while, then the memo tries again.
-    const u64 needed = info.jit_recordable ? Window * 3 / 5 : Window * 17 / 20;
-    if (info.hits < needed) {
+    // Fix F3d (F3d breakdown: the hit-rate break-even let 1 ms/f of recordings through): by
+    // estimated cost, not hit rate. A macro whose calls cost more through the memo than on
+    // the JIT runs on the JIT for a while, then the memo tries again.
+    if (info.saved_ns < 0) {
         info.bypass_left = BypassCalls;
+        ++statistics.cost_bypasses;
     }
     info.calls = 0;
-    info.hits = 0;
+    info.saved_ns = 0;
 }
 
 size_t Memo::Size() const {
@@ -346,6 +474,17 @@ void LogVerifyMismatch(u32 start, std::span<const u32> record_writes,
 void LogRecordFailure(u32 start, std::string_view error) {
     LOG_ERROR(HW_GPU, "Native MME (split front, memo recording) failed: start={:#x}, error={}",
               start, error);
+}
+
+void LogFastPathMismatch(u32 start, const char* what, u32 address, u32 expected, u32 found) {
+    static std::atomic<u32> logged{};
+    if (logged.fetch_add(1) >= 32) {
+        return;
+    }
+    LOG_WARNING(HW_GPU,
+                "V2 macro memo verify: start {:#x}: the {} takes register {:#x} as {:#x}, it "
+                "holds {:#x}",
+                start, what, address, expected, found);
 }
 
 } // namespace Detail
@@ -436,7 +575,8 @@ void CallStats::Report(const char* engine, const Statistics* memo, double second
             " | memo: hits {:.0f} ({:.1f}% of calls, {:.0f} on the last record), misses {:.0f}, "
             "guard failures {:.0f}, unmemoisable {:.0f}, JIT only {:.0f}, DMA refetches {:.0f}, "
             "stores {:.0f}, JIT recordings {:.0f}, verified {:.0f} ({:.0f} mismatches), "
-            "clears {:.0f}",
+            "clears {:.0f}, fingerprint hits {:.0f}, no-op hits {:.0f} ({:.0f} writes left "
+            "out), cost bypasses {:.0f}",
             delta(&Statistics::hits),
             percent(memo->hits - memo_start.hits, memo->calls - memo_start.calls),
             delta(&Statistics::slot_hits), delta(&Statistics::misses),
@@ -444,7 +584,9 @@ void CallStats::Report(const char* engine, const Statistics* memo, double second
             delta(&Statistics::bypassed), delta(&Statistics::refetches),
             delta(&Statistics::stores), delta(&Statistics::jit_records),
             delta(&Statistics::verified),
-            delta(&Statistics::verify_mismatches), delta(&Statistics::clears));
+            delta(&Statistics::verify_mismatches), delta(&Statistics::clears),
+            delta(&Statistics::fingerprint_hits), delta(&Statistics::noop_hits),
+            delta(&Statistics::skipped_writes), delta(&Statistics::cost_bypasses));
     }
     text += " | top:";
     for (size_t i = 0; i < std::min<size_t>(top.size(), 10); ++i) {

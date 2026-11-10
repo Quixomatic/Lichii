@@ -1716,6 +1716,10 @@ struct Maxwell3D::FrontState {
     std::unique_ptr<VideoCommon::V2::CbufRing::Decode> v2_cbuf_ring;
     /// Register blocks of 64 changed since the last P6 snapshot (all after a copy or resync).
     u64 v2_dirty_blocks{~u64{0}};
+    /// Fix F3d: when each block of these registers (or their shadow copies) last changed, for
+    /// the macro memo's fingerprint and no-op replays. Kept by the table path (Store3D);
+    /// anything else that sets registers invalidates it. Read only under S1 (s1_exec).
+    VideoCommon::V2::ChangeClock v2_change_clock;
     std::unique_ptr<VideoCommon::V2::RegSem::Front3D> v2;
     /// EDEN_NX2_V2_REGSEM=1 (v2 non-null and On): FrontWrite's table-driven fast path.
     bool v2_on{};
@@ -1735,6 +1739,8 @@ struct Maxwell3D::FrontState {
     /// S1Hook* bits per register: what FrontS1Hooks does after a write (none: no call). Only the
     /// registers with write notes or stats have any; the profile counts below need none.
     std::array<u8, Regs::NUM_REGS> s1_hooks{};
+    /// S1 with write tracking: the sink notes each constant buffer word's range (Fix F3d).
+    bool s1_note_cb{};
     /// Nx2Profile write counters, counted here (no thread-local access per write) and added to
     /// the profile at each draw.
     u64 s1_writes{};
@@ -1890,7 +1896,10 @@ Maxwell3D::FrontState& Maxwell3D::Front(Core::System& system, VideoCommon::GpuSp
                     front->s1_touch[method] =
                         dirty.tables[0][method] != 0 || dirty.tables[1][method] != 0;
                     u8 hooks = 0;
-                    if (split.TracksWrites() && front->v2_note_writes[method]) {
+                    // CB data words are noted by the S1 sink's Cbuf (F3d).
+                    const bool cb_data = (table.flags[method] & VideoCommon::V2::RegSem::CbData) != 0;
+                    if (split.TracksWrites() && front->v2_note_writes[method] &&
+                        !(front->s1_exec && cb_data)) {
                         hooks |= S1HookNotes;
                     }
                     if (stats && (table.flags[method] & VideoCommon::V2::RegSem::ReportSemaphore)) {
@@ -1898,6 +1907,7 @@ Maxwell3D::FrontState& Maxwell3D::Front(Core::System& system, VideoCommon::GpuSp
                     }
                     front->s1_hooks[method] = hooks;
                 }
+                front->s1_note_cb = front->s1_exec && split.TracksWrites();
             }
             if (front->s1_exec && split.TracksWrites() &&
                 VideoCommon::V2::On(VideoCommon::V2::Switch::CbufRing) &&
@@ -2023,7 +2033,15 @@ struct Maxwell3D::S1Sink {
     void Cbuf(bool store, u32 method, u64 buffer, u32 offset, u32 word) {
         split.S1Cbuf(engine, store, method - MAXWELL3D_REG_INDEX(const_buffer.buffer), buffer,
                      offset, word);
-        if (fs != nullptr && fs->v2_cbuf_ring) [[unlikely]] {
+        if (fs == nullptr) {
+            return; // S1Check's copy: notes nothing
+        }
+        if (fs->s1_note_cb) {
+            // Fix F3d (Fix F1's design: CB data ranges per Cbuf entry, not per word through
+            // FrontS1Hooks -> FrontNoteWrites): the split coalesces the words of an entry.
+            split.NoteCbWrite(engine->memory_manager, buffer + offset, sizeof(u32));
+        }
+        if (fs->v2_cbuf_ring) [[unlikely]] {
             engine->FrontCbufVersion(split, *fs, buffer, offset, &word, 1);
         }
     }
@@ -2380,6 +2398,7 @@ void Maxwell3D::FrontRegSemResync(FrontState& fs) {
     // The front's registers were set without the write path (copied, or resynchronized with
     // the back by EDEN_NX2_SPLIT_VERIFY).
     fs.v2_dirty_blocks = ~u64{0};
+    fs.v2_change_clock.Invalidate();
     for (size_t stage = 0; stage < VideoCommon::V2::Resolve::CbufStages; ++stage) {
         for (size_t slot = 0; slot < VideoCommon::V2::Resolve::CbufSlots; ++slot) {
             const auto& cbuf = state.shader_stages[stage].const_buffers[slot];
@@ -2729,7 +2748,10 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
         VideoCommon::V2::Resolve::MultiFront::EventKind::MacroCall, method);
     auto& engine = GetNativeMacroEngine();
     const auto positions = GetNativeMacroPositions();
-    const u32 start = positions[((method - MacroRegistersStart) >> 1) % positions.size()];
+    // Fix F3d: both position tables hold 0x80 entries: a mask, not a division per call.
+    static_assert(sizeof(macro_positions) / sizeof(u32) == 0x80 &&
+                  sizeof(Tegra::NativeMacroContext::positions) / sizeof(u32) == 0x80);
+    const u32 start = positions[((method - MacroRegistersStart) >> 1) & 0x7f];
     VideoCommon::Nx2Profile::CountMethod(method, false);
     namespace MacroHle = VideoCommon::V2::MacroHle;
     const bool dump = VideoCommon::V2::On(VideoCommon::V2::Switch::MacroDump);
@@ -2845,19 +2867,11 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
             if (fs.v2_observation && fs.v2_observation->writes.size() < 64) [[unlikely]] {
                 fs.v2_observation->writes.emplace_back(address, value);
             }
-            // F3c: over half the macros' writes change nothing (a state write of the value the
-            // register and its shadow copy hold). Under S1 those are dropped here, as
-            // FrontWriteS1 would drop them after its bookkeeping: only the executable ones
-            // and the changes go through it.
-            if (fs.s1_exec && fs.skip_same && fs.regs[address] == value &&
-                (fs.v2_table->flags[address] & VideoCommon::V2::RegSem::Exec) == 0 &&
-                (fs.control == Regs::ShadowRamControl::Passthrough ||
-                 ((fs.control == Regs::ShadowRamControl::Track ||
-                   fs.control == Regs::ShadowRamControl::TrackWithFilter) &&
-                  fs.shadow[address] == value)) &&
-                !fs.v2_draw_model.HasDeferredDraw()) [[likely]] {
-                ++fs.s1_writes;
-                ++fs.s1_same_writes;
+            // Fix F3d (F3c's test was a second compare in front of Write3D's): under S1 the
+            // write path is inlined here and Write3D's compare-on-write drops a write that
+            // changes nothing, once. No-op memo hits skip those writes before this.
+            if (fs.s1_exec) [[likely]] {
+                FrontWriteS1(split, fs, address, value, true, true);
                 return true;
             }
             FrontWrite(split, fs, address, value, true, true);
@@ -2881,16 +2895,19 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
             }
             return true;
         };
-        const auto live = [&](auto& live_read, auto& live_emit) {
+        // `dram_hooks`: the memo's JIT recordings of code that touches data RAM (F3d).
+        const auto live = [&](auto& live_read, auto& live_emit, auto&... dram_hooks) {
 #ifdef ARCHITECTURE_x86_64
             if (!engine.native_jit) {
                 engine.native_jit = std::make_shared<TuringMacroJit>();
             }
-            engine.native_jit->Prepare(engine.native_code, engine.native_code_generation);
+            engine.native_jit->Prepare(engine.native_code, engine.native_code_generation,
+                                       sizeof...(dram_hooks) != 0);
             return engine.native_jit->Execute(start, fs.parameters,
                                               std::span<u32>{native_data_ram}, live_read,
-                                              live_emit);
+                                              live_emit, dram_hooks...);
 #else
+            ((void)dram_hooks, ...); // jit_data_ram is off: never called with them
             return engine.native_interpreter.Execute(engine.native_code, start, fs.parameters,
                                                      live_read, live_emit);
 #endif
@@ -2928,9 +2945,36 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
                                       ? RenderEnableMode
                                       : ~0U,
                 .key = call_key,
+                // Fix F3d: the table path keeps the change clock (S1 only); a no-op replay
+                // needs Write3D to drop same-value writes (skip_same, not under Replay) and
+                // every write seen when the HLE checks or the dump observe them.
+                .clock = fs.s1_exec ? &fs.v2_change_clock : nullptr,
+                .flags = fs.v2_table->flags.data(),
+                .exec_mask = VideoCommon::V2::RegSem::Exec,
+                .barrier_mask = VideoCommon::V2::RegSem::ShadowControl,
+                .context = fs.s1_exec && fs.skip_same && !fs.v2_observation &&
+                                   fs.control != Regs::ShadowRamControl::Replay
+                               ? static_cast<u32>(fs.control)
+                               : MacroMemo::NoContext,
+                .writes_skippable =
+                    [](const void* model) {
+                        return !static_cast<const VideoCommon::V2::DrawModel*>(model)
+                                    ->HasDeferredDraw();
+                    },
+                .skippable_arg = &fs.v2_draw_model,
+                .shadow = fs.control == Regs::ShadowRamControl::Track ||
+                                  fs.control == Regs::ShadowRamControl::TrackWithFilter
+                              ? fs.shadow.data()
+                              : nullptr,
+#ifdef ARCHITECTURE_x86_64
+                .jit_data_ram = true,
+#endif
             };
             result = MacroMemo::Call(*fs.v2_memo, engine.native_interpreter, call, live, read,
                                      write, dma);
+            // The writes a no-op hit left out, counted as FrontWriteS1 counts dropped ones.
+            fs.s1_writes += fs.v2_memo->last_skipped;
+            fs.s1_same_writes += fs.v2_memo->last_skipped;
         } else {
             result = live(read, emit);
         }
@@ -3324,6 +3368,7 @@ void Maxwell3D::FrontHleRenderEnable(Core::System& system, VideoCommon::GpuSplit
     fs.v2_render_enable_unknown = true;
     if (tracked) {
         fs.shadow[RenderEnableMode] = ShadowUnknown;
+        fs.v2_change_clock.Change(RenderEnableMode);
     }
     const VideoCommon::V2::Ir::ReadbackBody body{
         .op = VideoCommon::V2::Ir::ReadbackOp::MacroRenderEnable,
@@ -3401,6 +3446,7 @@ void Maxwell3D::FrontSyncRenderEnable(VideoCommon::GpuSplit& split, FrontState& 
         VideoCommon::V2::RegSem::Store3D(fs, *fs.v2_table, RenderEnableMode, value);
     } else {
         fs.regs[RenderEnableMode] = value;
+        fs.v2_change_clock.Change(RenderEnableMode);
         if (fs.v2 != nullptr) {
             FrontRegSemResync(fs); // REGSEM=verify: the mirror and groups follow
         }
@@ -3785,6 +3831,7 @@ void Maxwell3D::FrontVerify(VideoCommon::GpuSplit& split, FrontState& fs) {
             fs.regs[i] = expected[i];
         }
     }
+    fs.v2_change_clock.Invalidate(); // set outside the write path
     fs.v2_render_enable_unknown = false; // The back's value, just taken
     if (fs.s1_exec) {
         // S1: the shadow RAM lives on the front only (the back never sees the method words).

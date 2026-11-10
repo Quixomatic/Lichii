@@ -23,6 +23,13 @@
 #include "video_core/v2/landing.h"
 #include "video_core/v2/v2_switches.h"
 
+// Fix F3d: the per-write S1 ring appends, which MSVC kept out of line (F3d breakdown).
+#if defined(_MSC_VER) && !defined(__clang__)
+#define GPU_SPLIT_INLINE __forceinline
+#else
+#define GPU_SPLIT_INLINE inline __attribute__((always_inline))
+#endif
+
 namespace Core {
 class System;
 }
@@ -151,7 +158,7 @@ public:
     }
     /// Front, S1: room for `words` of classified entries for `engine` in the open StateRun (a
     /// Classified one with S1Exec), opening one when needed. Fill them, then S1Commit(words).
-    u64* S1Begin(Tegra::Engines::EngineInterface* engine, size_t words) {
+    GPU_SPLIT_INLINE u64* S1Begin(Tegra::Engines::EngineInterface* engine, size_t words) {
         s1_cbuf = nullptr;
         // The open classified run's reserved words (S1Reserve): a pointer bump.
         if (engine == front_engine && static_cast<size_t>(s1_limit - s1_cursor) >= words)
@@ -163,7 +170,7 @@ public:
         }
         return S1BeginSlow(engine, words);
     }
-    void S1Commit(size_t words) {
+    GPU_SPLIT_INLINE void S1Commit(size_t words) {
         if (s1_open_words != 0) [[unlikely]] {
             const size_t header = std::exchange(s1_open_words, size_t{0});
             Commit(header);
@@ -185,7 +192,7 @@ public:
         }
     }
     /// Front, S1: a one-word entry (Delta, Exec).
-    void S1Word(Tegra::Engines::EngineInterface* engine, u64 word) {
+    GPU_SPLIT_INLINE void S1Word(Tegra::Engines::EngineInterface* engine, u64 word) {
         u64* const entry = S1Begin(engine, 1);
         entry[0] = word;
         S1Commit(1);
@@ -364,6 +371,13 @@ public:
         }
         unlanded.NoteKnown(device_address, bytes, size, ticket, V2::Producer::Release);
         RememberRelease(device_address, bytes, size, ticket, true);
+    }
+    /// Front (Fix F3d, F3-X1): a QMD release's payload the front's QMD model read. The release
+    /// lands at its dispatch's fence without a landing ticket (Landing::Untracked), so it is
+    /// only remembered for the suspended-acquire poll and its resume line (no hazard entry: its
+    /// range note stays the one FindWrites orders against).
+    void RememberQmdRelease(u64 device_address, u32 payload) {
+        RememberRelease(device_address, &payload, sizeof(payload), write_position, false);
     }
     /// Front (F3-X1 diagnostics): the newest release of known bytes noted to the word at
     /// `device_address` among the last RecentReleases notes.

@@ -1737,6 +1737,8 @@ struct KeplerCompute::FrontState {
         bool unbounded{}; ///< a launched QMD writes where the front can't bound it
         std::vector<std::pair<GPUVAddr, u64>> writes;   ///< storage buffer ranges
         std::vector<std::pair<GPUVAddr, u64>> releases; ///< release words
+        /// Payload releases (not a reduction or max) and their payloads (Fix F3d, F3-X1).
+        std::vector<std::pair<GPUVAddr, u32>> payloads;
     };
     std::deque<QmdSignal> qmd_signals; ///< this write's signals, consumed by the notes
     /// S1 single owner (GpuSplit::S1Exec, REGSEM=1, the native class): classified entries
@@ -1745,7 +1747,18 @@ struct KeplerCompute::FrontState {
     /// EDEN_NX2_V2_MACROMEMO: replayed macro calls; EDEN_NX2_V2_STATS: calls per macro (F5).
     std::unique_ptr<VideoCommon::V2::MacroMemo::Memo> v2_memo;
     std::unique_ptr<VideoCommon::V2::MacroMemo::CallStats> v2_call_stats;
+    /// Fix F3d: what a macro write needs besides the store, per register (WriteHook bits): the
+    /// QMD model and the hazard notes act on launch, signal, upload and release methods only
+    /// (MASTER_PLAN §5.2: one record per dispatch), so other writes make no call. Built for
+    /// `hooks_native` (MayWriteMemory depends on the class mode).
+    std::array<u8, 0xe00> write_hooks{};
+    s8 hooks_native{-1};
 };
+
+namespace {
+constexpr u8 WriteHookQmd = 1;   ///< FrontModelQmd
+constexpr u8 WriteHookNotes = 2; ///< FrontNoteWrites
+} // Anonymous namespace
 
 KeplerCompute::FrontState& KeplerCompute::Front(VideoCommon::GpuSplit& split) {
     if (!front) [[unlikely]] {
@@ -2161,6 +2174,13 @@ void KeplerCompute::FrontNoteWrites(VideoCommon::GpuSplit& split, FrontState& fs
                     VideoCommon::V2::NoteRangeWriteGpu(split, memory_manager, address, size,
                                                        Producer::QmdRelease);
                 }
+                // F3-X1 (971d resume lines: the satisfying release was in no front note): the
+                // payload releases' values, for the poll's deferral and its resume line.
+                for (const auto& [address, payload] : signal.payloads) {
+                    if (const auto device = memory_manager.GpuToCpuAddress(address)) {
+                        split.RememberQmdRelease(*device, payload);
+                    }
+                }
                 VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::QmdBoundedWrites,
                                                signal.writes.size() + signal.releases.size());
                 return;
@@ -2243,8 +2263,12 @@ void KeplerCompute::FrontModelQmd(VideoCommon::GpuSplit& split, FrontState& fs, 
                 signal.unbounded = true;
             }
         };
-        const auto on_release = [&](u64 address, u32, u32 flags) {
+        const auto on_release = [&](u64 address, u32 payload, u32 flags) {
             signal.releases.emplace_back(address, (flags >> 30) == 0 ? 16U : 4U);
+            if ((flags & ((1U << 26) | (1U << 19))) == 0) {
+                // As the back's release: the payload (a four-word one at +0), not a reduction.
+                signal.payloads.emplace_back(address, payload);
+            }
         };
         const auto result = model.Signal(qmd_address, argument, read, mapped, on_dispatch,
                                          on_release);
@@ -2445,6 +2469,26 @@ void KeplerCompute::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& s
                                fs.v2_memo ? &fs.v2_memo->statistics : nullptr);
     }
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Macro};
+    const s8 hooks_key = static_cast<s8>((native_mode ? 1 : 0) | (split.TracksWrites() ? 2 : 0) |
+                                         (fs.qmd_model != VideoCommon::V2::Mode::Off ? 4 : 0));
+    if (fs.hooks_native != hooks_key) [[unlikely]] {
+        // What FrontModelQmd and FrontNoteWrites act on (keep in step with them).
+        fs.hooks_native = hooks_key;
+        for (u32 method = 0; method < fs.write_hooks.size(); ++method) {
+            const bool launch = method == 0x107 || (method >= 0xae && method <= 0xb0);
+            const bool macro_code = method >= 0x45 && method <= 0x48;
+            u8 hooks = 0;
+            if ((hooks_key & 4) != 0 && launch) {
+                hooks |= WriteHookQmd;
+            }
+            if ((hooks_key & 2) != 0 &&
+                (launch || method == 0x6c3 || method == 0x6c || method == 0x6d ||
+                 (!macro_code && MayWriteMemory(method)))) {
+                hooks |= WriteHookNotes;
+            }
+            fs.write_hooks[method] = hooks;
+        }
+    }
     const auto read = [&fs](u32 address) {
         return address < fs.registers.size() ? fs.registers[address] : 0U;
     };
@@ -2453,8 +2497,9 @@ void KeplerCompute::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& s
             return false;
         }
         const u32 old_value = fs.registers[address];
+        const u8 hooks = fs.write_hooks[address];
         FrontApply(fs, address, value);
-        if (fs.qmd_model != VideoCommon::V2::Mode::Off) [[unlikely]] {
+        if ((hooks & WriteHookQmd) != 0) [[unlikely]] {
             FrontModelQmd(split, fs, address, &value, 1);
         }
         if (fs.s1 && address != KEPLER_COMPUTE_REG_INDEX(data_upload)) [[likely]] {
@@ -2468,21 +2513,23 @@ void KeplerCompute::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& s
         if (dump_identity && observation.writes.size() < 64) [[unlikely]] {
             observation.writes.emplace_back(address, value);
         }
-        if (split.TracksWrites()) [[unlikely]] {
+        if ((hooks & WriteHookNotes) != 0) [[unlikely]] {
             FrontNoteWrites(split, fs, address, value);
         }
         return true;
     };
-    const auto live = [&](auto& live_read, auto& live_emit) {
+    const auto live = [&](auto& live_read, auto& live_emit, auto&... dram_hooks) {
 #ifdef ARCHITECTURE_x86_64
         if (!macro.native_jit) {
             macro.native_jit = std::make_shared<TuringMacroJit>();
         }
-        macro.native_jit->Prepare(macro.native_code, macro.native_code_generation);
+        macro.native_jit->Prepare(macro.native_code, macro.native_code_generation,
+                                  sizeof...(dram_hooks) != 0);
         return macro.native_jit->Execute(start, fs.parameters,
                                          std::span<u32>{*macro.native_interpreter.active_dram},
-                                         live_read, live_emit);
+                                         live_read, live_emit, dram_hooks...);
 #else
+        ((void)dram_hooks, ...); // jit_data_ram is off: never called with them
         return macro.native_interpreter.Execute(macro.native_code, start, fs.parameters,
                                                 live_read, live_emit);
 #endif
@@ -2513,6 +2560,9 @@ void KeplerCompute::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& s
             .dma_fifoed = ~0U,
             .dma_ram = ~0U,
             .verify = memo == VideoCommon::V2::Mode::Verify,
+#ifdef ARCHITECTURE_x86_64
+            .jit_data_ram = true,
+#endif
         };
         result = MacroMemo::Call(*fs.v2_memo, macro.native_interpreter, call, live, read, emit,
                                  no_dma);
