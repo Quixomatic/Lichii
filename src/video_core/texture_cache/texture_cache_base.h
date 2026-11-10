@@ -552,12 +552,13 @@ public:
     [[nodiscard]] u64 TextureBindingsSerial() const noexcept {
         return texture_bindings_serial;
     }
-    /// DRAWREC=verify: live views and samplers (a creation during a draw grows them).
+    /// DRAWREC=verify: views and samplers created so far (deletions during a draw can keep the
+    /// live counts from growing).
     [[nodiscard]] size_t ImageViewSlots() const noexcept {
-        return slot_image_views.size();
+        return views_created;
     }
     [[nodiscard]] size_t SamplerSlots() const noexcept {
-        return slot_samplers.size();
+        return samplers_created;
     }
     /// DRAWREC=verify (step 10): a hash of what a cache mutation moves (slot vectors, serials,
     /// table changes, deferred requests); a pure resolve leaves it unchanged.
@@ -820,6 +821,8 @@ private:
     std::array<ImageId, 8> rt_image_id{};
     ImageId rt_depth_image_id{};
     u64 texture_bindings_serial = 0;
+    u64 views_created = 0;    ///< ImageViewSlots
+    u64 samplers_created = 0; ///< SamplerSlots
     u64 last_feedback_loop_serial = 0;
     u64 last_feedback_texture_serial = 0;
     bool last_feedback_loop_result = false;

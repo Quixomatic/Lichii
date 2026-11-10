@@ -67,6 +67,22 @@ bool SameRef(const Versions::WeakRef& resolved, const Versions::WeakRef& observe
     return resolved.id == observed.id;
 }
 
+/// SameRef for buffers: a buffer the resolve found and the configure deleted (a join into a
+/// buffer it created) is dependent too: after a deletion the apply looks every binding up
+/// again (RepeekRecordBuffers).
+bool SameBuffer(const Versions::WeakRef& resolved, const Versions::WeakRef& observed,
+                bool created, u32& dependent) {
+    if (SameRef(resolved, observed, created, dependent)) {
+        return true;
+    }
+    if (created && !Commit::IsProxy(resolved.id) &&
+        Versions::Gens().Get(Versions::Kind::Buffer, resolved.id) != resolved.generation) {
+        ++dependent;
+        return true;
+    }
+    return false;
+}
+
 constexpr u32 Bit(RecordGroup group) {
     return 1U << static_cast<u32>(group);
 }
@@ -277,7 +293,7 @@ bool CompareRecords(const ResolvedDraw& resolved, const ResolvedDraw& observed, 
             r.vertex, o.vertex, [&](const ResolvedVertex& lhs, const ResolvedVertex& rhs) {
                 return lhs.slot == rhs.slot && lhs.daddr == rhs.daddr && lhs.size == rhs.size &&
                        lhs.stride == rhs.stride &&
-                       SameRef(lhs.buffer, rhs.buffer, buffers_created, proxies);
+                       SameBuffer(lhs.buffer, rhs.buffer, buffers_created, proxies);
             })) {
         groups |= Bit(RecordGroup::Vertex);
     }
@@ -286,7 +302,7 @@ bool CompareRecords(const ResolvedDraw& resolved, const ResolvedDraw& observed, 
          (r.index.daddr != o.index.daddr || r.index.size != o.index.size ||
           r.index.format != o.index.format || r.index.first != o.index.first ||
           r.index.count != o.index.count ||
-          !SameRef(r.index.buffer, o.index.buffer, buffers_created, proxies)))) {
+          !SameBuffer(r.index.buffer, o.index.buffer, buffers_created, proxies)))) {
         groups |= Bit(RecordGroup::Index);
     }
     if (r.ubo_masks != o.ubo_masks ||
@@ -294,7 +310,7 @@ bool CompareRecords(const ResolvedDraw& resolved, const ResolvedDraw& observed, 
             r.ubo, o.ubo, [&](const ResolvedUbo& lhs, const ResolvedUbo& rhs) {
                 return lhs.stage == rhs.stage && lhs.slot == rhs.slot && lhs.daddr == rhs.daddr &&
                        lhs.size == rhs.size && lhs.version == rhs.version &&
-                       SameRef(lhs.buffer, rhs.buffer, buffers_created, proxies);
+                       SameBuffer(lhs.buffer, rhs.buffer, buffers_created, proxies);
             })) {
         groups |= Bit(RecordGroup::Ubo);
     }
@@ -303,7 +319,7 @@ bool CompareRecords(const ResolvedDraw& resolved, const ResolvedDraw& observed, 
                 return lhs.stage == rhs.stage && lhs.index == rhs.index &&
                        lhs.written == rhs.written && lhs.daddr == rhs.daddr &&
                        lhs.gpu_addr == rhs.gpu_addr && lhs.size == rhs.size &&
-                       SameRef(lhs.buffer, rhs.buffer, buffers_created, proxies);
+                       SameBuffer(lhs.buffer, rhs.buffer, buffers_created, proxies);
             })) {
         groups |= Bit(RecordGroup::Ssbo);
     }
@@ -313,7 +329,7 @@ bool CompareRecords(const ResolvedDraw& resolved, const ResolvedDraw& observed, 
                        lhs.written == rhs.written && lhs.image == rhs.image &&
                        lhs.gpu_addr == rhs.gpu_addr && lhs.daddr == rhs.daddr &&
                        lhs.size == rhs.size && lhs.format == rhs.format &&
-                       SameRef(lhs.buffer, rhs.buffer, buffers_created, proxies);
+                       SameBuffer(lhs.buffer, rhs.buffer, buffers_created, proxies);
             })) {
         groups |= Bit(RecordGroup::Tbo);
     }

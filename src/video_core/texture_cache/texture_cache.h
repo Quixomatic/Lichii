@@ -2856,6 +2856,7 @@ ImageViewId TextureCache<P>::CreateImageView(const TICEntry& raw_config) {
     const ImageInfo info(config);
     if (info.type == ImageType::Buffer) {
         const ImageViewInfo view_info(config, 0);
+        ++views_created;
         return slot_image_views.insert(runtime, info, view_info, config.Address());
     }
     const u32 layer_offset = config.BaseLayer() * info.layer_stride;
@@ -3829,6 +3830,7 @@ SamplerId TextureCache<P>::FindSampler(const TSCEntry& config, bool compute) {
     const auto [pair, is_new] = channel_state->samplers.try_emplace(config);
     if (is_new) {
         pair->second = slot_samplers.insert(runtime, config);
+        ++samplers_created;
         if (commit != nullptr) [[unlikely]] {
             channel_state->v2_samplers.Insert(config, std::hash<TSCEntry>{}(config),
                                               pair->second.index);
@@ -4110,6 +4112,7 @@ ImageViewId TextureCache<P>::FindOrEmplaceImageView(ImageId image_id, const Imag
                  info.range.extent.layers);
     }
     const ImageViewId image_view_id = slot_image_views.insert(runtime, info, image_id, image, slot_images);
+    ++views_created;
     image.InsertView(info, image_view_id);
     return image_view_id;
 }

@@ -647,9 +647,10 @@ public:
     [[nodiscard]] u64 BufferDeletions() const noexcept {
         return buffer_deletions;
     }
-    /// DRAWREC=verify: live buffers (a creation during a draw grows them).
+    /// DRAWREC=verify: buffers created so far (a join during a draw creates one and deletes
+    /// others, so the live count need not grow).
     [[nodiscard]] size_t BufferSlots() const noexcept {
-        return slot_buffers.size();
+        return buffers_created;
     }
     /// DRAWREC=verify (step 10): a hash of what a cache mutation moves; a pure resolve leaves
     /// it unchanged.
@@ -927,6 +928,7 @@ private:
     std::array<GeometrySync, NUM_VERTEX_BUFFERS + 1> geometry_syncs{};
     /// Counts DeleteBuffer calls: a buffer id older than this count may have been freed or reused.
     u64 buffer_deletions = 0;
+    u64 buffers_created = 0; ///< BufferSlots
     struct GeometryStats {
         u64 syncs{};
         u64 syncs_skipped{};

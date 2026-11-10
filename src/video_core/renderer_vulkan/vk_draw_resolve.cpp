@@ -1398,20 +1398,34 @@ void GraphicsPipeline::VerifyDrawEncode(const R::ResolvedDraw& record) {
         return;
     }
     // R-8: a second encode of equal bindings: the vertex and index binds repeat (harmless), its
-    // CommitBinds finds clean ranges, its stage buffers reference the same constant buffer
-    // versions (CBUFVER) or stream allocations (UBOREUSE); without either the stream offsets
-    // differ and only the entry count is compared.
+    // CommitBinds finds clean ranges. Its stage buffers may take new stream allocations (a
+    // version table miss, the root table bank, no CBUFVER/UBOREUSE): a stream entry matches
+    // when buffer and range are equal and both allocations hold the same bytes.
     if (!EncodeDraw(record, observer->derived, nullptr, EncodeMode::PayloadOnly)) {
         return;
     }
     R::RecordStats& stats = R::GetRecordStats();
     const size_t count = guest_descriptor_queue.UpdateCount();
-    const bool exact = VideoCommon::V2::On(VideoCommon::V2::Switch::CbufVer) ||
-                       VideoCommon::UniformStreamReuseEnabled();
-    const bool payload_equal =
-        count == observer->payload.size() &&
-        (!exact || std::memcmp(guest_descriptor_queue.UpdateData(), observer->payload.data(),
-                               count * sizeof(DescriptorUpdateEntry)) == 0);
+    const auto same_entry = [&](const DescriptorUpdateEntry& lhs,
+                                const DescriptorUpdateEntry& rhs) {
+        if (std::memcmp(&lhs, &rhs, sizeof(DescriptorUpdateEntry)) == 0) {
+            return true;
+        }
+        if (lhs.buffer.buffer != rhs.buffer.buffer || lhs.buffer.range != rhs.buffer.range) {
+            return false;
+        }
+        const auto& runtime = buffer_cache.runtime;
+        const std::span<const u8> a =
+            runtime.StreamBytes(lhs.buffer.buffer, lhs.buffer.offset, lhs.buffer.range);
+        const std::span<const u8> b =
+            runtime.StreamBytes(rhs.buffer.buffer, rhs.buffer.offset, rhs.buffer.range);
+        return !a.empty() && a.size() == b.size() &&
+               std::memcmp(a.data(), b.data(), a.size()) == 0;
+    };
+    bool payload_equal = count == observer->payload.size();
+    for (size_t i = 0; payload_equal && i < count; ++i) {
+        payload_equal = same_entry(guest_descriptor_queue.UpdateData()[i], observer->payload[i]);
+    }
     // The heap words as the encode interleaves them (texel words, then image words, per stage).
     const bool push_equal =
         observer->derived.rescaling.Data() == observer->rescaling &&
