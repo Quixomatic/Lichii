@@ -872,6 +872,7 @@ TEST_CASE("The record's index binding takes the draw's index range, not the vert
     VideoCommon::BufferCacheChannelInfo channel{state};
     VideoCommon::UniformBufferSizes sizes{};
     channel.uniform_buffer_sizes = &sizes;
+    f.memory->Map(0x110000, 0x20000, 0x10000, Tegra::PTEKind::PITCH, true);
     const auto id = Access::Add(*f.cache, 0x20000, 0x10000);
     Access::UseChannel(*f.cache, channel);
     auto& engine = channel.maxwell3d;
