@@ -23,6 +23,7 @@
 #include "common/bit_util.h"
 #include "common/div_ceil.h"
 #include "common/literals.h"
+#include "common/scope_exit.h"
 #include "common/settings.h"
 #include "shader_recompiler/byte_addressed_image.h"
 #include "shader_recompiler/exception.h"
@@ -78,6 +79,11 @@ using VideoCore::Surface::IsPixelFormatSRGB;
 using VideoCore::Surface::SurfaceType;
 
 namespace {
+/// F4-06: an image as the barrier tracker keys it (handle + guest range, for aliasing).
+[[nodiscard]] Scheduler::TrackedImage Tracked(const Image& image) {
+    return {image.Handle(), image.gpu_addr, image.gpu_addr + image.guest_size_bytes};
+}
+
 [[nodiscard]] u32 HostMipCount(const VideoCommon::ImageInfo& info) {
     if (info.num_samples > 1)
         return 1;
@@ -1416,10 +1422,12 @@ bool TextureCacheRuntime::GpuDecode(Image& image, const StagingBufferRef& raw,
         P5b::Add(P5b::Counter::HoistedUploads);
         return true;
     }
-    scheduler.RequestOutsideRenderPassOperationContext();
+    // F4-06: only pending writes to this image's memory get a barrier.
+    const bool scope = scheduler.RequestOutsideRenderPassForImages({Tracked(image)});
     scheduler.Record([this, job = std::move(job)](vk::CommandBuffer cmdbuf) {
         EncodeDecodes(cmdbuf, std::span{&job, 1});
     });
+    scheduler.EndImageOperation(scope);
     image.NoteV2Use();
     return true;
 }
@@ -1875,7 +1883,12 @@ void TextureCacheRuntime::ReinterpretImage(Image& dst, Image& src,
     const VkBuffer copy_buffer = GetTemporaryBuffer(total_size);
     const VkImage dst_image = dst.Handle();
     const VkImage src_image = src.Handle();
-    scheduler.RequestOutsideRenderPassOperationContext();
+    // F4-06: pending attachment writes elsewhere stay pending (the temporary buffer keeps its
+    // own barriers).
+    const bool scope = scheduler.RequestOutsideRenderPassForImages({Tracked(dst), Tracked(src)});
+    SCOPE_EXIT {
+        scheduler.EndImageOperation(scope);
+    };
     scheduler.Record([dst_image, src_image, copy_buffer, src_aspect_mask, dst_aspect_mask,
                       vk_in_copies, vk_out_copies](vk::CommandBuffer cmdbuf) {
         RangedBarrierRange dst_range;
@@ -2779,7 +2792,11 @@ void TextureCacheRuntime::CopyImage(Image& dst, Image& src,
     });
     const VkImage dst_image = dst.Handle();
     const VkImage src_image = src.Handle();
-    scheduler.RequestOutsideRenderPassOperationContext();
+    // F4-06: pending attachment writes elsewhere stay pending.
+    const bool scope = scheduler.RequestOutsideRenderPassForImages({Tracked(dst), Tracked(src)});
+    SCOPE_EXIT {
+        scheduler.EndImageOperation(scope);
+    };
     scheduler.Record([dst_image, src_image, aspect_mask, vk_copies](vk::CommandBuffer cmdbuf) {
         RangedBarrierRange dst_range;
         RangedBarrierRange src_range;
@@ -3396,7 +3413,9 @@ void Image::UploadMemory(VkBuffer buffer, VkDeviceSize offset,
         TryTransferUpload(buffer, offset, copies)) [[unlikely]] {
         return;
     }
-    scheduler->RequestOutsideRenderPassOperationContext();
+    // F4-06: only pending writes to this image's memory get a barrier.
+    const bool scope = scheduler->RequestOutsideRenderPassForImages(
+        {{*original_image, gpu_addr, gpu_addr + guest_size_bytes}});
     auto vk_copies = TransformBufferImageCopies(copies, offset, aspect_mask);
     const VkBuffer src_buffer = buffer;
     const VkImage vk_image = *original_image;
@@ -3407,6 +3426,7 @@ void Image::UploadMemory(VkBuffer buffer, VkDeviceSize offset,
                        vk_copies](vk::CommandBuffer cmdbuf) {
         CopyBufferToImage(cmdbuf, src_buffer, vk_image, vk_aspect_mask, was_initialized, vk_copies);
     });
+    scheduler->EndImageOperation(scope);
     NoteV2Use();
 
     if (is_rescaled) {

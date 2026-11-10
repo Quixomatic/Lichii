@@ -150,6 +150,8 @@ private:
 
 /// Counts one submission at file:line (callers check Enabled() first).
 void NoteSubmitSite(const char* file, u32 line);
+/// F4-06: one full barrier (an operation the range tracker doesn't follow) asked for at file:line.
+void NoteFullBarrierSite(const char* file, u32 line);
 
 /// Logs and resets once per window (any thread; the first to arrive in a new window reports).
 void Report(const char* thread_name, u64 window_ns);

@@ -16,6 +16,7 @@
 #include <thread>
 #include <utility>
 #include <queue>
+#include <initializer_list>
 #include <source_location>
 #include <vector>
 
@@ -195,6 +196,26 @@ public:
         Record(std::forward<T>(command));
         targeted_scope = saved;
         UpdateAutoFlush();
+    }
+    /// F4-06: an image the next out-of-pass operation reads or writes (guest range for aliasing).
+    struct TrackedImage {
+        VkImage image{};
+        u64 begin{};
+        u64 end{};
+    };
+    /// F4-06 (MASTER_PLAN §5.5 targeted barriers): the operation recorded next, outside any pass,
+    /// touches only `images` (and buffers). Pending attachment writes overlapping them get one
+    /// barrier; the others stay pending. The operation's own records run in the targeted scope
+    /// until EndImageOperation (pass the returned value). Without the tracker: the old
+    /// RequestOutsideRenderPassOperationContext.
+    [[nodiscard]] bool RequestOutsideRenderPassForImages(
+        std::initializer_list<TrackedImage> images,
+        std::source_location location = std::source_location::current());
+    void EndImageOperation(bool saved) {
+        if (track_barriers) {
+            targeted_scope = saved;
+            UpdateAutoFlush();
+        }
     }
     /// RecordBufferOperation's start with the tracker: ends the pass, opens the targeted scope
     /// and returns the scope's previous state.
@@ -637,7 +658,9 @@ private:
                             const std::array<VkClearValue, 8>& color_values, bool depth_clear,
                             const VkClearValue& depth_value);
     void NoteImageReadTracked(VkImage image, u64 begin, u64 end);
-    void FlushAllPendingWrites();
+    /// `location`: who asked (F4-06 stats: full barriers by site; Record's auto flush shows as
+    /// the header line).
+    void FlushAllPendingWrites(std::source_location location = std::source_location::current());
     void RecordHazardBarrier(u32 src_stages, u32 src_access, u32 dst_stages, u32 dst_access);
     /// The barrier without the targeted-barrier count (a full barrier counts as that).
     void RecordHazardBarrierUncounted(u32 src_stages, u32 src_access, u32 dst_stages,

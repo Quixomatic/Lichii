@@ -870,7 +870,7 @@ void Scheduler::FlushReadHazards() {
                             VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT);
 }
 
-void Scheduler::FlushAllPendingWrites() {
+void Scheduler::FlushAllPendingWrites(std::source_location location) {
     const auto hazard = barrier_tracker.TakeAll();
     auto_flush = false;
     const auto reads = std::exchange(read_hazard, {});
@@ -879,6 +879,9 @@ void Scheduler::FlushAllPendingWrites() {
         return; // Nothing pending: no barrier (Fix pass 1: this was still counted as one)
     }
     VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::FullBarriers);
+    if (VideoCommon::V2::P5bStats::Enabled()) [[unlikely]] {
+        VideoCommon::V2::P5bStats::NoteFullBarrierSite(location.file_name(), location.line());
+    }
     RecordHazardBarrierUncounted(stages, hazard.access | reads.access,
                                  VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
                                  VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
@@ -917,8 +920,39 @@ void Scheduler::RequestOutsideRenderPassOperationContext(std::source_location lo
     if (track_barriers && (!barrier_tracker.Empty() || read_hazard.Any())) [[unlikely]] {
         // An operation the tracker doesn't follow: every pending write before it, as the old
         // pass-end barrier gave it (one barrier for every pass that ended since).
-        FlushAllPendingWrites();
+        FlushAllPendingWrites(location);
     }
+}
+
+bool Scheduler::RequestOutsideRenderPassForImages(std::initializer_list<TrackedImage> images,
+                                                  std::source_location location) {
+    if (!track_barriers) {
+        RequestOutsideRenderPassOperationContext(location);
+        return false;
+    }
+    if (state.renderpass) {
+        CountRenderPassEnd(location.file_name(), location.line());
+    }
+    EndRenderPass();
+    // Reads noted for draws that never came keep their hazards (the next pass begin takes them).
+    VideoCommon::V2::RangeBarrierTracker::Hazard hazard{};
+    for (const TrackedImage& image : images) {
+        if (image.image == VK_NULL_HANDLE) {
+            continue;
+        }
+        const auto taken =
+            barrier_tracker.Take(reinterpret_cast<u64>(image.image), image.begin, image.end);
+        hazard.stages |= taken.stages;
+        hazard.access |= taken.access;
+        hazard.count += taken.count;
+    }
+    const bool saved = std::exchange(targeted_scope, true);
+    UpdateAutoFlush();
+    RecordHazardBarrier(hazard.stages, hazard.access,
+                        VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT |
+                            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                        VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+    return saved;
 }
 
 bool Scheduler::BeginBufferOperation(std::source_location location) {

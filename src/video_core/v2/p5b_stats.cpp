@@ -49,6 +49,17 @@ void NoteSubmitSite(const char* file, u32 line) {
     Sites().Note(file, line);
 }
 
+namespace {
+SubmitSites& BarrierSites() {
+    static SubmitSites sites;
+    return sites;
+}
+} // Anonymous namespace
+
+void NoteFullBarrierSite(const char* file, u32 line) {
+    BarrierSites().Note(file, line);
+}
+
 void Report(const char* thread_name, u64 window_ns) {
     if (!Enabled()) {
         return;
@@ -97,18 +108,22 @@ void Report(const char* thread_name, u64 window_ns) {
              PerSecond(at(Counter::FinishCompletions), seconds),
              Ratio(at(Counter::FinishLatencyUs), at(Counter::FinishCompletions)),
              PerSecond(at(Counter::RecycledContexts), seconds));
-    {
-        // F4-01: where the submissions came from (Scheduler::Flush/Finish call sites).
-        const auto sites = Sites().Take();
+    const auto site_list = [&per_frame](SubmitSites& table) {
+        const auto sites = table.Take();
         std::string list;
         for (size_t i = 0; i < sites.size() && i < 16; ++i) {
             list += fmt::format("{}{} {:.2f}", i == 0 ? "" : ", ",
                                 SubmitSites::Name(sites[i].file, sites[i].line),
                                 per_frame(sites[i].count));
         }
-        LOG_INFO(HW_GPU, "V2 stats {} P5b submits by site (per frame) | {}", thread_name,
-                 list.empty() ? std::string{"none"} : list);
-    }
+        return list.empty() ? std::string{"none"} : list;
+    };
+    // F4-01: where the submissions came from (Scheduler::Flush/Finish call sites).
+    LOG_INFO(HW_GPU, "V2 stats {} P5b submits by site (per frame) | {}", thread_name,
+             site_list(Sites()));
+    // F4-06: which untracked operations still flush every pending write.
+    LOG_INFO(HW_GPU, "V2 stats {} P5b full barriers by site (per frame) | {}", thread_name,
+             site_list(BarrierSites()));
     LOG_INFO(HW_GPU,
              "V2 stats {} P5b passes | {:.1f}/frame ({:.0f}% dynamic), {:.1f} draws each | "
              "barriers per frame: pass-end {:.1f}, targeted {:.1f}, full {:.1f}; pass ends "
