@@ -1209,6 +1209,37 @@ TEST_CASE("SYNC §9 idle back: operations with no fence get one, rule I submits 
 }
 
 
+TEST_CASE("SYNC §10: an idle back submits any non-empty open tick with fewer than two in flight",
+          "[video_core][v2_p5b]") {
+    using VideoCommon::V2::SubmitRequests;
+    using Action = SubmitRequests::IdleAction;
+    FlushParams params;
+    params.pass_boundaries = true;
+    FlushHeuristic heuristic{params};
+    constexpr u64 open = 11026; // 6 ticks past the newest lazy fence (11020)
+    // ServeSplitIdleHook: `wanted` includes RecordedSinceSubmit; sync_due is IdleDue.
+    const auto idle_hook = [&](bool recorded, u32 pending) {
+        SubmitRequests requests;
+        return requests.AtIdleHook(false, true, recorded, 11020, open,
+                                   heuristic.IdleDue(pending, recorded));
+    };
+    SECTION("(a) a dispatch only, no draws, no fence, no waiter, back idle: submitted") {
+        REQUIRE(idle_hook(true, 0) == Action::Sync);
+        REQUIRE(idle_hook(true, 1) == Action::Sync);
+    }
+    SECTION("(b) an empty open tick on an idle back: never submitted (storm guard)") {
+        for (int hook = 0; hook < 1000; ++hook) {
+            REQUIRE(idle_hook(false, 0) == Action::None);
+        }
+    }
+    SECTION("(c) two in flight with recorded work: waits for a finish publish, then submits") {
+        REQUIRE(idle_hook(true, 2) == Action::Leave);
+        // The finish thread publishes a completion (one in flight): RequestIdleHook (the back is
+        // idle, the open tick non-empty), and the hook submits.
+        REQUIRE(idle_hook(true, 1) == Action::Sync);
+    }
+}
+
 TEST_CASE("SYNC step 9: the post-pass list runs in order after the pass, before the submit",
           "[video_core][v2_p5b]") {
     // Model of the recording stream: the scheduler runs the list at the pass end (EndRenderPass)

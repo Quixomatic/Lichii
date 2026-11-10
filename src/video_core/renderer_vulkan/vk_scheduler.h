@@ -153,6 +153,11 @@ public:
     [[nodiscard]] bool SubmitWantedNow() const noexcept {
         return submit_wanted;
     }
+    /// Recording thread (SYNC_SUBMIT_SPEC §10): a command was recorded since the last submission
+    /// (lazy-fence mode): the open tick is not empty.
+    [[nodiscard]] bool RecordedSinceSubmit() const noexcept {
+        return recorded_since_submit;
+    }
     /// The idle hook (the back goes idle, or another thread asked with RequestIdleHook): what
     /// FlushDeferred submits, plus with lazy fences any work they or WantSubmit wait for.
     void ServeIdleHook();
@@ -422,6 +427,11 @@ public:
             // recording call site (STATS full barriers by site).
             FlushAllPendingWrites(location);
         }
+        if (lazy_fences && !recorded_since_submit) [[unlikely]] {
+            // SYNC_SUBMIT_SPEC §10: the open tick holds work (rule I submits it at idle).
+            recorded_since_submit = true;
+            open_tick_nonempty.store(true, std::memory_order_release);
+        }
         if (chunk->Record(command)) {
             return;
         }
@@ -672,6 +682,8 @@ private:
         after_pass.Run();
     }
     u64 open_since_us{}; ///< SYNC §7.3: when the open tick first held a lazy fence (0: none)
+    bool recorded_since_submit{}; ///< SYNC §10: RecordedSinceSubmit (recording thread)
+    std::atomic<bool> open_tick_nonempty{}; ///< ... for the finish thread's progress wake
     /// SYNC §7.3 counters and the 2 s line's state, at a lazy-fence-mode submission.
     void NoteOpenTickSubmitted() {
         if (open_since_us != 0) {
@@ -680,6 +692,12 @@ private:
             open_since_us = 0;
         }
         VideoCommon::V2::LandingFence::diag_submit_wanted.store(false, std::memory_order_relaxed);
+    }
+    /// SYNC §10: after SubmitExecution (whatever it recorded to close the command buffer went
+    /// with it), the new open tick is empty.
+    void NoteOpenTickEmpty() {
+        recorded_since_submit = false;
+        open_tick_nonempty.store(false, std::memory_order_release);
     }
     void (*pre_submit_hook)(void*){};   ///< SYNC Step 8: SetPreSubmitHook
     void* pre_submit_argument{};

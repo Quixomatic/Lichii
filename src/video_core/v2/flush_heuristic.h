@@ -199,8 +199,12 @@ public:
                (draws >= params.pass_min_draws && since >= params.pass_interval_us);
     }
 
-    /// SYNC_SUBMIT_SPEC §7.3 fix 2: rule I's guest-visible open work without draws (a lazy fence
-    /// in the open tick, a command-list end) is due once the GPU is about to go idle.
+    /// SYNC_SUBMIT_SPEC §10: rule I at an idle point: a non-empty open tick (`recorded`: any
+    /// command since the last submission) is due once fewer than busy_pending are in flight.
+    [[nodiscard]] bool IdleDue(u32 pending, bool recorded) const noexcept {
+        return pending < params.busy_pending && recorded;
+    }
+    /// §7.3 fix 2 (kept for its tests; §10's IdleDue covers it): a lazy fence or a list end.
     [[nodiscard]] bool OpenWorkDue(u32 pending, bool lazy_fence_open,
                                    bool list_end_open) const noexcept {
         return pending < params.busy_pending && (lazy_fence_open || list_end_open);

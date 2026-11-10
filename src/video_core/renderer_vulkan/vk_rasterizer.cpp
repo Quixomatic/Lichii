@@ -4962,15 +4962,13 @@ void RasterizerVulkan::ServeSplitIdleHook() {
             // still to land (a deferred QMD reduction, a counter report) is a synchronization
             // point (DXVK): with the GPU about to go idle it is worth a submission, so it lands
             // although no draw follows it and nobody blocks on it yet.
-            // SYNC_SUBMIT_SPEC §7.3 fix 2: any open work the guest will read (a lazy fence in the
-            // open tick, a command-list end) with the GPU about to idle, draws or not: fences pop
-            // in order, and the guest may submit its next work only once one lands (0c86/e412).
-            const u64 open = self.scheduler.CurrentTick();
-            if (self.flush_heuristic.OpenWorkDue(
-                    state.pending,
-                    VideoCommon::V2::LandingFence::TickForPending() >= open ||
-                        self.scheduler.LazyOutstandingTick() >= open,
-                    self.scheduler.SubmitWantedNow())) {
+            // SYNC_SUBMIT_SPEC §10 (MP §5.5 "pending GPU work"; DXVK ImplicitSynchronization): an
+            // idle back submits any non-empty open tick with fewer than two submissions in
+            // flight, whatever it holds (draws, dispatches, copies, fences) and whether anyone
+            // waits or not: some producers are visible to no waiter (49e1 hang). An empty tick
+            // never submits; two in flight wait for the finish thread's publish.
+            if (self.flush_heuristic.IdleDue(state.pending,
+                                             self.scheduler.RecordedSinceSubmit())) {
                 VideoCommon::V2::P5bStats::Add(
                     VideoCommon::V2::P5bStats::Counter::SubmitsIdleNonDraw);
                 return true;

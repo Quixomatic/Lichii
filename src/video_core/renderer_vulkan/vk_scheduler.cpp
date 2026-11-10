@@ -233,6 +233,7 @@ u64 Scheduler::Flush(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
     if (lazy_fences) [[unlikely]] {
         VideoCommon::V2::LandingFence::diag_open_tick.store(CurrentTick(),
                                                             std::memory_order_relaxed);
+        NoteOpenTickEmpty();
     }
     AllocateNewContext();
     last_flush = std::chrono::steady_clock::now();
@@ -290,13 +291,16 @@ void Scheduler::ServeSplitIdleHook(bool (*sync_due)(void*), void* argument) {
     // is not a reason. Work left here rides the next pass boundary or chunk; no thread waits on
     // it, and one that starts to files its own urgent request.
     const u64 open = CurrentTick();
-    if (!submit_requests.IdleSubmits(flush_pending, lazy_fences, submit_wanted,
-                                     lazy_outstanding_tick, open)) {
+    // SYNC_SUBMIT_SPEC §10: any recorded command makes the open tick work rule I weighs (the
+    // sync_due callback submits it with fewer than two submissions in flight).
+    const bool wanted = submit_wanted || recorded_since_submit;
+    if (!submit_requests.IdleSubmits(flush_pending, lazy_fences, wanted, lazy_outstanding_tick,
+                                     open)) {
         return;
     }
     // The heuristic is read only when nothing else decides.
     const bool due = !flush_pending && !submit_requests.Urgent(open) && sync_due(argument);
-    switch (submit_requests.AtIdleHook(flush_pending, lazy_fences, submit_wanted,
+    switch (submit_requests.AtIdleHook(flush_pending, lazy_fences, wanted,
                                        lazy_outstanding_tick, open, due)) {
     case IdleAction::None:
         return;
@@ -335,7 +339,9 @@ void Scheduler::OnGpuProgress() {
     // re-evaluates rule I (it submits open work only if DXVK's rule holds; nothing open, nothing
     // happens). Not a wait for full idle.
     auto& split = VideoCommon::GpuSplit::Get();
+    // SYNC §10: only with a non-empty open tick (nothing to weigh otherwise).
     if (lazy_fences && split.BackIdle() &&
+        open_tick_nonempty.load(std::memory_order_acquire) &&
         master_semaphore->CurrentTick() < master_semaphore->KnownGpuTick() + 3) {
         split.RequestIdleHook();
     }
@@ -455,6 +461,7 @@ void Scheduler::Finish(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
     if (lazy_fences) [[unlikely]] {
         VideoCommon::V2::LandingFence::diag_open_tick.store(CurrentTick(),
                                                             std::memory_order_relaxed);
+        NoteOpenTickEmpty();
     }
     Wait(presubmit_tick);
     AllocateNewContext();
