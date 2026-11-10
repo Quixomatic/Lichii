@@ -867,7 +867,10 @@ void BufferCacheRuntime::CopyBuffer(VkBuffer dst_buffer, VkBuffer src_buffer,
         return;
     }
     if (src_buffer == staging_pool.StreamBuf() && can_reorder_upload) {
-        scheduler.RecordWithUploadBuffer([src_buffer, dst_buffer, vk_copies](
+        // F4-06: only the upload command buffer (it runs before the submission's main stream):
+        // no pending main-stream write can be ordered before it, so no auto flush (8.75 full
+        // barriers/f at 8d31).
+        scheduler.RecordUpload([src_buffer, dst_buffer, vk_copies](
                                              vk::CommandBuffer, vk::CommandBuffer upload_cmdbuf) {
             upload_cmdbuf.CopyBuffer(src_buffer, dst_buffer, vk_copies);
         });

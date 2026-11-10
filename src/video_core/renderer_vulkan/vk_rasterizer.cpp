@@ -326,7 +326,9 @@ void EmitViewports(Scheduler& scheduler, const Device& device, const ViewportSou
             .minDepth = 0.0f,
             .maxDepth = 1.0f,
         };
-        scheduler.Record([&device, viewport](vk::CommandBuffer cmdbuf) {
+        // Dynamic state touches no memory: no auto flush when recorded outside a pass (a clear
+        // deferred into the next pass's load op records it there; 24.5 full barriers/f at 8d31).
+        scheduler.RecordState([&device, viewport](vk::CommandBuffer cmdbuf) {
             const u32 num_viewports = std::min<u32>(device.GetMaxViewports(), Maxwell::NumViewports);
             std::array<VkViewport, Maxwell::NumViewports> viewport_list{};
             viewport_list.fill(viewport);
@@ -345,7 +347,7 @@ void EmitViewports(Scheduler& scheduler, const Device& device, const ViewportSou
         GetViewportState(device, src, 12, scale), GetViewportState(device, src, 13, scale),
         GetViewportState(device, src, 14, scale), GetViewportState(device, src, 15, scale),
     };
-    scheduler.Record([&device, viewport_list](vk::CommandBuffer cmdbuf) {
+    scheduler.RecordState([&device, viewport_list](vk::CommandBuffer cmdbuf) {
         const u32 num_viewports = std::min<u32>(device.GetMaxViewports(), Maxwell::NumViewports);
         const vk::Span<VkViewport> viewports(viewport_list.data(), num_viewports);
         cmdbuf.SetViewport(0, viewports);
@@ -367,7 +369,7 @@ void EmitScissors(Scheduler& scheduler, const Device& device, const ViewportSour
         scissor.offset.y = static_cast<int32_t>(y);
         scissor.extent.width = width;
         scissor.extent.height = height;
-        scheduler.Record([&device, scissor](vk::CommandBuffer cmdbuf) {
+        scheduler.RecordState([&device, scissor](vk::CommandBuffer cmdbuf) {
             const u32 num_scissors = std::min<u32>(device.GetMaxViewports(), Maxwell::NumViewports);
             std::array<VkRect2D, Maxwell::NumViewports> scissor_list{};
             scissor_list.fill(scissor);
@@ -394,7 +396,7 @@ void EmitScissors(Scheduler& scheduler, const Device& device, const ViewportSour
         GetScissorState(src, 14, up_scale, down_shift),
         GetScissorState(src, 15, up_scale, down_shift),
     };
-    scheduler.Record([&device, scissor_list](vk::CommandBuffer cmdbuf) {
+    scheduler.RecordState([&device, scissor_list](vk::CommandBuffer cmdbuf) {
         const u32 num_scissors = std::min<u32>(device.GetMaxViewports(), Maxwell::NumViewports);
         const vk::Span<VkRect2D> scissors(scissor_list.data(), num_scissors);
         cmdbuf.SetScissor(0, scissors);
@@ -2924,16 +2926,11 @@ void RasterizerVulkan::Clear(u32 layer_count) {
                     : 0;
     const bool pass_was_active = scheduler.IsRenderPassActive();
     const u64 pass_serial = scheduler.RenderPassSerial();
-    if (deferrable_shape && pass_was_active && scheduler.TracksBarriers() &&
-        !scheduler.IsRenderPassFor(framebuffer)) [[unlikely]] {
-        // R2-F4-06 (the clear zone x4 at 0fe4): F4-X3 keeps passes open across wait-for-idles, so
-        // a full clear now often finds another framebuffer's pass still open, where it used to
-        // find none. Its own pass begin would end that pass anyway: end it here, and the clear
-        // becomes the next pass's load op again instead of a pass begin plus
-        // vkCmdClearAttachments.
-        scheduler.EndRenderPassForClear();
-    }
-    const bool can_defer_clear = deferrable_shape && !scheduler.IsRenderPassActive();
+    // R2-F4-06: a clear never ends an open pass to be deferred (77a898f8df did: +53 pass ends/f
+    // at 8d31). Its x4 was the deferred clears' viewport/scissor records outside a pass taking
+    // Record's auto flush (a full barrier) once F4-X3 left tracked writes pending across WFIs;
+    // dynamic state now records without it (Scheduler::RecordState).
+    const bool can_defer_clear = deferrable_shape && !pass_was_active;
     if (!can_defer_clear) {
         scheduler.RequestRendering(framebuffer);
     }

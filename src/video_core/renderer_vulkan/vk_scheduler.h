@@ -307,13 +307,6 @@ public:
         return state.renderpass != VK_NULL_HANDLE;
     }
 
-    /// R2-F4-06: whether the active pass renders to `framebuffer` (handle and area).
-    bool IsRenderPassFor(const Framebuffer* framebuffer) const;
-
-    /// R2-F4-06: a full clear of another framebuffer ends the active pass (as its own pass begin
-    /// would) so that the clear becomes the next pass's load op.
-    void EndRenderPassForClear(std::source_location location = std::source_location::current());
-
     /// Changes whenever a render pass begins or ends.
     u64 RenderPassSerial() const {
         return render_pass_serial;
@@ -380,6 +373,26 @@ public:
         }
         DispatchWork();
         (void)chunk->Record(command);
+    }
+
+    /// A command that touches no memory (dynamic state): pending attachment writes need no
+    /// barrier for it, inside a pass or not (no auto flush).
+    template <typename T>
+        requires std::is_invocable_v<T, vk::CommandBuffer>
+    void RecordState(T&& c) {
+        const bool saved = std::exchange(auto_flush, false);
+        Record(std::forward<T>(c));
+        auto_flush = saved;
+    }
+
+    /// A command recorded only into the upload command buffer, which runs before the whole
+    /// submission: no pending write of the main stream can be ordered before it (no auto flush).
+    template <typename T>
+        requires std::is_invocable_v<T, vk::CommandBuffer, vk::CommandBuffer>
+    void RecordUpload(T&& command) {
+        const bool saved = std::exchange(auto_flush, false);
+        RecordWithUploadBuffer(std::forward<T>(command));
+        auto_flush = saved;
     }
 
     template <typename T>

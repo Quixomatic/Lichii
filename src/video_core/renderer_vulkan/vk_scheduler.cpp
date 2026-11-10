@@ -693,21 +693,6 @@ bool Scheduler::DeferDepthStencilClear(const Framebuffer* framebuffer, const VkC
     return true;
 }
 
-bool Scheduler::IsRenderPassFor(const Framebuffer* framebuffer) const {
-    const VkExtent2D render_area = framebuffer->RenderArea();
-    return state.renderpass != VK_NULL_HANDLE && framebuffer->Handle() == state.framebuffer &&
-           render_area.width == state.render_area.width &&
-           render_area.height == state.render_area.height;
-}
-
-void Scheduler::EndRenderPassForClear(std::source_location location) {
-    if (!state.renderpass) {
-        return;
-    }
-    CountRenderPassEnd(location.file_name(), location.line());
-    EndRenderPass();
-}
-
 void Scheduler::FlushDeferredClear() {
     if (deferred_clear.framebuffer == nullptr) {
         return;
