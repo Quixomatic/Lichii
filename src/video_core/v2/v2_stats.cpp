@@ -17,6 +17,7 @@
 #include "video_core/v2/ir.h"
 #include "video_core/v2/commit.h"
 #include "video_core/v2/p3_stats.h"
+#include "video_core/v2/resolve/draw_record.h"
 #include "video_core/v2/v2_stats.h"
 
 #define OFF(field_name) MAXWELL3D_REG_INDEX(field_name)
@@ -803,6 +804,12 @@ void ReportSlow(const char* thread_name) {
     P3Stats::Report(thread_name, window_ns);
     Commit::Stats::Report(thread_name, window_ns);
     P5bStats::Report(thread_name, window_ns);
+    if (On(Switch::DrawRec)) [[unlikely]] {
+        const std::string text = Resolve::TakeRecordStatsText(static_cast<double>(window_ns) / 1e9);
+        if (!text.empty()) {
+            LOG_INFO(HW_GPU, "V2 stats {} P6 Step 0 | {}", thread_name, text);
+        }
+    }
     window.start_ns = now;
     window.start_ticks = now_ticks;
 }

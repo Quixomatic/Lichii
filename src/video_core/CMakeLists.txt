@@ -164,6 +164,8 @@ add_library(video_core STATIC
     v2/residency.h
     v2/resolve/cbuf_table.h
     v2/resolve/cow_regs.h
+    v2/resolve/draw_record.cpp
+    v2/resolve/draw_record.h
     v2/resolve/multifront.cpp
     v2/resolve/multifront.h
     v2/resolve/parallel_resolve.cpp
