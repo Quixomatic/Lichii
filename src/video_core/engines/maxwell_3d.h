@@ -3523,14 +3523,9 @@ private:
     /// MACROHLE: the back's render_enable.mode into the front's registers (drains; before an
     /// MME read of it while FrontState::v2_render_enable_unknown).
     void FrontSyncRenderEnable(VideoCommon::GpuSplit& split, FrontState& state);
-    /// MACROHLE: the shadow copy of render_enable.mode the back evaluated under shadow RAM
-    /// tracking into the front's shadow RAM (drains; before a Replay can read it).
-    void FrontSyncShadowRenderEnable(VideoCommon::GpuSplit& split, FrontState& state);
-    /// After a SET_SHADOW_RAM_CONTROL write the front made: a switch to Replay takes the
-    /// shadow copy above.
-    void FrontShadowControlWritten(VideoCommon::GpuSplit& split, FrontState& state);
-    /// MACROHLE (back writes, front reads after a drain): the mode the last conditional render
-    /// HLE call evaluated under shadow RAM tracking.
+    /// MACROHLE (back only): the mode the last conditional render HLE call evaluated under
+    /// shadow RAM tracking. A Replay of the front's unknown shadow copy (ShadowUnknown) resolves
+    /// to it in ProcessQueryCondition; ReleaseFront takes it (the back is idle then).
     u32 v2_hle_tracked_mode{};
     /// Tests: the split front's register, shadow copy and render-enable flag (front taken).
     [[nodiscard]] u32 FrontRegisterForTest(u32 method) const;

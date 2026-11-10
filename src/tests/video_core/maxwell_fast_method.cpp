@@ -1965,8 +1965,7 @@ TEST_CASE("V2 macro HLE: a conditional render under shadow RAM tracking runs on 
     // F3F5b-4 (report 7833a32: no HLE line at all): the entry applied only under Passthrough,
     // and OoT runs with shadow RAM tracking (the default), so every call ran the macro and its
     // front DMA read. Under Track the front makes the macro's register writes, the back
-    // evaluates the mode, and the front's shadow copy of it is taken from the back when a
-    // Replay could read it.
+    // evaluates the mode; a Replay of the front's unknown shadow copy resolves on the back.
     using Access = VideoCommon::GpuSplitTestAccess;
     using M3Access = Tegra::Engines::Maxwell3DTestAccess;
     using VideoCommon::V2::Mode;
@@ -2013,12 +2012,15 @@ TEST_CASE("V2 macro HLE: a conditional render under shadow RAM tracking runs on 
     Access::RunBack(split);
     CHECK(engine.regs.reg_array[Mode556] == 1);
     CHECK(M3Access::TrackedMode(engine) == 1);
-    // A switch to Replay takes the back's mode into the front's shadow RAM (drained: nothing
-    // is queued here).
+    // F3F5b-6: a switch to Replay costs the front nothing (it drained ~495 times a second); a
+    // replayed write of the mode the front doesn't know is resolved on the back.
     engine.FrontCallMethod(f.system, split, ShadowControl,
                            static_cast<u32>(Maxwell3D::Regs::ShadowRamControl::Replay), true);
-    CHECK(M3Access::FrontShadow(engine, f.system, split, Mode556) == 1);
+    CHECK(M3Access::FrontShadow(engine, f.system, split, Mode556) == ~0U);
+    engine.FrontCallMethod(f.system, split, Mode556, 0, true);
+    CHECK(M3Access::FrontRegister(engine, f.system, split, Mode556) == ~0U);
     Access::RunBack(split);
+    CHECK(engine.regs.reg_array[Mode556] == 1);
 }
 
 TEST_CASE("V2 S1 deltas applied on the back match the method executor on random streams",
