@@ -58,6 +58,45 @@ constexpr u8 KindImage = 3;
 
 } // Anonymous namespace
 
+void GraphicsPipeline::PushViewRequests(std::span<R::ResolvedView> views, bool blacklist,
+                                        C::RequestList& textures) const {
+    // PredictImageViews, every ready view as an ImagePrepare request (no prepare in place: as
+    // the first requests of the list it has the same effect).
+    const u64 table_changes = texture_cache.GraphicsImageTableChanges();
+    for (R::ResolvedView& entry : views) {
+        const auto lookup = texture_cache.LookupImageView(entry.tic_index, false);
+        u32 id = lookup.id.index;
+        if (lookup.request) {
+            C::Request request{};
+            request.kind = lookup.kind;
+            request.resource = C::Resource::ImageView;
+            request.address = entry.tic_index;
+            request.size = table_changes;
+            request.arg = 0;
+            request.slot = lookup.id.index;
+            const u32 proxy = textures.Push(request, true);
+            // A prepare keeps the view it found (a deletion while applying rebuilds the list);
+            // a table update or a creation is known once applied.
+            if (lookup.kind != C::Kind::ImagePrepare) {
+                id = proxy;
+            }
+            if (blacklist && entry.blacklist != 0 &&
+                !(lookup.kind == C::Kind::ViewBind &&
+                  lookup.id == VideoCommon::NULL_IMAGE_VIEW_ID)) {
+                C::Request rescale{};
+                rescale.kind = C::Kind::Rescale;
+                rescale.resource = C::Resource::ImageView;
+                rescale.slot = proxy;
+                rescale.arg = C::ArgBlacklist;
+                textures.Push(rescale);
+            }
+        }
+        entry.view = {id, C::IsProxy(id)
+                              ? 0U
+                              : texture_cache.ViewGeneration(VideoCommon::ImageViewId{id})};
+    }
+}
+
 template <class View>
 void GraphicsPipeline::ResolveTextures(const View& view, R::ResolvedDraw& out,
                                        C::RequestList& textures) const {
@@ -180,51 +219,19 @@ void GraphicsPipeline::ResolveTextures(const View& view, R::ResolvedDraw& out,
             add_image(desc, KindImage, desc.is_written);
         }
     }
-    // PredictImageViews, every ready view as an ImagePrepare request (no prepare in place: as the
-    // first requests of the list it has the same effect).
-    const bool blacklist = has_images;
-    const u64 table_changes = texture_cache.GraphicsImageTableChanges();
     boost::container::small_vector<R::ResolvedView, 160> views;
     for (const PendingView& entry : pending) {
-        const auto lookup = texture_cache.LookupImageView(entry.index, false);
-        u32 id = lookup.id.index;
-        if (lookup.request) {
-            C::Request request{};
-            request.kind = lookup.kind;
-            request.resource = C::Resource::ImageView;
-            request.address = entry.index;
-            request.size = table_changes;
-            request.arg = 0;
-            request.slot = lookup.id.index;
-            const u32 proxy = textures.Push(request, true);
-            // A prepare keeps the view it found (a deletion while applying rebuilds the list);
-            // a table update or a creation is known once applied.
-            if (lookup.kind != C::Kind::ImagePrepare) {
-                id = proxy;
-            }
-            if (blacklist && entry.blacklist &&
-                !(lookup.kind == C::Kind::ViewBind &&
-                  lookup.id == VideoCommon::NULL_IMAGE_VIEW_ID)) {
-                C::Request rescale{};
-                rescale.kind = C::Kind::Rescale;
-                rescale.resource = C::Resource::ImageView;
-                rescale.slot = proxy;
-                rescale.arg = C::ArgBlacklist;
-                textures.Push(rescale);
-            }
-        }
         views.push_back(R::ResolvedView{
             .tic_index = entry.index,
-            .view = {id, C::IsProxy(id) ? 0U
-                                        : texture_cache.ViewGeneration(VideoCommon::ImageViewId{id})},
             .stage = entry.stage,
             .kind = entry.kind,
             .blacklist = static_cast<u8>(entry.blacklist ? 1 : 0),
         });
     }
-    if (blacklist) {
+    if (has_images) {
         out.h.flags |= R::DrawFlagBlacklistedImages;
     }
+    PushViewRequests(std::span<R::ResolvedView>(views.data(), views.size()), has_images, textures);
     out.h.views = out.Push(std::span<const R::ResolvedView>(views.data(), views.size()));
     out.h.samplers = out.Push(std::span<const R::ResolvedSampler>(samplers.data(), samplers.size()));
     out.h.reads = out.Push(
@@ -478,12 +485,15 @@ template void GraphicsPipeline::ResolveTextures<R::SnapshotView>(const R::Snapsh
 
 void GraphicsPipeline::ObserveDrawRecord(std::span<const VideoCommon::ImageViewInOut> views,
                                          std::span<const VideoCommon::SamplerId> samplers,
+                                         const RescalingPushConstant& rescaling,
                                          const RenderAreaPushConstant& render_area) {
     DrawRecObserver& observer = *drawrec_observer;
     if (observer.done || observer.resolved == nullptr) {
         return;
     }
     observer.done = true;
+    observer.heap_words = heap_push.words;
+    observer.rescaling = rescaling.Data();
     const R::ResolvedDraw& resolved = *observer.resolved;
     if (resolved.h.status != R::ResolveStatus::Ready) {
         return;
@@ -589,6 +599,290 @@ void GraphicsPipeline::ObserveDrawRecord(std::span<const VideoCommon::ImageViewI
         }
     }
     R::CountRecordStat(stats.dependent, dependent);
+}
+
+// APPLY: the serial mutator of a record.
+
+namespace {
+
+/// Every buffer reference of a record (index, vertex, uniform, storage, texture buffers) with
+/// its guest range.
+template <typename Fn>
+void ForEachRecordBuffer(R::ResolvedDraw& record, Fn&& fn) {
+    R::DrawHeader& h = record.h;
+    if (h.indexed && h.index.valid) {
+        fn(h.index.buffer, h.index.daddr, h.index.size);
+    }
+    for (R::ResolvedVertex& entry : record.Span<R::ResolvedVertex>(h.vertex)) {
+        fn(entry.buffer, entry.daddr, entry.size);
+    }
+    for (R::ResolvedUbo& entry : record.Span<R::ResolvedUbo>(h.ubo)) {
+        if (entry.daddr != 0 || entry.size != 0) {
+            fn(entry.buffer, entry.daddr, entry.size);
+        }
+    }
+    for (R::ResolvedSsbo& entry : record.Span<R::ResolvedSsbo>(h.ssbo)) {
+        if (entry.daddr != 0 || entry.size != 0) {
+            fn(entry.buffer, entry.daddr, entry.size);
+        }
+    }
+    for (R::ResolvedTbo& entry : record.Span<R::ResolvedTbo>(h.tbo)) {
+        if (entry.size != 0) {
+            fn(entry.buffer, entry.daddr, entry.size);
+        }
+    }
+}
+
+} // Anonymous namespace
+
+void GraphicsPipeline::PatchRecordViews(R::ResolvedDraw& record,
+                                        const C::RequestList& textures) const {
+    for (R::ResolvedSampler& entry : record.Span<R::ResolvedSampler>(record.h.samplers)) {
+        if (C::IsProxy(entry.sampler.id)) {
+            entry.sampler.id = textures.Resolve(entry.sampler.id);
+            entry.sampler.generation =
+                texture_cache.SamplerGeneration(VideoCommon::SamplerId{entry.sampler.id});
+        }
+    }
+    for (R::ResolvedView& entry : record.Span<R::ResolvedView>(record.h.views)) {
+        if (C::IsProxy(entry.view.id)) {
+            entry.view.id = textures.Resolve(entry.view.id);
+            entry.view.generation =
+                texture_cache.ViewGeneration(VideoCommon::ImageViewId{entry.view.id});
+        }
+    }
+}
+
+void GraphicsPipeline::PatchRecordBuffers(R::ResolvedDraw& record,
+                                          const C::RequestList& buffers) const {
+    ForEachRecordBuffer(record, [&](VideoCommon::V2::Versions::WeakRef& ref, DAddr, u32) {
+        if (C::IsProxy(ref.id)) {
+            ref.id = buffers.Resolve(ref.id);
+            ref.generation = buffer_cache.BufferGeneration(VideoCommon::BufferId{ref.id});
+        }
+    });
+    // A patched creation is enabled as UpdateVertexBufferSlot enables it.
+    record.h.vertex_mask = 0;
+    for (const R::ResolvedVertex& entry : record.Span<const R::ResolvedVertex>(record.h.vertex)) {
+        if (entry.buffer.id != VideoCommon::NULL_BUFFER_ID.index && entry.size != 0) {
+            record.h.vertex_mask |= 1U << entry.slot;
+        }
+    }
+}
+
+void GraphicsPipeline::RepeekRecordBuffers(R::ResolvedDraw& record,
+                                           C::RequestList& buffers) const {
+    // UpdateGraphicsBuffers' loop after a deletion: every binding looked up again.
+    ForEachRecordBuffer(record, [&](VideoCommon::V2::Versions::WeakRef& ref, DAddr device_addr,
+                                    u32 size) {
+        const VideoCommon::BufferId id = buffer_cache.PeekBuffer(device_addr, size, false);
+        if (id) {
+            ref = {id.index, buffer_cache.BufferGeneration(id)};
+        } else {
+            ref = {buffers.Push(buffer_cache.MakeCreateRequest(device_addr, size, false), true),
+                   0};
+        }
+    });
+}
+
+void GraphicsPipeline::RelookupRecordProxies(R::ResolvedDraw& record) const {
+    // DeriveOnly: the old configure created what the proxies stood for; find it again.
+    for (R::ResolvedSampler& entry : record.Span<R::ResolvedSampler>(record.h.samplers)) {
+        if (C::IsProxy(entry.sampler.id)) {
+            const auto lookup = texture_cache.LookupSampler(entry.tsc_index, false);
+            entry.sampler = {lookup.id.index, texture_cache.SamplerGeneration(lookup.id)};
+        }
+    }
+    for (R::ResolvedView& entry : record.Span<R::ResolvedView>(record.h.views)) {
+        if (C::IsProxy(entry.view.id)) {
+            const auto lookup = texture_cache.LookupImageView(entry.tic_index, false);
+            entry.view = {lookup.id.index, texture_cache.ViewGeneration(lookup.id)};
+        }
+    }
+    ForEachRecordBuffer(record, [&](VideoCommon::V2::Versions::WeakRef& ref, DAddr device_addr,
+                                    u32 size) {
+        if (C::IsProxy(ref.id)) {
+            const VideoCommon::BufferId id = buffer_cache.PeekBuffer(device_addr, size, false);
+            ref = {id.index, buffer_cache.BufferGeneration(id)};
+        }
+    });
+}
+
+bool GraphicsPipeline::RefreshRecordTextureBuffers(R::ResolvedDraw& record) const {
+    // After the deleted-images loop: a texture buffer view may be another one now.
+    const auto views = record.Span<const R::ResolvedView>(record.h.views);
+    auto tbos = record.Span<R::ResolvedTbo>(record.h.tbo);
+    size_t view_index = 0;
+    size_t tbo_index = 0;
+    for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
+        if (!recipe_stages[stage]) {
+            continue;
+        }
+        const Shader::Info& info{stage_infos[stage]};
+        u32 index = 0;
+        const auto refresh = [&](const auto& desc, bool is_image) {
+            for (u32 i = 0; i < desc.count; ++i, ++view_index, ++index, ++tbo_index) {
+                if (tbo_index >= tbos.size() || C::IsProxy(views[view_index].view.id)) {
+                    return false;
+                }
+                const ImageView& image_view{
+                    texture_cache.GetImageView(VideoCommon::ImageViewId{views[view_index].view.id})};
+                PixelFormat format{image_view.format};
+                bool is_written = false;
+                if constexpr (std::is_same_v<std::remove_cvref_t<decltype(desc)>,
+                                             Shader::ImageBufferDescriptor>) {
+                    is_written = desc.is_written;
+                    if (const auto explicit_format{PixelFormatFromImageFormat(desc.format)}) {
+                        format = *explicit_format;
+                    }
+                }
+                tbos[tbo_index] = buffer_cache.ResolveTextureBufferBinding(
+                    stage, index, image_view.GpuAddr(), image_view.BufferSize(), format,
+                    is_written, is_image);
+            }
+            return true;
+        };
+        for (const auto& desc : info.texture_buffer_descriptors) {
+            if (!refresh(desc, false)) {
+                return false;
+            }
+        }
+        for (const auto& desc : info.image_buffer_descriptors) {
+            if (!refresh(desc, true)) {
+                return false;
+            }
+        }
+        view_index += Shader::NumDescriptors(info.texture_descriptors);
+        view_index += Shader::NumDescriptors(info.image_descriptors);
+    }
+    return true;
+}
+
+bool GraphicsPipeline::ApplyDraw(R::ResolvedDraw& record, C::RequestList& textures,
+                                 C::RequestList& buffers, DrawApplyOut& out, ApplyMode mode,
+                                 C::Stage& stage, VideoCommon::V2::DrawCache::Recipe* recipe) {
+    static_cast<void>(recipe);
+    R::RecordStats& stats = R::GetRecordStats();
+    R::DrawHeader& h = record.h;
+    const bool derive_only = mode == ApplyMode::DeriveOnly;
+    if (derive_only) {
+        RelookupRecordProxies(record);
+    } else {
+        // 1. Samplers, then views (CommitSamplerLookups, FillImageViewsCommit's loop: a deletion,
+        // or a blacklisted image scaled down, looks the views up again).
+        const bool blacklist = (h.flags & R::DrawFlagBlacklistedImages) != 0;
+        static_cast<void>(texture_cache.TakeDeletedImages());
+        bool looped = false;
+        for (;;) {
+            bool has_blacklisted = false;
+            stage.Apply(textures, [&](const C::Request& request) {
+                return texture_cache.ApplyDrawRequest(request, has_blacklisted);
+            });
+            PatchRecordViews(record, textures);
+            if (!texture_cache.TakeDeletedImages() && !(blacklist && has_blacklisted)) {
+                break;
+            }
+            R::CountRecordStat(stats.deleted_loops);
+            looped = true;
+            textures.Reset(textures.Segment());
+            PushViewRequests(record.Span<R::ResolvedView>(h.views), blacklist, textures);
+        }
+        if (looped && h.tbo.count != 0 && !RefreshRecordTextureBuffers(record)) {
+            return false;
+        }
+        // 2. Buffer creations (UpdateGraphicsBuffers' loop: a deletion looks every binding up
+        // again).
+        static_cast<void>(buffer_cache.TakeDeletedBuffers());
+        for (;;) {
+            stage.Apply(buffers, [&](const C::Request& request) {
+                return buffer_cache.ApplyDrawRequest(request);
+            });
+            // 3. The record's proxies patched.
+            PatchRecordBuffers(record, buffers);
+            if (!buffer_cache.TakeDeletedBuffers()) {
+                break;
+            }
+            R::CountRecordStat(stats.deleted_loops);
+            buffers.Reset(buffers.Segment());
+            RepeekRecordBuffers(record, buffers);
+        }
+    }
+    // 4. TraceTablePointer stays with the old bind (an env diagnostic of table pointers).
+    // 5. The image descriptors (handles, heap slots, modification marks, rescaling bits).
+    out.Clear();
+    for (const R::ResolvedView& entry : record.Span<const R::ResolvedView>(h.views)) {
+        out.views.push_back(VideoCommon::ImageViewInOut{
+            .index = entry.tic_index,
+            .blacklist = entry.blacklist != 0,
+            .id = VideoCommon::ImageViewId{entry.view.id},
+        });
+    }
+    for (const R::ResolvedSampler& entry : record.Span<const R::ResolvedSampler>(h.samplers)) {
+        out.samplers.push_back(VideoCommon::SamplerId{entry.sampler.id});
+    }
+    BindlessHeap* const heap = heap_pipeline ? heap_push.heap : nullptr;
+    const VideoCommon::SamplerId* samplers_it{out.samplers.data()};
+    const VideoCommon::ImageViewInOut* views_it{out.views.data()};
+    for (size_t index = 0; index < NUM_STAGES; ++index) {
+        if (!recipe_stages[index]) {
+            continue;
+        }
+        const size_t words_before = out.heap_words.size();
+        DeriveImageDescriptors(texture_cache, stage_infos[index], samplers_it, views_it, heap,
+                               heap_push.verify, out, derive_only);
+        out.heap_stage_words[index] = static_cast<u32>(out.heap_words.size() - words_before);
+    }
+    if (!derive_only) {
+        // 6. The heap slots reserved get their descriptors.
+        if (heap_pipeline) {
+            heap_push.heap->Commit();
+        }
+        // 7-8. Render targets (D4: the old update), the feedback-loop check.
+        texture_cache.UpdateRenderTargets(false);
+        texture_cache.CheckFeedbackLoop(
+            std::span<const VideoCommon::ImageViewInOut>(out.views.data(), out.views.size()));
+    }
+    // 9.
+    return !(IsBuilt() && (!pipeline || build->Failed()));
+}
+
+void GraphicsPipeline::VerifyDrawApply(R::ResolvedDraw& record, C::Stage& stage) {
+    DrawRecObserver* const observer = drawrec_observer;
+    if (observer == nullptr || !observer->done || record.h.status != R::ResolveStatus::Ready) {
+        return;
+    }
+    C::RequestList unused;
+    DrawApplyOut& out = observer->derived;
+    if (!ApplyDraw(record, unused, unused, out, ApplyMode::DeriveOnly, stage)) {
+        return;
+    }
+    R::RecordStats& stats = R::GetRecordStats();
+    const bool rescaling_equal = out.rescaling.Data() == observer->rescaling;
+    // The configure's heap words interleave each stage's texel buffer words (pushed by its buffer
+    // binds) ahead of its image words; compare where no stage has texel words in the heap.
+    const bool texels = std::ranges::any_of(heap_texels, [](const HeapTexelMasks& masks) {
+        return masks.heap != 0;
+    });
+    const bool heap_equal = texels || out.heap_words == observer->heap_words;
+    if (!rescaling_equal) {
+        R::CountRecordStat(stats.mismatches[static_cast<size_t>(R::RecordGroup::Push)]);
+    }
+    if (!heap_equal) {
+        R::CountRecordStat(stats.mismatches[static_cast<size_t>(R::RecordGroup::HeapWords)]);
+    }
+    if (!rescaling_equal || !heap_equal) {
+        static std::atomic<u32> logged{};
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+            LOG_WARNING(Render_Vulkan,
+                        "V2 draw record verify: draw {} pipeline {:016x}: the derived {} differ "
+                        "from the old configure's ({} heap words vs {})",
+                        record.h.ordinal, state_hash,
+                        !rescaling_equal && !heap_equal ? "rescaling and heap words"
+                        : !rescaling_equal              ? "rescaling words"
+                                                        : "heap words",
+                        out.heap_words.size(), observer->heap_words.size());
+        }
+    }
 }
 
 } // namespace Vulkan

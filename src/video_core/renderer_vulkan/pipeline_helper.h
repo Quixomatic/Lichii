@@ -675,18 +675,29 @@ inline void PushImageDescriptors(TextureCache& texture_cache,
 /// encode, in PushImageDescriptors' order: host handles of the descriptors outside the heap,
 /// the heap words, the rescaling words. Not relocatable (host handles, heap slots).
 struct DrawApplyOut {
+    static constexpr size_t NumStages = 5;
+
     boost::container::small_vector<std::pair<VkImageView, VkSampler>, 96> sampled;
     boost::container::small_vector<VkImageView, 32> storage;
     std::vector<u32> heap_words;
+    /// The image heap words of each stage (EncodeDraw interleaves a stage's texel words, which
+    /// its buffer binds push, ahead of them, as the old configure does).
+    std::array<u32, NumStages> heap_stage_words{};
     RescalingPushConstant rescaling; ///< its Push* cursors point into itself: never assigned
+    /// The record's views and samplers as the texture cache's in/out types (patched ids).
+    boost::container::small_vector<VideoCommon::ImageViewInOut, 160> views;
+    boost::container::small_vector<VideoCommon::SamplerId, 96> samplers;
     bool heap_replayed{};
 
     void Clear() {
         sampled.clear();
         storage.clear();
         heap_words.clear();
+        heap_stage_words.fill(0);
         std::destroy_at(&rescaling);
         std::construct_at(&rescaling);
+        views.clear();
+        samplers.clear();
         heap_replayed = false;
     }
 };

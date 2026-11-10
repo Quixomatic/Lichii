@@ -1169,7 +1169,7 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     }
     if (drawrec_observer) [[unlikely]] {
         ObserveDrawRecord(std::span(views.data(), views.size()),
-                          std::span(samplers.data(), samplers.size()), render_area);
+                          std::span(samplers.data(), samplers.size()), rescaling, render_area);
     }
     Profile::Scope scope{Profile::Zone::ConfigureDraw};
     return ConfigureDraw(rescaling, render_area);
@@ -1265,7 +1265,7 @@ bool GraphicsPipeline::ConfigureDelta(bool is_indexed) {
         return false;
     }
     if (drawrec_observer) [[unlikely]] {
-        ObserveDrawRecord(delta_views, delta_samplers, render_area);
+        ObserveDrawRecord(delta_views, delta_samplers, rescaling, render_area);
     }
     Profile::Scope scope{Profile::Zone::ConfigureDraw};
     return ConfigureDraw(rescaling, render_area);
@@ -1538,7 +1538,7 @@ GraphicsPipeline::RecipeResult GraphicsPipeline::ConfigureRecipe(
     delta_views_valid = true;
     if (drawrec_observer) [[unlikely]] {
         ObserveDrawRecord(std::span(views.data(), views.size()),
-                          std::span(samplers.data(), samplers.size()), render_area);
+                          std::span(samplers.data(), samplers.size()), rescaling, render_area);
     }
     Profile::Scope scope{Profile::Zone::ConfigureDraw};
     return ConfigureDraw(rescaling, render_area) ? RecipeResult::Recorded : RecipeResult::Failed;

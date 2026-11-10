@@ -433,6 +433,18 @@ public:
         VideoCommon::V2::Commit::RequestList& textures,
         VideoCommon::V2::Commit::RequestList& buffers) const;
 
+    /// The serial mutator of a record (spec §3): the texture then buffer requests (with the
+    /// deleted-images/buffers loops), the record's proxies patched, the image descriptors derived
+    /// (heap slots reserved), the heap committed, the render targets updated, the feedback-loop
+    /// check. Template: a recipe hit (heap words replayed while valid). DeriveOnly (verify):
+    /// nothing applied, proxies looked up again, slots peeked. False: the draw can't be recorded.
+    enum class ApplyMode : u8 { Normal, Template, DeriveOnly };
+    [[nodiscard]] bool ApplyDraw(VideoCommon::V2::Resolve::ResolvedDraw& record,
+                                 VideoCommon::V2::Commit::RequestList& textures,
+                                 VideoCommon::V2::Commit::RequestList& buffers, DrawApplyOut& out,
+                                 ApplyMode mode, VideoCommon::V2::Commit::Stage& stage,
+                                 VideoCommon::V2::DrawCache::Recipe* recipe = nullptr);
+
     /// DRAWREC=verify (step 11): the next configure (full, delta or recipe) builds the record it
     /// leaves behind and compares it with `resolved` before recording the draw. Null in v1.
     struct DrawRecObserver {
@@ -443,7 +455,15 @@ public:
         size_t samplers_before{};
         size_t buffers_before{};
         bool done{};
+        // Step 12: what the configure derived (heap and rescaling words).
+        std::vector<u32> heap_words;
+        std::array<u32, Shader::Backend::SPIRV::NUM_TEXTURE_AND_IMAGE_SCALING_WORDS> rescaling{};
+        DrawApplyOut derived;
     };
+    /// DRAWREC=verify (step 12): ApplyDraw(DeriveOnly) on the observed draw's record, its heap and
+    /// rescaling words compared with the ones the configure used.
+    void VerifyDrawApply(VideoCommon::V2::Resolve::ResolvedDraw& record,
+                         VideoCommon::V2::Commit::Stage& stage);
     void SetDrawRecObserver(DrawRecObserver* observer) noexcept {
         drawrec_observer = observer;
     }
@@ -453,8 +473,20 @@ private:
     /// bound, in ConfigureImpl's order.
     void ObserveDrawRecord(std::span<const VideoCommon::ImageViewInOut> views,
                            std::span<const VideoCommon::SamplerId> samplers,
+                           const RescalingPushConstant& rescaling,
                            const RenderAreaPushConstant& render_area);
     DrawRecObserver* drawrec_observer{};
+    /// ApplyDraw's pieces: record proxies patched from a list (or looked up again), bindings
+    /// peeked again after a deletion, texture buffers from the views again.
+    void PatchRecordViews(VideoCommon::V2::Resolve::ResolvedDraw& record,
+                          const VideoCommon::V2::Commit::RequestList& textures) const;
+    void PatchRecordBuffers(VideoCommon::V2::Resolve::ResolvedDraw& record,
+                            const VideoCommon::V2::Commit::RequestList& buffers) const;
+    void RepeekRecordBuffers(VideoCommon::V2::Resolve::ResolvedDraw& record,
+                             VideoCommon::V2::Commit::RequestList& buffers) const;
+    void RelookupRecordProxies(VideoCommon::V2::Resolve::ResolvedDraw& record) const;
+    [[nodiscard]] bool RefreshRecordTextureBuffers(
+        VideoCommon::V2::Resolve::ResolvedDraw& record) const;
 
     // Pipeline v2 P6 Step 0 (EDEN_NX2_V2_DRAWREC, vk_draw_resolve.cpp): the pure resolve of a
     // draw record. Reads only the view, guest memory and const cache lookups.
@@ -465,6 +497,9 @@ private:
     template <class View>
     void ResolveTextures(const View& view, VideoCommon::V2::Resolve::ResolvedDraw& out,
                          VideoCommon::V2::Commit::RequestList& textures) const;
+    /// The view lookups of `views` (TIC indices) and their requests (PredictImageViews).
+    void PushViewRequests(std::span<VideoCommon::V2::Resolve::ResolvedView> views,
+                          bool blacklist, VideoCommon::V2::Commit::RequestList& textures) const;
     /// The draw's index, vertex, uniform, storage and texture buffer bindings into `out`, a
     /// missing buffer as a BufferCreate request with a proxy into `buffers` (in the update
     /// passes' order). CommitOnly for what the record path doesn't take yet (transform feedback,
