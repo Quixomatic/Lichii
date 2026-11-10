@@ -156,28 +156,39 @@ void ReleaseFences(DmaPusher& dma_pusher) {
 bool LandEverythingPending(VideoCore::RasterizerInterface* rasterizer) {
     struct Job {
         VideoCore::RasterizerInterface* rasterizer{};
+        u64 blocked_ns{}; ///< SYNC Step 0: how long the back spent on it
         std::atomic<bool> done{false};
     };
     // Static: a job a stopping back never ran must not point at a dead frame. Front only.
     static Job job;
     job.rasterizer = rasterizer;
+    job.blocked_ns = 0;
     job.done.store(false, std::memory_order_relaxed);
     auto& split = VideoCommon::GpuSplit::Get();
     split.RequestBackJob(
         [](void* argument) {
             auto& self = *static_cast<Job*>(argument);
+            const auto start = std::chrono::steady_clock::now();
             VideoCore::g_signaling_query_report_fence = true;
             self.rasterizer->SignalFence([] {});
             VideoCore::g_signaling_query_report_fence = false;
             self.rasterizer->FlushCommands();
             self.rasterizer->ReleaseFences(true);
+            self.blocked_ns = static_cast<u64>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - start)
+                    .count());
             self.done.store(true, std::memory_order_release);
         },
         &job);
     while (!job.done.load(std::memory_order_acquire) && split.BackRunning()) {
         std::this_thread::yield();
     }
-    return job.done.load(std::memory_order_acquire);
+    const bool done = job.done.load(std::memory_order_acquire);
+    if (done) {
+        VideoCommon::V2::Stats::NoteForcedLanding(job.blocked_ns);
+    }
+    return done;
 }
 
 namespace V2Stats = VideoCommon::V2::Stats;
@@ -287,8 +298,12 @@ ViewCheck CheckWithView(DmaPusher& dma_pusher, GPUVAddr address, u32 value, V2::
         // `landed` after the operation wrote memory): read memory again, which now holds it.
         memory_word = memory.Read<u32>(address);
     }
-    if (word.kind == V2::HazardResult::Kind::Clear &&
-        !split.UnknownQmdMayWrite(*device, sizeof(u32))) {
+    const bool unknown_qmd = word.kind == V2::HazardResult::Kind::Clear &&
+                             split.UnknownQmdMayWrite(*device, sizeof(u32));
+    if (unknown_qmd && V2Stats::Enabled()) [[unlikely]] {
+        V2Stats::NoteReductionReject(V2Stats::ReductionReject::UnknownQmdMayWrite);
+    }
+    if (word.kind == V2::HazardResult::Kind::Clear && !unknown_qmd) {
         // Fix F3h (chunk C2: U-02 / R2-F3-05, §6 class A, diagram 2.3): only QMD reduction and
         // max releases the front's exact model saw write the word. Since d5e451eebf they land
         // at their fence; the word they leave is known now: memory plus the pending ones in
@@ -296,6 +311,9 @@ ViewCheck CheckWithView(DmaPusher& dma_pusher, GPUVAddr address, u32 value, V2::
         // (class B ordering, landing rule), so the channel goes on now instead of waiting for
         // the fence (67e9: ~817 such waits/s). Not met by it: decided as before.
         const auto view = split.QmdReductionView(*device, memory, address);
+        if (view.reject != 0 && V2Stats::Enabled()) [[unlikely]] {
+            V2Stats::NoteReductionReject(static_cast<V2Stats::ReductionReject>(view.reject - 1));
+        }
         if (view.known && view.any && V2::SemaphoreMet(op, view.value, value)) {
             return {V2::AcquireVerdict::MetByQueued, Reason::None, false, 0, view.position,
                     qmd_target, true};
@@ -566,6 +584,16 @@ bool Puller::PollAcquireView(DmaPusher& dma_pusher) {
                 return true; // NoteSyncAt not needed: nothing queued
             }
         }
+        if (V2Stats::Enabled()) [[unlikely]] {
+            using Wake = V2Stats::WakeClass;
+            const Wake wake = gpu_written                         ? Wake::Readback
+                              : check.reason == Reason::Unmapped  ? Wake::Map
+                              : acquire.producer_lands            ? Wake::Landing
+                              : check.reason == Reason::QueuedNotMet ? Wake::ReleaseParsed
+                              : queued                             ? Wake::Consumed
+                                                                   : Wake::Cpu;
+            acquire.wake = static_cast<u8>(wake);
+        }
         switch (V2::PlanSuspendedPoll(gpu_written, acquire.producer_lands, queued)) {
         case V2::SuspendedPoll::ReadBack:
             // Read the word back again once the back ran what was sent since (at most per
@@ -714,6 +742,8 @@ void Puller::SendWordReadback(DmaPusher& dma_pusher) {
 void Puller::SuspendOnView(DmaPusher& dma_pusher, PendingAcquire acquire, bool gpu_written,
                            u64 qmd_target) {
     acquire.qmd_target = qmd_target;
+    acquire.wake = static_cast<u8>(gpu_written ? V2Stats::WakeClass::Readback
+                                               : V2Stats::WakeClass::Cpu);
     // operation 0: a SEM_EXECUTE comparison the latch can't make (circular, mask zero); the polls
     // read the word.
     auto& waiters = Nx2SemaphoreWaiters::Get();
@@ -796,6 +826,14 @@ bool Puller::ResumeAcquire(DmaPusher& dma_pusher) {
     // counting those made the count odd ("suspended") at random, so submit-time snapshots were
     // thrown away for about half of all entries (CommandList::snapshot_suspensions).
     if (pending_acquire) {
+        if (V2Stats::Enabled() &&
+            VideoCommon::GpuSplit::Get().AcquireMode() != V2::Mode::Off) [[unlikely]] {
+            V2Stats::NoteSuspended(
+                static_cast<V2Stats::WakeClass>(pending_acquire->wake),
+                static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                     std::chrono::steady_clock::now() - pending_acquire->since)
+                                     .count()));
+        }
         pending_acquire.reset();
         dma_pusher.suspensions.fetch_add(1, std::memory_order_release);
         Nx2SemaphoreWaiters::Get().Remove(this);

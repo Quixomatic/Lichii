@@ -109,6 +109,13 @@ enum class Counter : u32 {
     ClearPassEndsPartial, ///< passes ended by a partial or blit clear
     PassColorRestarts,  ///< chunk B3: same attachments, pass restarted for the colour count
     ClearsDeferredEnded,///< chunk B3: full clears that ended another pass and became load ops
+    // SYNC_SUBMIT_SPEC §2.5 / Step 0: submissions by rule (the rest are counted as "other").
+    SubmitsPassBoundary, ///< rule B: the flush heuristic at a pass boundary
+    SubmitsChunk,        ///< rule C: the flush heuristic at a chunk
+    SubmitsIdle,         ///< rule I: the back's idle hook (DXVK's synchronization rule)
+    SubmitsWaiter,       ///< rule W: a thread blocks on the open tick (a request served)
+    SubmitsDeferred,     ///< DeferFlush's work (FlushDeferred, idle hook)
+    SubmitsPresent,      ///< the present's own submission
     Count,
 };
 
@@ -135,18 +142,20 @@ public:
         const char* file;
         u32 line;
         u64 count;
+        u64 sum; ///< Note's `amount` (a wait's ns), summed
     };
 
-    void Note(const char* file, u32 line) {
+    void Note(const char* file, u32 line, u64 amount = 0) {
         std::scoped_lock lock{mutex};
         for (Site& site : sites) {
             if (site.line == line &&
                 (site.file == file || std::strcmp(site.file, file) == 0)) {
                 ++site.count;
+                site.sum += amount;
                 return;
             }
         }
-        sites.push_back({file, line, 1});
+        sites.push_back({file, line, 1, amount});
     }
 
     /// The counts so far, most frequent first; resets them.
@@ -180,6 +189,8 @@ private:
 void NoteSubmitSite(const char* file, u32 line);
 /// F4-06: one full barrier (an operation the range tracker doesn't follow) asked for at file:line.
 void NoteFullBarrierSite(const char* file, u32 line);
+/// SYNC Step 0: one Scheduler::Finish at file:line that waited `ns` for the GPU.
+void NoteFinishSite(const char* file, u32 line, u64 ns);
 
 /// Logs and resets once per window (any thread; the first to arrive in a new window reports).
 void Report(const char* thread_name, u64 window_ns);

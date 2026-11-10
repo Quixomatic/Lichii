@@ -257,6 +257,11 @@ void Scheduler::ServeIdleHook() {
     if (submit_requests.IdleSubmits(flush_pending, lazy_fences, submit_wanted,
                                     lazy_outstanding_tick, CurrentTick())) {
         VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::FlushLazy);
+        VideoCommon::V2::P5bStats::Add(
+            flush_pending ? VideoCommon::V2::P5bStats::Counter::SubmitsDeferred
+            : submit_requests.Urgent(CurrentTick())
+                ? VideoCommon::V2::P5bStats::Counter::SubmitsWaiter
+                : VideoCommon::V2::P5bStats::Counter::SubmitsIdle);
         Flush();
     }
 }
@@ -292,6 +297,7 @@ void Scheduler::ServeSplitIdleHook(bool (*sync_due)(void*), void* argument) {
         return;
     case IdleAction::Deferred:
         P5b::Add(P5b::Counter::IdleDeferredWork);
+        P5b::Add(P5b::Counter::SubmitsDeferred);
         break;
     case IdleAction::Urgent:
         if (VideoCommon::GpuSplit::Get().HookBetweenEntries() &&
@@ -304,9 +310,11 @@ void Scheduler::ServeSplitIdleHook(bool (*sync_due)(void*), void* argument) {
             return;
         }
         P5b::Add(P5b::Counter::IdleUrgent);
+        P5b::Add(P5b::Counter::SubmitsWaiter);
         break;
     case IdleAction::Sync:
         P5b::Add(P5b::Counter::IdleSync);
+        P5b::Add(P5b::Counter::SubmitsIdle);
         break;
     }
     P5b::Add(P5b::Counter::FlushLazy);
@@ -343,6 +351,7 @@ bool Scheduler::DeferFlush() {
 void Scheduler::FlushDeferred() {
     if (flush_pending) {
         VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::FlushDeferred);
+        VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::SubmitsDeferred);
         Flush();
         return;
     }
@@ -358,6 +367,7 @@ void Scheduler::FlushDeferred() {
             }
         }
         VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::FlushLazy);
+        VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::SubmitsWaiter);
         Flush();
     }
 }
@@ -425,8 +435,9 @@ void Scheduler::Finish(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
     }
     // When finishing, we need to wait for the submission to have executed on the device.
     const u64 presubmit_tick = CurrentTick();
+    const bool p5b_stats = VideoCommon::V2::P5bStats::Enabled();
     const bool profile = VideoCommon::Nx2Profile::Enabled();
-    const u64 start = profile ? VideoCommon::Nx2Profile::Now() : 0;
+    const u64 start = profile || p5b_stats ? VideoCommon::Nx2Profile::Now() : 0;
     if (lazy_fences) [[unlikely]] {
         NoteBlockedWait();
     }
@@ -436,6 +447,11 @@ void Scheduler::Finish(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
     last_flush = std::chrono::steady_clock::now();
     flush_pending = false;
     submit_wanted = false;
+    if (p5b_stats) [[unlikely]] {
+        // SYNC Step 0: which Finish calls block their thread on the GPU, and for how long.
+        VideoCommon::V2::P5bStats::NoteFinishSite(location.file_name(), location.line(),
+                                                  VideoCommon::Nx2Profile::Now() - start);
+    }
     if (profile) {
         g_profile_finishes.fetch_add(1, std::memory_order_relaxed);
         g_profile_finish_ns.fetch_add(VideoCommon::Nx2Profile::Now() - start,

@@ -110,6 +110,31 @@ void NoteNarrowedBy(DrainSite site, u32 producers);
 /// where the old one went on (it costs time, never ordering); counted apart.
 void NoteMismatch(DrainSite site, bool benign = false);
 
+/// SYNC_SUBMIT_SPEC Step 0 (R2-B-05): what a suspended acquire waits for (spec §2.2 wake classes).
+enum class WakeClass : u8 {
+    ReleaseParsed, ///< A release the front has yet to parse (a queued one doesn't meet it)
+    Consumed,      ///< Work the back hasn't run yet
+    Landing,       ///< A producer that lands at a fence operation
+    Map,           ///< A map the back hasn't run yet (unmapped word)
+    Readback,      ///< The GPU-written word's readback
+    Cpu,           ///< Nothing known: a guest CPU write (memory read)
+    Count,
+};
+/// A suspended acquire resumed after `ns`, last waiting for `wake` (front thread).
+void NoteSuspended(WakeClass wake, u64 ns);
+/// Step 0: why GpuSplit::QmdReductionView (or its gate in the acquire) gave no answer.
+enum class ReductionReject : u8 {
+    UnknownQmdMayWrite, ///< The acquire's gate: an unknown QMD may write the word
+    Eviction,           ///< A pending reduction may have fallen out of the release ring
+    Kind,               ///< A pending writer of another kind (payload release, unknown QMD)
+    PartlyLanded,       ///< The newest landed entry's operations may be part landed
+    Raced,              ///< A landing between the reads
+    Count,
+};
+void NoteReductionReject(ReductionReject reason);
+/// Step 0: a forced landing (LandEverythingPending) blocked the back for `ns`.
+void NoteForcedLanding(u64 ns);
+
 /// Attributes the waits for the back made while it lives (acquire sites) to `sync_class`.
 class AcquireContext {
 public:

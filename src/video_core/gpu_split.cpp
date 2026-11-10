@@ -527,8 +527,13 @@ GpuSplit::ReductionView GpuSplit::QmdReductionView(u64 device_address,
     const u64 landed_before = V2::Landing::untracked_landed.load(std::memory_order_acquire);
     const u32 base = memory.Read<u32>(gpu_address);
     const u64 landed = V2::Landing::untracked_landed.load(std::memory_order_acquire);
+    // SYNC Step 0: why the view gives up (V2::Stats::ReductionReject + 1).
+    constexpr u8 RejectEviction = 2;
+    constexpr u8 RejectKind = 3;
+    constexpr u8 RejectPartlyLanded = 4;
+    constexpr u8 RejectRaced = 5;
     if (landed != landed_before) {
-        return {};
+        return {.reject = RejectRaced};
     }
     // Operations land in capture order: every one of an entry before the newest landed one's
     // entry has landed; none of a later entry has; that entry itself may be part landed.
@@ -555,7 +560,7 @@ GpuSplit::ReductionView GpuSplit::QmdReductionView(u64 device_address,
             continue;
         }
         if (entry.position <= done && entry.position == landed_entry) {
-            return {}; // Its entry's operations may be part landed
+            return {.reject = RejectPartlyLanded}; // Its entry's operations may be part landed
         }
         if (entry.kind == ReleaseKind::QmdReduction) {
             view.value = Tegra::ReduceSemaphore(entry.op & 7, (entry.op >> 3) & 1, view.value,
@@ -563,7 +568,8 @@ GpuSplit::ReductionView GpuSplit::QmdReductionView(u64 device_address,
         } else if (entry.kind == ReleaseKind::QmdMax) {
             view.value = std::max(view.value, entry.value);
         } else {
-            return {}; // A payload release, or one whose payload depends on a landing
+            // A payload release, or one whose payload depends on a landing
+            return {.reject = RejectKind};
         }
         view.any = true;
         view.position = std::max(view.position, entry.position);
@@ -573,7 +579,7 @@ GpuSplit::ReductionView GpuSplit::QmdReductionView(u64 device_address,
     const bool evicted_landed =
         oldest_kept <= landed_entry || (all_landed && oldest_kept <= done + 1);
     if (recent_release_head > size && !evicted_landed) {
-        return {};
+        return {.reject = RejectEviction};
     }
     return view;
 }

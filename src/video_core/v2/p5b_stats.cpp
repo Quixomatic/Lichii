@@ -60,6 +60,17 @@ void NoteFullBarrierSite(const char* file, u32 line) {
     BarrierSites().Note(file, line);
 }
 
+namespace {
+SubmitSites& FinishSites() {
+    static SubmitSites sites;
+    return sites;
+}
+} // Anonymous namespace
+
+void NoteFinishSite(const char* file, u32 line, u64 ns) {
+    FinishSites().Note(file, line, ns);
+}
+
 void Report(const char* thread_name, u64 window_ns) {
     if (!Enabled()) {
         return;
@@ -132,6 +143,30 @@ void Report(const char* thread_name, u64 window_ns) {
     // F4-01: where the submissions came from (Scheduler::Flush/Finish call sites).
     LOG_INFO(HW_GPU, "V2 stats {} P5b submits by site (per frame) | {}", thread_name,
              site_list(Sites()));
+    // SYNC_SUBMIT_SPEC §2.5 (Step 0): submissions by rule; Finish calls by site with their wait.
+    {
+        const u64 by_rule = at(Counter::SubmitsPassBoundary) + at(Counter::SubmitsChunk) +
+                            at(Counter::SubmitsIdle) + at(Counter::SubmitsWaiter) +
+                            at(Counter::SubmitsDeferred) + at(Counter::SubmitsPresent);
+        const auto finishes = FinishSites().Take();
+        std::string finish_list;
+        for (size_t i = 0; i < finishes.size() && i < 16; ++i) {
+            finish_list += fmt::format("{}{} {:.1f}/s {:.1f} ms/s", i == 0 ? "" : ", ",
+                                       SubmitSites::Name(finishes[i].file, finishes[i].line),
+                                       PerSecond(finishes[i].count, seconds),
+                                       PerSecond(finishes[i].sum, seconds) / 1e6);
+        }
+        LOG_INFO(HW_GPU,
+                 "V2 stats {} SYNC submits by rule (per frame) | B pass boundary {:.2f}, C chunk "
+                 "{:.2f}, I idle {:.2f}, W waiter {:.2f}, deferred {:.2f}, present {:.2f}, other "
+                 "{:.2f} | finishes by site: {}",
+                 thread_name, per_frame(at(Counter::SubmitsPassBoundary)),
+                 per_frame(at(Counter::SubmitsChunk)), per_frame(at(Counter::SubmitsIdle)),
+                 per_frame(at(Counter::SubmitsWaiter)), per_frame(at(Counter::SubmitsDeferred)),
+                 per_frame(at(Counter::SubmitsPresent)),
+                 per_frame(submits > by_rule ? submits - by_rule : 0),
+                 finish_list.empty() ? std::string{"none"} : finish_list);
+    }
     // F4-06: which untracked operations still flush every pending write.
     LOG_INFO(HW_GPU, "V2 stats {} P5b full barriers by site (per frame) | {}", thread_name,
              site_list(BarrierSites()));

@@ -96,6 +96,19 @@ struct FrontData {
     std::array<std::array<u64, 8>, NumSites> narrowed_by{};
     std::array<u64, NumSites> mismatches{};
     std::array<u64, NumSites> benign_mismatches{};
+    // SYNC Step 0.
+    std::array<u64, static_cast<size_t>(WakeClass::Count)> suspended{};
+    std::array<u64, static_cast<size_t>(WakeClass::Count)> suspended_ns{};
+    std::array<u64, static_cast<size_t>(ReductionReject::Count)> reduction_rejects{};
+    u64 forced_landings{};
+    u64 forced_landing_ns{};
+};
+
+constexpr std::array<const char*, static_cast<size_t>(WakeClass::Count)> wake_names{
+    "release parsed", "consumed", "landing", "map", "readback", "cpu",
+};
+constexpr std::array<const char*, static_cast<size_t>(ReductionReject::Count)> reject_names{
+    "unknown qmd may write", "eviction", "kind", "partly landed", "raced",
 };
 
 constexpr std::array<const char*, static_cast<size_t>(Decision::Count)> decision_names{
@@ -358,6 +371,35 @@ void ReportFront(const FrontData& data, const char* thread_name, u64 window_ns,
              PerSecond(data.table_evictions, window_ns));
 }
 
+// SYNC_SUBMIT_SPEC Step 0: suspended acquire time by wake class, reduction view rejects,
+// forced landings.
+void ReportSync(const FrontData& data, const char* thread_name, u64 window_ns) {
+    u64 any = data.forced_landings;
+    std::string wakes;
+    for (size_t w = 0; w < data.suspended.size(); ++w) {
+        any += data.suspended[w];
+        wakes += fmt::format(" {} {:.0f} ({:.1f} ms/s),", wake_names[w],
+                             PerSecond(data.suspended[w], window_ns),
+                             PerSecond(data.suspended_ns[w], window_ns) / 1e6);
+    }
+    std::string rejects;
+    for (size_t r = 0; r < data.reduction_rejects.size(); ++r) {
+        any += data.reduction_rejects[r];
+        rejects += fmt::format(" {} {:.0f},", reject_names[r],
+                               PerSecond(data.reduction_rejects[r], window_ns));
+    }
+    if (any == 0) {
+        return;
+    }
+    wakes.pop_back();
+    rejects.pop_back();
+    LOG_INFO(HW_GPU,
+             "V2 stats {} SYNC acquires resumed by wake class (per s):{} | reduction view "
+             "rejects (per s):{} | forced landings {:.0f}/s, back blocked {:.1f} ms/s",
+             thread_name, wakes, rejects, PerSecond(data.forced_landings, window_ns),
+             PerSecond(data.forced_landing_ns, window_ns) / 1e6);
+}
+
 void ReportDecisions(const FrontData& data, const char* thread_name, u64 window_ns) {
     std::string sites;
     for (size_t site = 0; site < NumSites; ++site) {
@@ -408,6 +450,7 @@ void ReportDecisions(const FrontData& data, const char* thread_name, u64 window_
         }
         sites += fmt::format(" {}:{};", drain_site_names[site], line);
     }
+    ReportSync(data, thread_name, window_ns);
     if (sites.empty()) {
         return;
     }
@@ -583,6 +626,31 @@ void NoteMismatch(DrainSite site, bool benign) {
     }
     auto& data = Front().data;
     ++(benign ? data.benign_mismatches : data.mismatches)[static_cast<size_t>(site)];
+}
+
+void NoteSuspended(WakeClass wake, u64 ns) {
+    if (!Enabled()) [[likely]] {
+        return;
+    }
+    auto& data = Front().data;
+    ++data.suspended[static_cast<size_t>(wake)];
+    data.suspended_ns[static_cast<size_t>(wake)] += ns;
+}
+
+void NoteReductionReject(ReductionReject reason) {
+    if (!Enabled()) [[likely]] {
+        return;
+    }
+    ++Front().data.reduction_rejects[static_cast<size_t>(reason)];
+}
+
+void NoteForcedLanding(u64 ns) {
+    if (!Enabled()) [[likely]] {
+        return;
+    }
+    auto& data = Front().data;
+    ++data.forced_landings;
+    data.forced_landing_ns += ns;
 }
 
 AcquireContext::AcquireContext(SyncClass sync_class) : enabled{Enabled()} {

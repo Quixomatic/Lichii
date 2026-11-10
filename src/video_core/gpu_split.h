@@ -494,6 +494,8 @@ public:
         bool any = false;
         u32 value = 0;
         u64 position = 0; ///< The newest pending one's ring position
+        /// Not known (SYNC Step 0): V2::Stats::ReductionReject + 1, 0 when known.
+        u8 reject = 0;
     };
     [[nodiscard]] ReductionView QmdReductionView(u64 device_address,
                                                  const Tegra::MemoryManager& memory,

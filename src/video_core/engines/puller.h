@@ -108,6 +108,8 @@ public:
         /// Fix F3h (F3-X1): the QMD release an Equal/Mask acquire orders behind, recorded when
         /// it was parsed (GpuSplit::QmdTargetFor); 0 when none.
         u64 qmd_target{};
+        /// SYNC Step 0: what its last poll waited for (V2::Stats::WakeClass), for the STATS line.
+        u8 wake{};
 
         [[nodiscard]] bool Matches(u32 current) const;
     };

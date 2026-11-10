@@ -5007,6 +5007,8 @@ void RasterizerVulkan::AdaptiveFlushWork(u32 cost) {
                 if (boundary.reason == H::ReasonRequest) {
                     P5b::Add(P5b::Counter::FlushRequestPass);
                 }
+                P5b::Add(boundary.reason == H::ReasonRequest ? P5b::Counter::SubmitsWaiter
+                                                             : P5b::Counter::SubmitsPassBoundary);
             }
         }
     }
@@ -5033,6 +5035,8 @@ void RasterizerVulkan::AdaptiveFlushWork(u32 cost) {
         if (decision.reason == H::ReasonRequest) {
             P5b::Add(P5b::Counter::FlushRequestChunk);
         }
+        P5b::Add(decision.reason == H::ReasonRequest ? P5b::Counter::SubmitsWaiter
+                                                     : P5b::Counter::SubmitsChunk);
         return;
     }
     pending_native_work = true;
