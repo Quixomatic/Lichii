@@ -50,10 +50,12 @@ enum class Tag : u8 {
     /// in dirty; the front's compute groups before a write that may launch QMDs.
     ComputeGroups = 14,
     /// EDEN_NX2_V2_CBUFRING (v2/cbuf_ring.h): [tag][size 32-63], [window GPU address], [ring
-    /// position, ~0 for none]; the window's decode-time version, sent before the next draw.
+    /// position, ~0 for none], and for F2-03 [the watch's page words], [the front's device
+    /// address, ~0 for none], [decoder epoch][trusted 32]; the window's decode-time version,
+    /// sent before the next draw.
     CbufVersion = 15,
 };
-inline constexpr size_t CbufVersionWords = 3;
+inline constexpr size_t CbufVersionWords = 6;
 
 inline constexpr u64 TagMask = 0xf;
 inline constexpr u64 IsLast = 1 << 4;

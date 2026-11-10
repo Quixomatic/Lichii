@@ -463,3 +463,73 @@ TEST_CASE("V2 F2-03: a version on armed pages is trusted until its pages see a w
     arming.ReleaseAll(counts);
     REQUIRE(counts.Count(page) == 0);
 }
+
+TEST_CASE("V2 F2-03: published versions carry their trust; bases read in flight never have it",
+          "[video_core][v2_cbufwatch]") {
+    static V2::CbufRing::Shared shared;
+    std::vector<u8> mapped(V2::CbufRing::Shared::Capacity);
+    shared.Init(mapped.data(), 256);
+    auto watch = std::make_unique<W::Watch>();
+    W::Arming arming{*watch};
+    FakeCounts counts;
+    auto decode = std::make_unique<V2::CbufRing::Decode>(shared, true);
+    WatchEnv env;
+    env.watch = watch.get();
+    constexpr u32 cbuf_bit = V2::ProducerBit(V2::Producer::CbData);
+    const auto publish = [&] {
+        std::vector<V2::CbufRing::Published> out;
+        decode->Publish([&](const V2::CbufRing::Published& version) { out.push_back(version); });
+        return out;
+    };
+    watch->RequestArm(DeviceBase + 0x3000, 0x2000);
+    arming.Tick(1, false, counts);
+    // Data on an armed window with nothing in flight: a trusted guest base, then patched.
+    const u32 a = 0xa;
+    decode->Write(0x3000, 0x100, 0, &a, 1, cbuf_bit, env);
+    auto versions = publish();
+    REQUIRE(versions.size() == 1);
+    REQUIRE(versions[0].trusted);
+    REQUIRE(versions[0].device == DeviceBase + 0x3000);
+    REQUIRE(versions[0].words == watch->Take(DeviceBase + 0x3000, 0x100).words);
+    // Its next version keeps the trusted base while only its data is in flight.
+    env.writers = cbuf_bit;
+    decode->Write(0x3000, 0x100, 4, &a, 1, cbuf_bit, env);
+    versions = publish();
+    REQUIRE(versions[0].trusted);
+    // G2: a window without a version whose own data is in flight takes guest bytes that may
+    // lack it: never trusted.
+    decode->Write(0x4000, 0x100, 0, &a, 1, cbuf_bit, env);
+    versions = publish();
+    REQUIRE(versions.size() == 1);
+    REQUIRE(versions[0].position != V2::CbufRing::NoPosition);
+    REQUIRE_FALSE(versions[0].trusted);
+    // A trap on the first window's page: its kept chain loses the trust.
+    watch->OnCpuWrite(DeviceBase + 0x3000, 4, [&](u64 p) {
+        counts.Hold(std::span<const std::pair<u64, u64>>{std::array{std::pair{p, W::PageSize}}},
+                    -1);
+    });
+    decode->Write(0x3000, 0x100, 8, &a, 1, cbuf_bit, env);
+    versions = publish();
+    REQUIRE_FALSE(versions[0].trusted);
+    // Data whose device address cannot be told untrusts every version (the epoch moves).
+    const u32 epoch = shared.decode_epoch.load();
+    struct Untranslatable : WatchEnv {
+        u64 Device(u64, u32) {
+            return V2::CbufRing::NoPosition;
+        }
+    } lost;
+    lost.watch = watch.get();
+    decode->Write(0x9000, 0x100, 0x200, &a, 1, cbuf_bit, lost); // outside its window
+    REQUIRE(shared.decode_epoch.load() == epoch + 1);
+    publish();
+    // The back table keeps what the entries carried.
+    V2::CbufRing::BackTable table;
+    table.Set(0x8000, 0x100, 0x400, 0x1234, 7, true);
+    const auto* const entry = table.Find(0x8000, 0x100);
+    REQUIRE(entry != nullptr);
+    REQUIRE(entry->trusted);
+    REQUIRE(entry->words == 0x1234);
+    REQUIRE(entry->epoch == 7);
+    REQUIRE(entry->checked_epoch == 0);
+    arming.ReleaseAll(counts);
+}

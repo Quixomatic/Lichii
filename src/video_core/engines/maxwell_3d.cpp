@@ -1001,13 +1001,23 @@ void Maxwell3D::ExecuteS1Run(const u64* it, const u64* const end) {
             break;
         case S1::Tag::CbufVersion: {
             // The window's decode-time version, by device address for the uniform binds.
-            auto& table = VideoCommon::V2::CbufRing::Get().table;
-            if (const auto device = memory_manager.GpuToCpuAddress(it[1])) {
-                if (it[2] == VideoCommon::V2::CbufRing::NoPosition) {
+            namespace Ring = VideoCommon::V2::CbufRing;
+            auto& table = Ring::Get().table;
+            const auto device = memory_manager.GpuToCpuAddress(it[1]);
+            // F2-03: the front's device address, where its index and the watch's words were
+            // taken; trusted only if the back's translation agrees.
+            const u64 front_device = it[4];
+            if (it[2] == Ring::NoPosition) {
+                if (device) {
                     table.Drop(*device);
-                } else {
-                    table.Set(*device, S1::ValueOf(word), it[2]);
                 }
+                if (front_device != Ring::NoPosition && (!device || *device != front_device)) {
+                    table.Drop(front_device);
+                }
+            } else if (device) {
+                const bool trusted = (it[5] >> 32) != 0 && front_device == *device;
+                table.Set(*device, S1::ValueOf(word), it[2], it[3],
+                          static_cast<u32>(it[5]), trusted);
             }
             it += S1::CbufVersionWords;
             break;
@@ -2310,11 +2320,14 @@ void Maxwell3D::FrontCbufBindVersions(VideoCommon::GpuSplit& split, FrontState& 
 
 void Maxwell3D::FrontPublishCbufVersions(VideoCommon::GpuSplit& split, FrontState& fs) {
     namespace S1 = VideoCommon::V2::S1;
-    fs.v2_cbuf_ring->Publish([&](u64 va, u32 size, u64 position) {
+    fs.v2_cbuf_ring->Publish([&](const VideoCommon::V2::CbufRing::Published& version) {
         u64* const entry = split.S1Begin(this, S1::CbufVersionWords);
-        entry[0] = static_cast<u64>(S1::Tag::CbufVersion) | (u64{size} << 32);
-        entry[1] = va;
-        entry[2] = position;
+        entry[0] = static_cast<u64>(S1::Tag::CbufVersion) | (u64{version.size} << 32);
+        entry[1] = version.va;
+        entry[2] = version.position;
+        entry[3] = version.words;
+        entry[4] = version.device;
+        entry[5] = u64{version.epoch} | (version.trusted ? u64{1} << 32 : 0);
         split.S1Commit(S1::CbufVersionWords);
     });
 }

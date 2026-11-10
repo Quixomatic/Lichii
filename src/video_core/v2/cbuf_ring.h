@@ -11,6 +11,7 @@
 #include <limits>
 #include <memory>
 #include <optional>
+#include <type_traits>
 #include <unordered_map>
 #include <vector>
 
@@ -152,10 +153,27 @@ public:
         u64 device_addr{};
         u32 size{};
         u64 position{NoPosition};
+        // F2-03 (v2/cbuf_watch.h): the version is what the shader reads while `trusted`, its
+        // decoder's epoch is current and the watch's page words still equal `words`.
+        u64 words{};
+        u32 epoch{};
+        bool trusted{};
+        /// The fallback memo: the bytes equalled guest memory at this collect epoch, with the
+        /// pages' words then (a foreign write since moves them).
+        mutable u64 checked_epoch{};
+        mutable u64 checked_words{};
     };
 
-    void Set(u64 device_addr, u32 size, u64 position) {
-        entries[Slot(device_addr)] = Entry{device_addr, size, position};
+    void Set(u64 device_addr, u32 size, u64 position, u64 words = 0, u32 epoch = 0,
+             bool trusted = false) {
+        entries[Slot(device_addr)] = Entry{
+            .device_addr = device_addr,
+            .size = size,
+            .position = position,
+            .words = words,
+            .epoch = epoch,
+            .trusted = trusted,
+        };
     }
     void Drop(u64 device_addr) {
         Entry& entry = entries[Slot(device_addr)];
@@ -248,6 +266,17 @@ struct Shared {
     static Shared shared;
     return shared;
 }
+
+/// A window's version as the front publishes it (position NoPosition: none now).
+struct Published {
+    u64 va{};
+    u32 size{};
+    u64 position{NoPosition};
+    u64 device{NoPosition}; ///< F2-03: the front's device address (NoPosition: the back translates)
+    u64 words{};            ///< ... the watch's page words before the version's bytes
+    u32 epoch{};            ///< ... Shared::decode_epoch it was trusted under
+    bool trusted{};
+};
 
 /// Front: the constant buffer windows written since the last draw and their versions.
 ///
@@ -399,8 +428,16 @@ public:
     /// (position NoPosition: the window has no version now), the versions copied to the ring.
     template <typename Emit>
     void Publish(Emit&& emit) {
+        // `emit(const Published&)` (F2-03), or `emit(va, size, position)`.
+        const auto send = [&](const Published& version) {
+            if constexpr (std::is_invocable_v<Emit&, const Published&>) {
+                emit(version);
+            } else {
+                emit(version.va, version.size, version.position);
+            }
+        };
         for (const Dropped& dropped : drops) {
-            emit(dropped.va, dropped.size, NoPosition);
+            send(Published{.va = dropped.va, .size = dropped.size, .device = dropped.device});
         }
         drops.clear();
         Ring& ring = shared->ring;
@@ -408,6 +445,7 @@ public:
         for (const u32 index : dirty) {
             Window& window = windows[index];
             window.dirty = false;
+            const u64 device = window.located ? window.device : NoPosition;
             if (ready && window.valid && window.position >= ring.Retired()) {
                 const u64 offset = ring.Offset(window.position);
                 // A published version only learnt its trust (Trust): its bytes are there.
@@ -416,10 +454,22 @@ public:
                                 window.size);
                 }
                 window.published = true;
-                emit(window.va, window.size, window.position);
+                const bool trusted = Trusted(window);
+                if (trusted) {
+                    shared->trusted_versions.fetch_add(1, std::memory_order_relaxed);
+                }
+                send(Published{
+                    .va = window.va,
+                    .size = window.size,
+                    .position = window.position,
+                    .device = device,
+                    .words = window.words,
+                    .epoch = epoch,
+                    .trusted = trusted,
+                });
             } else {
                 window.valid = false;
-                emit(window.va, window.size, NoPosition);
+                send(Published{.va = window.va, .size = window.size, .device = device});
             }
         }
         dirty.clear();
