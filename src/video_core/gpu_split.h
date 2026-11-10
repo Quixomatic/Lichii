@@ -392,12 +392,30 @@ public:
     }
     /// Front (Fix F3f, F3-X1b): UntrackedReleasePending for one word: a QMD release that may
     /// write [device_address, device_address + size) is still queued, or ran but its operation
-    /// hasn't (FindWrites' untracked answer). A placed QMD release elsewhere doesn't count.
+    /// hasn't (FindWrites' untracked answer). A placed QMD release elsewhere doesn't count; an
+    /// unknown QMD counts for every word only until the back ran it (Fix F3h, FindUntracked).
     [[nodiscard]] bool QmdReleaseMayWrite(u64 device_address, u64 size) {
         V2::HazardFilter filter;
         filter.ranged = V2::ProducerBit(V2::Producer::QmdRelease);
         filter.unbounded = V2::ProducerBit(V2::Producer::QmdRelease);
         return FindWrites(device_address, size, filter).kind != V2::HazardResult::Kind::Clear;
+    }
+    /// Front (Fix F3h, F3-X1): the producer an Equal or Mask acquire of the word waits for,
+    /// snapshotted when the acquire is parsed: the newest QMD release noted before it that may
+    /// write the word (an unknown QMD's, or a placed one over the word) whose operations may not
+    /// have run. 0 when none. A later QMD release doesn't move it (it is not ordered before the
+    /// acquire), so the acquire's polls wait for one fixed position, not the newest note.
+    [[nodiscard]] u64 QmdTargetFor(u64 device_address, u64 size) {
+        V2::HazardFilter filter;
+        filter.ranged = V2::ProducerBit(V2::Producer::QmdRelease);
+        filter.unbounded = V2::ProducerBit(V2::Producer::QmdRelease);
+        const V2::HazardResult result = FindWrites(device_address, size, filter);
+        return result.kind == V2::HazardResult::Kind::Clear ? 0 : V2::RingPositionOf(result);
+    }
+    /// Front: the back ran the entries up to `target` and every QMD release operation of them
+    /// landed (V2::Landing::UntrackedSettled).
+    [[nodiscard]] bool QmdTargetSettled(u64 target) const {
+        return target == 0 || V2::Landing::UntrackedSettled(ConsumedNow()) >= target;
     }
     /// Front: a release of known bytes just sent that lands at an operation (fence-flagged, at
     /// High accuracy, or deferred behind an earlier one), with its landing ticket. Until it lands

@@ -460,8 +460,34 @@ V2::HazardResult GpuSplit::FindUntracked(u64 device_address, u64 size, u64 done,
     // but memory doesn't either until the operation ran.
     const u64 settled = V2::Landing::UntrackedSettled(done);
     qmd_release_notes.Retire(settled);
-    V2::HazardResult result = qmd_release_notes.Find(device_address, size,
-                                                     std::max(settled, floor), untracked_filter);
+    const u64 live = std::max(settled, floor);
+    // Ranged notes: their ranges decide.
+    V2::HazardFilter ranged_filter;
+    ranged_filter.ranged = untracked_filter.ranged;
+    V2::HazardResult result =
+        qmd_release_notes.Find(device_address, size, live, ranged_filter);
+    // Fix F3h (F3-X1): an unbounded note (an unknown QMD) may write any word only while the
+    // back hasn't run its entry. Once it has, the operations still to land are captured with
+    // their device ranges (Landing::UntrackedTargetFor): only those that overlap the range
+    // count, so an unknown QMD no longer holds every word for about a frame.
+    if (untracked_filter.unbounded != 0) {
+        V2::HazardFilter unbounded_filter;
+        unbounded_filter.unbounded = filter.unbounded & qmd;
+        unbounded_filter.unbounded_synced = filter.unbounded_synced & qmd;
+        const V2::HazardResult unbounded =
+            qmd_release_notes.Find(device_address, size, live, unbounded_filter);
+        if (unbounded.kind != V2::HazardResult::Kind::Clear &&
+            (unbounded.position > done || unbounded.overflow ||
+             V2::Landing::UntrackedTargetFor(device_address, size) != 0)) {
+            if (result.kind == V2::HazardResult::Kind::Clear ||
+                unbounded.position > result.position) {
+                result.position = unbounded.position;
+            }
+            result.kind = V2::HazardResult::Kind::Wait;
+            result.producers |= unbounded.producers;
+            result.overflow |= unbounded.overflow;
+        }
+    }
     if (result.kind == V2::HazardResult::Kind::Clear) {
         return found;
     }

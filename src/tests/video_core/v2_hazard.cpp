@@ -554,46 +554,60 @@ TEST_CASE("V2 acquire: a suspended acquire whose release the view never records 
         CHECK(ViewSuspends(AcquireVerdict::NotMet, false));
         CHECK(!ViewSuspends(AcquireVerdict::Met, false));
     }
-    SECTION("a release written where the view doesn't look is found by the old path's poll") {
-        // The model: memory the view reads holds 0; the release (1) sits where only the old
-        // path's drain and flush reach it (a cache the back holds, another channel's queued
-        // work). The view keeps deciding NotMet from what it sees.
+    SECTION("a release written where the view doesn't look is found once the back went idle") {
+        // Fix F3h (F3-X1): no timed net. The model: memory the view reads holds 0; the release
+        // (1) is in work the back hasn't run yet (another channel's queued work). The view keeps
+        // deciding NotMet; the poll waits for the back (its `consumed` store rings the front),
+        // and once nothing is queued and no producer is known, the old read finds it.
         HazardResult clear;
-        const u32 view_word = 0;
-        const u32 old_path_word = 1;
-        u64 elapsed_us = 0;
+        u32 memory_word = 0;
+        u64 queued = 3; // entries the back still has to run; it runs one per poll
         bool resumed = false;
-        for (int poll = 0; poll < 100 && !resumed; ++poll, elapsed_us += 100) {
+        for (int poll = 0; poll < 10 && !resumed; ++poll) {
             const AcquireDecision view =
-                DecideAcquire(SemaphoreOp::Equal, 1, clear, view_word, view_word, 0);
-            REQUIRE(view.verdict == AcquireVerdict::NotMet);
+                DecideAcquire(SemaphoreOp::Equal, 1, clear, memory_word, memory_word, 0);
             REQUIRE(ViewSuspends(view.verdict, false));
-            switch (PlanSuspendedPoll(false, elapsed_us)) {
-            case SuspendedPoll::OldPath:
-                resumed = SemaphoreMet(SemaphoreOp::Equal, old_path_word, 1);
+            switch (PlanSuspendedPoll(false, false, queued != 0)) {
+            case SuspendedPoll::OldRead:
+                resumed = SemaphoreMet(SemaphoreOp::Equal, memory_word, 1);
+                break;
+            case SuspendedPoll::Wait:
+                if (--queued == 0) {
+                    memory_word = 1; // the last queued entry wrote it
+                }
                 break;
             case SuspendedPoll::ReadBack:
-            case SuspendedPoll::Wait:
+            case SuspendedPoll::Submit:
+                FAIL("no producer is known");
                 break;
             }
         }
         CHECK(resumed);
-        CHECK(elapsed_us <= OldPathEveryUs + 100);
-        // Before the net's interval only the view (or a read-back) decides.
-        CHECK(PlanSuspendedPoll(false, 0) == SuspendedPoll::Wait);
-        CHECK(PlanSuspendedPoll(true, 0) == SuspendedPoll::ReadBack);
+        CHECK(PlanSuspendedPoll(true, false, true) == SuspendedPoll::ReadBack);
+        CHECK(PlanSuspendedPoll(true, true, false) == SuspendedPoll::ReadBack);
     }
-    SECTION("a QMD release still on its way latches the waiter; the net waits for it, bounded") {
-        // F3F5b-5: the 32 net resumes at OoT's boot (word N-1 -> N after the drain). While a
-        // release the view can't see may land, the net doesn't drain for it...
-        CHECK(PlanSuspendedPoll(false, OldPathEveryUs, true) == SuspendedPoll::Wait);
-        CHECK(PlanSuspendedPoll(false, OldPathEveryUs + UntrackedDeferUs - 1, true) ==
-              SuspendedPoll::Wait);
-        CHECK(PlanSuspendedPoll(true, OldPathEveryUs, true) == SuspendedPoll::ReadBack);
-        // ...but a release the view never records still gets the net, later.
-        CHECK(PlanSuspendedPoll(false, OldPathEveryUs + UntrackedDeferUs, true) ==
-              SuspendedPoll::OldPath);
-        CHECK(PlanSuspendedPoll(false, OldPathEveryUs, false) == SuspendedPoll::OldPath);
+    SECTION("a producer that lands at a fence makes the poll ask for its submit, never a drain") {
+        // F3F5b-5 / F3-X1: a QMD release (or a release still to land) that may write the word
+        // latches the waiter when its operation runs; the poll asks for the submit that runs it,
+        // queued work or not, and never takes the old path for it.
+        CHECK(PlanSuspendedPoll(false, true, true) == SuspendedPoll::Submit);
+        CHECK(PlanSuspendedPoll(false, true, false) == SuspendedPoll::Submit);
+        CHECK(PlanSuspendedPoll(false, false, true) == SuspendedPoll::Wait);
+        CHECK(PlanSuspendedPoll(false, false, false) == SuspendedPoll::OldRead);
+    }
+    SECTION("an Equal acquire waits for the QMD producer it was given, not a newer one") {
+        // 0fe4: the poll passed the newest unknown QMD release noted (moving every signal), so
+        // with memory already meeting it the acquire never passed by the view.
+        HazardResult clear;
+        // The producer (ring position 200) settled: memory decides.
+        CHECK(DecideAcquire(SemaphoreOp::Equal, 5, clear, 5, 5, 0).verdict == AcquireVerdict::Met);
+        // Not settled: wait for that position.
+        const AcquireDecision waiting = DecideAcquire(SemaphoreOp::Equal, 5, clear, 5, 5, 200);
+        CHECK(waiting.verdict == AcquireVerdict::WaitFor);
+        CHECK(waiting.position == 200);
+        // A Gequal acquire doesn't wait for it (a word that only advances).
+        CHECK(DecideAcquire(SemaphoreOp::Gequal, 5, clear, 5, 5, 200).verdict ==
+              AcquireVerdict::Met);
     }
     SECTION("an untracked release reports its entry when it is queued and when it lands") {
         const u64 saved_tag = Landing::tag;

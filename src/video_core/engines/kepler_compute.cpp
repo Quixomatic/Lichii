@@ -150,10 +150,16 @@ void KeplerCompute::ProcessNativeReportSemaphore(u32 argument) {
             deferred || VideoCommon::V2::FencesDelayed() ? Landing::Capture() : 0;
         VideoCore::g_signaling_query_report_fence = deferred;
         rasterizer->SignalFence([this, address, payload, reduction, landing] {
-            memory_manager.Write<u32>(address, ReduceSemaphore(reduction, false,
-                                                               memory_manager.Read<u32>(address), payload));
+            const u32 value =
+                ReduceSemaphore(reduction, false, memory_manager.Read<u32>(address), payload);
+            memory_manager.Write<u32>(address, value);
             if (landing != 0) {
                 Landing::Note(landing);
+            }
+            // Fix F3h (F3-X1): every semaphore writer latches the acquires it meets (a
+            // suspended acquire has no timed net any more).
+            if (const auto device = memory_manager.GpuToCpuAddress(address)) {
+                Tegra::Nx2SemaphoreWaiters::Get().OnWrite(*device, value);
             }
         });
         VideoCore::g_signaling_query_report_fence = false;

@@ -264,8 +264,9 @@ struct AcquireDecision {
 
 /// Decides an acquire from the front's view of its word (GpuSplit::FindWrites over the queued
 /// writes and the releases still to land; `forwarded`: the word's value if Forward), memory's
-/// word now, and the newest queued compute dispatch (0 if none), whose QMD releases the front
-/// can't see (MASTER_PLAN §6):
+/// word now, and the QMD release the acquire orders behind (0 if none or it settled; Fix F3h:
+/// fixed when the acquire was parsed, GpuSplit::QmdTargetFor), whose bytes the front can't see
+/// (MASTER_PLAN §6):
 ///   Pending unknown write (counter report, reduction) or partly known: Fallback (class D).
 ///   Pending known write, queued or run but not landed, fence-flagged or not: the newest one's
 ///     value decides. MetByQueued (class B): the host queue runs it before the acquire's channel
@@ -288,30 +289,33 @@ struct AcquireDecision {
 
 /// What a poll of a channel suspended by the view does while the acquire stays unmet.
 enum class SuspendedPoll : u8 {
-    Wait,     ///< Keep waiting (latch, landing, the next poll's memory read)
+    Wait,     ///< Keep waiting: the back's `consumed` store rings the front (queued work)
     ReadBack, ///< Read the GPU-written word back (class C)
-    OldPath,  ///< Progress net: drain and read the word through the back
+    Submit,   ///< A producer of the word lands at a fence: ask for its submit, then wait
+    OldRead,  ///< No producer known, nothing queued: the old read (flush, read), counted
 };
 
-/// The view resumes a suspended acquire on what it records: a release landing (latch), a queued
-/// release, memory read at each poll. A release it never records (written through a cache the
-/// back flushes, a path no front note covers) would leave the channel suspended for good, so
-/// every OldPathEvery the old path (drain, flush, read) polls once. Not the old 1 ms valve: class
-/// B passes what the valve used to drain for.
-inline constexpr u64 OldPathEveryUs = 2000;
-/// F3F5b-5: while a QMD release the view can't see may still land (GpuSplit::
-/// UntrackedReleasePending), the net waits up to this much longer: that release latches the
-/// waiter when it lands, where the net would drain and wait for the fences to see it (OoT's
-/// boot: 32 net resumes, word N-1 → N, never a page the GPU wrote). Bounded, so a release the
-/// view never records still progresses while QMD releases keep coming.
-inline constexpr u64 UntrackedDeferUs = 20000;
-[[nodiscard]] constexpr SuspendedPoll PlanSuspendedPoll(bool gpu_written, u64 since_old_poll_us,
-                                                        bool untracked_pending = false) {
-    if (since_old_poll_us >= OldPathEveryUs &&
-        (!untracked_pending || since_old_poll_us >= OldPathEveryUs + UntrackedDeferUs)) {
-        return SuspendedPoll::OldPath;
+/// Fix F3h (F3-X1, MASTER_PLAN §6 class C): a suspended acquire resumes on its producer, never
+/// on a timed net. Every poll reads memory and the view (a queued release meeting it passes,
+/// class B), and a release landing latches it. What else lets it go on, by what is known:
+/// - the word is GPU-written: its readback behind the writers;
+/// - a producer of the word lands at a fence (a release or report still to land, a QMD release
+///   that may write it, an operation the back captured for a release the front noted, the QMD
+///   producer an Equal/Mask acquire orders behind): ask for that fence's submit (SESSION_HANDOFF
+///   §5g: the wait causes its submit), then the landing rings the front;
+/// - work the back hasn't run yet: its `consumed` store rings the front, and the next poll asks
+///   again with what the back made of it;
+/// - nothing known and nothing queued: the old read, once (a guest CPU write is read at every
+///   poll; the front sleeps one timer tick at most).
+[[nodiscard]] constexpr SuspendedPoll PlanSuspendedPoll(bool gpu_written, bool producer_lands,
+                                                        bool queued) {
+    if (gpu_written) {
+        return SuspendedPoll::ReadBack;
     }
-    return gpu_written ? SuspendedPoll::ReadBack : SuspendedPoll::Wait;
+    if (producer_lands) {
+        return SuspendedPoll::Submit;
+    }
+    return queued ? SuspendedPoll::Wait : SuspendedPoll::OldRead;
 }
 
 } // namespace VideoCommon::V2

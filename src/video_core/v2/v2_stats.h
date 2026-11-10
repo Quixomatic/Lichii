@@ -89,8 +89,11 @@ enum class Reason : u8 {
     NotMet,       ///< Not met by memory (the acquire suspends as before)
     ReportPage,   ///< Pages reports write (query results may be held back)
     Overflow,     ///< The hazard table overflowed or a lookup was too long
-    Valve,        ///< A waiting acquire's drain once per 1 ms
+    /// A suspended acquire with no producer known and nothing queued: the old read (Fix F3h:
+    /// once per suspension; no timed net)
+    Valve,
     Unlanded,     ///< A fence-flagged release to the word isn't in memory yet
+    QmdProducer,  ///< An Equal/Mask acquire waits for the QMD release ordered before it
     Count,
 };
 

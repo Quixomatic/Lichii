@@ -8,6 +8,7 @@
 #include <atomic>
 
 #include "common/common_types.h"
+#include "video_core/v2/front_wake.h"
 #include "video_core/v2/hazard.h"
 
 // Pipeline v2 P2: when releases reach guest memory. Since #337 the query cache writes a
@@ -129,25 +130,33 @@ inline void RaiseTo(std::atomic<u64>& value, u64 position) {
     }
 }
 
-/// Back only: the device ranges of the untracked operations captured last (F3-X6), so a front
-/// read waits only for the ones that write its words (UntrackedTargetFor).
+/// The device ranges of the untracked operations captured last (F3-X6), so a front read waits
+/// only for the ones that write its words (UntrackedTargetFor). Written by the back only; Fix
+/// F3h (F3-X1) reads them from the front too: once the back ran an unknown QMD's entry, its
+/// operations' ranges are known, so it no longer counts as writing every word. A slot's ticket
+/// is cleared while its range changes (a reader that sees it change answers conservatively).
 struct UntrackedWrite {
-    u64 address = 0;
-    u64 size = 0;
-    u64 ticket = 0;
+    std::atomic<u64> address{0};
+    std::atomic<u64> size{0};
+    std::atomic<u64> ticket{0};
 };
 inline constexpr size_t UntrackedWriteSlots = 256;
 inline std::array<UntrackedWrite, UntrackedWriteSlots> untracked_writes{};
-inline size_t untracked_write_head = 0;
-inline u64 untracked_evicted = 0; ///< The newest ticket whose range fell out of the slots
+inline size_t untracked_write_head = 0; ///< Back only
+/// The newest ticket whose range fell out of the slots (raised before the slot is reused).
+inline std::atomic<u64> untracked_evicted{0};
 
 /// The split (re)starts: no untracked operation is queued.
 inline void ResetUntracked() {
     untracked_issued.store(0, std::memory_order_relaxed);
     untracked_landed.store(0, std::memory_order_relaxed);
-    untracked_writes.fill({});
+    for (UntrackedWrite& write : untracked_writes) {
+        write.ticket.store(0, std::memory_order_relaxed);
+        write.address.store(0, std::memory_order_relaxed);
+        write.size.store(0, std::memory_order_relaxed);
+    }
     untracked_write_head = 0;
-    untracked_evicted = 0;
+    untracked_evicted.store(0, std::memory_order_relaxed);
 }
 
 /// Back: an untracked write of [address, address + size) (device) about to land at a delayed
@@ -166,31 +175,52 @@ inline u64 CaptureUntracked(u64 address, u64 size) {
     }
     const u64 ticket = UntrackedTicket(untracked_tag, untracked_captured_sub);
     UntrackedWrite& slot = untracked_writes[untracked_write_head++ % UntrackedWriteSlots];
-    untracked_evicted = std::max(untracked_evicted, slot.ticket);
-    slot = {address, size, ticket};
+    RaiseTo(untracked_evicted, slot.ticket.load(std::memory_order_relaxed));
+    slot.ticket.store(0, std::memory_order_release);
+    std::atomic_thread_fence(std::memory_order_release);
+    slot.address.store(address, std::memory_order_relaxed);
+    slot.size.store(size, std::memory_order_relaxed);
+    slot.ticket.store(ticket, std::memory_order_release);
     RaiseTo(untracked_issued, ticket);
     return ticket;
 }
 
-/// Back: the newest untracked ticket still to land whose write overlaps [address, address +
-/// size), 0 when none (conservative once a range still to land fell out of the slots).
+/// Any thread: the newest untracked ticket still to land whose write overlaps [address, address
+/// + size), 0 when none (conservative once a range still to land fell out of the slots, or a
+/// slot changed while it was read). The front sees every operation of the entries the back
+/// consumed: they were captured before the back stored `consumed`.
 [[nodiscard]] inline u64 UntrackedTargetFor(u64 address, u64 size) {
     const u64 newest_landed = untracked_landed.load(std::memory_order_acquire);
-    u64 target = untracked_evicted > newest_landed
-                     ? untracked_issued.load(std::memory_order_acquire)
+    const u64 newest_issued = untracked_issued.load(std::memory_order_acquire);
+    if (newest_issued <= newest_landed) {
+        return 0;
+    }
+    u64 target = untracked_evicted.load(std::memory_order_acquire) > newest_landed
+                     ? newest_issued
                      : 0;
     for (const UntrackedWrite& write : untracked_writes) {
-        if (write.ticket > newest_landed && write.address < address + size &&
-            address < write.address + write.size) {
-            target = std::max(target, write.ticket);
+        const u64 ticket = write.ticket.load(std::memory_order_acquire);
+        if (ticket <= newest_landed) {
+            continue;
+        }
+        const u64 begin = write.address.load(std::memory_order_relaxed);
+        const u64 length = write.size.load(std::memory_order_relaxed);
+        std::atomic_thread_fence(std::memory_order_acquire);
+        if (write.ticket.load(std::memory_order_relaxed) != ticket) {
+            return newest_issued; // Rewritten while read
+        }
+        if (begin < address + size && address < begin + length) {
+            target = std::max(target, ticket);
         }
     }
     return target;
 }
 
-/// Its operation ran (operations run in order).
+/// Its operation ran (operations run in order). A suspended acquire may wait for it (Fix F3h,
+/// F3-X1: an Equal/Mask acquire waits for its QMD producer's operations): end the front's sleep.
 inline void NoteUntracked(u64 ticket) {
     RaiseTo(untracked_landed, ticket);
+    FrontWake::Ring();
 }
 
 /// Back: writes made inside take no ticket (the front never noted them).

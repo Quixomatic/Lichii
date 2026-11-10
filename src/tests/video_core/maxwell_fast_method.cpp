@@ -2656,10 +2656,10 @@ TEST_CASE("V2 landing: one write table, tickets without IR cuts, ordered landing
         fencing.join();
         CHECK(split.FindQueuedWrites(word_a, 16, reads, nullptr, settled).kind == Kind::Clear);
         CHECK(split.FindWrites(word_a, 16, reads).kind == Kind::Clear);
-        // An unbounded QMD release (an unknown QMD): settled once the operations of its entry
-        // and the earlier ones ran, a range no queued operation writes needs no landing wait.
+        // An unbounded QMD release (an unknown QMD): while queued it may write any word.
         Access::SetEnd(split, 300);
         split.NoteUnboundedWrite(V2::Producer::QmdRelease);
+        CHECK(split.FindWrites(word_a, 16, reads).kind == Kind::Wait);
         Landing::tag = 300;
         u64 other = 0;
         {
@@ -2668,37 +2668,60 @@ TEST_CASE("V2 landing: one write table, tickets without IR cuts, ordered landing
         }
         Landing::tag = 0;
         Access::SetBack(split, 300, true);
-        const V2::HazardResult unbounded = split.FindWrites(word_a, 16, reads);
+        // Fix F3h (F3-X1): once the back ran it, its operations' ranges are known: a range none
+        // of them writes needs no landing wait, the word one writes waits for it.
+        CHECK(split.FindWrites(word_a, 16, reads).kind == Kind::Clear);
+        const V2::HazardResult unbounded = split.FindWrites(word_b, 4, reads);
         CHECK(unbounded.kind == Kind::Wait);
         CHECK(unbounded.untracked);
+        CHECK(unbounded.position == 300);
         hook.asked.store(false);
+        std::jthread fencing_b([&] {
+            while (!hook.asked.load() && !stop.load()) {
+                std::this_thread::yield();
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds{2});
+            Landing::NoteUntracked(other);
+        });
         settled = 0;
         CHECK(split.CompleteLanding(
             0, VideoCommon::DrainSite::MacroDmaRead, [](void*) -> u64 { return 0; }, nullptr,
-            unbounded.position, word_a, 16, &settled));
-        CHECK(Landing::untracked_landed.load() < other); // word_b's operation: not waited for
-        CHECK(split.FindQueuedWrites(word_a, 16, reads, nullptr, settled).kind == Kind::Clear);
+            unbounded.position, word_b, 4, &settled));
+        CHECK(hook.asked.load()); // the idle back was asked for the submit
+        CHECK(Landing::untracked_landed.load() >= other);
+        fencing_b.join();
+        CHECK(split.FindQueuedWrites(word_b, 4, reads, nullptr, settled).kind == Kind::Clear);
         stop.store(true);
         back.join();
         // A stopped back: the wait for an operation that can't land returns false at once.
-        Access::SetBack(split, 300, false);
+        Access::SetEnd(split, 310);
+        split.NoteUnboundedWrite(V2::Producer::QmdRelease);
+        Landing::tag = 310;
+        {
+            const Landing::Untracked untracked;
+            (void)Landing::CaptureUntracked(word_b, 4);
+        }
+        Landing::tag = 0;
+        Access::SetBack(split, 310, false);
+        const V2::HazardResult never = split.FindWrites(word_b, 4, reads);
+        CHECK(never.untracked);
         CHECK(!split.CompleteLanding(
             0, VideoCommon::DrainSite::MacroDmaRead, [](void*) -> u64 { return 0; }, nullptr,
-            unbounded.position, word_b, 4, &settled));
+            never.position, word_b, 4, &settled));
         split.SetIdleHook(nullptr, nullptr);
         Landing::ResetUntracked();
     }
 
-    SECTION("F3-X1b: only a QMD release that may write the word defers its suspended poll") {
+    SECTION("F3-X1b: only a QMD release that may write the word asks for its submit") {
         namespace Landing = V2::Landing;
         Landing::ResetUntracked();
         Landing::untracked_captured_tag = 0;
         Access::SetEnd(split, 200);
         split.NoteRangeWrite(word_a, 4, V2::Producer::QmdRelease);
         CHECK(split.QmdReleaseMayWrite(word_a, 4)); // queued
-        CHECK(!split.QmdReleaseMayWrite(word_b, 4)); // placed elsewhere: the net isn't deferred
-        CHECK(split.UntrackedReleasePending());      // the old, global answer deferred both
-        // Run, its operation still to land: still deferred (the latch resumes it).
+        CHECK(!split.QmdReleaseMayWrite(word_b, 4)); // placed elsewhere
+        CHECK(split.UntrackedReleasePending());      // the old, global answer held both
+        // Run, its operation still to land: it may still write the word (the latch resumes it).
         Landing::tag = 200;
         u64 ticket = 0;
         {
@@ -2709,13 +2732,94 @@ TEST_CASE("V2 landing: one write table, tickets without IR cuts, ordered landing
         Access::SetBack(split, 200, false);
         CHECK(split.QmdReleaseMayWrite(word_a, 4));
         Landing::NoteUntracked(ticket);
-        CHECK(!split.QmdReleaseMayWrite(word_a, 4)); // landed: the net decides again
-        // An unknown QMD may write any word until its entry's operations ran.
+        CHECK(!split.QmdReleaseMayWrite(word_a, 4)); // landed
+        // An unknown QMD may write any word until the back ran its entry...
         Access::SetEnd(split, 300);
         split.NoteUnboundedWrite(V2::Producer::QmdRelease);
+        CHECK(split.QmdReleaseMayWrite(word_a, 4));
         CHECK(split.QmdReleaseMayWrite(word_b, 4));
+        Landing::tag = 300;
+        u64 later = 0;
+        {
+            const Landing::Untracked untracked;
+            later = Landing::CaptureUntracked(word_a, 16);
+        }
+        Landing::tag = 0;
         Access::SetBack(split, 300, false);
-        CHECK(!split.QmdReleaseMayWrite(word_b, 4)); // ran, nothing queued behind a fence
+        // ...then only the words its operations still to land write (F3h, F3-X1: 0fe4 held
+        // every word for about a frame, until the operations landed).
+        CHECK(split.QmdReleaseMayWrite(word_a, 4));
+        CHECK(!split.QmdReleaseMayWrite(word_b, 4));
+        Landing::NoteUntracked(later);
+        CHECK(!split.QmdReleaseMayWrite(word_a, 4));
+        Landing::ResetUntracked();
+    }
+
+    SECTION("F3-X1: an Equal acquire's QMD producer is fixed at the acquire and settles on an idle "
+            "back") {
+        // 0fe4: Equal/Mask acquires compared against the newest unknown QMD release the front
+        // noted, which every later signal moved; with memory already meeting them nothing wrote
+        // the word, so no latch fired and only the 2/22 ms net resumed them.
+        namespace Landing = V2::Landing;
+        Landing::ResetUntracked();
+        Landing::untracked_captured_tag = 0;
+        Access::SetEnd(split, 200);
+        split.NoteUnboundedWrite(V2::Producer::QmdRelease);
+        Access::SetEnd(split, 204); // the acquire
+        const u64 target = split.QmdTargetFor(word_a, 4);
+        CHECK(target == 200);
+        CHECK(!split.QmdTargetSettled(target));
+        CHECK(split.QmdTargetSettled(0));
+        // Another channel's unknown QMD, parsed after the acquire, doesn't move it.
+        Access::SetEnd(split, 210);
+        split.NoteUnboundedWrite(V2::Producer::QmdRelease);
+        CHECK(split.QmdTargetFor(word_a, 4) == 210); // what a new acquire would take
+        // The back ran entry 200; its four-word release waits for its fence.
+        Landing::tag = 200;
+        u64 ticket = 0;
+        {
+            const Landing::Untracked untracked;
+            ticket = Landing::CaptureUntracked(word_a, 16);
+        }
+        Landing::tag = 0;
+        Access::SetBack(split, 205, true);
+        CHECK(!split.QmdTargetSettled(target));
+        // While it may land the suspended poll asks for the submit, not a drain.
+        CHECK(V2::PlanSuspendedPoll(false, !split.QmdTargetSettled(target), true) ==
+              V2::SuspendedPoll::Submit);
+        // The idle back serves the request; the fencing thread lands the operation only then.
+        struct Hook {
+            std::atomic<bool> asked{false};
+        } hook;
+        split.SetIdleHook([](void* argument) { static_cast<Hook*>(argument)->asked.store(true); },
+                          &hook);
+        std::atomic<bool> stop{false};
+        std::jthread back([&] {
+            while (!stop.load()) {
+                Access::ServeHookRequests(split);
+                std::this_thread::yield();
+            }
+        });
+        std::jthread fencing([&] {
+            while (!hook.asked.load() && !stop.load()) {
+                std::this_thread::yield();
+            }
+            Landing::NoteUntracked(ticket);
+        });
+        split.RequestIdleHook();
+        const auto begin = std::chrono::steady_clock::now();
+        while (!split.QmdTargetSettled(target) &&
+               std::chrono::steady_clock::now() - begin < std::chrono::seconds{1}) {
+            std::this_thread::yield();
+        }
+        CHECK(hook.asked.load());
+        // Settled although entry 210 is still queued: memory decides the acquire now.
+        CHECK(split.QmdTargetSettled(target));
+        CHECK(!split.QmdTargetSettled(210));
+        fencing.join();
+        stop.store(true);
+        back.join();
+        split.SetIdleHook(nullptr, nullptr);
         Landing::ResetUntracked();
     }
 

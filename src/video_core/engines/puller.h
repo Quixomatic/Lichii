@@ -94,11 +94,16 @@ public:
         bool sem_execute{};
         /// A GPU-written word's readback (V2::WordReadback) was sent and not landed yet.
         bool readback_sent{};
-        /// When the old path last polled it (V2::PlanSuspendedPoll's progress net).
-        std::chrono::steady_clock::time_point last_old_poll{};
         /// Fix F3f (F3-X1b): whether a poll already asked for the submit a release still to
         /// land needs (the first ask is at once, later ones once per millisecond).
         bool submit_requested{};
+        /// Fix F3h (F3-X1): a producer of the word lands at a fence (V2::PlanSuspendedPoll),
+        /// as the last submit request found; and whether the old read was counted.
+        bool producer_lands{};
+        bool old_read{};
+        /// Fix F3h (F3-X1): the QMD release an Equal/Mask acquire orders behind, recorded when
+        /// it was parsed (GpuSplit::QmdTargetFor); 0 when none.
+        u64 qmd_target{};
 
         [[nodiscard]] bool Matches(u32 current) const;
     };
@@ -123,7 +128,8 @@ private:
     [[nodiscard]] bool PollAcquireView(DmaPusher& dma_pusher);
     /// EDEN_NX2_V2_ACQUIRE=1: suspends the channel on an acquire the view doesn't pass, without
     /// draining (MASTER_PLAN §6). `gpu_written`: its word is read back (V2::WordReadback).
-    void SuspendOnView(DmaPusher& dma_pusher, PendingAcquire acquire, bool gpu_written);
+    void SuspendOnView(DmaPusher& dma_pusher, PendingAcquire acquire, bool gpu_written,
+                       u64 qmd_target);
     /// Sends the readback of the pending acquire's GPU-written word (no wait).
     void SendWordReadback(DmaPusher& dma_pusher);
 
