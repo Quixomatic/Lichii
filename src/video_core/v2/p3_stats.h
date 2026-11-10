@@ -89,6 +89,17 @@ struct Data {
     // EDEN_NX2_V2_LEANDRAW
     u64 lean_draws{};
     u64 lean_cold{};
+    // EDEN_NX2_V2_CBUFBDA (F2-02 (d))
+    u64 bda_draws{};        ///< draws of pipelines reading constant buffers through addresses
+    u64 bda_addresses{};    ///< addresses written (constant buffer binds without a descriptor)
+    u64 bda_pushed_draws{}; ///< addresses pushed, no table
+    u64 bda_tables{};       ///< address tables written
+    u64 bda_table_reuses{}; ///< a draw's table equal to the last one: pushed again, not written
+    u64 bda_padded{};       ///< binds shorter than the shader reads, zero-padded copies
+    u64 bda_short_device{}; ///< ... of device-local buffers read in place (the buffer holds it)
+    u64 bda_verify{};       ///< verify: addressed bytes compared with the old binding's
+    u64 bda_mismatches{};
+    u64 bda_ns{};           ///< ConfigureDraw's address push (time, with the stats)
 };
 
 /// Descriptor set reuse happens on the VulkanWorker, which reports no stats of its own: it

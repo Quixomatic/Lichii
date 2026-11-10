@@ -216,6 +216,19 @@ void Report(const char* thread_name, u64 window_ns) {
                  thread_name, PerSecond(d.lean_draws, window_ns),
                  Percent(d.lean_cold, d.lean_draws));
     }
+    if (d.bda_draws != 0) {
+        LOG_INFO(HW_GPU,
+                 "V2 stats {} F2-02 cbuf addresses: {:.0f} draws/s, {:.1f} addresses per draw, "
+                 "pushed {:.1f}%, tables {:.0f}/s (equal to the last {:.1f}%), padded binds "
+                 "{:.0f}/s (device-local in place {:.0f}/s), push {:.3f} us/draw | verify {} "
+                 "checked, {} mismatches",
+                 thread_name, PerSecond(d.bda_draws, window_ns),
+                 static_cast<double>(d.bda_addresses) / static_cast<double>(d.bda_draws),
+                 Percent(d.bda_pushed_draws, d.bda_draws), PerSecond(d.bda_tables, window_ns),
+                 Percent(d.bda_table_reuses, d.bda_tables + d.bda_table_reuses),
+                 PerSecond(d.bda_padded, window_ns), PerSecond(d.bda_short_device, window_ns),
+                 Micros(d.bda_ns, d.bda_draws), d.bda_verify, d.bda_mismatches);
+    }
     d = Data{};
 }
 

@@ -715,19 +715,44 @@ private:
     HeapPushConstant heap_push{};
     /// P5a (EDEN_NX2_V2_HEAP_TEXEL): per stage, the texel buffer bindings that read the heap.
     std::array<HeapTexelMasks, NUM_STAGES> heap_texels{};
-    /// Runs a stage's buffer binds; heap texel buffers push heap words instead of descriptors.
+    /// Runs a stage's buffer binds; heap texel buffers push heap words instead of descriptors,
+    /// constant buffers read through addresses write their addresses (CBUFBDA).
     template <typename Func>
     void WithHeapTexels(size_t stage, Func&& func) {
         const HeapTexelMasks& masks = heap_texels[stage];
-        if (masks.heap == 0) [[likely]] {
+        const u32 bda_mask = cbuf_bda_masks[stage];
+        if (masks.heap == 0 && bda_mask == 0) [[likely]] {
             func();
             return;
         }
-        buffer_cache.runtime.BeginHeapTexels(heap_push.words, masks.heap, masks.storage,
-                                             masks.integer, heap_push.verify);
+        if (masks.heap != 0) {
+            buffer_cache.runtime.BeginHeapTexels(heap_push.words, masks.heap, masks.storage,
+                                                 masks.integer, heap_push.verify);
+        }
+        if (bda_mask != 0) {
+            buffer_cache.runtime.BeginCbufAddresses(
+                cbuf_addresses.data() + cbuf_bda_bases[stage], enabled_uniform_buffer_masks[stage],
+                bda_mask, uniform_buffer_sizes[stage].data(), cbuf_bda_verify);
+        }
         func();
         buffer_cache.runtime.EndHeapTexels();
+        buffer_cache.runtime.EndCbufAddresses();
     }
+    /// EDEN_NX2_V2_CBUFBDA (shader_recompiler/backend/spirv/cbuf_bda.h): per stage, the constant
+    /// buffers read through addresses (by cbuf index) and their first address index; the
+    /// addresses the stages' binds write (pipeline order); where they are pushed, and the table
+    /// of pipelines whose addresses don't fit.
+    std::array<u32, NUM_STAGES> cbuf_bda_masks{};
+    std::array<u32, NUM_STAGES> cbuf_bda_bases{};
+    std::vector<u64> cbuf_addresses;
+    bool cbuf_bda{false};
+    bool cbuf_bda_pushed{false};
+    bool cbuf_bda_verify{false};
+    u32 cbuf_bda_offset{};
+    CbufAddressTable cbuf_table;
+    CbufAddressPush cbuf_push; ///< what the configured draw pushes at cbuf_bda_offset
+    /// Builds cbuf_push from cbuf_addresses (the table for pipelines whose addresses don't fit).
+    void AddCbufAddresses();
     u32 heap_reasons{}; ///< HeapReason bits of descriptors left out
     u32 heap_words{};
     /// F2-04: every sampled texture and storage image of the pipeline reads the heap and no

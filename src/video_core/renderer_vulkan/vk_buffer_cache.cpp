@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstring>
 #include <cstdlib>
 #include <span>
@@ -212,6 +213,150 @@ void BufferCacheRuntime::BindHeapTexelBuffer(Buffer& buffer, u32 offset, u32 siz
         ++data.heap_verify;
         if (heap->TexelAt(binding, slot) != view) {
             ++data.heap_mismatches;
+        }
+    }
+}
+
+std::span<const u8> BufferCacheRuntime::MappedBytes(VkBuffer buffer, u64 offset,
+                                                    u64 size) const noexcept {
+    if (buffer != VK_NULL_HANDLE && cbuf_ring_buffer && buffer == *cbuf_ring_buffer) {
+        const std::span<const u8> mapped = cbuf_ring_buffer.Mapped();
+        if (offset + size <= mapped.size()) {
+            return std::span<const u8>(mapped.data() + offset, size);
+        }
+        return {};
+    }
+    return StreamBytes(buffer, offset, size);
+}
+
+StagingBufferRef BufferCacheRuntime::PaddedCbufCopy(const u8* source, u32 size, u32 used) {
+    const StagingBufferRef ref = staging_pool.Request(used, MemoryUsage::Upload);
+    const u32 copied = source != nullptr ? (std::min)(size, used) : 0;
+    if (copied != 0) {
+        std::memcpy(ref.mapped_span.data(), source, copied);
+    }
+    std::memset(ref.mapped_span.data() + copied, 0, used - copied);
+    if (VideoCommon::V2::P3Stats::Enabled()) {
+        ++VideoCommon::V2::P3Stats::Get().bda_padded;
+    }
+    return ref;
+}
+
+void BufferCacheRuntime::VerifyCbufAddress(const u8* bound, const u8* addressed, u32 size,
+                                           u32 used) {
+    // EDEN_NX2_V2_CBUFBDA=verify: within the bound range the shader reads the bound bytes, past
+    // it zeros (a bounded uniform buffer's reads).
+    auto& data = VideoCommon::V2::P3Stats::Get();
+    ++data.bda_verify;
+    const u32 head = (std::min)(size, used);
+    bool same = bound == nullptr || std::memcmp(bound, addressed, head) == 0;
+    for (u32 i = head; same && i < used; ++i) {
+        same = addressed[i] == 0;
+    }
+    if (same) {
+        return;
+    }
+    ++data.bda_mismatches;
+    static std::atomic<u32> logged{};
+    if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+        LOG_WARNING(Render_Vulkan,
+                    "V2 cbuf address verify: {} bytes bound ({} read) differ at the address", size,
+                    used);
+    }
+}
+
+std::span<u8> BufferCacheRuntime::BindMappedCbufAddress(u32 size, u32 used) {
+    // The caller fills `size` bytes; a shorter bind than the shader reads gets a zero tail.
+    const u32 allocated = (std::max)(size, used);
+    const StagingBufferRef ref = staging_pool.Request(allocated, MemoryUsage::Upload);
+    last_stream_uniform = StreamUniformRef{
+        .buffer = ref.buffer,
+        .device_address = ref.device_address,
+        .offset = static_cast<u32>(ref.offset),
+    };
+    if (allocated != size) {
+        std::memset(ref.mapped_span.data() + size, 0, allocated - size);
+    }
+    *(cbuf_addresses++) = ref.device_address + ref.offset;
+    if (VideoCommon::V2::P3Stats::Enabled()) {
+        auto& data = VideoCommon::V2::P3Stats::Get();
+        ++data.bda_addresses;
+        data.bda_padded += allocated != size ? 1 : 0;
+    }
+    if (cbuf_verify) {
+        AddStreamUniform(last_stream_uniform, size);
+    }
+    return ref.mapped_span.first(size);
+}
+
+void BufferCacheRuntime::CbufAddressFromStream(const StreamUniformRef& ref, u32 size, u32 used) {
+    if (size >= used) {
+        // The range itself (ring or stream allocation, live for the tick).
+        *(cbuf_addresses++) = ref.device_address + ref.offset;
+        if (VideoCommon::V2::P3Stats::Enabled()) {
+            ++VideoCommon::V2::P3Stats::Get().bda_addresses;
+        }
+        if (cbuf_verify) {
+            // The address is the descriptor's range: the same bytes.
+            ++VideoCommon::V2::P3Stats::Get().bda_verify;
+        }
+        return;
+    }
+    // A ring or stream range is host visible: a copy with the zero tail.
+    const std::span<const u8> bytes = MappedBytes(ref.buffer, ref.offset, size);
+    const StagingBufferRef copy =
+        PaddedCbufCopy(bytes.empty() ? nullptr : bytes.data(), size, used);
+    *(cbuf_addresses++) = copy.device_address + copy.offset;
+    if (VideoCommon::V2::P3Stats::Enabled()) {
+        ++VideoCommon::V2::P3Stats::Get().bda_addresses;
+    }
+    if (cbuf_verify && !bytes.empty()) {
+        VerifyCbufAddress(bytes.data(), copy.mapped_span.data(), size, used);
+    }
+}
+
+void BufferCacheRuntime::CbufAddressFromBuffer(const Buffer& buffer, u32 offset, u32 size,
+                                               u32 used) {
+    const bool stats = VideoCommon::V2::P3Stats::Enabled();
+    const auto zeros = [&] {
+        const StagingBufferRef copy = PaddedCbufCopy(nullptr, 0, used);
+        return copy.device_address + copy.offset;
+    };
+    VkDeviceAddress address = 0;
+    if (buffer.Handle() == VK_NULL_HANDLE || buffer.DeviceAddress() == 0) {
+        // The null buffer: what an unbound uniform buffer reads.
+        address = zeros();
+    } else if (size >= used || offset + u64{used} <= buffer.SizeBytes()) {
+        // Device-local: read in place. A short bind reads the buffer's next bytes (its guest
+        // memory) instead of zeros; the buffer holds them, so the read stays inside it.
+        address = buffer.DeviceAddress() + offset;
+        if (stats && size < used) {
+            ++VideoCommon::V2::P3Stats::Get().bda_short_device;
+        }
+    } else {
+        // Past the end of the buffer: a device-local range can't be copied here; zeros instead
+        // of reading outside the buffer.
+        address = zeros();
+        static std::atomic<u32> logged{};
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+            LOG_WARNING(Render_Vulkan,
+                        "V2 cbuf address: a {}-byte uniform bind at the end of a buffer is read "
+                        "as {} bytes; zeros are read instead",
+                        size, used);
+        }
+    }
+    *(cbuf_addresses++) = address;
+    if (stats) {
+        ++VideoCommon::V2::P3Stats::Get().bda_addresses;
+    }
+    if (cbuf_verify) {
+        // Device-local bytes can't be read here: the address must be the descriptor's range.
+        auto& data = VideoCommon::V2::P3Stats::Get();
+        ++data.bda_verify;
+        const bool in_place = buffer.Handle() != VK_NULL_HANDLE && buffer.DeviceAddress() != 0 &&
+                              (size >= used || offset + u64{used} <= buffer.SizeBytes());
+        if (in_place && address != buffer.DeviceAddress() + offset) {
+            ++data.bda_mismatches;
         }
     }
 }

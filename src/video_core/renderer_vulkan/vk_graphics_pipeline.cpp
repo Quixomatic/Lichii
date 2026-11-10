@@ -505,6 +505,33 @@ GraphicsPipeline::GraphicsPipeline(
             return info.heap_words_pushed;
         });
     }
+    // EDEN_NX2_V2_CBUFBDA: the pipeline cache marked the constant buffers read through addresses
+    // before emission; their addresses follow the other push data.
+    u32 cbuf_address_count = 0;
+    for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
+        const Shader::Info& info = stage_infos[stage];
+        if (info.cbuf_bda_mask == 0 || mesh_emulation) [[likely]] {
+            continue;
+        }
+        cbuf_bda = true;
+        cbuf_bda_masks[stage] = info.cbuf_bda_mask;
+        cbuf_bda_bases[stage] = info.cbuf_bda_base;
+        cbuf_bda_pushed = info.cbuf_bda_pushed;
+        cbuf_bda_offset = info.cbuf_bda_offset;
+        cbuf_address_count =
+            (std::max)(cbuf_address_count,
+                       info.cbuf_bda_base + Shader::Backend::SPIRV::CbufBdaCount(info));
+    }
+    if (cbuf_bda) [[unlikely]] {
+        namespace SPIRV = Shader::Backend::SPIRV;
+        cbuf_addresses.assign(cbuf_address_count, 0);
+        cbuf_bda_verify = VideoCommon::V2::Verify(VideoCommon::V2::Switch::CbufBda);
+        // Pushed: the shaders declare every address the push constants hold from the offset.
+        builder.ReservePushConstants(
+            cbuf_bda_pushed ? cbuf_bda_offset + SPIRV::CbufBdaPushCapacity(cbuf_bda_offset) *
+                                                    SPIRV::CBUF_BDA_ADDRESS_BYTES
+                            : cbuf_bda_offset + SPIRV::CBUF_BDA_ADDRESS_BYTES);
+    }
     if (heap_pipeline && !heap_words_pushed) {
         // The heap word table, last in the payload (the cache kept set 0 below its binding).
         const bool added = builder.AddHeapWords();
@@ -1926,6 +1953,15 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
                                       descriptor_set, nullptr);
         }
     });
+    if (cbuf_bda) [[unlikely]] {
+        // EDEN_NX2_V2_CBUFBDA: the constant buffer addresses (or the address table's pointer).
+        AddCbufAddresses();
+        scheduler.Record([this, data = cbuf_push](vk::CommandBuffer cmdbuf) {
+            cmdbuf.PushConstants(*pipeline_layout, VK_SHADER_STAGE_ALL_GRAPHICS, cbuf_bda_offset,
+                                 static_cast<u32>(data.count * sizeof(u64)),
+                                 data.addresses.data());
+        });
+    }
     if (heap_pipeline && bind_pipeline) {
         // EDEN_NX2_V2_BINDLESS: the heap set, bound again with the pipeline (binds of set 0 with
         // this layout leave it bound).
@@ -1939,6 +1975,35 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
         CountHeapCoverage(heap_pipeline, heap_reasons, heap_words, false);
     }
     return true;
+}
+
+void GraphicsPipeline::AddCbufAddresses() {
+    namespace V2 = VideoCommon::V2;
+    const bool stats = V2::P3Stats::Enabled();
+    const u64 begin = stats ? VideoCommon::Nx2Profile::Now() : 0;
+    cbuf_push.count = 0;
+    if (cbuf_bda_pushed) {
+        const size_t count = (std::min)(cbuf_addresses.size(), cbuf_push.addresses.size());
+        std::copy_n(cbuf_addresses.begin(), count, cbuf_push.addresses.begin());
+        cbuf_push.count = static_cast<u32>(count);
+    } else {
+        // More than the push constants hold: the draw's table (written once while equal).
+        bool reused = false;
+        cbuf_push.addresses[0] = cbuf_table.Append(
+            std::span<const u64>(cbuf_addresses.data(), cbuf_addresses.size()),
+            scheduler.CurrentTick(), reused,
+            [this](size_t bytes) { return buffer_cache.runtime.UploadStagingBuffer(bytes); });
+        cbuf_push.count = 1;
+        if (stats) {
+            ++(reused ? V2::P3Stats::Get().bda_table_reuses : V2::P3Stats::Get().bda_tables);
+        }
+    }
+    if (stats) {
+        auto& data = V2::P3Stats::Get();
+        ++data.bda_draws;
+        data.bda_pushed_draws += cbuf_bda_pushed ? 1 : 0;
+        data.bda_ns += VideoCommon::Nx2Profile::Now() - begin;
+    }
 }
 
 void GraphicsPipeline::AddHeapWords() {

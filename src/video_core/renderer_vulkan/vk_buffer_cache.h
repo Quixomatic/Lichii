@@ -6,7 +6,9 @@
 
 #pragma once
 
+#include <bit>
 #include <limits>
+#include <span>
 #include <utility>
 
 #include <boost/container/small_vector.hpp>
@@ -245,14 +247,37 @@ public:
     std::span<u8> BindMappedUniformBuffer([[maybe_unused]] size_t stage,
                                           [[maybe_unused]] u32 binding_index,
                                           u32 size) {
+        if (cbuf_addresses != nullptr) [[unlikely]] {
+            if (const CbufSlot slot = NextCbufSlot(); slot.bda) {
+                return BindMappedCbufAddress(size, slot.used);
+            }
+        }
         const StagingBufferRef ref = staging_pool.Request(size, MemoryUsage::Upload);
         last_stream_uniform = StreamUniformRef{
             .buffer = ref.buffer,
             .device_address = ref.device_address,
             .offset = static_cast<u32>(ref.offset),
         };
-        RebindStreamUniform(last_stream_uniform, size);
+        AddStreamUniform(last_stream_uniform, size);
         return ref.mapped_span;
+    }
+
+    /// EDEN_NX2_V2_CBUFBDA (shader_recompiler/backend/spirv/cbuf_bda.h): the uniform buffers
+    /// bound until EndCbufAddresses (one stage, in cbuf index order over `stage_mask`) whose cbuf
+    /// is in `bda_mask` write their device address to `addresses` (in order) instead of adding a
+    /// descriptor; verify adds the descriptor too and compares. A bind shorter than the shader
+    /// reads (`used_sizes`, by cbuf index) is read from a copy with a zero tail: what a bounded
+    /// uniform buffer gives past its range.
+    void BeginCbufAddresses(u64* addresses, u32 stage_mask, u32 bda_mask, const u32* used_sizes,
+                            bool verify) noexcept {
+        cbuf_addresses = addresses;
+        cbuf_remaining = stage_mask;
+        cbuf_bda_mask = bda_mask;
+        cbuf_used_sizes = used_sizes;
+        cbuf_verify = verify;
+    }
+    void EndCbufAddresses() noexcept {
+        cbuf_addresses = nullptr;
     }
 
     /// Verify (Step 0 R-8): the bytes of `size` at `offset` of `buffer` when it is the stream
@@ -286,7 +311,15 @@ public:
     /// live: made on the scheduler tick that is current now, so the staging pool has not recycled
     /// it and the GPU has not even started on it.
     void RebindStreamUniform(const StreamUniformRef& ref, u32 size) {
-        guest_descriptor_queue.AddBuffer(ref.buffer, ref.device_address, ref.offset, size);
+        if (cbuf_addresses != nullptr) [[unlikely]] {
+            if (const CbufSlot slot = NextCbufSlot(); slot.bda) {
+                CbufAddressFromStream(ref, size, slot.used);
+                if (!cbuf_verify) {
+                    return;
+                }
+            }
+        }
+        AddStreamUniform(ref, size);
     }
 
     [[nodiscard]] VkDeviceSize SparseAlignmentFor(bool sparse_compatible) const noexcept {
@@ -330,6 +363,14 @@ public:
     }
 
     void BindUniformBuffer(const Buffer& buffer, u32 offset, u32 size) {
+        if (cbuf_addresses != nullptr) [[unlikely]] {
+            if (const CbufSlot slot = NextCbufSlot(); slot.bda) {
+                CbufAddressFromBuffer(buffer, offset, size, slot.used);
+                if (!cbuf_verify) {
+                    return;
+                }
+            }
+        }
         BindBuffer(buffer, offset, size);
     }
 
@@ -391,6 +432,39 @@ private:
     u64 heap_texel_integer{};
     u32 heap_texel_index{};
     bool heap_texel_verify{};
+
+    void AddStreamUniform(const StreamUniformRef& ref, u32 size) {
+        guest_descriptor_queue.AddBuffer(ref.buffer, ref.device_address, ref.offset, size);
+    }
+
+    /// EDEN_NX2_V2_CBUFBDA: the next uniform bind of the stage (BeginCbufAddresses).
+    struct CbufSlot {
+        bool bda;
+        u32 used;
+    };
+    [[nodiscard]] CbufSlot NextCbufSlot() noexcept {
+        if (cbuf_remaining == 0) {
+            return CbufSlot{false, 0};
+        }
+        const u32 index = static_cast<u32>(std::countr_zero(cbuf_remaining));
+        cbuf_remaining &= cbuf_remaining - 1;
+        return CbufSlot{((cbuf_bda_mask >> index) & 1) != 0, cbuf_used_sizes[index]};
+    }
+    std::span<u8> BindMappedCbufAddress(u32 size, u32 used);
+    void CbufAddressFromStream(const StreamUniformRef& ref, u32 size, u32 used);
+    void CbufAddressFromBuffer(const Buffer& buffer, u32 offset, u32 size, u32 used);
+    /// A stream copy of `used` bytes: `size` from `source` (none: zeros), then zeros.
+    [[nodiscard]] StagingBufferRef PaddedCbufCopy(const u8* source, u32 size, u32 used);
+    /// Verify: the bytes the shader reads at the address against the old binding's.
+    void VerifyCbufAddress(const u8* bound, const u8* addressed, u32 size, u32 used);
+    [[nodiscard]] std::span<const u8> MappedBytes(VkBuffer buffer, u64 offset,
+                                                  u64 size) const noexcept;
+
+    u64* cbuf_addresses{};
+    u32 cbuf_remaining{};
+    u32 cbuf_bda_mask{};
+    const u32* cbuf_used_sizes{};
+    bool cbuf_verify{};
 
     void BindBuffer(const Buffer& buffer, u32 offset, u32 size) {
         const VkBuffer handle = buffer.Handle();

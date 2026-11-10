@@ -13,18 +13,22 @@
 #include <memory>
 #include <vector>
 #include <optional>
+#include <span>
 #include <utility>
 
 #include <boost/container/small_vector.hpp>
+#include <boost/container/static_vector.hpp>
 
 #include "common/common_types.h"
 #include "shader_recompiler/backend/spirv/bindless_heap.h"
+#include "shader_recompiler/backend/spirv/cbuf_bda.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/shader_info.h"
 #include "video_core/renderer_vulkan/vk_bindless_heap.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
 #include "video_core/surface.h"
+#include "video_core/v2/cbuf_address_table.h"
 #include "video_core/v2/p3_stats.h"
 #include "video_core/texture_cache/types.h"
 #include "video_core/vulkan_common/vulkan_device.h"
@@ -144,15 +148,42 @@ inline void WriteDescriptorBuffer(const Device& device, const DescriptorBufferLa
 }
 
 [[nodiscard]] inline u32 NumDescriptorEntries(const Shader::Info& info) {
-    // Heap textures and images (EDEN_NX2_V2_BINDLESS) have no entry of their own.
+    // Heap textures and images (EDEN_NX2_V2_BINDLESS) and constant buffers read through
+    // addresses (EDEN_NX2_V2_CBUFBDA) have no entry of their own.
     return Shader::NumDescriptors(info.constant_buffer_descriptors) +
            Shader::NumDescriptors(info.storage_buffers_descriptors) +
            Shader::NumDescriptors(info.texture_buffer_descriptors) +
            Shader::NumDescriptors(info.image_buffer_descriptors) +
            Shader::NumDescriptors(info.texture_descriptors) +
            Shader::NumDescriptors(info.image_descriptors) -
-           Shader::Backend::SPIRV::HeapWordCount(info);
+           Shader::Backend::SPIRV::HeapWordCount(info) -
+           Shader::Backend::SPIRV::CbufUnboundCount(info);
 }
+
+/// EDEN_NX2_V2_CBUFBDA: the constant buffer descriptors (by descriptor index) that take no binding.
+[[nodiscard]] inline u64 CbufUnboundDescriptors(const Shader::Info& info) {
+    if (info.cbuf_bda_mask == 0 || info.cbuf_bda_keep_bindings) [[likely]] {
+        return 0;
+    }
+    u64 mask = 0;
+    for (size_t i = 0; i < info.constant_buffer_descriptors.size(); ++i) {
+        if (Shader::Backend::SPIRV::UsesCbufBda(info, info.constant_buffer_descriptors[i].index)) {
+            mask |= u64{1} << i;
+        }
+    }
+    return mask;
+}
+
+/// EDEN_NX2_V2_CBUFBDA: what a draw pushes at the pipeline's address offset: its addresses, or
+/// (table pipelines) its table's address.
+struct CbufAddressPush {
+    static constexpr size_t MaxPushed =
+        Shader::Backend::SPIRV::CbufBdaPushCapacity(Shader::Backend::SPIRV::HEAP_PUSH_OFFSET);
+    std::array<u64, MaxPushed> addresses{};
+    u32 count{}; ///< addresses pushed at the pipeline's offset (1: the table's pointer)
+};
+
+using VideoCommon::V2::CbufAddressTable;
 
 /// EDEN_NX2_V2_BINDLESS: why descriptors stay out of the heap (Info::heap_block_reasons).
 enum HeapReason : u32 {
@@ -373,12 +404,21 @@ public:
         });
     }
 
+    /// EDEN_NX2_V2_CBUFBDA: the push constant range reaches `end` (the addresses after the other
+    /// push data).
+    void ReservePushConstants(u32 end) noexcept {
+        push_end = (std::max)(push_end, end);
+    }
+
     /// With `heap` (EDEN_NX2_V2_BINDLESS), set 1 is the heap.
     vk::PipelineLayout CreatePipelineLayout(VkDescriptorSetLayout descriptor_set_layout,
                                             const BindlessHeap* heap = nullptr) const {
         using Shader::Backend::SPIRV::RenderAreaLayout;
         using Shader::Backend::SPIRV::RescalingLayout;
         const u32 size_offset = is_compute ? sizeof(RescalingLayout::down_factor) : 0u;
+        if (push_end != 0) [[unlikely]] {
+            return CreatePipelineLayoutReaching(descriptor_set_layout, heap, size_offset);
+        }
         if (heap != nullptr) [[unlikely]] {
             const std::array set_layouts{descriptor_set_layout ? descriptor_set_layout
                                                                : heap->EmptyLayout(),
@@ -462,7 +502,8 @@ public:
         is_compute |= (stage & VK_SHADER_STAGE_COMPUTE_BIT) != 0 && !mesh_emulation;
         uses_mesh |= (stage & (VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT)) != 0;
 
-        Add(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, stage, info.constant_buffer_descriptors);
+        Add(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, stage, info.constant_buffer_descriptors,
+            CbufUnboundDescriptors(info));
         Add(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, stage, info.storage_buffers_descriptors);
         Add(VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, stage, info.texture_buffer_descriptors,
             info.heap_texel_mask);
@@ -504,6 +545,48 @@ public:
     }
 
 private:
+    /// CreatePipelineLayout with the push constant range reaching push_end (EDEN_NX2_V2_CBUFBDA).
+    vk::PipelineLayout CreatePipelineLayoutReaching(VkDescriptorSetLayout descriptor_set_layout,
+                                                    const BindlessHeap* heap,
+                                                    u32 size_offset) const {
+        using Shader::Backend::SPIRV::RenderAreaLayout;
+        using Shader::Backend::SPIRV::RescalingLayout;
+        u32 size = static_cast<u32>(sizeof(RescalingLayout)) - size_offset +
+                   static_cast<u32>(sizeof(RenderAreaLayout));
+        if (heap != nullptr) {
+            size = (std::max)(size, Shader::Backend::SPIRV::HEAP_PUSH_RANGE_END);
+        }
+        const VkPushConstantRange range{
+            .stageFlags = static_cast<VkShaderStageFlags>(
+                is_compute ? VK_SHADER_STAGE_COMPUTE_BIT
+                : mesh_emulation && heap == nullptr
+                    ? VK_SHADER_STAGE_ALL_GRAPHICS | VK_SHADER_STAGE_COMPUTE_BIT
+                    : (uses_mesh ? VK_SHADER_STAGE_ALL_GRAPHICS | VK_SHADER_STAGE_TASK_BIT_EXT |
+                                       VK_SHADER_STAGE_MESH_BIT_EXT
+                                 : VK_SHADER_STAGE_ALL_GRAPHICS)),
+            .offset = 0,
+            .size = (std::max)(size, push_end),
+        };
+        boost::container::static_vector<VkDescriptorSetLayout, 2> set_layouts;
+        if (heap != nullptr) {
+            set_layouts.push_back(descriptor_set_layout ? descriptor_set_layout
+                                                        : heap->EmptyLayout());
+            set_layouts.push_back(heap->Layout());
+        } else if (descriptor_set_layout && !bindings.empty()) {
+            set_layouts.push_back(descriptor_set_layout);
+        }
+        return device->GetLogical().CreatePipelineLayout({
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .setLayoutCount = static_cast<u32>(set_layouts.size()),
+            .pSetLayouts = set_layouts.empty() ? nullptr : set_layouts.data(),
+            .pushConstantRangeCount = 1,
+            .pPushConstantRanges = &range,
+        });
+    }
+
+    u32 push_end{};
     VkShaderStageFlags heap_stages{};
     /// `skip`: descriptors (by index) that read the heap instead (EDEN_NX2_V2_BINDLESS).
     template <typename Descriptors>

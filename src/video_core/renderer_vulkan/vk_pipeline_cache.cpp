@@ -1930,6 +1930,32 @@ void MarkHeapTextures(std::span<Shader::IR::Program> programs, const GraphicsPip
         }
     }
 }
+
+/// EDEN_NX2_V2_CBUFBDA (cbuf_bda.h): the constant buffers each stage reads through addresses
+/// (those read at immediate offsets only), numbered across the stages in stage order (as the
+/// encode binds them), and where the addresses go: pushed after the heap words when they fit,
+/// else a pushed table pointer. Mesh and task programs and mesh emulation keep bindings.
+void MarkCbufBda(std::span<Shader::IR::Program> programs, const GraphicsPipelineCacheKey& key,
+                 size_t first, bool emulated_layer, bool mesh_emulation, bool keep_bindings) {
+    namespace SPIRV = Shader::Backend::SPIRV;
+    const auto active = [&](size_t index) {
+        return key.unique_hashes[index] != 0 ||
+               (emulated_layer && index == static_cast<size_t>(Maxwell::ShaderType::Geometry));
+    };
+    boost::container::static_vector<Shader::Info*, Maxwell::MaxShaderProgram> infos;
+    for (size_t index = first; index < programs.size(); ++index) {
+        if (!active(index)) {
+            continue;
+        }
+        Shader::IR::Program& program{programs[index]};
+        if (mesh_emulation || program.stage == Shader::Stage::Mesh ||
+            program.stage == Shader::Stage::Task) {
+            return;
+        }
+        infos.push_back(&program.info);
+    }
+    static_cast<void>(SPIRV::AssignCbufBda(infos, keep_bindings));
+}
 } // Anonymous namespace
 
 GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineSlowPath() {
@@ -2619,6 +2645,14 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         MarkHeapTextures(programs, key, uses_vertex_a && uses_vertex_b ? 1 : 0,
                          layer_source_program != nullptr, mesh_emulation.has_value(),
                          heap->StorageImages(), heap->TexelBuffers());
+    }
+    // EDEN_NX2_V2_CBUFBDA: which constant buffers read through addresses, after the heap marks
+    // (the addresses follow the heap words in the push constants).
+    if (VideoCommon::V2::On(VideoCommon::V2::Switch::CbufBda) &&
+        device.IsBufferDeviceAddressSupported() && profile.support_int64) [[unlikely]] {
+        MarkCbufBda(programs, key, uses_vertex_a && uses_vertex_b ? 1 : 0,
+                    layer_source_program != nullptr, mesh_emulation.has_value(),
+                    VideoCommon::V2::Verify(VideoCommon::V2::Switch::CbufBda));
     }
     std::array<const Shader::Info*, Maxwell::MaxShaderStage> infos{};
     std::array<vk::ShaderModule, Maxwell::MaxShaderStage> modules;
