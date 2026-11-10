@@ -1834,7 +1834,8 @@ V2::Resolve::ResolvedTbo BufferCache<P>::ResolveTextureBufferBinding(
     tbo.stage = static_cast<u8>(stage);
     tbo.index = static_cast<u8>(index);
     tbo.written = is_written ? 1 : 0;
-    tbo.image = is_image ? 1 : 0;
+    // Kept only where the bindings keep it (BindGraphicsTextureBuffer).
+    tbo.image = SEPARATE_IMAGE_BUFFERS_BINDINGS && is_image ? 1 : 0;
     tbo.gpu_addr = gpu_addr;
     // GetTextureBufferBinding, then UpdateTextureBuffers' lookup.
     const std::optional<DAddr> device_addr = gpu_memory->GpuToCpuAddress(gpu_addr);
@@ -1941,6 +1942,92 @@ void BufferCache<P>::EncodeGraphicsBindings(const V2::Resolve::ResolvedDraw& rec
         flags[Dirty::VertexBuffers] = false;
         flags[Dirty::IndexBuffer] = false;
     });
+}
+
+template <class P>
+void BufferCache<P>::ObserveGraphicsBindings(V2::Resolve::ResolvedDraw& observed, bool is_indexed,
+                                             const std::array<bool, NUM_STAGES>& stages) const {
+    namespace R = V2::Resolve;
+    const auto ref_of = [&](BufferId id) {
+        return V2::Versions::WeakRef{id.index, BufferGeneration(id)};
+    };
+    R::DrawHeader& h = observed.h;
+    if (is_indexed) {
+        const Binding& index = channel_state->index_buffer;
+        h.index.valid = index.device_addr != 0 || index.size != 0;
+        h.index.daddr = index.device_addr;
+        h.index.size = index.size;
+        h.index.buffer = ref_of(index.buffer_id);
+    }
+    boost::container::small_vector<R::ResolvedVertex, NUM_VERTEX_BUFFERS> vertex;
+    for (u32 slot = 0; slot < NUM_VERTEX_BUFFERS; ++slot) {
+        const Binding& binding = channel_state->vertex_buffers[slot];
+        if (binding.device_addr == 0 && binding.size == 0) {
+            continue;
+        }
+        vertex.push_back(R::ResolvedVertex{
+            .slot = static_cast<u8>(slot),
+            .buffer = ref_of(binding.buffer_id),
+            .daddr = binding.device_addr,
+            .size = binding.size,
+            .stride = maxwell3d->regs.vertex_streams[slot].stride,
+        });
+    }
+    h.vertex_mask = enabled_vertex_buffers_mask;
+    boost::container::small_vector<R::ResolvedUbo, 32> ubos;
+    boost::container::small_vector<R::ResolvedSsbo, 32> ssbos;
+    boost::container::small_vector<R::ResolvedTbo, 16> tbos;
+    for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
+        h.ubo_masks[stage] = 0;
+        if (!stages[stage]) {
+            continue;
+        }
+        h.ubo_masks[stage] = channel_state->enabled_uniform_buffer_masks[stage];
+        ForEachEnabledBit(channel_state->enabled_uniform_buffer_masks[stage], [&](u32 index) {
+            const Binding& binding = channel_state->uniform_buffers[stage][index];
+            ubos.push_back(R::ResolvedUbo{
+                .stage = static_cast<u8>(stage),
+                .slot = static_cast<u8>(index),
+                .daddr = binding.device_addr,
+                .size = binding.size,
+                .buffer = ref_of(binding.buffer_id),
+            });
+        });
+        ForEachEnabledBit(channel_state->enabled_storage_buffers[stage], [&](u32 index) {
+            const Binding& binding = channel_state->storage_buffers[stage][index];
+            ssbos.push_back(R::ResolvedSsbo{
+                .stage = static_cast<u8>(stage),
+                .index = static_cast<u8>(index),
+                .written = static_cast<u8>(
+                    (channel_state->written_storage_buffers[stage] >> index) & 1),
+                .daddr = binding.device_addr,
+                .gpu_addr = binding.gpu_addr,
+                .size = binding.size,
+                .buffer = ref_of(binding.buffer_id),
+            });
+        });
+        ForEachEnabledBit(channel_state->enabled_texture_buffers[stage], [&](u32 index) {
+            const TextureBufferBinding& binding = channel_state->texture_buffers[stage][index];
+            tbos.push_back(R::ResolvedTbo{
+                .stage = static_cast<u8>(stage),
+                .index = static_cast<u8>(index),
+                .written = static_cast<u8>(
+                    (channel_state->written_texture_buffers[stage] >> index) & 1),
+                .image = static_cast<u8>(
+                    SEPARATE_IMAGE_BUFFERS_BINDINGS
+                        ? (channel_state->image_texture_buffers[stage] >> index) & 1
+                        : 0),
+                .daddr = binding.device_addr,
+                .size = binding.size,
+                .format = static_cast<u32>(binding.format),
+                .buffer = ref_of(binding.buffer_id),
+            });
+        });
+    }
+    h.vertex = observed.Push(std::span<const R::ResolvedVertex>(vertex.data(), vertex.size()));
+    h.ubo = observed.Push(std::span<const R::ResolvedUbo>(ubos.data(), ubos.size()));
+    h.ssbo = observed.Push(std::span<const R::ResolvedSsbo>(ssbos.data(), ssbos.size()));
+    h.tbo = observed.Push(std::span<const R::ResolvedTbo>(tbos.data(), tbos.size()));
 }
 
 template <class P>

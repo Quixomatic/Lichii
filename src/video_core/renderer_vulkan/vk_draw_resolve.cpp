@@ -11,11 +11,13 @@
 #include <cstring>
 #include <optional>
 #include <span>
+#include <string>
 #include <type_traits>
 #include <vector>
 
 #include <boost/container/small_vector.hpp>
 
+#include "common/logging.h"
 #include "video_core/renderer_vulkan/pipeline_helper.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
@@ -473,5 +475,120 @@ template void GraphicsPipeline::ResolveTextures<R::SnapshotView>(const R::Snapsh
                                                                  C::RequestList&) const;
 
 // RESOLVE END
+
+void GraphicsPipeline::ObserveDrawRecord(std::span<const VideoCommon::ImageViewInOut> views,
+                                         std::span<const VideoCommon::SamplerId> samplers,
+                                         const RenderAreaPushConstant& render_area) {
+    DrawRecObserver& observer = *drawrec_observer;
+    if (observer.done || observer.resolved == nullptr) {
+        return;
+    }
+    observer.done = true;
+    const R::ResolvedDraw& resolved = *observer.resolved;
+    if (resolved.h.status != R::ResolveStatus::Ready) {
+        return;
+    }
+    R::ResolvedDraw& observed = observer.observed;
+    observed.Clear();
+    R::DrawHeader& h = observed.h;
+    h.pipeline = this;
+    h.indexed = resolved.h.indexed;
+    // The views and samplers the configure bound, in ConfigureImpl's order.
+    boost::container::small_vector<R::ResolvedView, 160> observed_views;
+    size_t view_index = 0;
+    const auto add = [&](u32 count, u8 stage, u8 kind) {
+        for (u32 i = 0; i < count && view_index < views.size(); ++i, ++view_index) {
+            const VideoCommon::ImageViewInOut& view = views[view_index];
+            observed_views.push_back(R::ResolvedView{
+                .tic_index = view.index,
+                .view = {view.id.index, texture_cache.ViewGeneration(view.id)},
+                .stage = stage,
+                .kind = kind,
+                .blacklist = static_cast<u8>(view.blacklist ? 1 : 0),
+            });
+        }
+    };
+    for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
+        if (!recipe_stages[stage]) {
+            continue;
+        }
+        const Shader::Info& info{stage_infos[stage]};
+        const u8 s = static_cast<u8>(stage);
+        add(Shader::NumDescriptors(info.texture_buffer_descriptors), s, KindTextureBuffer);
+        add(Shader::NumDescriptors(info.image_buffer_descriptors), s, KindImageBuffer);
+        add(Shader::NumDescriptors(info.texture_descriptors), s, KindTexture);
+        add(Shader::NumDescriptors(info.image_descriptors), s, KindImage);
+    }
+    h.views = observed.Push(
+        std::span<const R::ResolvedView>(observed_views.data(), observed_views.size()));
+    // A sampler's TSC index is not kept by the configure: the resolved one, by position.
+    const auto resolved_samplers = resolved.Span<const R::ResolvedSampler>(resolved.h.samplers);
+    boost::container::small_vector<R::ResolvedSampler, 96> observed_samplers;
+    for (size_t i = 0; i < samplers.size(); ++i) {
+        observed_samplers.push_back(R::ResolvedSampler{
+            .tsc_index = i < resolved_samplers.size() ? resolved_samplers[i].tsc_index : ~0U,
+            .sampler = {samplers[i].index, texture_cache.SamplerGeneration(samplers[i])},
+        });
+    }
+    h.samplers = observed.Push(
+        std::span<const R::ResolvedSampler>(observed_samplers.data(), observed_samplers.size()));
+    // The words read are not kept either (the recipe capture compares them, DRAWCACHE=verify).
+    h.reads = observed.Push(resolved.Span<const VideoCommon::V2::DrawCache::InputRead>(
+        resolved.h.reads));
+    buffer_cache.ObserveGraphicsBindings(observed, resolved.h.indexed, recipe_stages);
+    h.index.format = resolved.h.index.format;
+    h.index.first = resolved.h.index.first;
+    h.index.count = resolved.h.index.count;
+    {
+        // Texture buffer bindings keep no guest address.
+        const auto resolved_tbos = resolved.Span<const R::ResolvedTbo>(resolved.h.tbo);
+        auto observed_tbos = observed.Span<R::ResolvedTbo>(h.tbo);
+        for (size_t i = 0; i < observed_tbos.size() && i < resolved_tbos.size(); ++i) {
+            observed_tbos[i].gpu_addr = resolved_tbos[i].gpu_addr;
+        }
+    }
+    const auto& targets = texture_cache.GetRenderTargets();
+    for (size_t rt = 0; rt < R::NumRecordTargets - 1; ++rt) {
+        h.rt_ids[rt] = targets.color_buffer_ids[rt].index;
+    }
+    h.rt_ids[R::NumRecordTargets - 1] = targets.depth_buffer_id.index;
+    h.rt_known = true;
+    h.dynamic = R::ComputeDynamic(R::LiveView{*maxwell3d}, *observer.features);
+    h.render_area.uses = render_area.uses_render_area;
+    h.render_area.w = render_area.uses_render_area ? render_area.words[0] : 0.0f;
+    h.render_area.h = render_area.uses_render_area ? render_area.words[1] : 0.0f;
+
+    // Creations during the configure: a proxy of that kind is a dependent match.
+    u32 created = 0;
+    const auto bit = [](R::RecordGroup group) { return 1U << static_cast<u32>(group); };
+    if (texture_cache.ImageViewSlots() > observer.views_before) {
+        created |= bit(R::RecordGroup::Views) | bit(R::RecordGroup::Rt);
+    }
+    if (texture_cache.SamplerSlots() > observer.samplers_before) {
+        created |= bit(R::RecordGroup::Samplers);
+    }
+    if (buffer_cache.BufferSlots() > observer.buffers_before) {
+        created |= bit(R::RecordGroup::Vertex);
+    }
+    R::RecordStats& stats = R::GetRecordStats();
+    std::string reasons;
+    u32 groups = 0;
+    u32 dependent = 0;
+    if (!R::CompareRecords(resolved, observed, created, reasons, &groups, &dependent)) {
+        for (size_t group = 0; group < R::NumRecordGroups; ++group) {
+            if ((groups >> group) & 1) {
+                R::CountRecordStat(stats.mismatches[group]);
+            }
+        }
+        static std::atomic<u32> logged{};
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+            LOG_WARNING(Render_Vulkan,
+                        "V2 draw record verify: draw {} pipeline {:016x}: the record differs "
+                        "from the old configure in {}",
+                        resolved.h.ordinal, state_hash, reasons);
+        }
+    }
+    R::CountRecordStat(stats.dependent, dependent);
+}
 
 } // namespace Vulkan

@@ -552,6 +552,13 @@ public:
     [[nodiscard]] u64 TextureBindingsSerial() const noexcept {
         return texture_bindings_serial;
     }
+    /// DRAWREC=verify: live views and samplers (a creation during a draw grows them).
+    [[nodiscard]] size_t ImageViewSlots() const noexcept {
+        return slot_image_views.size();
+    }
+    [[nodiscard]] size_t SamplerSlots() const noexcept {
+        return slot_samplers.size();
+    }
     /// DRAWREC=verify (step 10): a hash of what a cache mutation moves (slot vectors, serials,
     /// table changes, deferred requests); a pure resolve leaves it unchanged.
     [[nodiscard]] u64 DrawRecPurity() const noexcept {

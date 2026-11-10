@@ -200,6 +200,7 @@ private:
     VideoCommon::V2::Commit::RequestList drawrec_textures;
     VideoCommon::V2::Commit::RequestList drawrec_buffers;
     u64 drawrec_ordinal{};
+    GraphicsPipeline::DrawRecObserver drawrec_observer_state;
     /// DRAWREC=verify (step 10): what a cache mutation moves, around a pure resolve.
     struct DrawRecPurity {
         u64 flags{};

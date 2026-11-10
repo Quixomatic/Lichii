@@ -1777,13 +1777,29 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
             }
         }
     }
+    GraphicsPipeline* drawrec_observed = nullptr;
+    SCOPE_EXIT {
+        if (drawrec_observed != nullptr) [[unlikely]] {
+            drawrec_observed->SetDrawRecObserver(nullptr);
+        }
+    };
     if (drawrec == VideoCommon::V2::Mode::Verify) [[unlikely]] {
-        // P6 Step 0 (step 10): the record resolve next to the old configure, which still runs;
-        // the resolve must change nothing (purity snapshot around it).
+        // P6 Step 0 (steps 10-11): the record resolve next to the old configure, which still
+        // runs; the resolve must change nothing (purity snapshot around it), and the configure
+        // compares what it leaves behind with the record (DrawRecObserver).
         Profile::Scope scope{Profile::Zone::Configure};
         static_cast<void>(ResolveDrawRecord(*pipeline, is_indexed, is_indirect, true));
         VideoCommon::V2::Resolve::CountRecordStat(
             VideoCommon::V2::Resolve::GetRecordStats().verify_draws);
+        GraphicsPipeline::DrawRecObserver& observer = drawrec_observer_state;
+        observer.resolved = &drawrec_record;
+        observer.features = &drawrec_features;
+        observer.views_before = texture_cache.ImageViewSlots();
+        observer.samplers_before = texture_cache.SamplerSlots();
+        observer.buffers_before = buffer_cache.BufferSlots();
+        observer.done = false;
+        pipeline->SetDrawRecObserver(&observer);
+        drawrec_observed = pipeline;
     }
     const bool delta_holds =
         delta_pipeline != nullptr && DeltaStillHolds(draw_serial, draw_map_serial);

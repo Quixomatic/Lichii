@@ -634,11 +634,20 @@ public:
     /// Writes the graphics bindings of a record into the channel state as the Update* calls
     /// leave them (in BufferOperations, as DoUpdateGraphicsBuffers runs).
     void EncodeGraphicsBindings(const V2::Resolve::ResolvedDraw& record);
+    /// DRAWREC=verify (step 11): the graphics bindings the old configure left in the channel
+    /// state, in a record's shape (index, vertex, uniform, storage and texture buffers of
+    /// `stages`), into `observed`.
+    void ObserveGraphicsBindings(V2::Resolve::ResolvedDraw& observed, bool is_indexed,
+                                 const std::array<bool, NUM_STAGES>& stages) const;
     [[nodiscard]] u32 BufferGeneration(BufferId id) const noexcept {
         return V2::Versions::Gens().Get(V2::Versions::Kind::Buffer, id.index);
     }
     [[nodiscard]] u64 BufferDeletions() const noexcept {
         return buffer_deletions;
+    }
+    /// DRAWREC=verify: live buffers (a creation during a draw grows them).
+    [[nodiscard]] size_t BufferSlots() const noexcept {
+        return slot_buffers.size();
     }
     /// DRAWREC=verify (step 10): a hash of what a cache mutation moves; a pure resolve leaves
     /// it unchanged.

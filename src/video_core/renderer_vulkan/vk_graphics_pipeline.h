@@ -433,7 +433,29 @@ public:
         VideoCommon::V2::Commit::RequestList& textures,
         VideoCommon::V2::Commit::RequestList& buffers) const;
 
+    /// DRAWREC=verify (step 11): the next configure (full, delta or recipe) builds the record it
+    /// leaves behind and compares it with `resolved` before recording the draw. Null in v1.
+    struct DrawRecObserver {
+        const VideoCommon::V2::Resolve::ResolvedDraw* resolved{};
+        const VideoCommon::V2::Resolve::DynamicFeatures* features{};
+        VideoCommon::V2::Resolve::ResolvedDraw observed;
+        size_t views_before{};
+        size_t samplers_before{};
+        size_t buffers_before{};
+        bool done{};
+    };
+    void SetDrawRecObserver(DrawRecObserver* observer) noexcept {
+        drawrec_observer = observer;
+    }
+
 private:
+    /// The observer's compare (vk_draw_resolve.cpp): `views`/`samplers` are what the configure
+    /// bound, in ConfigureImpl's order.
+    void ObserveDrawRecord(std::span<const VideoCommon::ImageViewInOut> views,
+                           std::span<const VideoCommon::SamplerId> samplers,
+                           const RenderAreaPushConstant& render_area);
+    DrawRecObserver* drawrec_observer{};
+
     // Pipeline v2 P6 Step 0 (EDEN_NX2_V2_DRAWREC, vk_draw_resolve.cpp): the pure resolve of a
     // draw record. Reads only the view, guest memory and const cache lookups.
     /// The draw's texture handles, views and samplers into `out` (views, samplers, reads) and
