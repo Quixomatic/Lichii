@@ -656,7 +656,7 @@ TEST_CASE("V2 P5b submits are counted by call site", "[video_core][v2_p5b]") {
     using VideoCommon::V2::P5bStats::SubmitSites;
     SubmitSites sites;
     static const char a[] = "src/video_core/renderer_vulkan/vk_fence_manager.cpp";
-    static const char b[] = "C:\lichii\src\video_core\renderer_vulkan\vk_rasterizer.cpp";
+    static const char b[] = R"(C:\lichii\src\video_core\renderer_vulkan\vk_rasterizer.cpp)";
     // The same file name from another literal (an inline function in two units) is one site.
     std::string a_copy{a};
     for (int i = 0; i < 5; ++i) {
