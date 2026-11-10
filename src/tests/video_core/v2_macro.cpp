@@ -382,11 +382,10 @@ TEST_CASE("V2 macro memo: hits leave out the writes Write3D would drop",
           "[video_core][v2_macro]") {
     // Fix F3e (replaces F3d's change clock, which never engaged in game: 64-register blocks
     // were stamped by the writes between calls): decided per write, from the registers.
-    Front front{state_read_code};
+    Front front{cb_select_code};
     front.skip_same = true;
-    front.regs[0x48c] = 3;
-    const Pairs expected = front.Plain({5});
-    REQUIRE(expected.size() == 3);
+    const Pairs expected = front.Plain({0x194});
+    REQUIRE(expected.size() >= 2);
     // The writes Write3D would send from registers `regs`, in order.
     const auto sent = [&](std::array<u32, 0x1000> regs) {
         Pairs out;
@@ -400,11 +399,12 @@ TEST_CASE("V2 macro memo: hits leave out the writes Write3D would drop",
     };
     const auto [method, value] = expected[0];
     front.regs[method] = ~value;
-    CHECK(front.Memoised({5}) == expected); // recorded: every write made
+    const std::vector<u32> call{0x194};
+    CHECK(front.Memoised(call) == expected); // recorded: every write made
     const Pairs held = sent(front.regs);
-    REQUIRE(held.size() < expected.size()); // the last value at least is held
+    REQUIRE(held.size() < expected.size()); // the registers hold what it wrote
     const u64 dropped = front.dropped;
-    CHECK(front.Memoised({5}) == held); // hit
+    CHECK(front.Memoised(call) == held); // hit
     CHECK(front.memo.statistics.hits == 1);
     CHECK(front.memo.statistics.noop_hits == 1);
     CHECK(front.memo.last_skipped == expected.size() - held.size());
@@ -413,7 +413,7 @@ TEST_CASE("V2 macro memo: hits leave out the writes Write3D would drop",
     front.regs[method] = ~value; // changed by another write
     const Pairs changed = sent(front.regs);
     CHECK(!changed.empty());
-    CHECK(front.Memoised({5}) == changed);
+    CHECK(front.Memoised(call) == changed);
     CHECK(front.regs == [&] {
         std::array<u32, 0x1000> after = front.regs;
         for (const auto& [m, v] : expected) {
@@ -423,40 +423,39 @@ TEST_CASE("V2 macro memo: hits leave out the writes Write3D would drop",
     }());
     SECTION("not without compare-on-write") {
         front.skip_same = false;
-        CHECK(front.Memoised({5}) == expected);
+        CHECK(front.Memoised(call) == expected);
         CHECK(front.memo.last_skipped == 0);
     }
     SECTION("executable writes are always made") {
         front.flags[method] = 1;
-        CHECK(front.Memoised({5}) == expected);
-        CHECK(front.memo.last_skipped == 0);
+        CHECK(front.Memoised(call) == Pairs{expected[0]}); // the others still left out
     }
     SECTION("a shadow copy that differs makes the write") {
         front.track = true;
-        front.shadow[method] = expected.back().second; // as the last write left it
-        CHECK(front.Memoised({5}) == held);
-        front.shadow[method] = ~expected.back().second;
-        const Pairs made = front.Memoised({5});
-        CHECK(!made.empty());
-        CHECK(made.front() == expected[0]);
-        CHECK(front.shadow[method] == expected.back().second);
+        for (const auto& [m, v] : expected) {
+            front.shadow[m] = v; // as the writes left them
+        }
+        CHECK(front.Memoised(call) == held);
+        front.shadow[method] = ~value;
+        CHECK(front.Memoised(call) == Pairs{expected[0]});
+        CHECK(front.shadow[method] == value);
     }
     SECTION("a deferred draw makes every write") {
         front.deferred_draw = true;
-        CHECK(front.Memoised({5}) == expected);
+        CHECK(front.Memoised(call) == expected);
         CHECK(front.memo.last_skipped == 0);
     }
     SECTION("verify: every write the replay would leave out must be dropped") {
         const u64 skipped = front.memo.statistics.skipped_writes;
         const u64 dropped_before = front.dropped;
-        CHECK(front.Memoised({5}, true) == expected); // the JIT makes every write
+        CHECK(front.Memoised(call, true) == expected); // the JIT makes every write
         CHECK(front.memo.statistics.verify_mismatches == 0);
         const u64 predicted = front.memo.statistics.skipped_writes - skipped;
         CHECK(predicted == expected.size() - held.size());
         CHECK(front.dropped - dropped_before == predicted);
         CHECK(front.memo.last_skipped == 0); // made, so FrontRunMacro counts nothing
         front.drop_counted = false;          // a write path that keeps them
-        front.Memoised({5}, true);
+        front.Memoised(call, true);
         CHECK(front.memo.statistics.verify_mismatches == predicted);
     }
 }
