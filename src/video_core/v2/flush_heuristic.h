@@ -199,6 +199,13 @@ public:
                (draws >= params.pass_min_draws && since >= params.pass_interval_us);
     }
 
+    /// SYNC_SUBMIT_SPEC §7.3 fix 2: rule I's guest-visible open work without draws (a lazy fence
+    /// in the open tick, a command-list end) is due once the GPU is about to go idle.
+    [[nodiscard]] bool OpenWorkDue(u32 pending, bool lazy_fence_open,
+                                   bool list_end_open) const noexcept {
+        return pending < params.busy_pending && (lazy_fence_open || list_end_open);
+    }
+
     /// Any submission (heuristic or not) resets the counters.
     void NoteSubmit(u64 now_us) noexcept {
         draws = 0;

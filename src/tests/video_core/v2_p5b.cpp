@@ -1062,6 +1062,87 @@ TEST_CASE("SYNC 5b06 boot hang: every channel suspended, the back idle, a lazy f
     REQUIRE(action == Action::Sync);
 }
 
+TEST_CASE("SYNC §7.3: open work without draws is submitted however the back is fed",
+          "[video_core][v2_p5b]") {
+    using VideoCommon::V2::SubmitRequests;
+    using Action = SubmitRequests::IdleAction;
+    FlushParams params;
+    params.pass_boundaries = true;
+    constexpr u64 open = 50;
+    SECTION("(a) a lazy fence with an operation, 0 draws, a record every 5 us: the batch end "
+            "runs rule I and the tick is submitted") {
+        // GpuSplit::BackLoop (fix 1) runs the idle hook at every batch end with the ring empty;
+        // with records every 5 us the timed hook (idle_hook_ns of emptiness) never would.
+        FlushHeuristic heuristic{params};
+        heuristic.NoteSubmit(1000);
+        SubmitRequests requests;
+        bool landed = false;
+        for (int batch = 0; batch < 100 && !landed; ++batch) {
+            const bool ring_empty_at_batch_end = true; // the back caught up before the next one
+            if (ring_empty_at_batch_end) {
+                const FlushState state{.pending = 0, .back_behind = false};
+                const bool due = heuristic.OpenWorkDue(state.pending, true, false) ||
+                                 heuristic.SyncPointDue(state, 2000);
+                const auto action = requests.AtIdleHook(false, true, false, open, open, due);
+                landed = action == Action::Sync; // submitted: the fence pops, the op lands
+            }
+        }
+        REQUIRE(landed);
+    }
+    SECTION("(b) a pure compute stream that never empties the ring: rule C submits within the "
+            "chunk bound") {
+        // Fix 3: dispatches, list ends and fences count toward chunks (no draws needed).
+        FlushHeuristic heuristic{params};
+        heuristic.NoteSubmit(1000);
+        const FlushState two{.pending = 2, .back_behind = true};
+        u32 items = 0;
+        bool flushed = false;
+        while (!flushed && items < 10'000) {
+            ++items;
+            const u32 cost = items % 3 == 0 ? 4 : 1; // dispatches, list ends, fences
+            flushed = heuristic.Advance(cost, two, 1000 + items).action == FlushAction::Flush;
+        }
+        REQUIRE(flushed);
+        REQUIRE(items <= params.max_chunk_threshold * params.chunk_draws);
+    }
+    SECTION("(c) the fencing thread blocked on an unsubmitted tick while the back is busy: rule W "
+            "submits it at the next entry boundary") {
+        // Fix 4 (InnerFence::Wait): after two `consumed` stores past its turn without a submit it
+        // files rule W once; the idle hook between entries serves it (Urgent).
+        SubmitRequests requests;
+        u64 consumed = 1000;
+        u64 last = consumed;
+        u32 moves = 0;
+        bool requested = false;
+        for (int spin = 0; spin < 10 && !requested; ++spin) {
+            consumed += 64; // the back keeps executing entries
+            if (consumed != last) {
+                last = consumed;
+                ++moves;
+            }
+            if (moves >= 2) {
+                requests.Request(open, true);
+                requested = true;
+            }
+        }
+        REQUIRE(requested);
+        REQUIRE(requests.AtIdleHook(false, true, false, open, open, false) == Action::Urgent);
+    }
+    SECTION("(d) nobody waits, two in flight, draws only: no extra submit") {
+        FlushHeuristic heuristic{params};
+        heuristic.NoteSubmit(1000);
+        const FlushState two{.pending = 2, .back_behind = false};
+        for (u32 i = 0; i < 40; ++i) {
+            REQUIRE(heuristic.Advance(1, two, 1000).action != FlushAction::Flush);
+        }
+        SubmitRequests requests;
+        const bool due = heuristic.OpenWorkDue(two.pending, true, true) ||
+                         heuristic.SyncPointDue(two, 1'000'000);
+        REQUIRE_FALSE(due);
+        REQUIRE(requests.AtIdleHook(false, true, false, open, open, due) == Action::Leave);
+    }
+}
+
 TEST_CASE("SYNC step 9: the post-pass list runs in order after the pass, before the submit",
           "[video_core][v2_p5b]") {
     // Model of the recording stream: the scheduler runs the list at the pass end (EndRenderPass)

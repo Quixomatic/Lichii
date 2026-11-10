@@ -24,9 +24,12 @@ inline std::atomic<u64> tick{0};
 inline std::atomic<u64> issued{0};
 inline std::atomic<u64> untracked{0};
 
-/// Submissions the recording thread made with lazy fences (any thread reads it): a suspended
-/// acquire asks for the open tick's submission once per value (V2::ShouldSubmitOpen).
-inline std::atomic<u64> submits{0};
+/// SYNC_SUBMIT_SPEC §7.3 fix 6: the open tick's state for the 2 s semaphore line (written by the
+/// recording and fencing threads with relaxed stores, read only for that line).
+inline std::atomic<u64> diag_open_tick{0};       ///< Scheduler::CurrentTick after the last submit
+inline std::atomic<u64> diag_lazy_tick{0};       ///< The newest lazy fence's tick
+inline std::atomic<bool> diag_submit_wanted{false};
+inline std::atomic<u64> diag_fence_wait_tick{0}; ///< The tick the fencing thread blocks on (0: none)
 
 /// The renderer's urgent request for a host tick (Scheduler::RequestLazyFlush) and the wake that
 /// runs the back's idle hook (GpuSplit::RequestIdleHook). Set once before the back starts.

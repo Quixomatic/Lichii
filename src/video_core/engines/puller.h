@@ -95,12 +95,9 @@ public:
         /// A GPU-written word's readback (V2::WordReadback) was sent and not landed yet.
         bool readback_sent{};
         /// SYNC_SUBMIT_SPEC §2.2 (V2::PlanSuspendedPoll): the fence tick it asked to be
-        /// submitted last (one request per tick change), and the back position + 1 at which it
-        /// had a fence signalled for an uncarried capture (0: never).
+        /// submitted last (one request per tick change).
         u64 requested_tick{};
-        u64 fence_job_at{};
-        /// Unmet checks of this suspension (the 2 s clock read every 64; V2::ShouldSubmitOpen
-        /// asks only after 64).
+        /// Unmet checks of this suspension (the 2 s clock is read every 64).
         u32 polls{};
         /// SYNC Step 0: what its last poll waited for (V2::Stats::WakeClass), for the STATS line.
         u8 wake{};

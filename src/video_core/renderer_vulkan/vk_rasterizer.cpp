@@ -3990,6 +3990,7 @@ void RasterizerVulkan::ModifyGPUMemory(size_t as_id, GPUVAddr addr, u64 size) {
 
 void RasterizerVulkan::SignalFence(std::function<void()>&& func) {
     fence_manager.SignalFence(std::move(func));
+    NoteNonDrawWork(1); // SYNC §7.3 fix 3: a fence counts toward rule C
 }
 
 void RasterizerVulkan::SyncOperation(std::function<void()>&& func) {
@@ -4098,6 +4099,7 @@ void RasterizerVulkan::FlushCommands() {
         // F4-02: a command list end orders nothing the host must submit for; the work goes out
         // at the next heuristic submission, a waiter's request or the idle hook.
         scheduler.WantSubmit();
+        NoteNonDrawWork(1); // SYNC §7.3 fix 3: a list end counts toward rule C
         return;
     }
     // Fences with downloads or queries come here right after queueing: ~9,400 a second in
@@ -4937,11 +4939,17 @@ void RasterizerVulkan::ServeSplitIdleHook() {
             // still to land (a deferred QMD reduction, a counter report) is a synchronization
             // point (DXVK): with the GPU about to go idle it is worth a submission, so it lands
             // although no draw follows it and nobody blocks on it yet.
-            // Any lazy fence in the open tick is such a point: the fencing thread pops fences in
-            // order, so later fences' operations wait behind it (5b06 boot hang).
-            if (state.pending < self.flush_heuristic.Params().busy_pending &&
-                (VideoCommon::V2::LandingFence::TickForPending() >= self.scheduler.CurrentTick() ||
-                 self.scheduler.LazyOutstandingTick() >= self.scheduler.CurrentTick())) {
+            // SYNC_SUBMIT_SPEC §7.3 fix 2: any open work the guest will read (a lazy fence in the
+            // open tick, a command-list end) with the GPU about to idle, draws or not: fences pop
+            // in order, and the guest may submit its next work only once one lands (0c86/e412).
+            const u64 open = self.scheduler.CurrentTick();
+            if (self.flush_heuristic.OpenWorkDue(
+                    state.pending,
+                    VideoCommon::V2::LandingFence::TickForPending() >= open ||
+                        self.scheduler.LazyOutstandingTick() >= open,
+                    self.scheduler.SubmitWantedNow())) {
+                VideoCommon::V2::P5bStats::Add(
+                    VideoCommon::V2::P5bStats::Counter::SubmitsIdleNonDraw);
                 return true;
             }
             if (!self.adaptive_flush_fed) {
@@ -5066,6 +5074,30 @@ void RasterizerVulkan::AdaptiveFlushWork(u32 cost) {
         return;
     }
     pending_native_work = true;
+}
+
+void RasterizerVulkan::NoteNonDrawWork(u32 cost) {
+    if (!adapt_submit || gpu_memory == nullptr || !gpu_memory->UsesNativeTiling() ||
+        !scheduler.LazyFencesHere()) {
+        return;
+    }
+    namespace P5b = VideoCommon::V2::P5bStats;
+    const u32 next = flush_heuristic.Draws() + 1;
+    u64 now_us = 0;
+    VideoCommon::V2::FlushState state{};
+    if (next % flush_heuristic.Params().chunk_draws == 0) {
+        SyncAdaptiveTick();
+        now_us = AdaptNowUs();
+        state = ReadFlushState();
+    }
+    const auto decision = flush_heuristic.Advance(cost, state, now_us);
+    if (decision.action == VideoCommon::V2::FlushAction::Flush) {
+        scheduler.Flush();
+        adapt_tick = scheduler.GetMasterSemaphore().CurrentTick();
+        P5b::Add(P5b::Counter::SubmitsChunk);
+    } else if (decision.action == VideoCommon::V2::FlushAction::Dispatch) {
+        scheduler.DispatchWork();
+    }
 }
 
 void RasterizerVulkan::FlushWork(u32 cost) {

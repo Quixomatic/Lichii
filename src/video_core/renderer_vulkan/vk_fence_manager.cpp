@@ -97,19 +97,28 @@ void InnerFence::Wait() {
         // is the next boundary, chunk or idle hook).
         auto& split = VideoCommon::GpuSplit::Get();
         bool requested = false;
+        // SYNC_SUBMIT_SPEC §7.3 fix 4 (MP §6 interrupt rule; SESSION_HANDOFF §5 lesson 2): the
+        // blocked fencing thread is a real waiter for every later fence's operations. Once the
+        // back has run entries past this fence's turn twice (two `consumed` stores: its batch
+        // ends, where fix 1 already ran rule I) without submitting it, it files rule W once for
+        // this tick. With the back asleep it does so at once. No timer; ≈ 0/s in steady state.
+        u64 last_consumed = split.ConsumedPosition();
+        u32 back_moves = 0;
+        VideoCommon::V2::LandingFence::diag_fence_wait_tick.store(wait_tick,
+                                                                  std::memory_order_relaxed);
         for (u32 spins = 0; !scheduler.IsSubmitted(wait_tick); ++spins) {
             if (!split.BackRunning()) {
                 break;
             }
-            // 5b06 boot hang (every channel suspended, back idle, no draw after the lazy fence):
-            // with the back idle no pass boundary or chunk will come, so this wait would block
-            // every later fence's operations (the reductions the acquires wait for) for good.
-            // The blocked fencing thread then files rule W itself (SESSION_HANDOFF §5: a wait
-            // must not wait on a submission nobody submits).
-            if (!requested && (host_waits() || split.BackIdle())) {
+            if (const u64 consumed = split.ConsumedPosition(); consumed != last_consumed) {
+                last_consumed = consumed;
+                ++back_moves;
+            }
+            if (!requested && (host_waits() || back_moves >= 2 || split.BackIdle())) {
                 scheduler.RequestLazyFlush(wait_tick, true);
                 split.RequestIdleHook();
                 requested = true;
+                VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::FencingRequests);
             }
             if (spins < 16) {
                 std::this_thread::yield();
@@ -117,6 +126,7 @@ void InnerFence::Wait() {
                 std::this_thread::sleep_for(std::chrono::microseconds{50});
             }
         }
+        VideoCommon::V2::LandingFence::diag_fence_wait_tick.store(0, std::memory_order_relaxed);
     }
     if (!scheduler.IsSubmitted(wait_tick) && VideoCommon::GpuSplit::Get().Active() &&
         !VideoCommon::GpuSplit::OnBackThread() && scheduler.WaitSubmitted(wait_tick)) {

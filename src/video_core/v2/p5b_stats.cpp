@@ -160,8 +160,9 @@ void Report(const char* thread_name, u64 window_ns) {
                  "V2 stats {} SYNC submits by rule (per frame) | B pass boundary {:.2f}, C chunk "
                  "{:.2f}, I idle {:.2f}, W waiter {:.2f}, deferred {:.2f}, present {:.2f}, other "
                  "{:.2f} | QMD reductions at execute {:.0f}/s, at their fence {:.0f}/s | "
-                 "requests by origin (per s): acquires {:.0f} (fence jobs {:.0f}), landing waits "
-                 "{:.0f} | macro DMA reads by the semaphore view (per s): forwarded {:.0f}, waited "
+                 "requests by origin (per s): acquires {:.0f}, landing waits {:.0f}, fencing "
+                 "thread {:.0f} | rule I at batch end {:.2f}/frame, non-draw {:.2f}/frame, open "
+                 "tick age at submit max {:.1f} ms | macro DMA reads by the semaphore view (per s): forwarded {:.0f}, waited "
                  "{:.0f}, clear {:.0f} | finishes by site: {}",
                  thread_name, per_frame(at(Counter::SubmitsPassBoundary)),
                  per_frame(at(Counter::SubmitsChunk)), per_frame(at(Counter::SubmitsIdle)),
@@ -171,8 +172,11 @@ void Report(const char* thread_name, u64 window_ns) {
                  PerSecond(at(Counter::QmdReductionsAtExecute), seconds),
                  PerSecond(at(Counter::QmdReductionsDeferred), seconds),
                  PerSecond(at(Counter::RequestsAcquire), seconds),
-                 PerSecond(at(Counter::FenceJobsAcquire), seconds),
                  PerSecond(at(Counter::RequestsLanding), seconds),
+                 PerSecond(at(Counter::FencingRequests), seconds),
+                 per_frame(at(Counter::SubmitsIdleBatchEnd)),
+                 per_frame(at(Counter::SubmitsIdleNonDraw)),
+                 static_cast<double>(at(Counter::OpenTickAgeMaxUs)) / 1000.0,
                  PerSecond(at(Counter::DmaReadsSemForwarded), seconds),
                  PerSecond(at(Counter::DmaReadsSemWaited), seconds),
                  PerSecond(at(Counter::DmaReadsSemClear), seconds),

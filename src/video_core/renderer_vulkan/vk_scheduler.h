@@ -32,6 +32,8 @@
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
 #include "video_core/v2/barrier_tracker.h"
 #include "video_core/v2/after_pass.h"
+#include "video_core/v2/landing_fence.h"
+#include "video_core/v2/p5b_stats.h"
 #include "video_core/v2/submit_requests.h"
 #include "video_core/v2/timeline_join.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
@@ -128,6 +130,10 @@ public:
     /// Recording thread: a lazy fence waits for `tick`.
     void NoteLazyFence(u64 tick) {
         lazy_outstanding_tick = tick;
+        VideoCommon::V2::LandingFence::diag_lazy_tick.store(tick, std::memory_order_relaxed);
+        if (open_since_us == 0) {
+            open_since_us = NowUs(); // SYNC §7.3: the open tick's age at its submit
+        }
     }
     /// Recording thread: the newest lazy fence's tick (0: none yet).
     [[nodiscard]] u64 LazyOutstandingTick() const noexcept {
@@ -138,6 +144,14 @@ public:
     /// instead of a submission of its own.
     void WantSubmit() {
         submit_wanted = true;
+        if (lazy_fences) [[unlikely]] {
+            VideoCommon::V2::LandingFence::diag_submit_wanted.store(true,
+                                                                    std::memory_order_relaxed);
+        }
+    }
+    /// Recording thread (SYNC §7.3 fix 2): work the guest waits on (a list end) is open.
+    [[nodiscard]] bool SubmitWantedNow() const noexcept {
+        return submit_wanted;
     }
     /// The idle hook (the back goes idle, or another thread asked with RequestIdleHook): what
     /// FlushDeferred submits, plus with lazy fences any work they or WantSubmit wait for.
@@ -656,6 +670,16 @@ private:
     VideoCommon::V2::AfterPassList after_pass;
     void RunAfterPass() {
         after_pass.Run();
+    }
+    u64 open_since_us{}; ///< SYNC §7.3: when the open tick first held a lazy fence (0: none)
+    /// SYNC §7.3 counters and the 2 s line's state, at a lazy-fence-mode submission.
+    void NoteOpenTickSubmitted() {
+        if (open_since_us != 0) {
+            VideoCommon::V2::P5bStats::Max(VideoCommon::V2::P5bStats::Counter::OpenTickAgeMaxUs,
+                                           NowUs() - open_since_us);
+            open_since_us = 0;
+        }
+        VideoCommon::V2::LandingFence::diag_submit_wanted.store(false, std::memory_order_relaxed);
     }
     void (*pre_submit_hook)(void*){};   ///< SYNC Step 8: SetPreSubmitHook
     void* pre_submit_argument{};

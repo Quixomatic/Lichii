@@ -339,53 +339,10 @@ TEST_CASE("SYNC step 4 idle back: every wake row of §2.2 resumes once its event
     }
 }
 
-TEST_CASE("SYNC 0c86 livelock: a busy back, no draws, every waiter 'no writer': the open tick "
-          "with the producer is submitted once per submission",
-          "[video_core][v2_sem_view]") {
-    // 0c86abfef7: channels on words 0x13 short of QMD reductions (and one at 0), view row 3. The
-    // back kept running small non-draw entries (never idle: no rule I), no draws (no rule B/C),
-    // and row 3 asked for nothing: the reductions stayed in the open tick. Model: the open tick
-    // lands only when submitted; the front polls every pass (busy).
-    u64 submits = 7; // LandingFence::submits
-    u64 seen = ~u64{0};
-    u32 word = 0x5e2;
-    bool open_holds_producer = true;
-    u32 polls = 0;
-    u32 asks = 0;
-    SemView view;
-    SemInputs in;
-    for (int pass = 0; pass < 10'000; ++pass) {
-        in.memory_word = word;
-        const auto d = DecideFromView(SemaphoreOp::Equal, 0x5f5, view.Find(0x9100, At(500)), in);
-        if (d.verdict == AcquireVerdict::Met) {
-            break;
-        }
-        REQUIRE(d.row == SemRow::NoWriter);
-        ++polls;
-        if (polls >= 64 && ShouldSubmitOpen(false, d.request, submits, seen)) {
-            ++asks;
-            ++submits; // the fence job: signal + submit
-            seen = submits;
-            if (open_holds_producer) {
-                open_holds_producer = false;
-                word += 0x13; // the GPU ran it and the fence operations landed
-            }
-        }
-    }
-    REQUIRE(word == 0x5f5);
-    REQUIRE(asks == 1);
-    // A short wait (fewer than 64 unmet checks) never asks; one ask per submission epoch, and
-    // never for an at-fence or GPU-written waiter (they ask per tick / read back).
-    REQUIRE_FALSE(ShouldSubmitOpen(false, false, 8, 8));
-    REQUIRE(ShouldSubmitOpen(false, false, 9, 8));
-    REQUIRE_FALSE(ShouldSubmitOpen(true, false, 9, 8));
-    REQUIRE_FALSE(ShouldSubmitOpen(false, true, 9, 8));
-}
-
 TEST_CASE("SYNC step 4: no submit when nobody waits and the GPU is busy",
           "[video_core][v2_sem_view]") {
     // A suspended acquire with no producer at a fence asks for nothing.
-    REQUIRE(PlanSuspendedPoll(false, false, 9, 0, true, true, false) == SuspendedPoll::Wait);
+    REQUIRE(PlanSuspendedPoll(false, false, 9, 0) == SuspendedPoll::Wait);
     // An idle hook with only a lazy fence's open tick, no request and DXVK's rule not due:
     // the work is left for the next boundary (no urgent-at-queue request exists any more).
     SubmitRequests requests;

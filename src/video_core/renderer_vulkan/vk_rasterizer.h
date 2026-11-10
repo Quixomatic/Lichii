@@ -324,6 +324,9 @@ private:
 
     /// EDEN_NX2_V2_ADAPTSUBMIT: FlushWork's adaptive form.
     void AdaptiveFlushWork(u32 cost);
+    /// SYNC_SUBMIT_SPEC §7.3 fix 3 (MP §5.5 "chunk count"): a list end or a fence counts toward
+    /// rule C's chunks and cost like a draw, so a stream without draws is bounded too.
+    void NoteNonDrawWork(u32 cost);
 
     /// A hint for the adaptive submission heuristic (no-op unless EDEN_NX2_V2_ADAPTSUBMIT).
     void FlushHint(VideoCommon::V2::FlushHint hint);

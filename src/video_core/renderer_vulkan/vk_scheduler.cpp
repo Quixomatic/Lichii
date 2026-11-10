@@ -226,11 +226,14 @@ u64 Scheduler::Flush(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
     }
     if (lazy_fences) [[unlikely]] {
         NoteBlockedWait();
-        // SYNC (0c86): suspended acquires ask for the open tick once per submission.
-        VideoCommon::V2::LandingFence::submits.fetch_add(1, std::memory_order_release);
+        NoteOpenTickSubmitted();
     }
     // When flushing, we only send data to the worker thread; no waiting is necessary.
     const u64 signal_value = SubmitExecution(signal_semaphore, wait_semaphore);
+    if (lazy_fences) [[unlikely]] {
+        VideoCommon::V2::LandingFence::diag_open_tick.store(CurrentTick(),
+                                                            std::memory_order_relaxed);
+    }
     AllocateNewContext();
     last_flush = std::chrono::steady_clock::now();
     flush_pending = false;
@@ -314,6 +317,9 @@ void Scheduler::ServeSplitIdleHook(bool (*sync_due)(void*), void* argument) {
     case IdleAction::Sync:
         P5b::Add(P5b::Counter::IdleSync);
         P5b::Add(P5b::Counter::SubmitsIdle);
+        if (VideoCommon::GpuSplit::Get().HookAtBatchEnd()) {
+            P5b::Add(P5b::Counter::SubmitsIdleBatchEnd);
+        }
         break;
     }
     P5b::Add(P5b::Counter::FlushLazy);
@@ -443,7 +449,7 @@ void Scheduler::Finish(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
     const u64 start = profile || p5b_stats ? VideoCommon::Nx2Profile::Now() : 0;
     if (lazy_fences) [[unlikely]] {
         NoteBlockedWait();
-        VideoCommon::V2::LandingFence::submits.fetch_add(1, std::memory_order_release);
+        NoteOpenTickSubmitted();
     }
     SubmitExecution(signal_semaphore, wait_semaphore);
     Wait(presubmit_tick);

@@ -2846,8 +2846,8 @@ TEST_CASE("V2 landing: one write table, tickets without IR cuts, ordered landing
         CHECK(!split.QmdTargetSettled(target));
         // While it may land the suspended poll asks for its fence's submit (SYNC Step 4: once per
         // tick; tick 7 stands for the fence that carries it), not a drain.
-        CHECK(V2::PlanSuspendedPoll(false, !split.QmdTargetSettled(target), 7, 0, true, false,
-                                    false) == V2::SuspendedPoll::Request);
+        CHECK(V2::PlanSuspendedPoll(false, !split.QmdTargetSettled(target), 7, 0) ==
+              V2::SuspendedPoll::Request);
         // The idle back serves the request; the fencing thread lands the operation only then.
         struct Hook {
             std::atomic<bool> asked{false};

@@ -150,37 +150,6 @@ void ReleaseFences(DmaPusher& dma_pusher) {
                    VideoCommon::DrainSite::FenceRelease);
 }
 
-// SYNC_SUBMIT_SPEC §2.2 (V2::SuspendedPoll::FenceJob; 019d case b): the producer of an
-// acquire's word is an operation the idle back captured that no fence carries yet (queued by
-// SyncOperation in the open command buffer). A job on the back (no ring record) signals the
-// delayed fence that carries it and submits the open command buffer, as IrExec::LandCaptured.
-// The fencing thread lands it once the GPU passed it; the landing rings the front. The back
-// never waits for the GPU here (no forced ReleaseFences: the 41/s LandEverythingPending blocks).
-// The front waits only for the job (the back is idle), as every other front job does.
-void SignalFenceForCaptures(VideoCore::RasterizerInterface* rasterizer) {
-    struct Job {
-        VideoCore::RasterizerInterface* rasterizer{};
-        std::atomic<bool> done{false};
-    };
-    // Static: a job a stopping back never ran must not point at a dead frame. Front only.
-    static Job job;
-    job.rasterizer = rasterizer;
-    job.done.store(false, std::memory_order_relaxed);
-    auto& split = VideoCommon::GpuSplit::Get();
-    split.RequestBackJob(
-        [](void* argument) {
-            auto& self = *static_cast<Job*>(argument);
-            VideoCore::g_signaling_query_report_fence = true;
-            self.rasterizer->SignalFence([] {});
-            VideoCore::g_signaling_query_report_fence = false;
-            self.rasterizer->FlushCommands();
-            self.done.store(true, std::memory_order_release);
-        },
-        &job);
-    while (!job.done.load(std::memory_order_acquire) && split.BackRunning()) {
-        std::this_thread::yield();
-    }
-}
 
 namespace V2Stats = VideoCommon::V2::Stats;
 
@@ -561,11 +530,8 @@ bool Puller::PollAcquireView(DmaPusher& dma_pusher) {
                 tick = untracked != 0 ? V2::LandingFence::TickFor(0, untracked) : 0;
             }
         }
-        const u64 consumed_now = split.ConsumedNow();
-        const bool back_idle = consumed_now == split.WritePosition();
         switch (V2::PlanSuspendedPoll(gpu_written, check.decision.request, tick,
-                                      acquire.requested_tick, consumed_now >= check.decision.position,
-                                      back_idle, acquire.fence_job_at == consumed_now + 1)) {
+                                      acquire.requested_tick)) {
         case V2::SuspendedPoll::ReadBack:
             // Read the word back again once the back ran what was sent since (at most per
             // 200 us): no drain, no synchronous download on the back.
@@ -583,27 +549,8 @@ bool Puller::PollAcquireView(DmaPusher& dma_pusher) {
             split.RequestIdleHook();
             V2::P5bStats::Add(V2::P5bStats::Counter::RequestsAcquire);
             break;
-        case V2::SuspendedPoll::FenceJob:
-            acquire.fence_job_at = consumed_now + 1;
-            SignalFenceForCaptures(dma_pusher.rasterizer);
-            V2::P5bStats::Add(V2::P5bStats::Counter::FenceJobsAcquire);
-            break;
         case V2::SuspendedPoll::Wait:
             break;
-        }
-        // The open tick may hold the producer (0c86 livelock: a busy back, no draws, nothing
-        // else submits it): once the waiter stayed unmet for 64 checks, the open work is
-        // submitted once per submission epoch, shared by every waiter (V2::ShouldSubmitOpen), so
-        // a short wait never adds a submission.
-        static u64 open_submits_seen = ~u64{0}; // Front thread only
-        const u64 submits = V2::LandingFence::submits.load(std::memory_order_acquire);
-        // An at-fence producer whose fence tick is known asks per tick above instead.
-        if (acquire.polls >= 64 &&
-            V2::ShouldSubmitOpen(gpu_written, check.decision.request && tick != 0, submits,
-                                 open_submits_seen)) {
-            SignalFenceForCaptures(dma_pusher.rasterizer);
-            open_submits_seen = V2::LandingFence::submits.load(std::memory_order_acquire);
-            V2::P5bStats::Add(V2::P5bStats::Counter::FenceJobsAcquire);
         }
         if (decided && V2Stats::Enabled()) [[unlikely]] {
             V2Stats::NoteDecision(VideoCommon::DrainSite::Acquire, Decision::Avoided,
@@ -613,10 +560,20 @@ bool Puller::PollAcquireView(DmaPusher& dma_pusher) {
             acquire.reported = true;
             LOG_WARNING(HW_GPU,
                         "Channel {} waits on semaphore {:#x} (op {}, {:#x}, now {:#x}) for 2 s "
-                        "(view: {}, row {})",
+                        "(view: {}, row {}; open tick {}, newest lazy fence tick {}, list end "
+                        "wanted {}, fencing thread waits for tick {}; back consumed {:#x} of "
+                        "{:#x}, landed {:#x}, untracked landed {:#x} of {:#x})",
                         dma_pusher.channel_state.bind_id, address, operation, value,
                         dma_pusher.memory_manager.Read<u32>(address),
-                        static_cast<u32>(check.reason), static_cast<u32>(check.decision.row));
+                        static_cast<u32>(check.reason), static_cast<u32>(check.decision.row),
+                        V2::LandingFence::diag_open_tick.load(std::memory_order_relaxed),
+                        V2::LandingFence::diag_lazy_tick.load(std::memory_order_relaxed),
+                        V2::LandingFence::diag_submit_wanted.load(std::memory_order_relaxed),
+                        V2::LandingFence::diag_fence_wait_tick.load(std::memory_order_relaxed),
+                        split.ConsumedNow(), split.WritePosition(),
+                        V2::Landing::landed.load(std::memory_order_relaxed),
+                        V2::Landing::untracked_landed.load(std::memory_order_relaxed),
+                        V2::Landing::untracked_issued.load(std::memory_order_relaxed));
             if (acquire.sem_execute) {
                 return SemExecuteGiveUp(acquire);
             }

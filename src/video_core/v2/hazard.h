@@ -292,7 +292,6 @@ enum class SuspendedPoll : u8 {
     Wait,      ///< Its wake classes bring the next check (consumed, landing, release, CPU, map)
     ReadBack,  ///< Read the GPU-written word back (class C)
     Request,   ///< File one submit request for the producer's fence tick (rule W)
-    FenceJob,  ///< The back ran the producer and idles, no fence carries it yet: have it signal one
 };
 
 /// SYNC_SUBMIT_SPEC §2.1/§2.2 (MP §6: class D "land on a host fence", "an interrupt forces a
@@ -301,37 +300,19 @@ enum class SuspendedPoll : u8 {
 /// classes. Only the at-fence row (`request`: a producer that lands at a fence operation) asks
 /// for anything:
 /// - its fence is queued (`tick` != 0): one request per tick change (no timed re-ask);
-/// - no fence carries it yet: once the back ran the producer and is idle (nothing else will
-///   signal a fence), a back job signals the delayed fence that carries it and submits
-///   (IrExec::LandCaptured), once per back position (`job_here`). 019d case (b): an operation
-///   queued without a fence in the open command buffer.
+/// - no fence carries it yet: wait (the back signals the fence that carries it; the open tick
+///   holding it is submitted by rule I at the back's batch end or by the blocked fencing
+///   thread's rule W, §7.3 fixes 1-4).
 /// No forced landing (the back never blocks on the GPU for an acquire, §2.7), no drain.
-/// 0c86 livelock (every channel suspended on words 0x13 short, view row "no writer", the back
-/// busy with small non-draw entries, so no pass boundary, chunk or idle hook ever submitted the
-/// open tick holding the producer): MP §6 "an interrupt forces a submit if the sync is not yet
-/// submitted", SESSION_HANDOFF §5 "every wait causes its submit". A suspended, unmet acquire
-/// that is neither at-fence (it asks per tick) nor GPU-written (read back) has the open work
-/// submitted once per submission: `submits` is LandingFence::submits now, `seen` its value after
-/// the waiter's last ask. Bounded by the submission rate: never a storm, never a timer.
-[[nodiscard]] constexpr bool ShouldSubmitOpen(bool gpu_written, bool at_fence, u64 submits,
-                                              u64 seen) {
-    return !gpu_written && !at_fence && submits != seen;
-}
-
 [[nodiscard]] constexpr SuspendedPoll PlanSuspendedPoll(bool gpu_written, bool request, u64 tick,
-                                                        u64 requested_tick, bool producer_ran,
-                                                        bool back_idle, bool job_here) {
+                                                        u64 requested_tick) {
     if (gpu_written) {
         return SuspendedPoll::ReadBack;
     }
-    if (!request) {
+    if (!request || tick == 0) {
         return SuspendedPoll::Wait;
     }
-    if (tick != 0) {
-        return tick != requested_tick ? SuspendedPoll::Request : SuspendedPoll::Wait;
-    }
-    return producer_ran && back_idle && !job_here ? SuspendedPoll::FenceJob
-                                                  : SuspendedPoll::Wait;
+    return tick != requested_tick ? SuspendedPoll::Request : SuspendedPoll::Wait;
 }
 
 } // namespace VideoCommon::V2

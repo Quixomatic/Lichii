@@ -119,13 +119,16 @@ enum class Counter : u32 {
     QmdReductionsAtExecute, ///< SYNC Step 3: QMD reduction/max releases run at execute time
     QmdReductionsDeferred,  ///< ... at their fence (delayed fences, the landing rule)
     RequestsAcquire,  ///< SYNC Step 4: submit requests filed by suspended acquires (at-fence row)
-    FenceJobsAcquire, ///< ... fences signalled for a capture no fence carried (idle back)
     RequestsLanding,  ///< ... filed by front landing waits (WaitLanded/WaitUntrackedLanded)
     DmaReadsSemForwarded, ///< SYNC Step 6: macro DMA reads forwarded from the semaphore view
     DmaReadsSemWaited,    ///< ... after waiting for an unknown at-execute writer's position
     DmaReadsSemClear,     ///< ... nothing pending: memory
     HoistedCopies,        ///< SYNC Step 9: hazard-free buffer copies in the upload command buffer
     QueryWfiAfterPass,    ///< SYNC Step 9: query result copies deferred to the pass end
+    SubmitsIdleBatchEnd,  ///< SYNC §7.3: rule I submits from the idle hook at a batch end
+    SubmitsIdleNonDraw,   ///< ... rule I for guest-visible work without draws
+    FencingRequests,      ///< ... rule W requests from the blocked fencing thread
+    OpenTickAgeMaxUs,     ///< ... the oldest open tick (with a lazy fence) at its submit (max)
     Count,
 };
 
@@ -141,6 +144,17 @@ struct Data {
 inline void Add(Counter counter, u64 amount = 1) {
     if (Enabled()) [[unlikely]] {
         Get().values[static_cast<size_t>(counter)].fetch_add(amount, std::memory_order_relaxed);
+    }
+}
+
+/// The largest value seen this window (a max counter).
+inline void Max(Counter counter, u64 value) {
+    if (Enabled()) [[unlikely]] {
+        auto& slot = Get().values[static_cast<size_t>(counter)];
+        u64 current = slot.load(std::memory_order_relaxed);
+        while (current < value &&
+               !slot.compare_exchange_weak(current, value, std::memory_order_relaxed)) {
+        }
     }
 }
 
