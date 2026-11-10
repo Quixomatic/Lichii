@@ -633,6 +633,24 @@ TEST_CASE("V2 P5b unused-region uploads join the transfer batch without a graphi
     join.BlockHoisting();
     REQUIRE_FALSE(join.CanHoistUnordered());
 }
+
+TEST_CASE("V2 P5b graphics waits for buffer-only transfer batches at buffer stages only",
+          "[video_core][v2_p5b]") {
+    TimelineJoin join;
+    join.HoistUnordered();
+    auto batch = join.Close(5);
+    REQUIRE(batch.graphics_waits_transfer);
+    REQUIRE_FALSE(batch.transfer_images);
+    // An image upload (ownership acquired at the submission's start) makes it every stage.
+    join.HoistUnordered();
+    join.Hoist(3, 6);
+    batch = join.Close(6);
+    REQUIRE(batch.transfer_images);
+    // Reset by Close.
+    join.HoistUnordered();
+    REQUIRE_FALSE(join.Close(7).transfer_images);
+    REQUIRE_FALSE(join.Close(8).transfer_images);
+}
 TEST_CASE("V2 P5b submits are counted by call site", "[video_core][v2_p5b]") {
     using VideoCommon::V2::P5bStats::SubmitSites;
     SubmitSites sites;

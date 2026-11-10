@@ -94,8 +94,20 @@ SubmitEngine::SubmitEngine(const Device& device_, MasterSemaphore& master_,
                            std::mutex& submit_mutex_, bool threaded_, TransferQueue* transfer_)
     : device{device_}, master{master_}, submit_mutex{submit_mutex_}, transfer{transfer_},
       threaded{threaded_} {
+    buffer_consumer_stages = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT |
+                             VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT |
+                             VK_PIPELINE_STAGE_2_VERTEX_INPUT_BIT |
+                             VK_PIPELINE_STAGE_2_PRE_RASTERIZATION_SHADERS_BIT |
+                             VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
+                             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    if (device.IsExtTransformFeedbackSupported()) {
+        buffer_consumer_stages |= VK_PIPELINE_STAGE_2_TRANSFORM_FEEDBACK_BIT_EXT;
+    }
+    if (device.IsExtConditionalRendering()) {
+        buffer_consumer_stages |= VK_PIPELINE_STAGE_2_CONDITIONAL_RENDERING_BIT_EXT;
+    }
     if (threaded) {
-        submit_thread = std::jthread([this](std::stop_token token) { SubmitThread(token); });
+        submit_thread =std::jthread([this](std::stop_token token) { SubmitThread(token); });
         finish_thread = std::jthread([this](std::stop_token token) { FinishThread(token); });
         LOG_INFO(Render_Vulkan, "EDEN_NX2_V2_SUBMITTHREAD: submit and finish threads started");
     }
@@ -207,12 +219,16 @@ void SubmitEngine::DoSubmit(SubmitWork& work) {
         P5bStats::Add(Counter::TransferBatches);
     }
     if (work.graphics_waits_transfer && transfer != nullptr) {
+        // U-09 (§8 joins): buffer uploads are read only by copies, vertex/index fetch, indirect
+        // reads, shaders and the optional buffer-reading stages; attachment work of the
+        // submission need not wait. Image uploads are acquired at its start: every stage.
         waits[num_waits++] = VkSemaphoreSubmitInfo{
             .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
             .pNext = nullptr,
             .semaphore = transfer->Timeline(),
             .value = work.tick,
-            .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+            .stageMask = work.transfer_images ? VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT
+                                              : buffer_consumer_stages,
             .deviceIndex = 0,
         };
     }

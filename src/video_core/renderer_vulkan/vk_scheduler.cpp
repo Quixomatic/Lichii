@@ -1357,6 +1357,7 @@ void Scheduler::SubmitExecutionEngine(VkSemaphore signal_semaphore, VkSemaphore 
         work.transfer = transfer;
         work.transfer_wait = batch.transfer_wait;
         work.graphics_waits_transfer = transfer && batch.graphics_waits_transfer;
+        work.transfer_images = batch.transfer_images;
         work.num_extra_waits = batch.num_extra_waits;
         for (u32 i = 0; i < batch.num_extra_waits; ++i) {
             work.extra_waits[i] = {reinterpret_cast<VkSemaphore>(batch.extra_waits[i].semaphore),

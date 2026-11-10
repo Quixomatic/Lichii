@@ -50,6 +50,10 @@ public:
         u64 transfer_wait = 0;        ///< it waits for graphics >= this (0: no wait)
         u64 transfer_signal = 0;      ///< and signals the transfer timeline with this
         bool graphics_waits_transfer = false;
+        /// U-09: the batch holds image uploads (ownership acquired at the submission's start),
+        /// so graphics waits for it at every stage; buffer-only batches only at the stages that
+        /// read buffers.
+        bool transfer_images = false;
         u32 num_extra_waits = 0;      ///< readback jobs the graphics submission waits for
         std::array<Wait, MaxExtraWaits> extra_waits{};
         u32 num_post_jobs = 0;        ///< readback jobs submitted right after this submission
@@ -76,6 +80,7 @@ public:
     /// Records a transfer op on such a resource: the batch waits for its last graphics use.
     void Hoist(u64 track, u64 open_tick) noexcept {
         has_transfer = true;
+        has_images = true;
         transfer_wait = (std::max)({transfer_wait, track, acquire_floor});
         (void)open_tick;
     }
@@ -134,12 +139,14 @@ public:
         batch.transfer_wait = has_transfer ? transfer_wait : 0;
         batch.transfer_signal = has_transfer ? tick : 0;
         batch.graphics_waits_transfer = has_transfer;
+        batch.transfer_images = has_transfer && has_images;
         batch.num_extra_waits = num_waits;
         batch.extra_waits = waits;
         batch.num_post_jobs = num_post_jobs;
         batch.post_jobs = post_jobs;
         num_post_jobs = 0;
         has_transfer = false;
+        has_images = false;
         transfer_wait = 0;
         num_waits = 0;
         blocked = false;
@@ -150,6 +157,7 @@ private:
     u64 acquire_floor = 0;
     u64 transfer_wait = 0;
     bool has_transfer = false;
+    bool has_images = false; ///< U-09: Hoist (image uploads) since the last Close
     bool blocked = false;
     u32 num_waits = 0;
     std::array<Wait, MaxExtraWaits> waits{};

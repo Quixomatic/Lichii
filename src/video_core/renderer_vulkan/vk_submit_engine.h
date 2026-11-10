@@ -85,6 +85,7 @@ struct SubmitWork {
     bool transfer{};          ///< context's transfer command buffer is recorded
     u64 transfer_wait{};      ///< the transfer batch waits for graphics >= this (0: none)
     bool graphics_waits_transfer{};
+    bool transfer_images{};   ///< U-09: the batch holds image uploads (wait at every stage)
     u32 num_extra_waits{};
     std::array<std::pair<VkSemaphore, u64>, 8> extra_waits{};
     /// Perf fix C (EDEN_NX2_V2_XREADBACK): readback jobs submitted on the transfer queue right
@@ -158,6 +159,7 @@ private:
     std::mutex& submit_mutex;
     TransferQueue* transfer;
     const bool threaded;
+    VkPipelineStageFlags2 buffer_consumer_stages{}; ///< U-09
 
     std::vector<std::unique_ptr<SubmitContext>> contexts;
     std::mutex free_mutex;
