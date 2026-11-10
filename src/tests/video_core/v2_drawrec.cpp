@@ -14,6 +14,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include "video_core/v2/cbuf_ring.h"
 #include "video_core/v2/commit.h"
 #include "video_core/v2/resolve/draw_record.h"
 #include "video_core/v2/resolve/dynamic_state.h"
@@ -266,6 +267,32 @@ TEST_CASE("V2 DRAWREC: a mismatch log names the first differing entry of its gro
     const std::string index = R::DescribeRecordGroup(resolved, observed, R::RecordGroup::Index);
     REQUIRE(index.find("size 0x48") != std::string::npos);
     REQUIRE(index.find("size 0x258") != std::string::npos);
+}
+
+TEST_CASE("V2 F2-02: the version ring retires by timeline value", "[video_core][v2_drawrec]") {
+    V2::CbufRing::Ring ring{0x1000};
+    // Front: aligned allocations; a tail too short is skipped, the ring never overruns.
+    REQUIRE(ring.Allocate(0x100, 0x100) == 0);
+    REQUIRE(ring.Allocate(0x10, 0x100) == 0x100);
+    REQUIRE(ring.Allocate(0xd00, 0x100) == 0x200);
+    REQUIRE(ring.Head() == 0xf00);
+    REQUIRE_FALSE(ring.Allocate(0x200, 0x100).has_value()); // would wrap over unretired bytes
+    REQUIRE(ring.Refusals() == 1);
+    // Back: two submits; the first one's completion frees only what it referenced.
+    ring.NoteSubmit(5, 0x110);
+    ring.NoteSubmit(6, 0x110); // nothing new
+    ring.NoteSubmit(7, 0xf00);
+    ring.Collect(4);
+    REQUIRE(ring.Retired() == 0);
+    ring.Collect(6);
+    REQUIRE(ring.Retired() == 0x110);
+    // 0x200 bytes at the next lap need positions up to 0x1200: 0x1200 - 0x110 > capacity.
+    REQUIRE_FALSE(ring.Allocate(0x200, 0x100).has_value());
+    ring.Collect(7);
+    REQUIRE(ring.Retired() == 0xf00);
+    const auto wrapped = ring.Allocate(0x200, 0x100);
+    REQUIRE(wrapped == 0x1000);
+    REQUIRE(ring.Offset(*wrapped) == 0);
 }
 
 namespace {
