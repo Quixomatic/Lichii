@@ -323,7 +323,10 @@ TEST_CASE("V2 macro memo: DMA words checked at their place in the replay",
     const Pairs taken{{0x154, 0x21}, {0x155, 0x13760dc0}, {0x158, 6}, {0x556, 1}};
     CHECK(front.Memoised({0, 0x21, 0x13760dc0}) == taken);
     CHECK(front.memo.statistics.stores == 1);
+    // T-01: the DMA read grows the FIFO past its capacity; the record keeps the parameters as
+    // they were, so the repeat hits (a span taken before the read stored freed memory).
     CHECK(front.Memoised({0, 0x21, 0x13760dc0}) == taken);
+    CHECK(front.memo.statistics.guard_failures == 0);
     CHECK(front.memo.statistics.hits == 1);
     CHECK(front.dma_reads == 2);
     // Other words: the prefix is not written twice and the interpreter finishes the call.

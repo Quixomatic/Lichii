@@ -341,14 +341,18 @@ Result RecordCall(Memo& memo, Tegra::TuringMacroInterpreter& interpreter, const 
     Result result;
     bool stored;
     bool by_interpreter = false;
-    const std::span<const u32> parameters{fifo.data(), num_parameters};
+    // T-01: taken after the run, not before: a DMA read appends to the FIFO and may move it, and
+    // a span made before pointed at freed memory (stored parameters were garbage now and then).
+    const auto parameters = [&fifo, num_parameters] {
+        return std::span<const u32>{fifo.data(), num_parameters};
+    };
     if (prefix == 0 && memo.JitRecordable(call.start)) {
         // No data RAM access in the code: the JIT's register reads and writes are all of it.
         ++memo.statistics.jit_records;
         result = live(read_fn, emit_fn);
         stored = result.success && trace.memoisable && *call.generation == generation;
         if (stored) {
-            memo.Store(key, call, parameters, trace, {}, {});
+            memo.Store(key, call, parameters(), trace, {}, {});
         }
     } else if (prefix == 0 && call.jit_data_ram) {
         // Fix F3d: code that may touch data RAM, recorded by the JIT through data RAM hooks
@@ -375,7 +379,7 @@ Result RecordCall(Memo& memo, Tegra::TuringMacroInterpreter& interpreter, const 
         result = live(read_fn, emit_fn, dram_read, dram_write);
         stored = result.success && trace.memoisable && !reread && *call.generation == generation;
         if (stored) {
-            memo.Store(key, call, parameters, trace, dram_reads, dram_writes);
+            memo.Store(key, call, parameters(), trace, dram_reads, dram_writes);
         }
     } else {
         // The JIT reads never-written MME registers as 0; so does the recording.
@@ -386,7 +390,7 @@ Result RecordCall(Memo& memo, Tegra::TuringMacroInterpreter& interpreter, const 
         stored = result.success && trace.memoisable && !interpreter.reread_data_ram &&
                  *call.generation == generation;
         if (stored) {
-            memo.Store(key, call, parameters, trace, interpreter.data_ram_reads,
+            memo.Store(key, call, parameters(), trace, interpreter.data_ram_reads,
                        interpreter.data_ram_writes);
         }
     }
