@@ -347,6 +347,16 @@ void Scheduler::FlushDeferred() {
         return;
     }
     if (submit_requests.Open(CurrentTick())) [[unlikely]] {
+        if (lazy_fences) {
+            // F4-X2 chunk B2 (d5e4: 16.4 submits/f here): called after every delayed fence (now
+            // every tracked QMD reduction), mid-entry. A lazy fence's window request rides the
+            // pass boundary; an urgent one submits now unless two submissions are in flight,
+            // then the next boundary, chunk or idle hook takes it with the others (coalesced).
+            if (!submit_requests.Urgent(CurrentTick()) ||
+                master_semaphore->CurrentTick() >= master_semaphore->KnownGpuTick() + 3) {
+                return;
+            }
+        }
         VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::FlushLazy);
         Flush();
     }
