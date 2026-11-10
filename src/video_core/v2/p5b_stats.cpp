@@ -145,10 +145,10 @@ void Report(const char* thread_name, u64 window_ns) {
              site_list(Sites()));
     // SYNC_SUBMIT_SPEC §2.5 (Step 0): submissions by rule; Finish calls by site with their wait.
     {
-        const u64 by_rule = at(Counter::SubmitsPassBoundary) + at(Counter::SubmitsChunk) +
-                            at(Counter::SubmitsIdle) + at(Counter::SubmitsWaiter) +
-                            at(Counter::SubmitsDeferred) + at(Counter::SubmitsPresent) +
-                            at(Counter::SubmitsSleep);
+        u64 by_rule = 0;
+        for (const Counter rule : SubmitRuleCounters) {
+            by_rule += at(rule);
+        }
         const auto finishes = FinishSites().Take();
         std::string finish_list;
         for (size_t i = 0; i < finishes.size() && i < 16; ++i) {
@@ -158,19 +158,21 @@ void Report(const char* thread_name, u64 window_ns) {
                                        PerSecond(finishes[i].sum, seconds) / 1e6);
         }
         LOG_INFO(HW_GPU,
-                 "V2 stats {} SYNC submits by rule (per frame) | B pass boundary {:.2f}, C chunk "
-                 "{:.2f}, I idle {:.2f}, W waiter {:.2f}, deferred {:.2f}, present {:.2f}, other "
+                 "V2 stats {} SYNC submits by rule (per frame) | B pass boundary {:.2f} (strong "
+                 "hint {:.2f}), C chunk {:.2f}, W waiter {:.2f}, S sleep point {:.2f}, present "
+                 "{:.2f}, readback {:.2f}, deferred {:.2f}, idle (non-split) {:.2f}, other "
                  "{:.2f} | QMD reductions at execute {:.0f}/s, at their fence {:.0f}/s | "
                  "requests by origin (per s): acquires {:.0f}, landing waits {:.0f}, fencing "
                  "thread {:.0f} | open tick age at submit max {:.1f} ms | resume passes {:.0f}/s, resumed without "
                  "progress {:.0f}/s | idle fences for unfenced operations {:.0f}/s | macro DMA "
                  "reads by the semaphore view (per s): forwarded {:.0f}, waited "
-                 "{:.0f}, clear {:.0f} | S sleep point {:.2f}/frame (after a racing completion "
-                 "{:.2f}), back sleeps {:.1f}/frame | finishes by site: {}",
+                 "{:.0f}, clear {:.0f} | S: racing completions caught {:.2f}/frame, back sleeps "
+                 "{:.1f}/frame | finishes by site: {}",
                  thread_name, per_frame(at(Counter::SubmitsPassBoundary)),
-                 per_frame(at(Counter::SubmitsChunk)), per_frame(at(Counter::SubmitsIdle)),
-                 per_frame(at(Counter::SubmitsWaiter)), per_frame(at(Counter::SubmitsDeferred)),
-                 per_frame(at(Counter::SubmitsPresent)),
+                 per_frame(at(Counter::SubmitsStrong)), per_frame(at(Counter::SubmitsChunk)),
+                 per_frame(at(Counter::SubmitsWaiter)), per_frame(at(Counter::SubmitsSleep)),
+                 per_frame(at(Counter::SubmitsPresent)), per_frame(at(Counter::SubmitsReadback)),
+                 per_frame(at(Counter::SubmitsDeferred)), per_frame(at(Counter::SubmitsIdle)),
                  per_frame(submits > by_rule ? submits - by_rule : 0),
                  PerSecond(at(Counter::QmdReductionsAtExecute), seconds),
                  PerSecond(at(Counter::QmdReductionsDeferred), seconds),
@@ -184,8 +186,7 @@ void Report(const char* thread_name, u64 window_ns) {
                  PerSecond(at(Counter::DmaReadsSemForwarded), seconds),
                  PerSecond(at(Counter::DmaReadsSemWaited), seconds),
                  PerSecond(at(Counter::DmaReadsSemClear), seconds),
-                 per_frame(at(Counter::SubmitsSleep)), per_frame(at(Counter::SleepWakeSubmits)),
-                 per_frame(at(Counter::BackSleeps)),
+                 per_frame(at(Counter::SleepWakeSubmits)), per_frame(at(Counter::BackSleeps)),
                  finish_list.empty() ? std::string{"none"} : finish_list);
     }
     // F4-06: which untracked operations still flush every pending write.

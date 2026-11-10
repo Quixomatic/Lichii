@@ -152,6 +152,11 @@ public:
                                                                     std::memory_order_relaxed);
         }
     }
+    /// Recording thread (SYNC §11.6 item 7): DeferFlush's work under lazy fences, taken once as
+    /// a strong hint by the flush heuristic's next pass boundary.
+    [[nodiscard]] bool TakeDeferredHint() noexcept {
+        return std::exchange(deferred_hint, false);
+    }
     /// Recording thread (SYNC §7.3 fix 2): work the guest waits on (a list end) is open.
     [[nodiscard]] bool SubmitWantedNow() const noexcept {
         return submit_wanted;
@@ -581,6 +586,10 @@ public:
                                        : std::chrono::steady_clock::time_point{};
         if (tick > 0 && (may_flush || WaitForSubmission(tick))) {
             if (tick >= master_semaphore->CurrentTick()) {
+                if (lazy_fences) [[unlikely]] {
+                    VideoCommon::V2::P5bStats::Add(
+                        VideoCommon::V2::P5bStats::Counter::SubmitsWaiter); // blocks on it: W
+                }
                 Flush();
             }
             master_semaphore->Wait(tick);
@@ -685,6 +694,7 @@ private:
     }
     u64 open_since_us{}; ///< SYNC §7.3: when the open tick first held a lazy fence (0: none)
     bool recorded_since_submit{}; ///< SYNC §10: RecordedSinceSubmit (recording thread)
+    bool deferred_hint{};         ///< SYNC §11.6 item 7: TakeDeferredHint
     std::atomic<bool> open_tick_nonempty{}; ///< ... for the finish thread's progress wake
     /// SYNC §7.3 counters and the 2 s line's state, at a lazy-fence-mode submission.
     void NoteOpenTickSubmitted() {

@@ -3435,6 +3435,10 @@ void RasterizerVulkan::SubmitNx2ListCopies() {
         scheduler.WantSubmit();
         return;
     }
+    if (scheduler.LazyFencesHere()) [[unlikely]] {
+        // The front waits on the back for these copies: rule W.
+        VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::SubmitsWaiter);
+    }
     scheduler.Flush();
 }
 
@@ -4934,6 +4938,7 @@ void RasterizerVulkan::FlushHint(VideoCommon::V2::FlushHint hint) {
         adapt_tick = scheduler.GetMasterSemaphore().CurrentTick();
         flush_heuristic.NoteSubmit(AdaptNowUs());
         VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::FlushStrong);
+        VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::SubmitsStrong);
     }
 }
 
@@ -5073,6 +5078,9 @@ void RasterizerVulkan::AdaptiveFlushWork(u32 cost) {
     using H = VideoCommon::V2::FlushHeuristic;
     const auto& params = flush_heuristic.Params();
     SyncAdaptiveTick();
+    if (scheduler.TakeDeferredHint()) [[unlikely]] {
+        flush_heuristic.Hint(VideoCommon::V2::FlushHint::Strong); // SYNC §11.6 item 7
+    }
     const auto read_state = [this] { return ReadFlushState(); };
     const auto count_reason = [](u8 reason) {
         if (P5b::Enabled()) {
@@ -5213,6 +5221,7 @@ void RasterizerVulkan::FlushWork(u32 cost) {
         scheduler.DispatchWork();
         break;
     case SubmissionPolicy::Action::Flush:
+        VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::SubmitsChunk);
         scheduler.Flush();
         pending_native_work = false;
         break;
@@ -5245,7 +5254,22 @@ bool AccelerateDMA::BufferCopy(GPUVAddr src_address, GPUVAddr dest_address, u64 
         buffer_cache.Nx2CollectListCopies(true);
         copied = buffer_cache.DMACopy(src_address, dest_address, amount);
         if (buffer_cache.Nx2CopyListPages(scheduler.CurrentTick())) {
-            scheduler.Flush();
+            if (scheduler.LazyFencesHere()) [[unlikely]] {
+                // SYNC §11.6 item 7 (an "other" submit site): as RasterizerVulkan's list copies,
+                // they ride the open submission unless the front waits on the back now (rule W);
+                // a later front read of an unsubmitted copy asks for it urgently.
+                if (!VideoCommon::GpuSplit::Get().FrontWaiting()) {
+                    VideoCommon::V2::P5bStats::Add(
+                        VideoCommon::V2::P5bStats::Counter::ListCopiesRiding);
+                    scheduler.WantSubmit();
+                } else {
+                    VideoCommon::V2::P5bStats::Add(
+                        VideoCommon::V2::P5bStats::Counter::SubmitsWaiter);
+                    scheduler.Flush();
+                }
+            } else {
+                scheduler.Flush();
+            }
         }
         buffer_cache.Nx2CollectListCopies(false);
     }

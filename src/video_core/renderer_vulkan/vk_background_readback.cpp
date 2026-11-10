@@ -208,8 +208,10 @@ BackgroundReadback::Job BackgroundReadback::Submit(u64 producer, u64* ride_tick)
         // the recorder never waits for the worker. Fix pass 1's B1 order (job after the batch
         // graphics `producer_tick` waits for) holds by construction.
         r.last_post_tick = open_tick;
+        P5bStats::Add(Counter::SubmitsReadback);
         scheduler.Flush();
     } else {
+        P5bStats::Add(Counter::SubmitsReadback);
         scheduler.Flush();
         // Fix pass 1 (B1, the save-load deadlock): Flush only hands the tick to the Vulkan
         // worker, and its transfer batch reaches the queue when the worker submits it; a job

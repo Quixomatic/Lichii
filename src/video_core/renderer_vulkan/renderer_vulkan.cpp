@@ -254,6 +254,7 @@ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebu
         Frame* generated = present_manager.GetRenderFrame();
         blit_swapchain.PrepareFrame(device, generated, render_window.GetFramebufferLayout());
         frame_gen.GenerateInto(device, generated, generation);
+        VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::SubmitsPresent);
         scheduler.Flush(*generated->render_ready);
         present_manager.Present(generated);
     }

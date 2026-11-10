@@ -825,6 +825,8 @@ void ASTCDecoderPass::AssembleInto(const VideoCommon::ImageInfo& info, u32 skip,
     }
     const auto start = std::chrono::steady_clock::now();
     if (flush_only) {
+        // The decode's reader waits for it (target.wait): rule W (SYNC §11.6 item 7).
+        VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::SubmitsWaiter);
         scheduler.Flush();
     } else {
         scheduler.Finish();

@@ -133,7 +133,18 @@ enum class Counter : u32 {
     SubmitsSleep,         ///< SYNC §11.2 rule S: the back submits the open tick before it sleeps
     BackSleeps,           ///< ... the back's sleeps (S's trigger frequency, §11.6 gate)
     SleepWakeSubmits,     ///< ... S submits after a completion came between the check and the sleep
+    SubmitsStrong,        ///< SYNC §11.6 item 7: rule B's strong hint (DXVK, readback latency)
+    SubmitsReadback,      ///< ... a readback's own submission (background readback)
     Count,
+};
+
+/// SYNC_SUBMIT_SPEC §11.6 item 7: the submission rules. Every Flush/Finish adds one of these;
+/// what no rule claims is printed as "other" (expected 0). Deferred and idle are the non-split
+/// and non-lazy paths (DeferFlush, Scheduler::ServeIdleHook).
+inline constexpr std::array<Counter, 9> SubmitRuleCounters{
+    Counter::SubmitsPassBoundary, Counter::SubmitsStrong, Counter::SubmitsChunk,
+    Counter::SubmitsWaiter,       Counter::SubmitsSleep,  Counter::SubmitsPresent,
+    Counter::SubmitsReadback,     Counter::SubmitsDeferred, Counter::SubmitsIdle,
 };
 
 struct Data {

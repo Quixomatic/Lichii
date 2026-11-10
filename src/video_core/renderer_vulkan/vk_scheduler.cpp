@@ -343,6 +343,14 @@ bool Scheduler::DeferFlush() {
     // kept the Vulkan worker busy submitting. Batched within 500 us: ~10-15% more fps there.
     // Command list copies after dispatches were ~9,000 more a second, of which the front waited
     // for about 5%.
+    if (lazy_fences && VideoCommon::GpuSplit::OnBackThread()) [[unlikely]] {
+        // SYNC_SUBMIT_SPEC §11.6 item 7: with lazy fences deferred work is never an idle submit
+        // (no flush_pending): it is a strong hint for rule B (TakeDeferredHint) and open work
+        // for C and S. Both callers take their lazy branch first, so this is the fallback.
+        deferred_hint = true;
+        WantSubmit();
+        return true;
+    }
     static const s64 interval_us = [] {
         const char* value = std::getenv("EDEN_NX2_FENCE_FLUSH_US");
         if (value != nullptr) {
@@ -381,6 +389,10 @@ void Scheduler::EnsureSubmitted(u64 tick) {
     }
     auto& split = VideoCommon::GpuSplit::Get();
     if (!split.Active() || VideoCommon::GpuSplit::OnBackThread()) {
+        if (lazy_fences) [[unlikely]] {
+            // The recording thread itself blocks on the tick (a readback, a host read): rule W.
+            VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::SubmitsWaiter);
+        }
         Flush();
         return;
     }
@@ -446,6 +458,8 @@ void Scheduler::Finish(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
     if (lazy_fences) [[unlikely]] {
         NoteBlockedWait();
         NoteOpenTickSubmitted();
+        // SYNC §11.6 item 7: the caller blocks on this submission (finishes by site name it): W.
+        VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::SubmitsWaiter);
     }
     SubmitExecution(signal_semaphore, wait_semaphore);
     if (lazy_fences) [[unlikely]] {

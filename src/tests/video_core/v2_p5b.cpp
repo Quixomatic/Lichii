@@ -1378,6 +1378,32 @@ TEST_CASE("SYNC §11.2 invariant S: no completion wake is lost and no open tick 
     }
 }
 
+TEST_CASE("SYNC §11.6 item 7: submits by rule are only B/C/W/S/present/readback (+ non-split)",
+          "[video_core][v2_p5b]") {
+    namespace P5b = VideoCommon::V2::P5bStats;
+    using P5b::Counter;
+    const auto has = [](Counter counter) {
+        return std::find(P5b::SubmitRuleCounters.begin(), P5b::SubmitRuleCounters.end(),
+                         counter) != P5b::SubmitRuleCounters.end();
+    };
+    for (const Counter rule : {Counter::SubmitsPassBoundary, Counter::SubmitsStrong,
+                               Counter::SubmitsChunk, Counter::SubmitsWaiter, Counter::SubmitsSleep,
+                               Counter::SubmitsPresent, Counter::SubmitsReadback}) {
+        REQUIRE(has(rule));
+    }
+    // DeferFlush's and Scheduler::ServeIdleHook's own submits exist only without lazy fences or
+    // the split; nothing else may be a submit rule.
+    REQUIRE(P5b::SubmitRuleCounters.size() == 9);
+    REQUIRE(has(Counter::SubmitsDeferred));
+    REQUIRE(has(Counter::SubmitsIdle));
+    // No counter is listed twice (the "other" figure would go negative).
+    for (size_t i = 0; i < P5b::SubmitRuleCounters.size(); ++i) {
+        for (size_t j = i + 1; j < P5b::SubmitRuleCounters.size(); ++j) {
+            REQUIRE(P5b::SubmitRuleCounters[i] != P5b::SubmitRuleCounters[j]);
+        }
+    }
+}
+
 TEST_CASE("SYNC §11.2 step 1: the unfenced and owed writebacks are fenced before the back sleeps",
           "[video_core][v2_p5b]") {
     // Model of RasterizerVulkan::FenceUnfenced + the fence manager's SignalFence with
