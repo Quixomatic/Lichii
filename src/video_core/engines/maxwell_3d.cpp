@@ -996,6 +996,12 @@ void Maxwell3D::ExecuteS1Run(const u64* it, const u64* const end) {
             break;
         }
         case S1::Tag::Draw:
+            if (VideoCommon::V2::On(VideoCommon::V2::Switch::Parallel)) [[unlikely]] {
+                // F6-01: the draw's ordinal in its segment, drawn or predicated off.
+                if (auto* const parallel = VideoCommon::V2::Resolve::SplitResolve::t_commit) {
+                    parallel->NoteDraws(reinterpret_cast<uintptr_t>(this), 1, true);
+                }
+            }
             draw_manager.DrawPredicted(*this, S1::DrawOf(it), static_cast<u8>(word >> 8));
             it += S1::DrawWords;
             break;

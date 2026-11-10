@@ -102,6 +102,11 @@ struct Stats {
     std::array<std::atomic<u64>, NumSteps> step_commit{};
     std::atomic<u64> commit_draws{};   ///< draws resolved and recorded on the commit thread
     std::atomic<u64> commit_draw_ns{}; ///< their time in PrepareDraw
+    /// F1-36: the front's draws the commit reached in segments (ordinals, predicated-off ones
+    /// included: the unit the segmenter cuts in), and those the back never drew.
+    std::atomic<u64> front_draws{};
+    std::atomic<u64> draws_predicated_off{};
+    std::atomic<u64> draws_misfit{}; ///< the record at the draw's ordinal was for another draw
 };
 Stats& GetStats();
 
@@ -207,12 +212,51 @@ struct RequestCompare {
     return result;
 }
 
+/// Fixed-size chunks whose elements never move: a record may point at an element (§5.2: records
+/// are plain data with their payloads in an arena) while the resolver adds more. Clear keeps the
+/// chunks for the next segment.
+template <typename T, size_t ChunkSize = 8>
+class StableArena {
+public:
+    T& Push() {
+        const size_t chunk = used / ChunkSize;
+        if (chunk == chunks.size()) {
+            chunks.push_back(std::make_unique<std::array<T, ChunkSize>>());
+        }
+        return (*chunks[chunk])[used++ % ChunkSize];
+    }
+    void Clear() {
+        used = 0;
+    }
+    [[nodiscard]] size_t Size() const {
+        return used;
+    }
+
+private:
+    std::vector<std::unique_ptr<std::array<T, ChunkSize>>> chunks;
+    size_t used = 0;
+};
+
+/// Traits::Arena (optional): payloads a segment's records point into, kept with its result.
+template <typename Traits>
+struct ArenaOf {
+    struct type {
+        void Clear() {}
+    };
+};
+template <typename Traits>
+    requires requires { typename Traits::Arena; }
+struct ArenaOf<Traits> {
+    using type = typename Traits::Arena;
+};
+
 template <typename Traits>
 class ParallelResolver {
 public:
     using Input = typename Traits::Input;
     using Record = typename Traits::Record;
     using Shard = typename Traits::Shard;
+    using Arena = typename ArenaOf<Traits>::type;
 
     struct Config {
         u32 shards = 2;
@@ -226,6 +270,7 @@ public:
         u64 id = 0;
         std::vector<Record> records;
         Commit::RequestList requests;
+        Arena arena; ///< what `records` point into (valid until the segment is released)
         SerialReason serial = SerialReason::None;
         bool by_shard = false; ///< the records came from a shard
         bool resolved = false; ///< records and requests are filled (else the caller resolves)
@@ -392,6 +437,19 @@ public:
     template <typename Fallback, typename Apply, typename Encode>
     SerialReason Commit(u64 id, Fallback&& fallback, Apply&& apply, Encode&& encode) {
         const u64 start = config.stats ? NowNs() : 0;
+        Result& result = Merge(id, fallback, apply);
+        encode(std::span<const Record>(result.records));
+        NoteCommitted(result, start);
+        Release(id);
+        return result.serial;
+    }
+
+    /// Commit thread: the ordered merge of segment `id` up to the encode (§5.6.3): take it in
+    /// order, fill an unresolved result with `fallback`, apply its requests in order, patch the
+    /// records' proxies. A caller that encodes the records one at a time later (the split: one
+    /// per draw method) consumes the result until it calls Release(id).
+    template <typename Fallback, typename Apply>
+    Result& Merge(u64 id, Fallback&& fallback, Apply&& apply) {
         Result& result = Take(id);
         NoteOrder(id);
         if (!result.resolved) {
@@ -402,10 +460,7 @@ public:
         for (Record& record : result.records) {
             Traits::Patch(record, result.requests);
         }
-        encode(std::span<const Record>(result.records));
-        NoteCommitted(result, start);
-        Release(id);
-        return result.serial;
+        return result;
     }
 
     /// Commit thread: the segment is consumed; its slot goes to segment id + depth.
@@ -488,6 +543,7 @@ private:
         result.id = id;
         result.records.clear();
         result.requests.Reset(id);
+        result.arena.Clear();
         result.serial = SerialReason::None;
         result.by_shard = false;
         result.resolved = false;
@@ -503,18 +559,29 @@ private:
         result.stolen = true;
     }
 
+    static SerialReason RunResolve(Shard& shard, const Input& input, std::vector<Record>& records,
+                                   Commit::RequestList& requests, Arena& arena) {
+        if constexpr (requires { typename Traits::Arena; }) {
+            return Traits::Resolve(shard, input, records, requests, arena);
+        } else {
+            static_cast<void>(arena);
+            return Traits::Resolve(shard, input, records, requests);
+        }
+    }
+
     void ResolveHere(Slot& slot) {
         Result& result = slot.result;
         result.records.clear();
         result.requests.Reset(result.id);
+        result.arena.Clear();
         result.by_shard = false;
         if (!config.resolve_stolen) {
             result.resolved = false;
             return;
         }
         const u64 start = config.stats ? NowNs() : 0;
-        const SerialReason found =
-            Traits::Resolve(commit_shard, slot.input, result.records, result.requests);
+        const SerialReason found = RunResolve(commit_shard, slot.input, result.records,
+                                              result.requests, result.arena);
         static_cast<void>(found); // serial on the commit thread is the fallback itself
         result.resolved = true;
         if (config.stats) {
@@ -526,7 +593,8 @@ private:
         Result& result = slot.result;
         verify_records.clear();
         verify_requests.Reset(result.id);
-        Traits::Resolve(commit_shard, slot.input, verify_records, verify_requests);
+        verify_arena.Clear();
+        RunResolve(commit_shard, slot.input, verify_records, verify_requests, verify_arena);
         Count(GetStats().verify_segments);
         const RequestCompare requests =
             CompareRequests(result.requests.Requests(), verify_requests.Requests());
@@ -585,9 +653,11 @@ private:
             if (ShouldLogMismatch()) {
                 LogMismatch(result.id, index, field);
             }
-            // The serial resolve decides (as every v2 verify mode).
+            // The serial resolve decides (as every v2 verify mode). The arenas go with their
+            // records (elements never move, so the records' pointers stay valid).
             std::swap(result.records, verify_records);
             std::swap(result.requests, verify_requests);
+            std::swap(result.arena, verify_arena);
         }
     }
 
@@ -611,14 +681,24 @@ private:
                     continue; // the commit stole it
                 }
                 const u64 start = NowNs();
+                u64 waited_before = 0;
+                if constexpr (requires { shard.wait_ns; }) {
+                    waited_before = shard.wait_ns;
+                }
                 Result& result = slot.result;
                 ResetResult(result, cursor);
-                result.serial = Traits::Resolve(shard, slot.input, result.records,
-                                                result.requests);
+                result.serial = RunResolve(shard, slot.input, result.records, result.requests,
+                                           result.arena);
                 result.by_shard = result.serial == SerialReason::None;
                 result.resolved = result.by_shard;
                 if (config.stats) {
-                    Count(GetStats().shard_busy_ns[index], NowNs() - start);
+                    // F6-01: resolve time only; a shard waiting for the front is idle.
+                    u64 waited = 0;
+                    if constexpr (requires { shard.wait_ns; }) {
+                        waited = shard.wait_ns - waited_before;
+                    }
+                    const u64 elapsed = NowNs() - start;
+                    Count(GetStats().shard_busy_ns[index], elapsed - (std::min)(elapsed, waited));
                     Count(GetStats().shard_segments[index]);
                 }
                 slot.word.store(Pack(cursor, State::Done), std::memory_order_release);
@@ -669,6 +749,7 @@ private:
     bool committed_any = false; ///< The first commit starts the order (segment ids start at 1)
     std::vector<Record> verify_records;
     Commit::RequestList verify_requests;
+    Arena verify_arena;
 };
 
 void LogSegmentMismatch(u64 segment, size_t record, const char* field);

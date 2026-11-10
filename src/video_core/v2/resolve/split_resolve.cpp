@@ -8,6 +8,7 @@
 #include <optional>
 #include <thread>
 
+#include "common/assert.h"
 #include "common/logging.h"
 #include "common/scope_exit.h"
 #include "video_core/gpu_split.h"
@@ -248,12 +249,14 @@ u64 PublishDynamicFeatures(const DynamicFeatures& features) {
     return published->generation;
 }
 
-std::shared_ptr<const DynamicState> ShardDynamic(const SnapshotView& view, u64& generation) {
+u64 ShardDynamicInputs(const SnapshotView& view, u64& generation,
+                       const DynamicFeatures** features) {
     const PublishedFeatures* const published = g_features.load(std::memory_order_acquire);
     if (published == nullptr || !On(Switch::DrawRec)) {
-        return nullptr;
+        return 0;
     }
     generation = published->generation;
+    *features = &published->features;
     // ComputeDynamic reads these groups and the topology (the record path's same_dynamic
     // rule): a shard reuses its last result while their hashes and the features hold.
     constexpr u32 groups = GroupBit(RegGroup::Pipeline) | GroupBit(RegGroup::Viewport) |
@@ -263,14 +266,7 @@ std::shared_ptr<const DynamicState> ShardDynamic(const SnapshotView& view, u64& 
     u64 inputs = view.Groups().Fingerprint(groups);
     inputs = Mix64(inputs ^ static_cast<u64>(view.Topology()));
     inputs = Mix64(inputs ^ published->generation);
-    thread_local std::shared_ptr<const DynamicState> last;
-    thread_local u64 last_inputs = 0;
-    if (last != nullptr && last_inputs == inputs && view.Groups().valid) {
-        return last;
-    }
-    last = std::make_shared<const DynamicState>(ComputeDynamic(view, published->features));
-    last_inputs = inputs;
-    return last;
+    return inputs == 0 ? 1 : inputs; // reusable only while view.Groups().valid
 }
 
 // ---- Shards ---------------------------------------------------------------------------------------
@@ -298,9 +294,18 @@ void LoadMirror(RegSem::Mirror3D& mirror, const FrontSnapshot& snapshot) {
 
 /// An early-submitted segment: the position the shard may read up to, waiting for the front to
 /// publish more; `position` itself once it is the segment's end; nothing when abandoned.
-std::optional<u64> WaitPublished(const SegmentInput& input, u64 position) {
+std::optional<u64> WaitPublished(const SegmentInput& input, u64 position, u64& wait_ns) {
     SegmentProgress& progress = *input.progress;
+    u64 wait_start = 0;
+    SCOPE_EXIT {
+        if (wait_start != 0) {
+            wait_ns += NowNs() - wait_start; // F6-01: idle, not busy
+        }
+    };
     for (u32 spins = 0;; ++spins) {
+        if (spins == 1) {
+            wait_start = NowNs();
+        }
         // F1-X2: the publish position first. The front stores `end` before it publishes anything
         // past the cut, so an end read after this acquire is never older than the position read;
         // in the other order a stale "no end yet" with a newer position read on into the next
@@ -329,7 +334,7 @@ std::optional<u64> WaitPublished(const SegmentInput& input, u64 position) {
 } // Anonymous namespace
 
 SerialReason SplitTraits::Resolve(Shard& shard, const Input& input, std::vector<Record>& records,
-                                  Commit::RequestList& requests) {
+                                  Commit::RequestList& requests, Arena& arena) {
     static_cast<void>(requests); // the shard's lookups are pure and need no mutation
     if (input.snapshot == nullptr || input.ring == nullptr || g_shard_key == nullptr) {
         return SerialReason::NoSnapshot;
@@ -344,9 +349,61 @@ SerialReason SplitTraits::Resolve(Shard& shard, const Input& input, std::vector<
     const auto no_effects = [](RegSem::Effect, u32, u32) {};
     constexpr u64 RingWords = GpuSplit::RingWords;
     bool active = true;
-    // Counts every draw of the segment, skipped ones too (other kinds, other engines, host
-    // indirect), so a draw one side skips does not shift the ordinals Compare checks.
+    // Counts every draw of the segment's engine, skipped ones too (other kinds, host indirect),
+    // as the commit counts them (NoteDraws): records pair with draws by it (F6-01).
     u32 ordinal = 0;
+    // F6-01: keys and dynamic states live in the segment's arena; consecutive draws with equal
+    // inputs share one, and the shard's last one is copied in instead of computed again.
+    const PipelineKey* segment_key = nullptr;
+    const DynamicState* segment_dynamic = nullptr;
+    u64 segment_dynamic_inputs = 0;
+    const auto pipeline_key_of = [&](const SnapshotView& view) -> const PipelineKey* {
+        const u64 inputs = g_pipeline_key_inputs != nullptr ? g_pipeline_key_inputs(view) : 0;
+        if (inputs != 0 && segment_key != nullptr && segment_key->inputs == inputs) {
+            return segment_key;
+        }
+        PipelineKey& key = arena.keys.Push();
+        if (inputs != 0 && shard.last_key != nullptr && shard.last_key->inputs == inputs) {
+            key = *shard.last_key;
+        } else {
+            g_pipeline_key(view, inputs, key);
+            if (inputs != 0) {
+                if (shard.last_key == nullptr) {
+                    shard.last_key = std::make_unique<PipelineKey>();
+                }
+                *shard.last_key = key;
+            }
+        }
+        segment_key = &key;
+        return &key;
+    };
+    const auto dynamic_of = [&](const SnapshotView& view, u64& generation) -> const DynamicState* {
+        const DynamicFeatures* features = nullptr;
+        const u64 inputs = ShardDynamicInputs(view, generation, &features);
+        if (inputs == 0) {
+            return nullptr;
+        }
+        const bool reusable = view.Groups().valid;
+        if (reusable && segment_dynamic != nullptr && segment_dynamic_inputs == inputs) {
+            return segment_dynamic;
+        }
+        DynamicState& dynamic = arena.dynamics.Push();
+        if (reusable && shard.last_dynamic != nullptr && shard.last_dynamic_inputs == inputs) {
+            dynamic = *shard.last_dynamic;
+        } else {
+            dynamic = ComputeDynamic(view, *features);
+            if (reusable) {
+                if (shard.last_dynamic == nullptr) {
+                    shard.last_dynamic = std::make_unique<DynamicState>();
+                }
+                *shard.last_dynamic = dynamic;
+                shard.last_dynamic_inputs = inputs;
+            }
+        }
+        segment_dynamic = &dynamic;
+        segment_dynamic_inputs = reusable ? inputs : 0;
+        return &dynamic;
+    };
     // One predicted draw: its draw-cache shape and keys from the mirror at its position.
     const auto add_draw = [&](const Ir::PredictedDraw& draw, u64 fingerprint, bool drift,
                               const GroupTracker& groups) {
@@ -378,13 +435,13 @@ SerialReason SplitTraits::Resolve(Shard& shard, const Input& input, std::vector<
                         .indexed = pre.indexed,
                     },
                     snapshot.native_turing};
-                pre.pipeline_key = g_pipeline_key(view);
+                pre.pipeline_key = pipeline_key_of(view);
                 // R3: and the pipeline it names, from the published programs and lookup.
                 if (pre.pipeline_key != nullptr && g_shard_pipeline != nullptr) {
                     g_shard_pipeline(view, snapshot.memory, pre);
                 }
                 // R5: the draw's dynamic state (scale-independent: the view alone).
-                pre.dynamic = ShardDynamic(view, pre.dynamic_generation);
+                pre.dynamic = dynamic_of(view, pre.dynamic_generation);
             }
             // The draw-cache shape holds the pipeline key's hash: only the canonical key the
             // serial path uses with EDEN_NX2_V2_PIPEKEY equals the shard's.
@@ -453,7 +510,7 @@ SerialReason SplitTraits::Resolve(Shard& shard, const Input& input, std::vector<
             if (input.progress == nullptr) {
                 break;
             }
-            const std::optional<u64> available = WaitPublished(input, position);
+            const std::optional<u64> available = WaitPublished(input, position, shard.wait_ns);
             if (!available) {
                 // F1-36: the commit reached the segment while the front still writes it. The
                 // draws resolved so far are published ones: the commit takes them (TakeDraw
@@ -528,9 +585,15 @@ SerialReason SplitTraits::Resolve(Shard& shard, const Input& input, std::vector<
         }
         case Ir::Kind::Draw: {
             const auto& body = record.As<Ir::DrawBody>();
-            if (body.engine != snapshot.engine_ref || body.op == Ir::DrawOp::HostIndirect) {
-                ordinal += body.op == Ir::DrawOp::HostIndirect ? 1 : body.num_draws;
+            if (body.engine != snapshot.engine_ref) {
+                break; // the commit counts only the segment's engine's draws (NoteDraws)
+            }
+            if (body.op == Ir::DrawOp::HostIndirect) {
+                ++ordinal; // one ordinal, no record: its draws resolve on the commit
                 break;
+            }
+            if (body.op != Ir::DrawOp::Predicted) {
+                break; // a macro end: no draw (the commit notes none)
             }
             // The record's hashes are the back's at the draw: either these registers, or these
             // plus the trigger write the record precedes (a draw method the mirror took first).
@@ -582,8 +645,7 @@ const char* SplitTraits::Compare(const Record& a, const Record& b) {
                              a.cbuf_masks != b.cbuf_masks;
     const bool pipeline_key_differs =
         (a.pipeline_key == nullptr) != (b.pipeline_key == nullptr) ||
-        (a.pipeline_key != nullptr && (a.pipeline_key->hash != b.pipeline_key->hash ||
-                                       a.pipeline_key->bytes != b.pipeline_key->bytes));
+        (a.pipeline_key != nullptr && !a.pipeline_key->SameKey(*b.pipeline_key));
     if (key_differs && GenerationsDiffer(a.shape_generation, b.shape_generation)) {
         Count(GetStats().verify_dependent);
         return pipeline_key_differs ? "pipeline key" : nullptr;
@@ -605,9 +667,7 @@ const char* SplitTraits::Compare(const Record& a, const Record& b) {
     if ((a.pipeline_key == nullptr) != (b.pipeline_key == nullptr)) {
         return "pipeline key presence";
     }
-    if (a.pipeline_key != nullptr &&
-        (a.pipeline_key->hash != b.pipeline_key->hash ||
-         a.pipeline_key->bytes != b.pipeline_key->bytes)) {
+    if (a.pipeline_key != nullptr && !a.pipeline_key->SameKey(*b.pipeline_key)) {
         return "pipeline key";
     }
     // R3: the pipeline object. A lookup insert or clear, or a program published in between,
@@ -623,7 +683,7 @@ const char* SplitTraits::Compare(const Record& a, const Record& b) {
     // R5: the dynamic state (features published in between: dependent).
     if ((a.dynamic == nullptr) != (b.dynamic == nullptr) ||
         (a.dynamic != nullptr && a.dynamic != b.dynamic &&
-         std::memcmp(a.dynamic.get(), b.dynamic.get(), sizeof(DynamicState)) != 0)) {
+         std::memcmp(a.dynamic, b.dynamic, sizeof(DynamicState)) != 0)) {
         if (a.dynamic_generation != b.dynamic_generation) {
             Count(GetStats().verify_dependent);
             return nullptr;
@@ -894,16 +954,29 @@ void SplitResolve::OnSegment(const Ir::SegmentBody& body, const u32* back_regs,
     }
     taken = nullptr;
     record_taken = nullptr; // it pointed into the released segment's records
-    Resolver::Result& result = resolver->Take(body.id);
+    NotePredicatedOff();
+    // F6-01: the ordered merge (§5.6.3): in order, the segment's requests applied before any of
+    // its draws, its records' proxies patched; the draws then take their records one at a time.
+    // A stolen segment's draws decide on the commit thread live (no fallback resolve).
+    Resolver::Result& result = resolver->Merge(
+        body.id, [](Resolver::Result&) {},
+        [](const Commit::Request& request) -> u32 {
+            // Shards make no requests before R4 wires the texture appliers here.
+            ASSERT_MSG(g_apply_request != nullptr, "V2 parallel: a shard request with no applier");
+            return g_apply_request(request);
+        });
     // Segments are taken in id order and Take returns once no shard reads `body.id`: every older
     // one's input is done with (the front reuses their snapshots, F1-30).
     if (body.id > 1) {
         released.store(body.id - 1, std::memory_order_release);
     }
+    segment_engine = 0;
     if (result.has_input) {
-        in_flight_draws.fetch_sub(resolver->InputOf(body.id).draws, std::memory_order_acq_rel);
+        const SegmentInput& input = resolver->InputOf(body.id);
+        in_flight_draws.fetch_sub(input.draws, std::memory_order_acq_rel);
+        segment_engine = input.snapshot != nullptr ? input.snapshot->engine : 0;
     }
-    resolver->NoteOrder(body.id);
+    next_ordinal = 0;
     holding = true;
     held_id = body.id;
     current = &result;
@@ -997,25 +1070,57 @@ void SplitResolve::OnSegment(const Ir::SegmentBody& body, const u32* back_regs,
     }
 }
 
+void SplitResolve::NoteDraws(uintptr_t engine, u32 count, bool usable) {
+    // A segment without input (stolen before submission) has no records: any engine counts.
+    if (segment_engine != 0 && engine != segment_engine) {
+        return;
+    }
+    NotePredicatedOff();
+    record_base = next_ordinal;
+    record_count = usable ? count : 0;
+    record_used = 0;
+    next_ordinal += count;
+    if (stats) {
+        Count(GetStats().front_draws, count);
+    }
+}
+
+void SplitResolve::NotePredicatedOff() {
+    if (stats && record_used < record_count) {
+        Count(GetStats().draws_predicated_off, record_count - record_used);
+    }
+    record_count = 0;
+    record_used = 0;
+}
+
 const PreDraw* SplitResolve::TakeDraw(u64 fingerprint, bool indexed) {
     if (current == nullptr || !current->by_shard) {
         return nullptr;
     }
-    const auto& records = current->records;
-    const size_t limit = (std::min)(records.size(), cursor + 8);
-    for (size_t index = cursor; index < limit; ++index) {
-        const PreDraw& pre = records[index];
-        if (pre.fingerprint == fingerprint && pre.indexed == indexed) {
-            cursor = index + 1;
-            if (pre.drift) {
-                Count(GetStats().draws_drift);
-                return nullptr;
-            }
-            return &pre;
-        }
+    if (record_used >= record_count) {
+        // A draw no predicted entry announced (or a host indirect draw's): resolved live.
+        Count(GetStats().draws_unmatched);
+        return nullptr;
     }
-    Count(GetStats().draws_unmatched);
-    return nullptr;
+    const u32 ordinal = record_base + record_used++;
+    const auto& records = current->records;
+    while (cursor < records.size() && records[cursor].ordinal < ordinal) {
+        ++cursor;
+    }
+    if (cursor == records.size() || records[cursor].ordinal != ordinal) {
+        Count(GetStats().draws_unmatched); // the shard kept no record for it
+        return nullptr;
+    }
+    const PreDraw& pre = records[cursor++];
+    if (pre.fingerprint != fingerprint || pre.indexed != indexed) {
+        Count(GetStats().draws_misfit);
+        return nullptr;
+    }
+    if (pre.drift) {
+        Count(GetStats().draws_drift);
+        return nullptr;
+    }
+    return &pre;
 }
 
 } // namespace VideoCommon::V2::Resolve

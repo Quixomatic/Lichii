@@ -5,6 +5,7 @@
 
 #include <array>
 #include <atomic>
+#include <cstring>
 #include <deque>
 #include <memory>
 #include <utility>
@@ -16,6 +17,7 @@
 #include "video_core/v2/regsem.h"
 #include "video_core/v2/resolve/cbuf_table.h"
 #include "video_core/v2/resolve/cow_regs.h"
+#include "video_core/v2/resolve/draw_record.h"
 #include "video_core/v2/resolve/parallel_resolve.h"
 #include "video_core/v2/resolve/segment.h"
 
@@ -100,13 +102,23 @@ inline constexpr u64 UnstableGeneration = 0;
 [[nodiscard]] u64 CbufMasksHash(const std::array<u32, CbufStages>& key_cbufs);
 
 /// P6c: a draw's pipeline key computed by a shard (the Vulkan FixedPipelineState, opaque here).
+/// Plain data (F6-01, §5.2): it lives in its segment's arena, records point at it.
+inline constexpr size_t MaxPipelineKeyBytes = 1024;
 struct PipelineKey {
     u64 hash = 0;   ///< FixedPipelineState::Hash
-    u64 inputs = 0; ///< what it was computed from (shards reuse it while that holds)
-    std::vector<u8> bytes;
+    u64 inputs = 0; ///< what it was computed from (shards reuse it while that holds; 0: never)
+    u32 size = 0;   ///< bytes used (sizeof(FixedPipelineState); 0: no key)
+    alignas(16) std::array<u8, MaxPipelineKeyBytes> bytes{};
+    [[nodiscard]] bool SameKey(const PipelineKey& other) const {
+        return hash == other.hash && size == other.size &&
+               std::memcmp(bytes.data(), other.bytes.data(), size) == 0;
+    }
 };
-/// Set by the Vulkan pipeline cache (the key code lives with it, shared with the serial path).
-using PipelineKeyFn = std::shared_ptr<const PipelineKey> (*)(const SnapshotView& view);
+/// Set by the Vulkan pipeline cache (the key code lives with it, shared with the serial path):
+/// what a draw's key is computed from (0: not reusable), and the key itself.
+using PipelineKeyInputsFn = u64 (*)(const SnapshotView& view);
+using PipelineKeyFn = void (*)(const SnapshotView& view, u64 inputs, PipelineKey& out);
+inline PipelineKeyInputsFn g_pipeline_key_inputs = nullptr;
 inline PipelineKeyFn g_pipeline_key = nullptr;
 
 /// R3 (S0-02): the graphics programs' shader hashes the commit thread found, published for the
@@ -121,6 +133,11 @@ void ClearPrograms();
 [[nodiscard]] u64 ProgramGeneration();
 [[nodiscard]] bool ProgramGenerationHolds(u64 before);
 
+/// §5.6.3: the commit's applier for a shard's request (the slot for the request's proxy), set
+/// by the rasterizer that owns the caches the requests mutate.
+using ApplyRequestFn = u32 (*)(const Commit::Request& request);
+inline ApplyRequestFn g_apply_request = nullptr;
+
 struct PreDraw;
 /// R3: the draw's pipeline looked up on the shard from its key (set by the Vulkan pipeline
 /// cache, which owns the lookup tables; null: no shard lookup).
@@ -133,10 +150,12 @@ struct DynamicFeatures;
 /// commit thread before its draws use them (a copy is kept per change; shards compute with the
 /// current one). Returns the generation `features` have.
 u64 PublishDynamicFeatures(const DynamicFeatures& features);
-/// R5: a draw's dynamic state from a shard's view with the published features (null: none
-/// published yet, or EDEN_NX2_V2_DRAWREC off). `generation`: the features' generation.
-[[nodiscard]] std::shared_ptr<const DynamicState> ShardDynamic(const SnapshotView& view,
-                                                               u64& generation);
+/// R5: what a draw's dynamic state is computed from on a shard's view with the published
+/// features (0: none published yet, or EDEN_NX2_V2_DRAWREC off; a result is reused only while
+/// the view's groups are valid). `generation`: the features' generation; `features`: them
+/// (valid for the process).
+[[nodiscard]] u64 ShardDynamicInputs(const SnapshotView& view, u64& generation,
+                                     const DynamicFeatures** features);
 
 /// A draw resolved by a shard.
 struct PreDraw {
@@ -146,7 +165,9 @@ struct PreDraw {
     u64 full = 0;       ///< P6c: the whole draw-cache key
     u64 cbuf_masks = 0; ///< P6c: CbufMasksHash of the slots `full` used
     u64 shape_generation = 0; ///< ShapeGeneration() before the key read the shape table
-    std::shared_ptr<const PipelineKey> pipeline_key; ///< P6c (null: none computed)
+    /// P6c (null: none computed). F6-01: in the segment's arena (records are plain data, no
+    /// reference counts); valid until the commit releases the segment.
+    const PipelineKey* pipeline_key = nullptr;
     /// R3: the pipeline the shard's lookup found for (hashes, pipeline_key) (an opaque
     /// GraphicsPipeline*, never dereferenced off the commit thread), valid while the lookup's
     /// generation is `lookup_generation`.
@@ -159,8 +180,8 @@ struct PreDraw {
     std::array<u64, 6> hashes{};
     bool has_pipeline = false;
     /// R5: the draw's dynamic state (ComputeDynamic on the shard's view; null: none), computed
-    /// with the published features of `dynamic_generation`.
-    std::shared_ptr<const DynamicState> dynamic;
+    /// with the published features of `dynamic_generation`; in the segment's arena as the key.
+    const DynamicState* dynamic = nullptr;
     u64 dynamic_generation = 0;
     uintptr_t engine = 0;
     uintptr_t memory = 0;
@@ -239,9 +260,24 @@ struct SplitTraits {
     using Record = PreDraw;
     struct Shard {
         std::unique_ptr<RegSem::Mirror3D> mirror;
+        u64 wait_ns = 0; ///< time spent waiting for the front (not busy, F6-01)
+        /// The shard's last key and dynamic state, copied into the next segment's arena while
+        /// their inputs hold (a segment's records point only into its own arena).
+        std::unique_ptr<PipelineKey> last_key;
+        std::unique_ptr<DynamicState> last_dynamic;
+        u64 last_dynamic_inputs = 0;
+    };
+    /// What a segment's records point into.
+    struct Arena {
+        StableArena<PipelineKey> keys;
+        StableArena<DynamicState> dynamics;
+        void Clear() {
+            keys.Clear();
+            dynamics.Clear();
+        }
     };
     static SerialReason Resolve(Shard& shard, const Input& input, std::vector<Record>& records,
-                                Commit::RequestList& requests);
+                                Commit::RequestList& requests, Arena& arena);
     static void Patch(Record&, const Commit::RequestList&) {}
     static const char* Compare(const Record& a, const Record& b);
 };
@@ -306,7 +342,14 @@ public:
     /// (verify only, else null).
     void OnSegment(const Ir::SegmentBody& body, const u32* back_regs, const u32* back_shadow,
                    const CbufTable* back_cbufs);
-    /// The shard's record for the draw the back is about to decide (null: none matches).
+    /// F6-01: the back reached `count` predicted draws of `engine` (an S1 Draw entry or a
+    /// Predicted/HostIndirect Draw record), in ring order, whether or not they will be drawn
+    /// (MACROHLE conditional render predicates some off). Their ordinals follow the previous
+    /// ones; `usable`: shard records may stand for them (not for a host indirect draw).
+    void NoteDraws(uintptr_t engine, u32 count, bool usable);
+    /// The shard's record for the draw the back is about to decide (null: none matches): the
+    /// one with the next noted ordinal (§5.6.3: records pair with draws in sequence order), if
+    /// its fingerprint and kind are the draw's.
     [[nodiscard]] const PreDraw* TakeDraw(u64 fingerprint, bool indexed);
     /// P6c: the record DecideDraw accepted for the draw being resolved (engine, memory and
     /// engine hint checked), for the later resolve steps of the same draw. Cleared when the
@@ -326,7 +369,7 @@ public:
     /// The shard's pipeline key for the draw being resolved, once (null: none).
     [[nodiscard]] const PipelineKey* TakePipelineKey() {
         const PreDraw* const pre = TakePipelineRecord();
-        return pre != nullptr ? pre->pipeline_key.get() : nullptr;
+        return pre != nullptr ? pre->pipeline_key : nullptr;
     }
     /// R3: the shard's record for the pipeline step (key and lookup), once (null: none).
     [[nodiscard]] const PreDraw* TakePipelineRecord() {
@@ -391,6 +434,14 @@ private:
     u64 held_id = 0;
     Resolver::Result* current = nullptr;
     size_t cursor = 0;
+    /// F6-01: ordinals of the current segment's draws as the back reaches them (NoteDraws).
+    uintptr_t segment_engine = 0;
+    u32 next_ordinal = 0;
+    u32 record_base = 0;
+    u32 record_count = 0;
+    u32 record_used = 0;
+    /// The draws of the last noted entry the back never drew (predicated off): counted.
+    void NotePredicatedOff();
     const PreDraw* taken = nullptr;
     const PreDraw* record_taken = nullptr;
     AdaptiveSize adaptive;

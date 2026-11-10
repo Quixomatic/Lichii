@@ -20,6 +20,8 @@
 #include "video_core/v2/ir_exec.h"
 #include "video_core/v2/landing.h"
 #include "video_core/v2/macro_hle.h"
+#include "video_core/v2/resolve/split_resolve.h"
+#include "video_core/v2/v2_switches.h"
 #include "video_core/v2/word_readback.h"
 
 namespace VideoCommon::V2::IrExec {
@@ -136,12 +138,25 @@ void SyncPoint(const Ir::SyncPointBody& body, const Context& context) {
     LOG_ERROR(HW_GPU, "V2 IR: unknown sync point op {}", static_cast<u32>(body.op));
 }
 
+/// EDEN_NX2_V2_PARALLEL (F6-01): the draws' ordinals in their segment, drawn or predicated off.
+void NoteParallelDraws(const Ir::DrawBody& body, const Context& context, u32 count, bool usable) {
+    if (!On(Switch::Parallel)) [[likely]] {
+        return;
+    }
+    if (Resolve::SplitResolve* const parallel = Resolve::SplitResolve::t_commit) {
+        parallel->NoteDraws(
+            reinterpret_cast<uintptr_t>(context.objects.As<Tegra::Engines::Maxwell3D>(body.engine)),
+            count, usable);
+    }
+}
+
 void Draw(const Ir::RecordView& record, const Ir::DrawBody& body, const Context& context) {
     switch (body.op) {
     case Ir::DrawOp::Predicted:
         if (IrCheck::g_active) {
             IrCheck::NoteDrawRecord(body);
         }
+        NoteParallelDraws(body, context, body.num_draws, true);
         return;
     case Ir::DrawOp::MacroEnd:
         if (IrCheck::g_active) {
@@ -154,6 +169,7 @@ void Draw(const Ir::RecordView& record, const Ir::DrawBody& body, const Context&
         if (IrCheck::g_active) {
             IrCheck::NoteDrawRecord(body);
         }
+        NoteParallelDraws(body, context, 1, false);
         const MacroHle::Draw draw{
             .kind = static_cast<MacroHle::Kind>(body.hle.kind),
             .topology = body.hle.topology,

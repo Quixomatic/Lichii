@@ -1494,6 +1494,12 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
                         regs.rt[0].Address(), regs.rt[0].width, regs.rt[0].height);
         }
     };
+    // EDEN_NX2_V2_PARALLEL R3-b (F6-01): the shard's record first, so the continued-draw check's
+    // pipeline step (ContinuedDrawHolds) takes the shard's key and pipeline (MASTER_PLAN §5.3:
+    // the ladder needs the pipeline only to prove it unchanged).
+    if (drawcache) [[unlikely]] {
+        DrawCache().TakeParallelDraw(is_indexed, *maxwell3d, *gpu_memory);
+    }
     GraphicsPipeline* const delta_pipeline =
         fast_draw_on ? TakeReusableDraw(is_indexed, is_indirect) : nullptr;
     const auto lookup_pipeline = [&] {
@@ -1512,7 +1518,6 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     GraphicsPipeline* looked_up = nullptr;
     bool have_lookup = false;
     if (drawcache) [[unlikely]] {
-        DrawCache().TakeParallelDraw(is_indexed, *maxwell3d, *gpu_memory);
         if (delta_pipeline == nullptr) {
             looked_up = lookup_pipeline();
             have_lookup = true;
@@ -5576,12 +5581,12 @@ const VideoCommon::V2::Resolve::DynamicState* TakeShardDynamic(
     const bool usable =
         pre != nullptr && pre->dynamic != nullptr && pre->dynamic_generation == generation;
     if (usable && (check || parallel->Verify())) {
-        verify = pre->dynamic.get();
+        verify = pre->dynamic;
         return nullptr;
     }
     R::Count(usable ? R::GetStats().step_shard[static_cast<size_t>(R::Step::Dynamic)]
                     : R::GetStats().step_commit[static_cast<size_t>(R::Step::Dynamic)]);
-    return usable ? pre->dynamic.get() : nullptr;
+    return usable ? pre->dynamic : nullptr;
 }
 
 /// PARALLEL=verify: the shard's dynamic state against the one the record holds.

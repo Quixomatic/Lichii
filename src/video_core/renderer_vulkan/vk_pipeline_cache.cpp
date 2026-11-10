@@ -505,24 +505,31 @@ u32 ShardKeyGroups() {
     return groups;
 }
 
-/// A shard's pipeline key from its snapshot view: the same FixedPipelineState code the commit
-/// thread runs (RefreshFull is RefreshIncremental's blocks, forced), from a zeroed state. A
-/// shard reuses its last key while the key's register groups, the topology and the device
-/// features are unchanged.
-std::shared_ptr<const VideoCommon::V2::Resolve::PipelineKey> ShardPipelineKey(
-    const VideoCommon::V2::Resolve::SnapshotView& view) {
+static_assert(sizeof(FixedPipelineState) <= VideoCommon::V2::Resolve::MaxPipelineKeyBytes);
+
+/// What a shard's pipeline key is computed from: the key's register groups, the topology and
+/// the device features (0: not reusable, the key's groups are not all hashed). A shard reuses
+/// its last key while this holds.
+u64 ShardPipelineKeyInputs(const VideoCommon::V2::Resolve::SnapshotView& view) {
     namespace V2 = VideoCommon::V2;
     const u32 groups = ShardKeyGroups();
-    const bool reusable = (groups & ~V2::HashedGroups) == 0;
+    if ((groups & ~V2::HashedGroups) != 0) {
+        return 0;
+    }
     const bool squashed = Settings::values.use_squashed_iterated_blend ? true : false;
     u64 inputs = view.Groups().Fingerprint(groups);
     inputs = V2::Mix64(inputs ^ static_cast<u64>(view.Topology()));
     inputs = V2::Mix64(inputs ^ (static_cast<u64>(view.EngineState()) << 1) ^ (squashed ? 1 : 0));
     inputs = V2::Mix64(inputs ^ g_shard_features_generation.load(std::memory_order_relaxed));
-    thread_local std::shared_ptr<const V2::Resolve::PipelineKey> last;
-    if (reusable && last != nullptr && last->inputs == inputs) {
-        return last;
-    }
+    return inputs == 0 ? 1 : inputs;
+}
+
+/// A shard's pipeline key from its snapshot view: the same FixedPipelineState code the commit
+/// thread runs (RefreshFull is RefreshIncremental's blocks, forced), from a zeroed state, into
+/// the segment's arena (F6-01: plain data).
+void ShardPipelineKey(const VideoCommon::V2::Resolve::SnapshotView& view, u64 inputs,
+                      VideoCommon::V2::Resolve::PipelineKey& key) {
+    const bool squashed = Settings::values.use_squashed_iterated_blend ? true : false;
     FixedPipelineState state;
     std::memset(&state, 0, sizeof(state));
     state.RefreshFull(view.Regs(),
@@ -532,13 +539,10 @@ std::shared_ptr<const VideoCommon::V2::Resolve::PipelineKey> ShardPipelineKey(
                           .squashed_iterated_blend = squashed,
                       },
                       g_shard_features);
-    auto key = std::make_shared<V2::Resolve::PipelineKey>();
-    key->hash = state.Hash();
-    key->inputs = inputs;
-    key->bytes.resize(sizeof(state));
-    std::memcpy(key->bytes.data(), &state, sizeof(state));
-    last = key;
-    return key;
+    key.hash = state.Hash();
+    key.inputs = inputs;
+    key.size = static_cast<u32>(sizeof(state));
+    std::memcpy(key.bytes.data(), &state, sizeof(state));
 }
 
 /// R3: the cache whose lookup the shards read (set with the hooks, cleared at its destruction).
@@ -554,7 +558,7 @@ void ShardPipeline(const VideoCommon::V2::Resolve::SnapshotView& view, uintptr_t
     namespace Resolve = V2::Resolve;
     const PipelineCache* const cache = g_shard_cache;
     if (cache == nullptr || pre.pipeline_key == nullptr ||
-        pre.pipeline_key->bytes.size() != sizeof(FixedPipelineState) ||
+        pre.pipeline_key->size != sizeof(FixedPipelineState) ||
         (view.NativeTuring() && view.Regs().IsMeshEnabled())) {
         return;
     }
@@ -594,6 +598,7 @@ void PublishShardPipelineKey(const DynamicFeatures& features, PipelineCache* cac
     g_shard_features = features;
     g_shard_features_generation.fetch_add(1, std::memory_order_relaxed);
     g_shard_cache = cache;
+    VideoCommon::V2::Resolve::g_pipeline_key_inputs = &ShardPipelineKeyInputs;
     VideoCommon::V2::Resolve::g_pipeline_key = &ShardPipelineKey;
     VideoCommon::V2::Resolve::g_shard_pipeline = &ShardPipeline;
 }
@@ -962,6 +967,7 @@ PipelineCache::~PipelineCache() {
     graphics_cache.clear();
     evicted_pipelines.clear();
     VideoCommon::V2::Resolve::g_pipeline_key = nullptr;
+    VideoCommon::V2::Resolve::g_pipeline_key_inputs = nullptr;
     VideoCommon::V2::Resolve::g_shard_pipeline = nullptr;
     if (g_shard_cache == this) {
         g_shard_cache = nullptr;
@@ -2016,8 +2022,8 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineV2() {
         V2::On(V2::Switch::Parallel) ? V2::Resolve::SplitResolve::t_commit : nullptr;
     if (parallel != nullptr) [[unlikely]] {
         shard_pre = parallel->TakePipelineRecord();
-        shard_key = shard_pre != nullptr ? shard_pre->pipeline_key.get() : nullptr;
-        if (shard_key != nullptr && (shard_key->bytes.size() != sizeof(FixedPipelineState) ||
+        shard_key = shard_pre != nullptr ? shard_pre->pipeline_key : nullptr;
+        if (shard_key != nullptr && (shard_key->size != sizeof(FixedPipelineState) ||
                                      maxwell3d->engine_state !=
                                          Tegra::Engines::Maxwell3D::EngineHint::None)) {
             shard_key = nullptr;

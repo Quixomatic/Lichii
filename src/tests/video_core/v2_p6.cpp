@@ -905,14 +905,17 @@ TEST_CASE("V2 P6: a shard replays its segment from the IR ring onto the snapshot
     std::vector<Resolve::PreDraw> records;
     Commit::RequestList requests;
     requests.Reset(1);
-    const SerialReason reason = Resolve::SplitTraits::Resolve(shard, input, records, requests);
+    Resolve::SplitTraits::Arena arena;
+    const SerialReason reason =
+        Resolve::SplitTraits::Resolve(shard, input, records, requests, arena);
     Resolve::g_shard_key = saved;
     REQUIRE(reason == SerialReason::None);
     REQUIRE(records.size() == 12);
     for (u32 draw = 0; draw < 12; ++draw) {
         INFO("draw " << draw);
-        // Ordinals count the other engine's draw after each one too (F1-35).
-        CHECK(records[draw].ordinal == draw * 2);
+        // Ordinals count the segment's engine's draws only, as the commit's NoteDraws does
+        // (F6-01: records pair with draws by ordinal).
+        CHECK(records[draw].ordinal == draw);
         CHECK(records[draw].indexed);
         CHECK(records[draw].engine == 0x1000);
         if (draw == 7) {
@@ -969,7 +972,8 @@ TEST_CASE("V2 P6: an early-submitted segment's shard stops at the end the front 
             Resolve::SplitTraits::Shard state;
             Commit::RequestList requests;
             requests.Reset(1);
-            reason = Resolve::SplitTraits::Resolve(state, input, records, requests);
+            Resolve::SplitTraits::Arena arena;
+            reason = Resolve::SplitTraits::Resolve(state, input, records, requests, arena);
         }};
         // The front: its draws, published one by one, the cut (end stored), then the next
         // segment's draws published as fast as the shard reads.
@@ -1034,7 +1038,8 @@ TEST_CASE("V2 P6: an abandoned early segment keeps the draws its shard resolved 
             Resolve::SplitTraits::Shard state;
             Commit::RequestList requests;
             requests.Reset(1);
-            reason = Resolve::SplitTraits::Resolve(state, input, records, requests);
+            Resolve::SplitTraits::Arena arena;
+            reason = Resolve::SplitTraits::Resolve(state, input, records, requests, arena);
         }};
         // The commit reaches the segment while the shard waits for more of it.
         while (!progress.waiting.load()) {
@@ -1376,11 +1381,11 @@ TEST_CASE("V2 P6 F6-X1: render_enable.mode is not an input of any shard resolve"
 
 namespace {
 
-std::shared_ptr<const Resolve::PipelineKey> FakePipelineKey(const Resolve::SnapshotView& view) {
-    auto key = std::make_shared<Resolve::PipelineKey>();
-    key->hash = view.Regs().reg_array[0x200] + 1;
-    key->bytes.assign(8, static_cast<u8>(key->hash));
-    return key;
+void FakePipelineKey(const Resolve::SnapshotView& view, u64 inputs, Resolve::PipelineKey& key) {
+    key.hash = view.Regs().reg_array[0x200] + 1;
+    key.inputs = inputs;
+    key.size = 8;
+    std::memset(key.bytes.data(), static_cast<u8>(key.hash), key.size);
 }
 
 /// A shard lookup that names a pipeline by its key (as the real lookup does, keyed by state).
@@ -1433,14 +1438,18 @@ TEST_CASE("V2 P6 R3: shards look up each draw's pipeline; verify compares the ob
     Resolve::g_shard_key = &FakeShardKey;
     Resolve::g_pipeline_key = &FakePipelineKey;
     Resolve::g_shard_pipeline = &FakeShardPipeline;
+    const auto saved_inputs = std::exchange(Resolve::g_pipeline_key_inputs, nullptr);
     Resolve::SplitTraits::Shard shard;
     std::vector<Resolve::PreDraw> records;
     Commit::RequestList requests;
     requests.Reset(1);
-    const SerialReason reason = Resolve::SplitTraits::Resolve(shard, input, records, requests);
+    Resolve::SplitTraits::Arena arena;
+    const SerialReason reason =
+        Resolve::SplitTraits::Resolve(shard, input, records, requests, arena);
     Resolve::g_shard_key = saved_key;
     Resolve::g_pipeline_key = saved_pipeline_key;
     Resolve::g_shard_pipeline = saved_pipeline;
+    Resolve::g_pipeline_key_inputs = saved_inputs;
     REQUIRE(reason == SerialReason::None);
     REQUIRE(records.size() == 2);
     CHECK(records[0].has_pipeline);
@@ -1498,38 +1507,40 @@ TEST_CASE("V2 P6 R5: a shard's dynamic state equals ComputeDynamic on the same v
     Resolve::DynamicFeatures features{};
     features.eds1 = features.eds2 = features.eds3_enables = true;
     features.depth_bounds = true;
+    const Resolve::DynamicFeatures* published = nullptr;
     // No features published yet, or DRAWREC off: nothing (the commit computes).
-    CHECK(Resolve::ShardDynamic(view, generation) == nullptr);
+    CHECK(Resolve::ShardDynamicInputs(view, generation, &published) == 0);
     const u64 first = Resolve::PublishDynamicFeatures(features);
     CHECK(Resolve::PublishDynamicFeatures(features) == first); // unchanged: same generation
-    CHECK(Resolve::ShardDynamic(view, generation) == nullptr);
+    CHECK(Resolve::ShardDynamicInputs(view, generation, &published) == 0);
     mode = V2::Mode::On;
-    const auto dynamic = Resolve::ShardDynamic(view, generation);
-    REQUIRE(dynamic != nullptr);
+    const u64 inputs = Resolve::ShardDynamicInputs(view, generation, &published);
+    REQUIRE(inputs != 0);
+    REQUIRE(published != nullptr);
     CHECK(generation == first);
+    const Resolve::DynamicState dynamic = Resolve::ComputeDynamic(view, *published);
     const Resolve::DynamicState serial = Resolve::ComputeDynamic(view, features);
-    CHECK(std::memcmp(dynamic.get(), &serial, sizeof(serial)) == 0);
-    // Unchanged groups, topology and features: the same result, not computed again.
-    CHECK(Resolve::ShardDynamic(view, generation) == dynamic);
-    // New features: a new generation and a new result.
+    CHECK(std::memcmp(&dynamic, &serial, sizeof(serial)) == 0);
+    // Unchanged groups, topology and features: the same inputs (a shard reuses its result).
+    CHECK(Resolve::ShardDynamicInputs(view, generation, &published) == inputs);
+    // New features: a new generation and new inputs.
     features.eds3_blending = true;
     const u64 second = Resolve::PublishDynamicFeatures(features);
     CHECK(second != first);
-    const auto again = Resolve::ShardDynamic(view, generation);
-    REQUIRE(again != nullptr);
-    CHECK(again != dynamic);
+    CHECK(Resolve::ShardDynamicInputs(view, generation, &published) != inputs);
     CHECK(generation == second);
+    const Resolve::DynamicState again = Resolve::ComputeDynamic(view, *published);
     const Resolve::DynamicState serial2 = Resolve::ComputeDynamic(view, features);
-    CHECK(std::memcmp(again.get(), &serial2, sizeof(serial2)) == 0);
+    CHECK(std::memcmp(&again, &serial2, sizeof(serial2)) == 0);
     // Verify: another dynamic state at the same generation is a mismatch, else dependent.
     Resolve::PreDraw a;
-    a.dynamic = dynamic;
+    a.dynamic = &dynamic;
     a.dynamic_generation = first;
     Resolve::PreDraw b = a;
     CHECK(Resolve::SplitTraits::Compare(a, b) == nullptr);
-    auto changed = std::make_shared<Resolve::DynamicState>(*dynamic);
-    changed->values.line_width += 1.0f;
-    b.dynamic = changed;
+    Resolve::DynamicState changed = dynamic;
+    changed.values.line_width += 1.0f;
+    b.dynamic = &changed;
     CHECK(Resolve::SplitTraits::Compare(a, b) != nullptr);
     b.dynamic_generation = second;
     CHECK(Resolve::SplitTraits::Compare(a, b) == nullptr);
@@ -1761,7 +1772,7 @@ Resolve::ShardKey TestShardKey(const Resolve::ShardKeyInputs& in) {
     return key;
 }
 
-std::shared_ptr<const Resolve::PipelineKey> TestPipelineKey(const Resolve::SnapshotView& view) {
+void TestPipelineKey(const Resolve::SnapshotView& view, u64 inputs, Resolve::PipelineKey& key) {
     Vulkan::FixedPipelineState state;
     std::memset(&state, 0, sizeof(state));
     state.RefreshFull(view.Regs(),
@@ -1769,11 +1780,10 @@ std::shared_ptr<const Resolve::PipelineKey> TestPipelineKey(const Resolve::Snaps
                                         .engine_state = view.EngineState(),
                                         .squashed_iterated_blend = false},
                       g_test_features);
-    auto key = std::make_shared<Resolve::PipelineKey>();
-    key->hash = state.Hash();
-    key->bytes.resize(sizeof(state));
-    std::memcpy(key->bytes.data(), &state, sizeof(state));
-    return key;
+    key.hash = state.Hash();
+    key.inputs = inputs;
+    key.size = static_cast<u32>(sizeof(state));
+    std::memcpy(key.bytes.data(), &state, sizeof(state));
 }
 
 } // Anonymous namespace
@@ -1827,6 +1837,7 @@ TEST_CASE("V2 P6c: shards resolve the draw key and the pipeline key as the seria
     const Resolve::PipelineKeyFn saved_pipeline = Resolve::g_pipeline_key;
     Resolve::g_shard_key = &TestShardKey;
     Resolve::g_pipeline_key = &TestPipelineKey;
+    const auto saved_inputs = std::exchange(Resolve::g_pipeline_key_inputs, nullptr);
     Resolve::ClearShapes();
     Resolve::PublishShape(TestShape, V2::AllGroups, TestKeyCbufs);
 
@@ -1939,7 +1950,8 @@ TEST_CASE("V2 P6c: shards resolve the draw key and the pipeline key as the seria
             std::vector<Resolve::PreDraw> records;
             Commit::RequestList requests;
             requests.Reset(input.id);
-            REQUIRE(Resolve::SplitTraits::Resolve(shard, input, records, requests) ==
+            Resolve::SplitTraits::Arena arena;
+            REQUIRE(Resolve::SplitTraits::Resolve(shard, input, records, requests, arena) ==
                     SerialReason::None);
             REQUIRE(records.size() == expected.size());
             for (size_t draw = 0; draw < records.size(); ++draw) {
@@ -1952,7 +1964,7 @@ TEST_CASE("V2 P6c: shards resolve the draw key and the pipeline key as the seria
                 REQUIRE(pre.pipeline_key != nullptr);
                 CHECK(pre.pipeline_key->hash == expected[draw].hash);
                 const std::vector<u8>& serial = expected[draw].pipeline;
-                REQUIRE(pre.pipeline_key->bytes.size() >= serial.size());
+                REQUIRE(pre.pipeline_key->size >= serial.size());
                 size_t offset = 0;
                 while (offset < serial.size() && serial[offset] == pre.pipeline_key->bytes[offset]) {
                     ++offset;
@@ -1964,6 +1976,7 @@ TEST_CASE("V2 P6c: shards resolve the draw key and the pipeline key as the seria
     }
     Resolve::g_shard_key = saved_key;
     Resolve::g_pipeline_key = saved_pipeline;
+    Resolve::g_pipeline_key_inputs = saved_inputs;
     Resolve::ClearShapes();
     CHECK(draws_checked > 100);
     CHECK(keys_changed > 40);

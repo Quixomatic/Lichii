@@ -128,28 +128,35 @@ void ReportStats(const char* thread_name, u64 window_ns) {
     }
     const u64 commit_draws = Take(stats.commit_draws);
     const u64 commit_draw_ns = Take(stats.commit_draw_ns);
-    // F1-36: draws per segment from the draws the commit thread ran (a stolen segment has no
-    // records, so records per segment understated the segment size), and the share of draws a
-    // shard pre-resolved.
+    const u64 front_draws = Take(stats.front_draws);
+    const u64 predicated_off = Take(stats.draws_predicated_off);
+    const u64 misfit = Take(stats.draws_misfit);
+    // F1-36 (R2-F6-03): draws per segment in the segmenter's unit, the front's draws (records
+    // and ordinals, predicated-off ones included); the commit's draws and the predicated-off
+    // ones separately. The share of draws a shard pre-resolved is of the commit's draws.
     const double draws_each =
+        segments != 0 ? static_cast<double>(front_draws) / static_cast<double>(segments) : 0.0;
+    const double commit_draws_each =
         segments != 0 ? static_cast<double>(commit_draws) / static_cast<double>(segments) : 0.0;
     const double draws_by_shards =
         commit_draws != 0 ? 100.0 * static_cast<double>(pre) / static_cast<double>(commit_draws)
                           : 0.0;
     LOG_INFO(
         HW_GPU,
-        "V2 stats {} P6 parallel resolve | segments {:.0f}/s ({:.1f} draws each, {:.1f} records; "
-        "draws by shards {:.1f}%), by shards "
+        "V2 stats {} P6 parallel resolve | segments {:.0f}/s ({:.1f} front draws each, {:.1f} "
+        "commit draws, {:.1f} records; predicated off {:.0f}/s; draws by shards {:.1f}%), by "
+        "shards "
         "{:.1f}%, serial {:.1f}% ({}) | cuts: {} | size {} | shards {} ({:.1f}% busy overall): {} | "
         "commit {:.2f} ms/s, merge wait {:.2f} ms/s ({} waits), serial resolve on commit {:.2f} "
         "ms/s | refused {}, stolen before submit {}, while queued {}, early submits {} (abandoned {}) | front snapshot {:.2f} ms/s, blocks copied {:.0f}/s, shared {:.1f}% | pre-resolved draws "
-        "{:.0f}/s, unmatched {:.0f}/s, drift {}, no shape {:.0f}/s | verify: {} segments, {} "
+        "{:.0f}/s, unmatched {:.0f}/s, misfit {:.0f}/s, drift {}, no shape {:.0f}/s | verify: {} "
+        "segments, {} "
         "mismatches ({} dependent); {} draws, {} mismatches; {} snapshots, {} mismatches | determinism: {} "
         "in order, {} out of order | steps on shards: {} | commit per draw {:.2f} us ({:.0f} "
         "draws/s)",
-        thread_name, static_cast<double>(segments) / seconds, draws_each,
+        thread_name, static_cast<double>(segments) / seconds, draws_each, commit_draws_each,
         segments != 0 ? static_cast<double>(records) / static_cast<double>(segments) : 0.0,
-        draws_by_shards,
+        static_cast<double>(predicated_off) / seconds, draws_by_shards,
         segments != 0 ? 100.0 * static_cast<double>(by_shard) / static_cast<double>(segments) : 0.0,
         segments != 0 ? 100.0 * static_cast<double>(serial_total) / static_cast<double>(segments)
                       : 0.0,
@@ -167,7 +174,8 @@ void ReportStats(const char* thread_name, u64 window_ns) {
         copied + shared != 0 ? 100.0 * static_cast<double>(shared) /
                                    static_cast<double>(copied + shared)
                              : 0.0,
-        static_cast<double>(pre) / seconds, static_cast<double>(unmatched) / seconds, drift,
+        static_cast<double>(pre) / seconds, static_cast<double>(unmatched) / seconds,
+        static_cast<double>(misfit) / seconds, drift,
         static_cast<double>(no_shape) / seconds, Take(stats.verify_segments),
         Take(stats.verify_mismatches), Take(stats.verify_dependent), Take(stats.verify_draws),
         Take(stats.verify_draw_mismatches), Take(stats.snapshot_checks),
