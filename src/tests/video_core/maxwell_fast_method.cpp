@@ -53,6 +53,19 @@ struct GpuSplitTestAccess {
     static void SetEnd(GpuSplit& split, u64 position) {
         split.write_position = position;
     }
+    /// As if the back consumed up to `position` and runs (or not).
+    static void SetBack(GpuSplit& split, u64 consumed, bool running) {
+        split.consumed.store(consumed);
+        split.consumed_cache = consumed;
+        split.back_running.store(running);
+    }
+    /// A front job queued for a running back, as RequestBackJob does.
+    static void QueueBackJob(GpuSplit& split, void (*job)(void*), void* argument) {
+        split.back_job = job;
+        split.back_job_argument = argument;
+        split.back_job_requested.store(true);
+        split.hook_requested.store(true);
+    }
 
     static void Start(GpuSplit& split, Core::System& system) {
         Initialize(split, system);
@@ -2292,6 +2305,40 @@ TEST_CASE("V2 landing: one write table, tickets without IR cuts, ordered landing
         Landing::tag = 0;
         Landing::captured_tag = 0;
         Landing::pending = 0;
+    }
+
+    SECTION("valve replacement: the front waits for a landing, never for a drain") {
+        // The back ran the release's entry (consumed 100) but much more is queued (end 5000):
+        // waiting for the landing must not wait for the back to consume the rest.
+        Access::SetEnd(split, 5000);
+        Access::SetBack(split, 100, true);
+        const u64 ticket = V2::Landing::Ticket(100, 0);
+        std::jthread fence_thread([ticket] {
+            std::this_thread::sleep_for(std::chrono::milliseconds{5});
+            V2::Landing::Note(ticket);
+        });
+        CHECK(split.WaitLanded(ticket, VideoCommon::DrainSite::Acquire, 2'000'000));
+        CHECK(split.ConsumedNow() == 100);
+        fence_thread.join();
+        // A landing that never comes times out instead of hanging.
+        CHECK(!split.WaitLanded(V2::Landing::Ticket(100, 1), VideoCommon::DrainSite::Acquire,
+                                1'000));
+        Access::SetBack(split, 0, false);
+    }
+
+    SECTION("class C readback: a front job runs on the back after its current entry") {
+        struct Job {
+            bool ran = false;
+        } job;
+        Access::QueueBackJob(split, [](void* argument) { static_cast<Job*>(argument)->ran = true; },
+                             &job);
+        Access::ServeHookRequests(split);
+        CHECK(job.ran);
+        // Without a running back, the front runs it itself.
+        Job here;
+        split.RequestBackJob([](void* argument) { static_cast<Job*>(argument)->ran = true; },
+                             &here);
+        CHECK(here.ran);
     }
     V2::Landing::landed.store(0);
 }
