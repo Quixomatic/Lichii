@@ -3577,6 +3577,10 @@ private:
     /// Fix F3-08: reads GPU-written words back into guest memory through the readback path,
     /// recorded by the back after its current entry; waits for that download only.
     void FrontReadBack(VideoCommon::GpuSplit& split, DAddr device, size_t bytes);
+    /// Fix F3-08: makes the reports in [source, source + bytes) reach memory (the back writes
+    /// them out after its current entry, GpuSplit::CompleteLanding) and waits for that.
+    void FrontFlushReports(VideoCommon::GpuSplit& split, GPUVAddr source, size_t bytes,
+                           u64 ticket);
     std::unique_ptr<FrontState> front;
     bool front_macros{};
     friend struct Maxwell3DTestAccess;

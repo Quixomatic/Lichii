@@ -352,9 +352,26 @@ public:
         }
         unlanded.NoteRange(device_address, size, ticket, V2::Producer::Report);
     }
-    /// Front: waits until `ticket` landed (class D strict, class B verify). Asks the back to
-    /// submit what it deferred while waiting, never drains. False after `timeout_us`.
+    /// Front: waits until `ticket` landed (class B verify). Asks the back to submit what it
+    /// deferred while waiting, never drains. False after `timeout_us`.
     bool WaitLanded(u64 ticket, DrainSite site, u64 timeout_us);
+    /// Front: makes the write of `ticket` reach memory and waits for it (class D strict, MASTER_PLAN
+    /// §6: a targeted wait makes its producer complete). Once the back ran the write, `complete`
+    /// runs on the back after its current entry (RequestBackJob): it writes the write's bytes to
+    /// memory itself, submitting and waiting for the GPU as it needs to (a counter report's
+    /// operation otherwise waits for the next fence, which an idle back never makes). Returns
+    /// once the ticket landed or `complete` ran; memory then holds the bytes.
+    void CompleteLanding(u64 ticket, DrainSite site, void (*complete)(void*), void* argument);
+    /// Front: FindWrites over the queued writes only (after CompleteLanding wrote the landing
+    /// writes of a range to memory).
+    [[nodiscard]] V2::HazardResult FindQueuedWrites(u64 device_address, u64 size,
+                                                    const V2::HazardFilter& filter,
+                                                    u8* out = nullptr) {
+        FlushCbWrite();
+        const u64 done = ConsumedNow();
+        hazards.Retire(done);
+        return hazards.Find(device_address, size, done, filter, out);
+    }
     /// Any thread, EDEN_NX2_V2_CPULANE: has the back run `hook` after its current entry (or at
     /// once if it waits for work).
     /// EDEN_NX2_V2_XFERQ: run on the back at every host-level sync position (NoteSync). Set by
@@ -932,6 +949,12 @@ private:
     void (*cpu_lane_hook)(void*){};
     void* cpu_lane_argument{};
     std::atomic<bool> cpu_lane_requested{};
+    struct LandingJob {
+        void (*complete)(void*);
+        void* argument;
+        std::atomic<bool> done;
+    };
+    LandingJob landing_job{}; ///< CompleteLanding (front, one at a time)
     void (*back_job)(void*){};  ///< RequestBackJob, published by back_job_requested
     void* back_job_argument{};
     std::atomic<bool> back_job_requested{};

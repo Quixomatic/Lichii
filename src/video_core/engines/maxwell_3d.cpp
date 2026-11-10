@@ -3421,19 +3421,25 @@ bool Maxwell3D::FrontDmaReadHazard(VideoCommon::GpuSplit& split, GPUVAddr source
     filter.unbounded_synced = V2::ProducerBit(V2::Producer::Draw);
     bool narrowed = false;
     bool read_back = false;
+    bool reports_flushed = false;
     for (int attempt = 0; attempt < 4; ++attempt) {
         for (size_t i = 0; i < out.size(); ++i) {
             out[i] = memory_manager.Read<u32>(source + i * sizeof(u32));
         }
         // Releases still to land are applied, then the queued writes (GpuSplit::FindWrites).
+        // Once the range's reports were written out, memory holds what they leave.
         const V2::HazardResult result =
-            split.FindWrites(*device, out.size() * sizeof(u32), filter,
-                             reinterpret_cast<u8*>(out.data()));
+            reports_flushed ? split.FindQueuedWrites(*device, out.size() * sizeof(u32), filter,
+                                                     reinterpret_cast<u8*>(out.data()))
+                            : split.FindWrites(*device, out.size() * sizeof(u32), filter,
+                                               reinterpret_cast<u8*>(out.data()));
         if (result.kind == V2::HazardResult::Kind::Wait && result.landing) {
-            // A counter or timestamp only its operation writes: wait for that landing.
-            if (attempt == 3 || !split.WaitLanded(result.position, site, 50'000)) {
-                return fall_back(Reason::ReportPage);
-            }
+            // A counter or timestamp only its operation writes, and that operation waits for a
+            // fence an idle back never makes (SESSION_HANDOFF §5g): as the old path's deferred
+            // QueryFlush (Perf fix A item 9), the back writes the range's reports out itself,
+            // after the entry it runs, submitting and waiting as it needs to.
+            FrontFlushReports(split, source, bytes, result.position);
+            reports_flushed = true;
             narrowed = true;
             continue;
         }
@@ -3462,6 +3468,26 @@ bool Maxwell3D::FrontDmaReadHazard(VideoCommon::GpuSplit& split, GPUVAddr source
         narrowed = true;
     }
     return fall_back(Reason::Overflow);
+}
+
+void Maxwell3D::FrontFlushReports(VideoCommon::GpuSplit& split, GPUVAddr source, size_t bytes,
+                                  u64 ticket) {
+    struct Job {
+        Tegra::MemoryManager* memory{};
+        VideoCore::RasterizerInterface* rasterizer{};
+        GPUVAddr source{};
+        size_t bytes{};
+    };
+    static Job job; // Front thread only, one at a time (CompleteLanding waits for it)
+    job = {&memory_manager, rasterizer, source, bytes};
+    split.CompleteLanding(
+        ticket, VideoCommon::DrainSite::MacroDmaRead,
+        [](void* argument) {
+            const auto& self = *static_cast<const Job*>(argument);
+            VideoCommon::QueryDma::FlushPending(*self.memory, *self.rasterizer, self.source,
+                                                self.bytes);
+        },
+        &job);
 }
 
 void Maxwell3D::FrontReadBack(VideoCommon::GpuSplit& split, DAddr device, size_t bytes) {

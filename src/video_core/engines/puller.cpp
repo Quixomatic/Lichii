@@ -382,6 +382,7 @@ bool Puller::PollAcquireView(DmaPusher& dma_pusher) {
         CheckWithView(dma_pusher, address, value, op, verify, word_landed);
     bool decided = false;
     bool passes = false;
+    bool net = false;
     if (Passes(check)) {
         decided = true;
         passes = true;
@@ -401,6 +402,7 @@ bool Puller::PollAcquireView(DmaPusher& dma_pusher) {
             // the word and reads it.
             acquire.last_old_poll = now;
             decided = false;
+            net = true;
             break;
         case V2::SuspendedPoll::ReadBack:
             // Read the word back again once the back ran what was sent since (at most per
@@ -442,7 +444,26 @@ bool Puller::PollAcquireView(DmaPusher& dma_pusher) {
         NoteViewDecision(check);
     }
     if (!decided || verify) {
+        const u32 view_word = dma_pusher.memory_manager.Read<u32>(address);
         const bool old_passed = PollAcquire(dma_pusher);
+        if (net && old_passed) [[unlikely]] {
+            // A release the view didn't resolve: which (F3 follow-up, the net's rate).
+            static std::atomic<u32> logged{};
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+                const auto device = dma_pusher.memory_manager.GpuToCpuAddress(address);
+                LOG_INFO(HW_GPU,
+                         "V2 acquire progress poll resumed channel {} semaphore {:#x} (device "
+                         "{:#x}) op {} value {:#x}: view reason {}, word {:#x} before the drain, "
+                         "{:#x} after, gpu-written page {}, sem_execute {}, waited {} us",
+                         dma_pusher.channel_state.bind_id, address, device.value_or(0),
+                         operation, value, static_cast<u32>(check.reason), view_word,
+                         dma_pusher.memory_manager.Read<u32>(address),
+                         device && Nx2MayBeGpuWritten(*device, sizeof(u32)), acquire.sem_execute,
+                         std::chrono::duration_cast<std::chrono::microseconds>(
+                             std::chrono::steady_clock::now() - acquire.since)
+                             .count());
+            }
+        }
         if (verify && decided) {
             ReportViewMismatch(dma_pusher, address, value, operation, passes, old_passed,
                                "poll", check.landing, op);

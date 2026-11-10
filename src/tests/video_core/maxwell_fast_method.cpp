@@ -2322,6 +2322,42 @@ TEST_CASE("V2 landing: one write table, tickets without IR cuts, ordered landing
         Access::SetBack(split, 0, false);
     }
 
+    SECTION("class D landing wait makes its producer complete (bf6e22effa regression)") {
+        // A counter report the back ran (consumed 100) whose operation waits for a fence an
+        // idle back never makes: the wait must make the back write it out, not spin.
+        Access::SetEnd(split, 100);
+        Access::SetBack(split, 100, true);
+        const u64 ticket = V2::Landing::Ticket(100, 0);
+        struct Flush {
+            std::atomic<bool> ran{false};
+        } flush;
+        std::atomic<bool> stop{false};
+        // The back: idle, serving front requests after its (empty) entry.
+        std::jthread back([&] {
+            while (!stop.load()) {
+                Access::ServeHookRequests(split);
+                std::this_thread::yield();
+            }
+        });
+        const auto begin = std::chrono::steady_clock::now();
+        split.CompleteLanding(
+            ticket, VideoCommon::DrainSite::MacroDmaRead,
+            [](void* argument) { static_cast<Flush*>(argument)->ran.store(true); }, &flush);
+        CHECK(flush.ran.load());
+        CHECK(V2::Landing::landed.load() < ticket); // completed by the flush, not by a landing
+        CHECK(std::chrono::steady_clock::now() - begin < std::chrono::seconds{1});
+        stop.store(true);
+        back.join();
+        // Already landed: nothing to run.
+        V2::Landing::Note(ticket);
+        Flush unused;
+        split.CompleteLanding(
+            ticket, VideoCommon::DrainSite::MacroDmaRead,
+            [](void* argument) { static_cast<Flush*>(argument)->ran.store(true); }, &unused);
+        CHECK(!unused.ran.load());
+        Access::SetBack(split, 0, false);
+    }
+
     SECTION("class C readback: a front job runs on the back after its current entry") {
         struct Job {
             bool ran = false;
