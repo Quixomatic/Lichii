@@ -93,7 +93,10 @@ enum class Reason : u8 {
     /// once per suspension; no timed net)
     Valve,
     Unlanded,     ///< A fence-flagged release to the word isn't in memory yet
-    QmdProducer,  ///< An Equal/Mask acquire waits for the QMD release ordered before it
+    QmdProducer,  ///< A suspended acquire waits on a known producer that lands at a fence
+    /// A suspended acquire with the back idle made its pending operations land (F3h: the
+    /// waiter's back job: fence, submit, forced release; only while an operation is pending)
+    Forced,
     Count,
 };
 

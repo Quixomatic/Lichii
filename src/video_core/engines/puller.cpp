@@ -529,14 +529,27 @@ bool Puller::PollAcquireView(DmaPusher& dma_pusher) {
         // back is idle and nothing the polls asked for landed since the back last moved, the
         // waiter makes every pending fence land (the v1 acquire's ReleaseFences, on the back):
         // once per back position, so it repeats only after new work ran — never on a timer.
-        const u64 landings = V2::Landing::landed.load(std::memory_order_acquire) +
-                             V2::Landing::untracked_landed.load(std::memory_order_acquire);
-        if (V2::ForcePendingLandings(queued, gpu_written, acquire.submit_requested,
-                                     acquire.producer_lands, landings != acquire.landings_seen,
-                                     acquire.released_at == split.ConsumedNow() + 1)) {
+        const u64 landed_now = V2::Landing::landed.load(std::memory_order_acquire);
+        const u64 untracked_landed_now =
+            V2::Landing::untracked_landed.load(std::memory_order_acquire);
+        const u64 landings = landed_now + untracked_landed_now;
+        const bool landing_pending =
+            V2::Landing::issued.load(std::memory_order_acquire) > landed_now ||
+            V2::Landing::untracked_issued.load(std::memory_order_acquire) > untracked_landed_now;
+        // Judged once per submit request cycle (`ask`, at most 1/ms), not per poll: landings
+        // since the previous request, not since the previous poll (90k polls/s made "nothing
+        // landed since" almost always true: d5e4 forced 10-14k times a second).
+        const bool landed_since = landings != acquire.landings_seen;
+        if (ask) {
+            acquire.landings_seen = landings;
+        }
+        if (ask && V2::ForcePendingLandings(queued, gpu_written, acquire.submit_requested,
+                                            acquire.producer_lands, landed_since,
+                                            acquire.released_at == split.ConsumedNow() + 1,
+                                            landing_pending)) {
             if (V2Stats::Enabled()) [[unlikely]] {
                 V2Stats::NoteDecision(VideoCommon::DrainSite::Acquire, Decision::Waited,
-                                      Reason::Valve);
+                                      Reason::Forced);
             }
             LandEverythingPending(dma_pusher.rasterizer);
             // After it (a job adds no ring record, but other channels' work may have run):
@@ -548,8 +561,6 @@ bool Puller::PollAcquireView(DmaPusher& dma_pusher) {
                 V2::SemaphoreMet(op, dma_pusher.memory_manager.Read<u32>(address), value)) {
                 return true; // NoteSyncAt not needed: nothing queued
             }
-        } else if (landings != acquire.landings_seen) {
-            acquire.landings_seen = landings;
         }
         switch (V2::PlanSuspendedPoll(gpu_written, acquire.producer_lands, queued)) {
         case V2::SuspendedPoll::ReadBack:
@@ -565,6 +576,11 @@ bool Puller::PollAcquireView(DmaPusher& dma_pusher) {
                 // Its fence may sit in a deferred submission: the wait causes its submit
                 // (SESSION_HANDOFF §5g). The first ask is at once.
                 const bool first_ask = !acquire.submit_requested;
+                if (first_ask && V2Stats::Enabled()) [[unlikely]] {
+                    // A wait on a known producer (counted once per suspension, F3h).
+                    V2Stats::NoteDecision(VideoCommon::DrainSite::Acquire, Decision::Narrowed,
+                                          Reason::QmdProducer);
+                }
                 acquire.submit_requested = true;
                 acquire.last_request = now;
                 // F4-X2 (R2-F4-01): urgently, for the tick of the newest fence still to land;

@@ -310,14 +310,19 @@ enum class SuspendedPoll : u8 {
 /// F3-X1 follow-up (8d31 deadlock): whether a suspended poll makes every pending fence land now
 /// (the v1 acquire's ReleaseFences, on the back). An operation can sit at a fence nothing submits
 /// (one the front can't see, or deferred behind a landing); with the back idle (nothing queued)
-/// and no landing since the last poll after the submit was asked for (or with no producer known
-/// to ask for), nothing else lands it. Once per back position (`released_here`): it repeats only
-/// after the back ran new work, never on a timer.
+/// and no landing in a whole request cycle after the submit was asked for, nothing else lands
+/// it. Once per back position (`released_here`): it repeats only after the back ran new work.
+/// d5e4 (10-14k forces/s, "valve"): only for a known producer (every QMD reduction and max
+/// release is tracked since d5e451eebf, reports and releases have tickets) whose submit was
+/// asked for, while an operation is pending, judged once per request cycle by the caller
+/// (`landed_since`: any landing since the previous request). A wait with no known producer
+/// (a guest CPU release) never forces: nothing at a fence can meet it.
 [[nodiscard]] constexpr bool ForcePendingLandings(bool queued, bool gpu_written,
                                                   bool submit_requested, bool producer_lands,
-                                                  bool landed_since, bool released_here) {
-    return !queued && !gpu_written && !released_here && !landed_since &&
-           (submit_requested || !producer_lands);
+                                                  bool landed_since, bool released_here,
+                                                  bool landing_pending = true) {
+    return landing_pending && producer_lands && submit_requested && !queued && !gpu_written &&
+           !released_here && !landed_since;
 }
 
 [[nodiscard]] constexpr SuspendedPoll PlanSuspendedPoll(bool gpu_written, bool producer_lands,

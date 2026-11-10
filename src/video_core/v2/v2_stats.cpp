@@ -103,7 +103,7 @@ constexpr std::array<const char*, static_cast<size_t>(Decision::Count)> decision
 };
 constexpr std::array<const char*, static_cast<size_t>(Reason::Count)> reason_names{
     "-",         "settings",      "operation",   "unmapped", "gpu-written", "unknown write",
-    "queued not met", "not met", "report page", "overflow", "valve", "unlanded", "qmd producer",
+    "queued not met", "not met", "report page", "overflow", "valve", "unlanded", "qmd producer", "forced landing",
 };
 
 constexpr size_t NumReleases = 4096;

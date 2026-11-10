@@ -596,8 +596,9 @@ TEST_CASE("V2 acquire: a suspended acquire whose release the view never records 
     SECTION("8d31 deadlock: an operation at a fence nothing submits lands when the back idles") {
         // Four channels waited on QMD reduction words 0x13 short, back idle, nothing queued:
         // the reductions sat at a fence no submit request reached. The model: the fence lands
-        // only when forced (ReleaseFences); submit requests alone never land it.
-        for (const bool producer_known : {true, false}) {
+        // only when forced (ReleaseFences); submit requests alone never land it. Since
+        // d5e451eebf the reductions are tracked: the producer is known.
+        for (const bool producer_known : {true}) {
             u32 word = 0x8099;
             bool fence_pending = true;
             bool submit_requested = false;
@@ -634,8 +635,10 @@ TEST_CASE("V2 acquire: a suspended acquire whose release the view never records 
         CHECK(!ForcePendingLandings(true, false, true, true, false, false));
         CHECK(!ForcePendingLandings(false, false, true, true, true, false));
         CHECK(!ForcePendingLandings(false, true, true, true, false, false));
-        // A known producer gets its submit request first.
+        // A known producer gets its submit request first; with no known producer (a guest CPU
+        // release) nothing at a fence can meet it: never forced.
         CHECK(!ForcePendingLandings(false, false, false, true, false, false));
+        CHECK(!ForcePendingLandings(false, false, true, false, false, false));
     }
     SECTION("019d livelock: a producer in the open command buffer lands once; no re-fire") {
         // The producer was an operation queued without a fence (SyncOperation) in work not yet
@@ -668,7 +671,8 @@ TEST_CASE("V2 acquire: a suspended acquire whose release the view never records 
         u32 forces = 0;
         bool resumed = false;
         for (int poll = 0; poll < 100 && !resumed; ++poll) {
-            if (ForcePendingLandings(false, false, true, false, false,
+            // The report's landing ticket is the known producer; its submit was asked for.
+            if (ForcePendingLandings(false, false, true, true, false,
                                      released_at == back.consumed + 1)) {
                 ++forces;
                 back.LandEverythingPending();
@@ -682,12 +686,26 @@ TEST_CASE("V2 acquire: a suspended acquire whose release the view never records 
         u64 again_at = 701;
         u32 refires = 0;
         for (int poll = 0; poll < 100; ++poll) {
-            refires += ForcePendingLandings(false, false, true, false, false,
+            refires += ForcePendingLandings(false, false, true, true, false,
                                             again_at == back.consumed + 1)
                            ? 1
                            : 0;
         }
         CHECK(refires == 0);
+        // d5e4 (20-30k forces/s): a wait with nothing pending at all (a guest CPU release)
+        // never forces, however the back moves.
+        u32 idle_forces = 0;
+        for (u64 position = 800; position < 900; ++position) {
+            idle_forces += ForcePendingLandings(false, false, true, true, false, false, false)
+                               ? 1
+                               : 0;
+            idle_forces += ForcePendingLandings(false, false, true, false, false, false, true)
+                               ? 1
+                               : 0;
+        }
+        CHECK(idle_forces == 0);
+        // Judged per request cycle: a landing anywhere since the last request defers it.
+        CHECK(!ForcePendingLandings(false, false, true, true, true, false, true));
     }
     SECTION("a producer that lands at a fence makes the poll ask for its submit, never a drain") {
         // F3F5b-5 / F3-X1: a QMD release (or a release still to land) that may write the word
