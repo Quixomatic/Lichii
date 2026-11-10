@@ -26,7 +26,9 @@ inline std::atomic<u64> untracked{0};
 
 /// SYNC_SUBMIT_SPEC §7.3 fix 6: the open tick's state for the 2 s semaphore line (written by the
 /// recording and fencing threads with relaxed stores, read only for that line).
-inline std::atomic<u64> diag_open_tick{0};       ///< Scheduler::CurrentTick after the last submit
+/// Scheduler::CurrentTick after the last submission (the open tick; also the tick an idle-back
+/// waiter asks for, 9c4a)
+inline std::atomic<u64> diag_open_tick{0};
 inline std::atomic<u64> diag_lazy_tick{0};       ///< The newest lazy fence's tick
 inline std::atomic<bool> diag_submit_wanted{false};
 inline std::atomic<u64> diag_fence_wait_tick{0}; ///< The tick the fencing thread blocks on (0: none)

@@ -1143,6 +1143,32 @@ TEST_CASE("SYNC §7.3: open work without draws is submitted however the back is 
     }
 }
 
+TEST_CASE("SYNC 9c4a quiet deadlock: back idle, open tick with work but no lazy fence, every "
+          "waiter 'no writer': the open tick is submitted once",
+          "[video_core][v2_p5b]") {
+    using VideoCommon::V2::SubmitRequests;
+    using Action = SubmitRequests::IdleAction;
+    constexpr u64 open = 8855; // work recorded after lazy fence 8854; no fence, no list end
+    SubmitRequests requests;
+    // Rule I has nothing to weigh: no lazy fence in the open tick, nothing wanted.
+    REQUIRE(requests.AtIdleHook(false, true, false, 8854, open, true) == Action::None);
+    // The suspended polls (the back ran everything sent) ask once for the open tick.
+    u64 asked_open_tick = 0;
+    u32 requests_filed = 0;
+    for (int poll = 0; poll < 1000; ++poll) {
+        const bool back_idle = true;
+        if (back_idle && open != asked_open_tick) {
+            asked_open_tick = open;
+            requests.Request(open, true);
+            ++requests_filed;
+        }
+    }
+    REQUIRE(requests_filed == 1);
+    REQUIRE(requests.AtIdleHook(false, true, false, 8854, open, false) == Action::Urgent);
+    // Submitted: the next tick is open and nothing is asked until a poll sees it idle again.
+    REQUIRE_FALSE(requests.Urgent(open + 1));
+}
+
 TEST_CASE("SYNC step 9: the post-pass list runs in order after the pass, before the submit",
           "[video_core][v2_p5b]") {
     // Model of the recording stream: the scheduler runs the list at the pass end (EndRenderPass)

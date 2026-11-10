@@ -73,6 +73,9 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
         CpuRecord next;
         // When a pending channel last moved or a command arrived (see the polling below).
         auto last_progress = std::chrono::steady_clock::now();
+        // SYNC: the event epoch of the last suspended-channel pass, and whether the next must run.
+        u64 last_event_epoch = ~u64{0};
+        bool resume_due = true;
         namespace Profile = VideoCommon::Nx2Profile;
         auto& split = VideoCommon::GpuSplit::Get();
         while (!stop_token.stop_requested()) {
@@ -84,10 +87,19 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                 bool resumed = false;
                 // SYNC Step 5: rings after this point end the sleep below (or skip it).
                 const u64 ring_epoch = V2::FrontWake::Epoch();
-                static_cast<void>(V2::FrontWake::TakeTickWaiter());
-                {
-                    Profile::Scope scope{Profile::Zone::ResumePending};
-                    resumed = scheduler.ResumePending(system.GPU());
+                // SYNC (9c4a: 68-90k passes/s): with the view, a pass runs only when something
+                // that can change an answer happened since the last one (a ring, a release
+                // parsed), or the last pass resumed a channel or polled a guest CPU waiter.
+                const bool view_pass = split.AcquireMode() != V2::Mode::Off;
+                const u64 event_epoch = ring_epoch + (view_pass ? split.Sem().Notes() : 0);
+                if (!view_pass || resume_due || event_epoch != last_event_epoch) {
+                    static_cast<void>(V2::FrontWake::TakeTickWaiter());
+                    {
+                        Profile::Scope scope{Profile::Zone::ResumePending};
+                        resumed = scheduler.ResumePending(system.GPU());
+                    }
+                    last_event_epoch = event_epoch;
+                    resume_due = resumed || V2::FrontWake::TickWaiter();
                 }
                 if (resumed) {
                     last_progress = std::chrono::steady_clock::now();

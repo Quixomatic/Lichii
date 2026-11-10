@@ -50,6 +50,9 @@ SleepEnd SleepUntilRing(u64 seen);
 inline void NoteTickWaiter() {
     Detail::tick_waiter = true;
 }
+[[nodiscard]] inline bool TickWaiter() {
+    return Detail::tick_waiter;
+}
 [[nodiscard]] inline bool TakeTickWaiter() {
     const bool waiter = Detail::tick_waiter;
     Detail::tick_waiter = false;

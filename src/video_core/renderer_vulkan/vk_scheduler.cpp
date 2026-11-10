@@ -452,6 +452,10 @@ void Scheduler::Finish(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
         NoteOpenTickSubmitted();
     }
     SubmitExecution(signal_semaphore, wait_semaphore);
+    if (lazy_fences) [[unlikely]] {
+        VideoCommon::V2::LandingFence::diag_open_tick.store(CurrentTick(),
+                                                            std::memory_order_relaxed);
+    }
     Wait(presubmit_tick);
     AllocateNewContext();
     last_flush = std::chrono::steady_clock::now();
