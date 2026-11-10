@@ -209,10 +209,6 @@ VkViewport GetViewportState(const Device& device, const ViewportSource& regs, si
     return viewport;
 }
 
-VkViewport GetViewportState(const Device& device, const Maxwell& regs, size_t index, float scale) {
-    return GetViewportState(device, ViewportSourceOf(regs), index, scale);
-}
-
 VkRect2D GetScissorState(const ViewportSource& regs, size_t index, u32 up_scale = 1,
                          u32 down_shift = 0) {
     const auto& src = regs.scissor[index];

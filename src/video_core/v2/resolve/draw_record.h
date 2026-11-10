@@ -426,7 +426,7 @@ struct RecordStats {
 [[nodiscard]] RecordStats& GetRecordStats();
 
 /// Counts one relaxed increment (stats).
-inline void Count(std::atomic<u64>& counter, u64 value = 1) {
+inline void CountRecordStat(std::atomic<u64>& counter, u64 value = 1) {
     counter.fetch_add(value, std::memory_order_relaxed);
 }
 
