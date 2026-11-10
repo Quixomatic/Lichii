@@ -3789,7 +3789,12 @@ void Image::DownloadMemory(std::span<VkBuffer> buffers_span, std::span<size_t> o
             vk_copies.emplace_back(
                 TransformBufferImageCopies(copies, offsets_span[index], aspect_mask));
         }
-        scheduler->RequestOutsideRenderPassOperationContext();
+        // F4-06: only pending writes to this image's memory get a barrier.
+        const bool scope = scheduler->RequestOutsideRenderPassForImages(
+            {{*original_image, gpu_addr, gpu_addr + guest_size_bytes}});
+        SCOPE_EXIT {
+            scheduler->EndImageOperation(scope);
+        };
         scheduler->Record([buffers = std::move(buffers_vector), image = *original_image,
                            aspect_mask_ = aspect_mask, vk_copies](vk::CommandBuffer cmdbuf) {
             const VkImageMemoryBarrier read_barrier{
