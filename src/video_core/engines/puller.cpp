@@ -604,7 +604,8 @@ bool Puller::PollAcquireView(DmaPusher& dma_pusher) {
                         "(view: {}, row {}; open tick {}, newest lazy fence tick {}, list end "
                         "wanted {}, fencing thread waits for tick {}; back consumed {:#x} of "
                         "{:#x}, landed {:#x} of issued {:#x}, untracked landed {:#x} of {:#x}; "
-                        "unfenced operations {}, uncommitted query flushes {})",
+                        "unfenced operations {}, uncommitted query flushes {}; GPU known tick {}, "
+                        "open tick recorded {}, back asleep {})",
                         dma_pusher.channel_state.bind_id, address, operation, value,
                         dma_pusher.memory_manager.Read<u32>(address),
                         static_cast<u32>(check.reason), static_cast<u32>(check.decision.row),
@@ -618,7 +619,10 @@ bool Puller::PollAcquireView(DmaPusher& dma_pusher) {
                         V2::Landing::untracked_landed.load(std::memory_order_relaxed),
                         V2::Landing::untracked_issued.load(std::memory_order_relaxed),
                         V2::LandingFence::diag_unfenced.load(std::memory_order_relaxed),
-                        V2::LandingFence::diag_query_flushes.load(std::memory_order_relaxed));
+                        V2::LandingFence::diag_query_flushes.load(std::memory_order_relaxed),
+                        V2::LandingFence::diag_known_tick.load(std::memory_order_relaxed),
+                        V2::LandingFence::diag_recorded.load(std::memory_order_relaxed),
+                        split.BackIdle());
             if (acquire.sem_execute) {
                 return SemExecuteGiveUp(acquire);
             }

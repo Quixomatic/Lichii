@@ -428,9 +428,11 @@ public:
             FlushAllPendingWrites(location);
         }
         if (lazy_fences && !recorded_since_submit) [[unlikely]] {
-            // SYNC_SUBMIT_SPEC §10: the open tick holds work (rule I submits it at idle).
+            // SYNC_SUBMIT_SPEC §11 invariant S: the open tick holds work (the back may not sleep
+            // on it with fewer than two submissions in flight).
             recorded_since_submit = true;
-            open_tick_nonempty.store(true, std::memory_order_release);
+            open_tick_nonempty.store(true, std::memory_order_seq_cst);
+            VideoCommon::V2::LandingFence::diag_recorded.store(true, std::memory_order_relaxed);
         }
         if (chunk->Record(command)) {
             return;
@@ -697,7 +699,8 @@ private:
     /// with it), the new open tick is empty.
     void NoteOpenTickEmpty() {
         recorded_since_submit = false;
-        open_tick_nonempty.store(false, std::memory_order_release);
+        open_tick_nonempty.store(false, std::memory_order_seq_cst);
+        VideoCommon::V2::LandingFence::diag_recorded.store(false, std::memory_order_relaxed);
     }
     void (*pre_submit_hook)(void*){};   ///< SYNC Step 8: SetPreSubmitHook
     void* pre_submit_argument{};

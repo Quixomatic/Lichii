@@ -32,6 +32,9 @@ inline std::atomic<u64> diag_open_tick{1};
 inline std::atomic<u64> diag_lazy_tick{0};       ///< The newest lazy fence's tick
 inline std::atomic<bool> diag_submit_wanted{false};
 inline std::atomic<u64> diag_fence_wait_tick{0}; ///< The tick the fencing thread blocks on (0: none)
+/// §11.6-0: the newest GPU tick known complete, and whether the open tick holds recorded work.
+inline std::atomic<u64> diag_known_tick{0};
+inline std::atomic<bool> diag_recorded{false};
 /// §9.3: at the back's last idle hook, operations with no fence / uncommitted query flushes.
 inline std::atomic<bool> diag_unfenced{false};
 inline std::atomic<bool> diag_query_flushes{false};
