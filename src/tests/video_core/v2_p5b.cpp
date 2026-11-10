@@ -796,39 +796,45 @@ TEST_CASE("V2 P5b flush decisions at pass boundaries", "[video_core][v2_p5b]") {
     params.pass_boundaries = true;
     const FlushState busy{.pending = 1, .back_behind = true};
     const FlushState requested{.pending = 1, .back_behind = true, .requested = true};
-    SECTION("mid-pass: only the safety nets, no interval or idle submits") {
+    SECTION("SYNC rule C mid-pass: busy GPU, only DXVK's pending threshold; max draws") {
         FlushHeuristic heuristic{params};
-        const FlushState idle{.pending = 0, .back_behind = false};
+        const FlushState two{.pending = 2, .back_behind = false};
+        heuristic.NoteSubmit(1000);
         u32 flushes = 0;
-        // 1000 draws over 7 ms, GPU idle: the old rules would have flushed (idle, interval).
-        for (u32 i = 1; i <= 1000; ++i) {
-            if (heuristic.Advance(1, idle, 1000 + u64{i} * 7).action == FlushAction::Flush) {
+        // Two in flight: min(20, 2 × 3) = 6 chunks, however long it takes.
+        for (u32 i = 1; i < 6 * params.chunk_draws; ++i) {
+            if (heuristic.Advance(1, two, 1000 + u64{i} * 100).action == FlushAction::Flush) {
                 ++flushes;
             }
         }
         REQUIRE(flushes == 0);
-        REQUIRE(heuristic.Advance(1, idle, 9000).action == FlushAction::None);
-        // max draws still applies.
+        const auto pending = heuristic.Advance(1, two, 100'000);
+        REQUIRE(pending.action == FlushAction::Flush);
+        REQUIRE(pending.reason == FlushHeuristic::ReasonPending);
+        // max draws still applies (a busy GPU with a higher threshold).
+        const FlushState many{.pending = 10, .back_behind = false};
         for (u32 i = heuristic.Draws(); i < params.max_draws - 1; ++i) {
-            REQUIRE(heuristic.Advance(1, idle, 9000).action != FlushAction::Flush);
+            REQUIRE(heuristic.Advance(1, many, 100'000).action != FlushAction::Flush);
         }
-        const auto last = heuristic.Advance(1, idle, 9000);
+        const auto last = heuristic.Advance(1, many, 100'000);
         REQUIRE(last.action == FlushAction::Flush);
         REQUIRE(last.reason == FlushHeuristic::ReasonMaxDraws);
     }
-    SECTION("mid-pass safety interval") {
+    SECTION("SYNC rule C mid-pass: the GPU about to go idle, min draws and the interval") {
         FlushHeuristic heuristic{params};
+        const FlushState one{.pending = 1, .back_behind = false};
         heuristic.NoteSubmit(1000);
         FlushHeuristic::Decision decision{};
-        for (u32 i = 1; i <= params.chunk_draws; ++i) {
-            decision = heuristic.Advance(1, busy, 1000 + params.mid_pass_interval_us - 1);
+        // Enough draws but too soon after the last submission: no cut.
+        for (u32 i = 1; i <= params.min_draws; ++i) {
+            decision = heuristic.Advance(1, one, 1000 + params.pass_interval_us - 1);
         }
         REQUIRE(decision.action == FlushAction::Dispatch);
         for (u32 i = 1; i <= params.chunk_draws; ++i) {
-            decision = heuristic.Advance(1, busy, 1000 + params.mid_pass_interval_us);
+            decision = heuristic.Advance(1, one, 1000 + params.pass_interval_us);
         }
         REQUIRE(decision.action == FlushAction::Flush);
-        REQUIRE(decision.reason == FlushHeuristic::ReasonInterval);
+        REQUIRE(decision.reason == FlushHeuristic::ReasonIdle);
     }
     SECTION("Ryujinx: a boundary after enough draws and time") {
         FlushHeuristic heuristic{params};
@@ -854,30 +860,22 @@ TEST_CASE("V2 P5b flush decisions at pass boundaries", "[video_core][v2_p5b]") {
         REQUIRE(heuristic.AtPassBoundary(FlushHint::Strong, requested, 1'000'000).action ==
                 FlushAction::None);
     }
-    SECTION("a waiter's request rides the next boundary, mid-pass only after the gap") {
+    SECTION("a waiter's request rides the next boundary; mid-pass it never cuts the pass") {
         FlushHeuristic heuristic{params};
         heuristic.NoteSubmit(1000);
         heuristic.Advance(1, busy, 1000);
         auto boundary = heuristic.AtPassBoundary(FlushHint::Weak, requested, 1001);
         REQUIRE(boundary.action == FlushAction::Flush);
         REQUIRE(boundary.reason == FlushHeuristic::ReasonRequest);
-        // Mid-pass: only an urgent request (a thread blocks), and not before the gap.
-        const FlushState urgent{.pending = 1, .back_behind = true, .requested = true,
+        // SYNC rule W: an urgent request is served at the back's next entry boundary (the idle
+        // hook between entries), not by a chunk mid-pass.
+        const FlushState urgent{.pending = 2, .back_behind = true, .requested = true,
                                 .urgent = true};
         FlushHeuristic::Decision decision{};
-        for (u32 i = 1; i <= params.chunk_draws; ++i) {
-            decision = heuristic.Advance(1, urgent, 1001 + params.request_gap_us / 2);
+        for (u32 i = 1; i <= 3 * params.chunk_draws; ++i) {
+            decision = heuristic.Advance(1, urgent, 1001 + params.request_gap_us * 10);
         }
         REQUIRE(decision.action == FlushAction::Dispatch);
-        for (u32 i = 1; i <= params.chunk_draws; ++i) {
-            decision = heuristic.Advance(1, requested, 1001 + params.request_gap_us);
-        }
-        REQUIRE(decision.action == FlushAction::Dispatch); // a lazy fence's window request
-        for (u32 i = 1; i <= params.chunk_draws; ++i) {
-            decision = heuristic.Advance(1, urgent, 1001 + params.request_gap_us);
-        }
-        REQUIRE(decision.action == FlushAction::Flush);
-        REQUIRE(decision.reason == FlushHeuristic::ReasonRequest);
     }
     SECTION("RT0 change is a strong hint after 3 chunks; weak needs min draws and 6 chunks") {
         FlushHeuristic heuristic{params};
@@ -899,12 +897,12 @@ TEST_CASE("V2 P5b flush decisions at pass boundaries", "[video_core][v2_p5b]") {
             heuristic.Advance(1, two, 1000);
         }
         REQUIRE(heuristic.AtPassBoundary(FlushHint::None, two, 1001).action == FlushAction::None);
-        heuristic.Advance(1, two, 1000);
-        const auto decision = heuristic.AtPassBoundary(FlushHint::None, two, 1001);
+        // The sixth chunk: rule C takes it mid-pass (the same DXVK threshold).
+        const auto decision = heuristic.Advance(1, two, 1000);
         REQUIRE(decision.action == FlushAction::Flush);
         REQUIRE(decision.reason == FlushHeuristic::ReasonPending);
     }
-    SECTION("F4-X2: strong hints submit at 3 chunks while the GPU is busy (DXVK)") {
+    SECTION("SYNC rule B: a strong hint is weighed at the pass boundary, not mid-pass") {
         FlushHeuristic heuristic{params};
         const FlushState two{.pending = 2, .back_behind = true};
         heuristic.NoteSubmit(1000);
@@ -913,16 +911,12 @@ TEST_CASE("V2 P5b flush decisions at pass boundaries", "[video_core][v2_p5b]") {
         for (u32 i = 0; i < params.strong_chunks * params.chunk_draws; ++i) {
             decision = heuristic.Advance(1, two, 1001);
         }
-        REQUIRE(decision.action == FlushAction::Flush);
-        REQUIRE(decision.reason == FlushHeuristic::ReasonStrong);
-        // FlushHint's immediate form: a strong hint after enough chunks, whatever is in flight.
-        for (u32 i = 0; i < params.strong_chunks * params.chunk_draws - 1; ++i) {
-            heuristic.Advance(1, two, 1002);
-        }
-        heuristic.Hint(FlushHint::Strong);
-        REQUIRE_FALSE(heuristic.WantsFlushNow());
-        heuristic.Advance(1, two, 1002); // a chunk boundary: the strong hint flushes there
-        REQUIRE(heuristic.Draws() == 0);
+        REQUIRE(decision.action == FlushAction::Dispatch);
+        // FlushHint's immediate form (after readback work) still decides at once.
+        REQUIRE(heuristic.WantsFlushNow());
+        const auto boundary = heuristic.AtPassBoundary(FlushHint::Strong, two, 1002);
+        REQUIRE(boundary.action == FlushAction::Flush);
+        REQUIRE(boundary.reason == FlushHeuristic::ReasonStrong);
     }
     SECTION("F4-X2: the idle hook's synchronization rule (DXVK pending < 2, minimum work)") {
         const FlushState idle{.pending = 0, .back_behind = false};
@@ -1013,6 +1007,78 @@ TEST_CASE("V2 P5b the idle hook submits nothing while the GPU is busy and nobody
     REQUIRE(requests.AtIdleHook(true, true, false, 0, open, false) == Action::Deferred);
     // Submitted ticks are no longer urgent.
     REQUIRE_FALSE(blocked.Urgent(open + 1));
+}
+
+TEST_CASE("SYNC step 7: the back submits for rules B, C, I and W only", "[video_core][v2_p5b]") {
+    using VideoCommon::V2::SubmitRequests;
+    using Action = SubmitRequests::IdleAction;
+    FlushParams params;
+    params.pass_boundaries = true;
+    constexpr u64 open = 20;
+    // The idle hook's rule I input (RasterizerVulkan::ServeSplitIdleHook): DXVK's sync point, or
+    // a lazy fence in the open tick carrying captures with the GPU about to go idle.
+    const auto rule_i = [&](const FlushHeuristic& heuristic, u32 pending, bool captures_open) {
+        const FlushState state{.pending = pending, .back_behind = false};
+        return (pending < params.busy_pending && captures_open) ||
+               heuristic.SyncPointDue(state, 1'000'000);
+    };
+    SECTION("idle back (a): a lazy fence nobody waits on is submitted by rule I") {
+        FlushHeuristic heuristic{params};
+        heuristic.NoteSubmit(1000);
+        SubmitRequests requests;
+        // No draw after it (draws == 0), one submission in flight, captures in the open tick.
+        REQUIRE(requests.AtIdleHook(false, true, false, open, open, rule_i(heuristic, 1, true)) ==
+                Action::Sync);
+        // Without captures and without work worth a submission: left (nothing waits on it).
+        REQUIRE(requests.AtIdleHook(false, true, false, open, open, rule_i(heuristic, 1, false)) ==
+                Action::Leave);
+    }
+    SECTION("idle back (b): a host waiter's request is served at the next entry boundary, "
+            "however many submissions are in flight") {
+        SubmitRequests requests;
+        requests.Request(open, true);
+        // No "two in flight → postpone" exception: the hook between entries submits it.
+        REQUIRE(requests.AtIdleHook(false, true, false, open, open, false) == Action::Urgent);
+        // Mid-pass a chunk doesn't take it (rule C has no request branch).
+        FlushHeuristic heuristic{params};
+        heuristic.NoteSubmit(1000);
+        const FlushState urgent{.pending = 3, .back_behind = true, .requested = true,
+                                .urgent = true};
+        FlushHeuristic::Decision decision{};
+        for (u32 i = 0; i < 2 * params.chunk_draws; ++i) {
+            decision = heuristic.Advance(1, urgent, 100'000);
+        }
+        REQUIRE(decision.action == FlushAction::Dispatch);
+    }
+    SECTION("idle back (c): two in flight, nobody waits: not submitted until the finish thread "
+            "publishes progress, then submitted with one still in flight") {
+        FlushHeuristic heuristic{params};
+        heuristic.NoteSubmit(1000);
+        const FlushState one{.pending = 1, .back_behind = false};
+        for (u32 i = 0; i < params.min_draws - 1; ++i) {
+            heuristic.Advance(1, one, 1000);
+        }
+        SubmitRequests requests;
+        // Two in flight: DXVK's threshold (6 chunks) is not reached: left.
+        REQUIRE(requests.AtIdleHook(false, true, false, open, open, rule_i(heuristic, 2, false)) ==
+                Action::Leave);
+        // The finish thread published a completion (one in flight): the GPU progress wake runs
+        // the idle hook again, and rule I submits the work while one is still in flight.
+        REQUIRE(requests.AtIdleHook(false, true, false, open, open, rule_i(heuristic, 1, false)) ==
+                Action::Sync);
+    }
+    SECTION("rule B at pass boundaries, rule C at chunks, nothing else") {
+        FlushHeuristic heuristic{params};
+        heuristic.NoteSubmit(1000);
+        const FlushState one{.pending = 1, .back_behind = false};
+        for (u32 i = 0; i < params.pass_min_draws; ++i) {
+            REQUIRE(heuristic.Advance(1, one, 1000).action != FlushAction::Flush);
+        }
+        const auto boundary =
+            heuristic.AtPassBoundary(FlushHint::Weak, one, 1000 + params.pass_interval_us);
+        REQUIRE(boundary.action == FlushAction::Flush);
+        REQUIRE(boundary.reason == FlushHeuristic::ReasonPass);
+    }
 }
 
 TEST_CASE("V2 P5b a landing wait asks for its fence's tick and an idle back submits it",

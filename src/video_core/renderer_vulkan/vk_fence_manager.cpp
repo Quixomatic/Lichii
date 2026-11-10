@@ -84,59 +84,27 @@ void InnerFence::Wait() {
     // A deferred fence flush (Scheduler::DeferFlush) may not be submitted yet. Only the
     // split's back may submit; other threads (the fencing thread) ask it to and wait. If the back
     // has stopped, nothing else uses the scheduler and Wait below submits it.
-    if (adaptive && !scheduler.IsSubmitted(wait_tick) && VideoCommon::GpuSplit::Get().Active() &&
-        !VideoCommon::GpuSplit::OnBackThread()) [[unlikely]] {
-        // F4-02: the request is made at once while a host syncpoint wait is open, after
-        // LazyWindow otherwise; the back serves it at its next pass boundary or chunk (RequestGap
-        // after its last submission), an urgent one at its next idle hook, so requests made close
-        // together share one submission. Past RequestGap (host wait) or EscalateWindow it is
-        // forced through WaitSubmitted's urgent request below.
-        constexpr auto LazyWindow = std::chrono::milliseconds{1};
-        constexpr auto RequestGap = std::chrono::microseconds{500};
-        constexpr auto EscalateWindow = std::chrono::milliseconds{4};
-        std::chrono::steady_clock::time_point guest_since{};
+    if ((adaptive || lazy) && !scheduler.IsSubmitted(wait_tick) &&
+        VideoCommon::GpuSplit::Get().Active() && !VideoCommon::GpuSplit::OnBackThread())
+        [[unlikely]] {
+        // SYNC_SUBMIT_SPEC §2.5: the fencing thread is not a guest waiter. It waits for the
+        // submission the back makes anyway (rule B at a pass boundary, C at a chunk, I when the
+        // back goes idle with the GPU about to idle; a fence carrying captures counts as work
+        // then), and files rule W (one urgent request, served at the back's next entry boundary)
+        // only while a guest thread waits on a host syncpoint value (46e10b8289). No LazyWindow
+        // / RequestGap / EscalateWindow timers (SESSION_HANDOFF §5 "lazy fences must request a
+        // flush after a bounded time, and immediately while the guest waits on them": the bound
+        // is the next boundary, chunk or idle hook).
+        auto& split = VideoCommon::GpuSplit::Get();
         bool requested = false;
-        bool urgent = false;
         for (u32 spins = 0; !scheduler.IsSubmitted(wait_tick); ++spins) {
-            const auto now = std::chrono::steady_clock::now();
-            if (!VideoCommon::GpuSplit::Get().BackRunning() || now - queued_at >= EscalateWindow) {
+            if (!split.BackRunning()) {
                 break;
             }
-            const bool guest = host_waits();
-            if ((!requested && now - queued_at >= LazyWindow) || (guest && !urgent)) {
-                scheduler.RequestLazyFlush(wait_tick, guest);
+            if (!requested && host_waits()) {
+                scheduler.RequestLazyFlush(wait_tick, true);
+                split.RequestIdleHook();
                 requested = true;
-                urgent = guest;
-            }
-            if (guest) {
-                if (guest_since == std::chrono::steady_clock::time_point{}) {
-                    guest_since = now;
-                } else if (now - guest_since >= RequestGap) {
-                    break;
-                }
-            }
-            if (spins < 16) {
-                std::this_thread::yield();
-            } else {
-                std::this_thread::sleep_for(std::chrono::microseconds{50});
-            }
-        }
-        if (!requested) {
-            scheduler.RequestLazyFlush(wait_tick, false);
-        }
-    } else if (lazy && !scheduler.IsSubmitted(wait_tick) && VideoCommon::GpuSplit::Get().Active() &&
-        !VideoCommon::GpuSplit::OnBackThread()) {
-        // A lazy fence (early downloads) goes with the next submission the back makes anyway
-        // (~1 per ms in heavy scenes). Only if none came within LazyWindow, or a guest thread
-        // waits on a host syncpoint, does it ask for one, so the operations behind it never wait
-        // long.
-        constexpr auto LazyWindow = std::chrono::milliseconds{1};
-        for (u32 spins = 0; !scheduler.IsSubmitted(wait_tick); ++spins) {
-            const bool guest = host_waits();
-            if (std::chrono::steady_clock::now() - queued_at >= LazyWindow || guest ||
-                !VideoCommon::GpuSplit::Get().BackRunning()) {
-                scheduler.RequestLazyFlush(wait_tick, guest);
-                break;
             }
             if (spins < 16) {
                 std::this_thread::yield();

@@ -236,18 +236,27 @@ public:
 private:
     Decision DecideAtChunk(u32 chunks, const FlushState& state, u64 now_us) const noexcept {
         const u64 since = now_us - last_submit_us;
-        if (hint >= FlushHint::Strong && chunks >= params.strong_chunks) {
-            return {FlushAction::Flush, ReasonStrong};
-        }
         if (params.pass_boundaries) {
-            // F4-03: mid-pass only the safety nets (max draws and cost are checked by Advance).
-            if (state.urgent && since >= params.request_gap_us) {
-                return {FlushAction::Flush, ReasonRequest};
+            // SYNC_SUBMIT_SPEC §2.5 rule C (MP §5.5, DXVK GpuFlushTracker): mid-pass only the
+            // pending rule. With busy_pending submissions in flight, min(20, pending × 3) chunks;
+            // with fewer (the GPU is about to go idle) once the work is worth one (min_draws,
+            // and Ryujinx's AutoFlushCounter interval since the last submission, so a pass is
+            // cut at most once per pass_interval_us). No waiter's request (rule W is served at
+            // the back's entry boundary), no hint (rule B weighs hints at the pass boundary).
+            // Max draws and cost stay in Advance.
+            if (state.pending >= params.busy_pending) {
+                if (chunks >= (std::min)(params.max_chunk_threshold, state.pending * 3)) {
+                    return {FlushAction::Flush, ReasonPending};
+                }
+                return {};
             }
-            if (since >= params.mid_pass_interval_us) {
-                return {FlushAction::Flush, ReasonInterval};
+            if (draws >= params.min_draws && since >= params.pass_interval_us) {
+                return {FlushAction::Flush, ReasonIdle};
             }
             return {};
+        }
+        if (hint >= FlushHint::Strong && chunks >= params.strong_chunks) {
+            return {FlushAction::Flush, ReasonStrong};
         }
         // Ryujinx: the guest is waiting on unsubmitted work. Not while the recorder is behind:
         // then the wait is the recorder's speed, and more submits only slow it further.

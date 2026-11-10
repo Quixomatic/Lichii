@@ -4918,6 +4918,15 @@ void RasterizerVulkan::ServeSplitIdleHook() {
             }
             self.SyncAdaptiveTick();
             const auto state = self.ReadFlushState();
+            // SYNC_SUBMIT_SPEC §2.5 rule I: a lazy fence in the open tick that carries operations
+            // still to land (a deferred QMD reduction, a counter report) is a synchronization
+            // point (DXVK): with the GPU about to go idle it is worth a submission, so it lands
+            // although no draw follows it and nobody blocks on it yet.
+            if (state.pending < self.flush_heuristic.Params().busy_pending &&
+                VideoCommon::V2::LandingFence::TickForPending() >=
+                    self.scheduler.CurrentTick()) {
+                return true;
+            }
             if (!self.adaptive_flush_fed) {
                 // Titles without native tiling keep the draw cadence of FlushWork: only the
                 // pending rule applies.

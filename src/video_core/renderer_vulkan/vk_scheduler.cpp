@@ -300,15 +300,9 @@ void Scheduler::ServeSplitIdleHook(bool (*sync_due)(void*), void* argument) {
         P5b::Add(P5b::Counter::SubmitsDeferred);
         break;
     case IdleAction::Urgent:
-        if (VideoCommon::GpuSplit::Get().HookBetweenEntries() &&
-            master_semaphore->CurrentTick() >= master_semaphore->KnownGpuTick() + 3) {
-            // Coalesced (§5.5): a waiter asked between two entries while two submissions are
-            // still in flight. Its tick can't start before they finish; the back keeps recording
-            // and its next pass boundary, chunk (request gap) or idle hook submits it together
-            // with every other request made meanwhile.
-            P5b::Add(P5b::Counter::IdleUrgentCoalesced);
-            return;
-        }
+        // SYNC_SUBMIT_SPEC §2.5 rule W: a thread blocks on the open tick; served at this entry
+        // boundary (requests filed since the previous one share this submit), with no "two in
+        // flight → postpone" exception (d1435e18fd's coalescing branch removed).
         P5b::Add(P5b::Counter::IdleUrgent);
         P5b::Add(P5b::Counter::SubmitsWaiter);
         break;
@@ -325,6 +319,15 @@ void Scheduler::OnGpuProgress() {
     // Finish thread, a completion published. A front channel suspended on a command list copy
     // (DmaPusher's pending list tick) may go on: end the front's pending sleep (W-01b).
     VideoCommon::V2::FrontWake::Ring();
+    // SYNC_SUBMIT_SPEC §2.5 "GPU progress wake" (DXVK's "about to go idle" point, ALL_FINDINGS_R2
+    // P5b row 1): fewer than two submissions still in flight while the back sleeps: its idle hook
+    // re-evaluates rule I (it submits open work only if DXVK's rule holds; nothing open, nothing
+    // happens). Not a wait for full idle.
+    auto& split = VideoCommon::GpuSplit::Get();
+    if (lazy_fences && split.BackIdle() &&
+        master_semaphore->CurrentTick() < master_semaphore->KnownGpuTick() + 3) {
+        split.RequestIdleHook();
+    }
 }
 
 bool Scheduler::DeferFlush() {
@@ -355,17 +358,10 @@ void Scheduler::FlushDeferred() {
         Flush();
         return;
     }
-    if (submit_requests.Open(CurrentTick())) [[unlikely]] {
-        if (lazy_fences) {
-            // F4-X2 chunk B2 (d5e4: 16.4 submits/f here): called after every delayed fence (now
-            // every tracked QMD reduction), mid-entry. A lazy fence's window request rides the
-            // pass boundary; an urgent one submits now unless two submissions are in flight,
-            // then the next boundary, chunk or idle hook takes it with the others (coalesced).
-            if (!submit_requests.Urgent(CurrentTick()) ||
-                master_semaphore->CurrentTick() >= master_semaphore->KnownGpuTick() + 3) {
-                return;
-            }
-        }
+    // SYNC_SUBMIT_SPEC §2.5: with lazy fences an open request is rule W, served at the back's
+    // next entry boundary (the idle hook between entries) or by a pass boundary, never mid-entry
+    // here (63eeb187d1 / d5e4: ~18 submits/f cut passes from this call after delayed fences).
+    if (!lazy_fences && submit_requests.Open(CurrentTick())) [[unlikely]] {
         VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::FlushLazy);
         VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::SubmitsWaiter);
         Flush();
