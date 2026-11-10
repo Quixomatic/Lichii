@@ -114,11 +114,11 @@ inline std::atomic<u64> untracked_landed{0};
 /// run in the order they were captured: one of a later entry ran, so did every earlier one; and
 /// once the newest ticket captured ran, so did every operation of the entries consumed.
 [[nodiscard]] inline u64 UntrackedSettled(u64 consumed) {
-    const u64 issued = untracked_issued.load(std::memory_order_acquire);
-    const u64 landed = untracked_landed.load(std::memory_order_acquire);
-    const u64 position = UntrackedPosition(landed);
+    const u64 newest_issued = untracked_issued.load(std::memory_order_acquire);
+    const u64 newest_landed = untracked_landed.load(std::memory_order_acquire);
+    const u64 position = UntrackedPosition(newest_landed);
     const u64 before = position != 0 ? position - 1 : 0;
-    return landed >= issued ? std::max(consumed, before) : before;
+    return newest_landed >= newest_issued ? std::max(consumed, before) : before;
 }
 
 inline void RaiseTo(std::atomic<u64>& value, u64 position) {
@@ -175,10 +175,12 @@ inline u64 CaptureUntracked(u64 address, u64 size) {
 /// Back: the newest untracked ticket still to land whose write overlaps [address, address +
 /// size), 0 when none (conservative once a range still to land fell out of the slots).
 [[nodiscard]] inline u64 UntrackedTargetFor(u64 address, u64 size) {
-    const u64 landed = untracked_landed.load(std::memory_order_acquire);
-    u64 target = untracked_evicted > landed ? untracked_issued.load(std::memory_order_acquire) : 0;
+    const u64 newest_landed = untracked_landed.load(std::memory_order_acquire);
+    u64 target = untracked_evicted > newest_landed
+                     ? untracked_issued.load(std::memory_order_acquire)
+                     : 0;
     for (const UntrackedWrite& write : untracked_writes) {
-        if (write.ticket > landed && write.address < address + size &&
+        if (write.ticket > newest_landed && write.address < address + size &&
             address < write.address + write.size) {
             target = std::max(target, write.ticket);
         }
