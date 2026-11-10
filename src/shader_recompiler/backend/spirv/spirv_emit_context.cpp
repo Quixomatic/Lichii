@@ -16,6 +16,7 @@
 #include "common/common_types.h"
 #include "common/div_ceil.h"
 #include "shader_recompiler/backend/nvn_storage_descriptor.h"
+#include "shader_recompiler/backend/spirv/cbuf_bda.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/backend/spirv/emit_spirv_instructions.h"
 #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
@@ -285,11 +286,26 @@ void DefineConstBuffers(EmitContext& ctx, const Info& info, Id UniformDefinition
     ctx.MemberName(struct_type, 0, "data");
     ctx.MemberDecorate(struct_type, 0, spv::Decoration::Offset, 0U);
 
+    if (info.cbuf_bda_mask != 0) [[unlikely]] {
+        // EDEN_NX2_V2_CBUFBDA: the same block read through an address (cbuf_bda.h).
+        ctx.cbuf_bda_blocks.*member_type =
+            ctx.TypePointer(spv::StorageClass::PhysicalStorageBuffer, struct_type);
+        ctx.cbuf_bda_elements.*member_type =
+            ctx.TypePointer(spv::StorageClass::PhysicalStorageBuffer, type);
+        if (CbufBoundCount(info) == 0) {
+            return;
+        }
+    }
     const Id struct_pointer_type{ctx.TypePointer(spv::StorageClass::Uniform, struct_type)};
     const Id uniform_type{ctx.TypePointer(spv::StorageClass::Uniform, type)};
     ctx.uniform_types.*member_type = uniform_type;
 
     for (const ConstantBufferDescriptor& desc : info.constant_buffer_descriptors) {
+        if (UsesCbufBda(info, desc.index)) [[unlikely]] {
+            // No uniform buffer: verify keeps its binding (bound the old way too).
+            binding += info.cbuf_bda_keep_bindings ? desc.count : 0;
+            continue;
+        }
         const Id id{ctx.AddGlobalVariable(struct_pointer_type, spv::StorageClass::Uniform)};
         ctx.Decorate(id, spv::Decoration::Binding, binding);
         ctx.Decorate(id, spv::Decoration::DescriptorSet, 0U);
@@ -486,6 +502,7 @@ EmitContext::EmitContext(const Profile& profile_, const RuntimeInfo& runtime_inf
     AddCapability(spv::Capability::Shader);
     heap_push_needed = UsesAnyHeap(program.info);
     heap_words_pushed = program.info.heap_words_pushed;
+    cbuf_bda_mask = program.info.cbuf_bda_mask;
     DefineCommonTypes(program.info);
     DefineCommonConstants();
     DefineInterfaces(program);
@@ -577,7 +594,8 @@ void EmitContext::DefineCommonTypes(const Info& info) {
         U16 = Name(TypeInt(16, false), "u16");
         S16 = Name(TypeInt(16, true), "s16");
     }
-    if (info.uses_int64 && profile.support_int64) {
+    // EDEN_NX2_V2_CBUFBDA addresses are 64-bit (the host marks constant buffers only with int64).
+    if ((info.uses_int64 || info.cbuf_bda_mask != 0) && profile.support_int64) {
         AddCapability(spv::Capability::Int64);
         U64 = Name(TypeInt(64, false), "u64");
     }
@@ -1273,7 +1291,7 @@ void EmitContext::DefineRescalingInput(const Info& info) {
 }
 
 void EmitContext::DefineRescalingInputPushConstant() {
-    boost::container::static_vector<Id, 4> members{};
+    boost::container::static_vector<Id, 5> members{};
     u32 member_index{0};
 
     rescaling_textures_type = TypeArray(U32[1], Const(4u));
@@ -1336,7 +1354,7 @@ void EmitContext::DefineRenderArea(const Info& info) {
     }
 
     if (profile.unified_descriptor_binding) {
-        boost::container::static_vector<Id, 4> members{};
+        boost::container::static_vector<Id, 5> members{};
         u32 member_index{0};
 
         members.push_back(F32[4]);
@@ -1366,9 +1384,16 @@ void EmitContext::DefineConstantBuffers(const Info& info, u32& binding) {
     if (info.constant_buffer_descriptors.empty()) {
         return;
     }
+    if (info.cbuf_bda_mask != 0) [[unlikely]] {
+        DefineCbufBda(info);
+    }
     if (!profile.support_descriptor_aliasing) {
         DefineConstBuffers(*this, info, &UniformDefinitions::U32x4, binding, U32[4], 'u',
                            sizeof(u32[4]));
+        if (info.cbuf_bda_mask != 0) [[unlikely]] {
+            binding += CbufBoundCount(info);
+            return;
+        }
         for (const ConstantBufferDescriptor& desc : info.constant_buffer_descriptors) {
             binding += desc.count;
         }
@@ -1404,6 +1429,10 @@ void EmitContext::DefineConstantBuffers(const Info& info, u32& binding) {
     if (True(types & IR::Type::U32x2)) {
         DefineConstBuffers(*this, info, &UniformDefinitions::U32x2, binding, U32[2], 'u',
                            sizeof(u32[2]));
+    }
+    if (info.cbuf_bda_mask != 0) [[unlikely]] {
+        binding += CbufBoundCount(info);
+        return;
     }
     binding += static_cast<u32>(info.constant_buffer_descriptors.size());
 }
@@ -1692,8 +1721,24 @@ void EmitContext::DefineTextures(const Info& info, u32& binding, u32& scaling_in
     }
 }
 
-void EmitContext::AddHeapPushMember(boost::container::static_vector<Id, 4>& members,
+void EmitContext::AddHeapPushMember(boost::container::static_vector<Id, 5>& members,
                                     u32& member_index) {
+    if (cbuf_bda_mask != 0 && !cbuf_bda_push_placed) [[unlikely]] {
+        // The address member goes into the same block (one push constant block per stage).
+        if (heap_push_needed && !Sirit::ValidId(heap_push_block) && heap_push_member == 0) {
+            const Id array_type{
+                TypeArray(U32[1], Const(heap_words_pushed ? HEAP_PUSH_WORDS : 1U))};
+            Decorate(array_type, spv::Decoration::ArrayStride, 4U);
+            members.push_back(array_type);
+            heap_push_member = member_index++;
+        }
+        const Id array_type{TypeArray(U64, Const(cbuf_bda_count))};
+        Decorate(array_type, spv::Decoration::ArrayStride, CBUF_BDA_ADDRESS_BYTES);
+        members.push_back(array_type);
+        cbuf_bda_push_member = member_index++;
+        cbuf_bda_push_placed = true;
+        return;
+    }
     if (!heap_push_needed || Sirit::ValidId(heap_push_block) || heap_push_member != 0) {
         return;
     }
@@ -1704,6 +1749,13 @@ void EmitContext::AddHeapPushMember(boost::container::static_vector<Id, 4>& memb
 }
 
 void EmitContext::DecorateHeapPushMember(Id struct_type, Id block) {
+    if (cbuf_bda_push_placed && !Sirit::ValidId(cbuf_bda_push_block)) [[unlikely]] {
+        MemberDecorate(struct_type, cbuf_bda_push_member, spv::Decoration::Offset,
+                       cbuf_bda_offset);
+        MemberName(struct_type, cbuf_bda_push_member, "cbuf_addresses");
+        cbuf_bda_push_block = block;
+        cbuf_bda_push_pointer = TypePointer(spv::StorageClass::PushConstant, U64);
+    }
     if (!heap_push_needed || Sirit::ValidId(heap_push_block) || heap_push_member == 0) {
         return;
     }
@@ -1714,6 +1766,31 @@ void EmitContext::DecorateHeapPushMember(Id struct_type, Id block) {
 }
 
 void EmitContext::DefineHeapPush() {
+    if (cbuf_bda_mask != 0 && !cbuf_bda_push_placed) [[unlikely]] {
+        // A block of its own for the address member, with the heap member when the stage has it.
+        boost::container::static_vector<Id, 5> members{};
+        u32 member_index{0};
+        AddHeapPushMember(members, member_index);
+        const Id struct_type{TypeStruct(std::span(members.data(), members.size()))};
+        Decorate(struct_type, spv::Decoration::Block);
+        Name(struct_type, "CbufAddressPush");
+        const Id block{AddGlobalVariable(TypePointer(spv::StorageClass::PushConstant, struct_type),
+                                         spv::StorageClass::PushConstant)};
+        Name(block, "cbuf_address_push_constants");
+        if (heap_push_needed && !Sirit::ValidId(heap_push_block)) {
+            // Member 0: DecorateHeapPushMember's "already placed" test can't see it.
+            MemberDecorate(struct_type, heap_push_member, spv::Decoration::Offset,
+                           HEAP_PUSH_OFFSET);
+            MemberName(struct_type, heap_push_member, "heap_words");
+            heap_push_block = block;
+            heap_push_pointer = TypePointer(spv::StorageClass::PushConstant, U32[1]);
+        }
+        DecorateHeapPushMember(struct_type, block);
+        if (profile.supported_spirv >= 0x00010400) {
+            interfaces.push_back(block);
+        }
+        return;
+    }
     if (!heap_push_needed || Sirit::ValidId(heap_push_block)) {
         return;
     }
@@ -1733,6 +1810,51 @@ void EmitContext::DefineHeapPush() {
     if (profile.supported_spirv >= 0x00010400) {
         interfaces.push_back(heap_push_block);
     }
+}
+
+void EmitContext::DefineCbufBda(const Info& info) {
+    AddExtension("SPV_KHR_physical_storage_buffer");
+    AddCapability(spv::Capability::PhysicalStorageBufferAddresses);
+    SetMemoryModel(spv::AddressingModel::PhysicalStorageBuffer64, spv::MemoryModel::GLSL450);
+    cbuf_bda_base = info.cbuf_bda_base;
+    cbuf_bda_offset = info.cbuf_bda_offset;
+    cbuf_bda_pushed = info.cbuf_bda_pushed;
+    // Pushed: every address the push constants hold (the stages index one array); else the
+    // table's pointer.
+    cbuf_bda_count = cbuf_bda_pushed ? CbufBdaPushCapacity(cbuf_bda_offset) : 1U;
+    if (cbuf_bda_pushed) {
+        return;
+    }
+    const Id array_type{TypeRuntimeArray(U64)};
+    Decorate(array_type, spv::Decoration::ArrayStride, CBUF_BDA_ADDRESS_BYTES);
+    const Id struct_type{TypeStruct(array_type)};
+    Decorate(struct_type, spv::Decoration::Block);
+    MemberDecorate(struct_type, 0, spv::Decoration::Offset, 0U);
+    MemberDecorate(struct_type, 0, spv::Decoration::NonWritable);
+    Name(struct_type, "CbufAddressTable");
+    cbuf_bda_table_type = TypePointer(spv::StorageClass::PhysicalStorageBuffer, struct_type);
+    cbuf_bda_table_element = TypePointer(spv::StorageClass::PhysicalStorageBuffer, U64);
+}
+
+Id EmitContext::CbufBdaBlock(u32 index, Id UniformDefinitions::*member) {
+    const u32 slot{cbuf_bda_base +
+                   static_cast<u32>(std::popcount(cbuf_bda_mask & ((1U << index) - 1)))};
+    const Id push_member{Const(cbuf_bda_push_member)};
+    Id address{};
+    if (cbuf_bda_pushed) {
+        address = OpLoad(U64, OpAccessChain(cbuf_bda_push_pointer, cbuf_bda_push_block,
+                                            push_member, Const(slot)));
+    } else {
+        // The draw's table: one address per index.
+        const Id table_address{OpLoad(U64, OpAccessChain(cbuf_bda_push_pointer,
+                                                         cbuf_bda_push_block, push_member,
+                                                         u32_zero_value))};
+        const Id table{OpConvertUToPtr(cbuf_bda_table_type, table_address)};
+        const Id entry{
+            OpAccessChain(cbuf_bda_table_element, table, u32_zero_value, Const(slot))};
+        address = OpLoad(U64, entry, spv::MemoryAccessMask::Aligned, CBUF_BDA_ADDRESS_BYTES);
+    }
+    return OpConvertUToPtr(cbuf_bda_blocks.*member, address);
 }
 
 void EmitContext::DefineHeapWords() {

@@ -406,6 +406,17 @@ struct Info {
     bool heap_words_pushed{};
     /// Why descriptors of this stage were left out of the heap (host bits, for the stats).
     u32 heap_block_reasons{};
+    /// Pipeline v2 F2-02 (d) (EDEN_NX2_V2_CBUFBDA, backend/spirv/cbuf_bda.h): constant buffers (by
+    /// cbuf index) read through a buffer device address instead of a uniform buffer binding; the
+    /// stage's first address index; the push constant offset of the addresses (or of the address
+    /// table's pointer); whether the addresses are pushed or in the table; whether those
+    /// constant buffers keep their bindings (verify binds them the old way too). Set by the host
+    /// before emission; a zero mask emits the program exactly as before.
+    u32 cbuf_bda_mask{};
+    u32 cbuf_bda_base{};
+    u32 cbuf_bda_offset{};
+    bool cbuf_bda_pushed{};
+    bool cbuf_bda_keep_bindings{};
     /// Texture handles the shader reads from storage buffers, as programs over constant buffer
     /// and storage buffer words (see EvaluateHandleProgram), evaluated for each draw.
     std::vector<std::vector<u32>> handle_programs;

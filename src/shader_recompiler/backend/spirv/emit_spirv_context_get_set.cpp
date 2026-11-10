@@ -131,6 +131,13 @@ Id GetCbuf(EmitContext& ctx, Id result_type, Id UniformDefinitions::*member_ptr,
     if (!binding.IsImmediate()) {
         return ctx.OpFunctionCall(result_type, indirect_func, ctx.Def(binding), buffer_offset);
     }
+    if (ctx.UsesCbufBdaSlot(binding.U32())) [[unlikely]] {
+        // EDEN_NX2_V2_CBUFBDA: read at an immediate offset from the block at its address.
+        const Id block{ctx.CbufBdaBlock(binding.U32(), member_ptr)};
+        const Id pointer{ctx.OpAccessChain(ctx.cbuf_bda_elements.*member_ptr, block,
+                                           ctx.u32_zero_value, buffer_offset)};
+        return ctx.OpLoad(result_type, pointer, spv::MemoryAccessMask::Aligned, element_size);
+    }
 
     const Id cbuf{ctx.cbufs[binding.U32()].*member_ptr};
     const Id access_chain{ctx.OpAccessChain(uniform_type, cbuf, ctx.u32_zero_value, buffer_offset)};

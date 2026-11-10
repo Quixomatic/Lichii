@@ -365,6 +365,30 @@ public:
     /// `word`.
     Id HeapWord(u32 word, const IR::Value& index, bool arrayed);
 
+    // EDEN_NX2_V2_CBUFBDA (cbuf_bda.h): constant buffers read through addresses. Per element
+    // type, PhysicalStorageBuffer pointers to the constant buffer block and to one element; the
+    // push constant block holding the addresses (or the table pointer), its member, a pointer
+    // type to one of them; the address table's pointer types.
+    UniformDefinitions cbuf_bda_blocks;
+    UniformDefinitions cbuf_bda_elements;
+    Id cbuf_bda_push_block{};
+    u32 cbuf_bda_push_member{};
+    bool cbuf_bda_push_placed{};
+    Id cbuf_bda_push_pointer{};
+    Id cbuf_bda_table_type{};
+    Id cbuf_bda_table_element{};
+    u32 cbuf_bda_mask{};
+    u32 cbuf_bda_base{};
+    u32 cbuf_bda_offset{};
+    u32 cbuf_bda_count{}; ///< the pipeline's pushed addresses (cbuf_bda_pushed), else 1
+    bool cbuf_bda_pushed{};
+
+    [[nodiscard]] bool UsesCbufBdaSlot(u32 index) const {
+        return index < 32 && ((cbuf_bda_mask >> index) & 1) != 0;
+    }
+    /// A PhysicalStorageBuffer pointer to constant buffer `index` as a block of `member` elements.
+    Id CbufBdaBlock(u32 index, Id UniformDefinitions::*member);
+
     Id local_memory{};
 
     bool uses_explicit_workgroup_layout{};
@@ -503,11 +527,14 @@ private:
     void DefineHeapWords();
     /// Appends the heap push member to a push constant block being built (`members`), when the
     /// stage needs it and no block holds it yet; DecorateHeapPushMember decorates it once the
-    /// block's struct exists.
-    void AddHeapPushMember(boost::container::static_vector<Id, 4>& members, u32& member_index);
+    /// block's struct exists. The same for the constant buffer address member (CBUFBDA).
+    void AddHeapPushMember(boost::container::static_vector<Id, 5>& members, u32& member_index);
     void DecorateHeapPushMember(Id struct_type, Id block);
-    /// A push constant block of its own for the heap member (no other block in the stage).
+    /// A push constant block of its own for the heap and address members (no other block in the
+    /// stage).
     void DefineHeapPush();
+    /// EDEN_NX2_V2_CBUFBDA: the addressing model, the address member's and table's types.
+    void DefineCbufBda(const Info& info);
     Id HeapArray(Id image_type, u32 heap_binding, bool coherent);
     void DefineImages(const Info& info, u32& binding, u32& scaling_index);
     void DefineAttributeMemAccess(const Info& info);
