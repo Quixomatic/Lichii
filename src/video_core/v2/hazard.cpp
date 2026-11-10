@@ -332,37 +332,24 @@ HazardResult HazardTable::Find(u64 address, u64 size, u64 consumed, const Hazard
 }
 
 AcquireDecision DecideAcquire(SemaphoreOp op, u32 value, const HazardResult& word, u32 forwarded,
-                              u32 memory_word, u64 pending_dispatch,
-                              const HazardResult& unlanded) {
-    if (unlanded.kind != HazardResult::Kind::Clear) {
-        // A fence-flagged release to the word that isn't in memory: the query cache writes it when
-        // its fence runs on the host (after the GPU work before it), not when the back runs it. The
-        // drained path waits for that too, so it never meets the acquire here. With other writes
-        // queued the drained path decides; with none, memory does (as the drained path reads it).
-        if (word.kind != HazardResult::Kind::Clear) {
-            return {AcquireVerdict::Fallback, word.position};
-        }
-        if (!SemaphoreWaitsToReach(op) && pending_dispatch != 0) {
-            return {AcquireVerdict::WaitFor, pending_dispatch};
-        }
-        return {SemaphoreMet(op, memory_word, value) ? AcquireVerdict::Met
-                                                     : AcquireVerdict::NotMet,
-                0};
-    }
+                              u32 memory_word, u64 pending_dispatch) {
     switch (word.kind) {
     case HazardResult::Kind::Wait:
-        // A queued counter report or reduction: the front can't tell what it leaves.
+        // A counter report or reduction (queued, or not landed): the front can't tell what it
+        // leaves.
         return {AcquireVerdict::Fallback, word.position};
     case HazardResult::Kind::Forward:
         if (!word.covered) {
             return {AcquireVerdict::Fallback, word.position};
         }
         if (!SemaphoreMet(op, forwarded, value)) {
-            return {AcquireVerdict::Fallback, word.position};
+            // The newest write to the word doesn't meet it: only a later release can.
+            return {AcquireVerdict::NotMet, word.position};
         }
-        // The host runs the release before the acquire's channel goes on. A dispatch queued
-        // after the release may release the word again (QMD releases the front can't see).
-        if (!SemaphoreWaitsToReach(op) && pending_dispatch > word.position) {
+        // Class B: the host runs the release before the acquire's channel goes on. A dispatch
+        // queued after the release may release the word again (QMD releases the front can't
+        // see).
+        if (!SemaphoreWaitsToReach(op) && pending_dispatch > RingPositionOf(word)) {
             return {AcquireVerdict::WaitFor, pending_dispatch};
         }
         return {AcquireVerdict::MetByQueued, word.position};

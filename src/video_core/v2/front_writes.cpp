@@ -24,36 +24,47 @@ constexpr u64 MaxRangePages = 64;
 
 } // Anonymous namespace
 
+bool FencesDelayed() {
+    return Settings::IsGPUFenceBehaviorDefault()
+               ? Settings::IsGPULevelHigh()
+               : Settings::IsGPUFenceBehaviorBalanced() || Settings::IsGPUFenceBehaviorAccurate();
+}
+
 void NoteReleaseWrite(GpuSplit& split, const Tegra::MemoryManager& memory, GPUVAddr address,
-                      u32 payload, u32 bytes, bool known, Producer producer, bool fenced) {
+                      u32 payload, u32 bytes, bool known, Producer producer, bool fenced,
+                      bool reduction) {
     const auto device = memory.GpuToCpuAddress(address);
     if (!device) {
         return; // The back drops it too (the query cache skips unmapped reports)
     }
-    if (!known) {
-        // A counter or reduction: in memory when the query cache's operation runs.
-        split.NoteRangeWrite(*device, bytes, producer);
-        split.NoteUnlandedRange(*device, bytes);
-        return;
-    }
-    if (bytes <= 4) {
-        split.NoteKnownWrite(*device, &payload, sizeof(payload), producer);
-        if (fenced) {
-            split.NoteUnlandedWrite(*device, &payload, sizeof(payload));
+    // Where the back writes it (QueryCacheBase::CounterReport, KeplerCompute's reduction): at an
+    // operation, or at once. A write made at once while an earlier one may still land is
+    // deferred by the back (Landing::MustDefer); LandingPending is the front's conservative
+    // view of that.
+    const bool at_once = reduction ? !FencesDelayed()
+                                   : known && !fenced && !Settings::IsGPULevelHigh();
+    if (at_once && !split.LandingPending()) {
+        if (!known) {
+            split.NoteRangeWrite(*device, bytes, producer);
+        } else if (bytes <= 4) {
+            split.NoteKnownWrite(*device, &payload, sizeof(payload), producer);
+        } else {
+            const std::array<u32, 2> value{payload, 0};
+            split.NoteKnownWrite(*device, value.data(), sizeof(value), producer);
+            split.NoteRangeWrite(*device + 8, bytes - 8, producer);
         }
         return;
     }
-    // The payload as 64 bits, then a timestamp the front can't tell.
-    const std::array<u32, 2> value{payload, 0};
-    split.NoteKnownWrite(*device, value.data(), sizeof(value), producer);
-    split.NoteRangeWrite(*device + 8, bytes - 8, producer);
-    if (fenced) {
-        split.NoteUnlandedWrite(*device, value.data(), sizeof(value));
-    }
-    if (fenced || Settings::IsGPULevelHigh()) {
-        // The timestamp is written by the query cache's operation (below High accuracy an
-        // unfenced payload report is written at once, when the back runs it).
-        split.NoteUnlandedRange(*device + 8, bytes - 8);
+    const u64 ticket = split.NextLandingTicket();
+    if (!known) {
+        split.NoteUnlandedRange(*device, bytes, ticket);
+    } else if (bytes <= 4) {
+        split.NoteUnlandedWrite(*device, &payload, sizeof(payload), ticket);
+    } else {
+        // The payload as 64 bits, then a timestamp only the operation knows.
+        const std::array<u32, 2> value{payload, 0};
+        split.NoteUnlandedWrite(*device, value.data(), sizeof(value), ticket);
+        split.NoteUnlandedRange(*device + 8, bytes - 8, ticket);
     }
 }
 
@@ -189,7 +200,7 @@ void NoteReportCompute(GpuSplit& split, const Tegra::MemoryManager& memory, cons
     const bool reduction = ((control >> 3) & 1) != 0;
     const bool one_word = ((control >> 28) & 1) != 0;
     NoteReleaseWrite(split, memory, address, registers[0x6c2], reduction || one_word ? 4 : 16,
-                     !reduction, Producer::Report, one_word);
+                     !reduction, Producer::Report, one_word, reduction);
 }
 
 void DmaWriteTracker::Note(GpuSplit& split, const Tegra::MemoryManager& memory, u32 method,

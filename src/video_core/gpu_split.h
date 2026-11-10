@@ -232,11 +232,10 @@ public:
     /// An open StateRun stays open: its record is already in the ring, so the write position is
     /// its end, the back stores `consumed` only after the whole run and tags every method of it
     /// with that end (Landing::tag). Waiting for the position covers the write (and at most the
-    /// rest of the run). Only writes that can land at a fence cut the run, so that each one has
-    /// its own landing position (NoteUnlandedWrite retires by landing).
+    /// rest of the run). Writes that land at an operation go to NoteUnlandedWrite instead, by
+    /// landing ticket.
     void NoteKnownWrite(u64 device_address, const void* bytes, u32 size, V2::Producer producer) {
         FlushCbWrite();
-        CutForLanding(producer);
         PrepareHazardNote();
         hazards.NoteKnown(device_address, bytes, size, write_position, producer);
     }
@@ -244,7 +243,6 @@ public:
         if (producer != V2::Producer::CbData) {
             FlushCbWrite();
         }
-        CutForLanding(producer);
         PrepareHazardNote();
         hazards.NoteRange(device_address, size, write_position, producer);
     }
@@ -268,13 +266,22 @@ public:
             FlushCbWriteSlow();
         }
     }
-    /// Front: the queued writes to a device range that `filter` orders against (V2::HazardTable).
+    /// Front: the writes to a device range that `filter` orders against (V2::HazardTable): the
+    /// queued ones and, for releases and reports, those still to land (one table each: a
+    /// release that lands at an operation is only in `unlanded`, by its landing ticket). Forward
+    /// applies the landing releases first, then the queued writes; when a landing release is
+    /// not older than every queued store applied, the answer is Wait for those queued stores.
     [[nodiscard]] V2::HazardResult FindWrites(u64 device_address, u64 size,
                                               const V2::HazardFilter& filter, u8* out = nullptr) {
         FlushCbWrite();
         const u64 done = ConsumedNow();
         hazards.Retire(done);
-        return hazards.Find(device_address, size, done, filter, out);
+        constexpr u32 landing_producers =
+            V2::ProducerBit(V2::Producer::Release) | V2::ProducerBit(V2::Producer::Report);
+        if ((filter.ranged & landing_producers) == 0 || unlanded.Size() == 0) {
+            return hazards.Find(device_address, size, done, filter, out);
+        }
+        return FindWithLanding(device_address, size, done, filter, out);
     }
     [[nodiscard]] u64 PendingUnboundedWrite(V2::Producer producer) const {
         return hazards.PendingUnbounded(producer, ConsumedNow());
@@ -300,32 +307,49 @@ public:
     [[nodiscard]] u64 SyncPosition() const {
         return std::min(last_sync_position, write_position);
     }
-    /// Front: a fence-flagged release of known bytes was just sent. It is in memory only once
-    /// its fence ran (v2/landing.h); until then FindUnlanded forwards it.
-    void NoteUnlandedWrite(u64 device_address, const void* bytes, u32 size) {
-        IrCut();
+    /// Front: the landing ticket (v2/landing.h) of a release just sent that lands at a query
+    /// cache operation: the write position and its index among such writes of that entry. The
+    /// run is not cut per release; only one that filled an entry's indices is cut.
+    [[nodiscard]] u64 NextLandingTicket() {
+        if (write_position != ticket_position) {
+            ticket_position = write_position;
+            ticket_sub = 0;
+        } else if (ticket_sub < V2::Landing::SubMask) {
+            ++ticket_sub;
+        }
+        if (ticket_sub == V2::Landing::SubMask) [[unlikely]] {
+            IrCut(); // The next landing write goes to a new entry
+        }
+        last_ticket = V2::Landing::Ticket(ticket_position, ticket_sub);
+        return last_ticket;
+    }
+    /// Front: whether a release noted earlier may not have landed yet: the back then defers a
+    /// CPU-visible write it would make at once (Landing::MustDefer), so it lands at an
+    /// operation too. Conservative: the back defers only if this held when the write was noted.
+    [[nodiscard]] bool LandingPending() const {
+        return last_ticket > V2::Landing::landed.load(std::memory_order_acquire);
+    }
+    /// Front: a release of known bytes just sent that lands at an operation (fence-flagged, at
+    /// High accuracy, or deferred behind an earlier one), with its landing ticket. Until it lands
+    /// FindWrites forwards it.
+    void NoteUnlandedWrite(u64 device_address, const void* bytes, u32 size, u64 ticket) {
         if (unlanded.Size() == V2::HazardTable::Capacity) [[unlikely]] {
             unlanded.Retire(V2::Landing::landed.load(std::memory_order_acquire));
         }
-        unlanded.NoteKnown(device_address, bytes, size, write_position, V2::Producer::Release);
+        unlanded.NoteKnown(device_address, bytes, size, ticket, V2::Producer::Release);
     }
-    /// Front: a report whose bytes the front can't tell (a counter, a timestamp) was just sent;
-    /// the query cache writes it when its operation runs (v2/landing.h). Until it lands,
-    /// FindUnlanded answers Wait for its range: reads of it take the back's flushes, reads of
-    /// the rest of its page don't (no sticky report pages).
-    void NoteUnlandedRange(u64 device_address, u64 size) {
+    /// Front: a report whose bytes the front can't tell (a counter, a timestamp) just sent; the
+    /// query cache writes it when its operation runs. Until it lands FindWrites answers Wait
+    /// (landing) for its range, and only for its range.
+    void NoteUnlandedRange(u64 device_address, u64 size, u64 ticket) {
         if (unlanded.Size() == V2::HazardTable::Capacity) [[unlikely]] {
             unlanded.Retire(V2::Landing::landed.load(std::memory_order_acquire));
         }
-        unlanded.NoteRange(device_address, size, write_position, V2::Producer::Report);
+        unlanded.NoteRange(device_address, size, ticket, V2::Producer::Report);
     }
-    /// Front: the fence-flagged releases to a device range that are not in memory yet, queued
-    /// or run by the back (Forward applies their bytes over `out`).
-    [[nodiscard]] V2::HazardResult FindUnlanded(u64 device_address, u64 size, u8* out) {
-        const u64 landed = V2::Landing::landed.load(std::memory_order_acquire);
-        unlanded.Retire(landed);
-        return unlanded.Find(device_address, size, landed, V2::HazardFilter{}, out);
-    }
+    /// Front: waits until `ticket` landed (class D strict, class B verify). Asks the back to
+    /// submit what it deferred while waiting, never drains. False after `timeout_us`.
+    bool WaitLanded(u64 ticket, DrainSite site, u64 timeout_us);
     /// Any thread, EDEN_NX2_V2_CPULANE: has the back run `hook` after its current entry (or at
     /// once if it waits for work).
     /// EDEN_NX2_V2_XFERQ: run on the back at every host-level sync position (NoteSync). Set by
@@ -647,6 +671,8 @@ private:
         }
     }
     void FlushCbWriteSlow();
+    V2::HazardResult FindWithLanding(u64 device_address, u64 size, u64 done,
+                                     const V2::HazardFilter& filter, u8* out);
     void PrepareHazardNote() {
         if (hazards.Size() == V2::HazardTable::Capacity) [[unlikely]] {
             hazards.Retire(consumed.load(std::memory_order_acquire));
@@ -708,13 +734,6 @@ private:
     void IrCut() {
         if (ir_run != nullptr) [[unlikely]] {
             IrCloseRun();
-        }
-    }
-    /// Releases and reports may land only when their fence runs (v2/landing.h): the methods
-    /// after one start a new record, so a later landing never retires it early.
-    void CutForLanding(V2::Producer producer) {
-        if (producer == V2::Producer::Release || producer == V2::Producer::Report) {
-            IrCut();
         }
     }
     /// Closes the open run and reserves a record of `words` with its header and sequence
@@ -863,7 +882,10 @@ private:
     u32 map_epoch{};        ///< MapEpoch
     u64 front_spin_start{};
     V2::HazardTable hazards;
-    V2::HazardTable unlanded; ///< Fence-flagged known releases until they land (Landing)
+    V2::HazardTable unlanded; ///< Writes that land at an operation, by landing ticket (Landing)
+    u64 ticket_position{};    ///< NextLandingTicket: the entry and index of the last ticket
+    u64 ticket_sub{};
+    u64 last_ticket{};
     u64 back_entry_position{}; ///< Back: ring position of the entry it runs (TracksWrites)
 
     // Back side.

@@ -71,7 +71,20 @@ struct HazardResult {
     u32 producers = 0;
     /// Wait: the table overflowed (or a scan was too long) rather than a known write overlapping.
     bool overflow = false;
+    /// GpuSplit::FindWrites: `position` is a landing ticket (v2/landing.h), not a ring position.
+    /// Wait: a write only the query cache's operation makes (a counter, a timestamp) hasn't
+    /// landed; waiting for the back to consume doesn't settle it. Forward: the newest store
+    /// applied is a release still to land.
+    bool landing = false;
 };
+
+/// Landing tickets (v2/landing.h): ring position << LandingSubBits | index within the entry.
+inline constexpr u64 LandingSubBits = 8;
+
+/// The ring position of a result's `position` (landing tickets are converted).
+[[nodiscard]] constexpr u64 RingPositionOf(const HazardResult& result) {
+    return result.landing ? result.position >> LandingSubBits : result.position;
+}
 
 class HazardTable {
 public:
@@ -214,22 +227,20 @@ struct AcquireDecision {
     u64 position = 0;
 };
 
-/// Decides an acquire from the table's answer for its word (`word`, `forwarded`: the word's
-/// value if Forward), memory's word now, and the newest queued compute dispatch (0 if none),
-/// whose QMD releases the front can't see.
-///   Pending unknown write (counter report, reduction) or partly known: Fallback.
-///   Pending known write: its value decides (MetByQueued: the host runs it before the acquire's
-///     channel goes on; Fallback when it doesn't meet the acquire). Equal and mask acquires
-///     first wait for a dispatch queued after it.
-///   Nothing pending: memory decides; equal and mask acquires first wait for queued dispatches
-///     (a word that only advances can't be moved back by them).
-/// `unlanded`: the fence-flagged releases to the word not in memory yet (GpuSplit::FindUnlanded,
-/// queued or run by the back). They land only when their fence runs, so they never meet the
-/// acquire (Fix pass 1: forwarding them passed acquires the drained path waits on). With one
-/// pending, other queued writes give Fallback and memory alone decides otherwise.
+/// Decides an acquire from the front's view of its word (GpuSplit::FindWrites over the queued
+/// writes and the releases still to land; `forwarded`: the word's value if Forward), memory's
+/// word now, and the newest queued compute dispatch (0 if none), whose QMD releases the front
+/// can't see (MASTER_PLAN §6):
+///   Pending unknown write (counter report, reduction) or partly known: Fallback (class D).
+///   Pending known write, queued or run but not landed, fence-flagged or not: the newest one's
+///     value decides. MetByQueued (class B): the host queue runs it before the acquire's channel
+///     goes on, and the landing rule (v2/landing.h) keeps later CPU-visible writes behind it.
+///     NotMet when it doesn't meet the acquire: only a later release can. Equal and mask
+///     acquires first wait for a dispatch queued after it.
+///   Nothing pending: memory decides (class A); equal and mask acquires first wait for queued
+///     dispatches (a word that only advances can't be moved back by them).
 [[nodiscard]] AcquireDecision DecideAcquire(SemaphoreOp op, u32 value, const HazardResult& word,
                                             u32 forwarded, u32 memory_word,
-                                            u64 pending_dispatch,
-                                            const HazardResult& unlanded = {});
+                                            u64 pending_dispatch);
 
 } // namespace VideoCommon::V2

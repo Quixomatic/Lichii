@@ -140,10 +140,21 @@ void KeplerCompute::ProcessNativeReportSemaphore(u32 argument) {
     }
     if ((argument >> 3) & 1) {
         const u32 reduction = (argument >> 9) & 7;
-        rasterizer->SignalFence([this, address, payload, reduction] {
+        // Written at its fence's operation. Without delayed fences that runs at once, unless an
+        // earlier write still has to land (v2/landing.h): then it lands behind it, in order.
+        namespace Landing = VideoCommon::V2::Landing;
+        const bool deferred = Landing::MustDefer();
+        const u64 landing =
+            deferred || VideoCommon::V2::FencesDelayed() ? Landing::Capture() : 0;
+        VideoCore::g_signaling_query_report_fence = deferred;
+        rasterizer->SignalFence([this, address, payload, reduction, landing] {
             memory_manager.Write<u32>(address, ReduceSemaphore(reduction, false,
                                                                memory_manager.Read<u32>(address), payload));
+            if (landing != 0) {
+                Landing::Note(landing);
+            }
         });
+        VideoCore::g_signaling_query_report_fence = false;
         return;
     }
     rasterizer->Query(address, VideoCommon::QueryType::Payload,
@@ -364,6 +375,8 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
                     qmd_address, fmt::join(descriptor, ","));
             }
         }
+        // The front can't see QMD releases (Producer::QmdRelease): they take no landing ticket.
+        const VideoCommon::V2::Landing::Untracked untracked;
         const auto error = native_qmd.Signal(qmd_address, argument,
             [&](u64 address, NativeQmdScheduler::Descriptor& descriptor) {
                 if (!memory_manager.IsFullyMappedRange(address, sizeof(descriptor))) return false;
@@ -2212,7 +2225,8 @@ void KeplerCompute::FrontModelQmd(VideoCommon::GpuSplit& split, FrontState& fs, 
             const auto pending =
                 split.FindWrites(*device, sizeof(descriptor), VideoCommon::V2::HazardFilter{},
                                  reinterpret_cast<u8*>(descriptor.data()));
-            return pending.kind == VideoCommon::V2::HazardResult::Kind::Wait
+            // A release still to land: the back reads memory, which doesn't hold it yet.
+            return pending.kind == VideoCommon::V2::HazardResult::Kind::Wait || pending.landing
                        ? QmdFront::ReadResult::Unknown
                        : QmdFront::ReadResult::Ok;
         };
@@ -2279,7 +2293,7 @@ bool KeplerCompute::FrontQmdWriteRanges(VideoCommon::GpuSplit& split, const u32*
             const V2::HazardResult pending =
                 split.FindWrites(*device, sizeof(descriptor), descriptor_filter,
                                  reinterpret_cast<u8*>(descriptor.data()));
-            if (pending.kind == V2::HazardResult::Kind::Wait) {
+            if (pending.kind == V2::HazardResult::Kind::Wait || pending.landing) {
                 return false;
             }
             out.emplace_back((GPUVAddr{descriptor[1]} << 32) | descriptor[0], descriptor[2]);
@@ -2341,7 +2355,7 @@ void KeplerCompute::FrontNoteInlineQmd(VideoCommon::GpuSplit& split, FrontState&
             const V2::HazardResult pending =
                 split.FindWrites(*device, sizeof(descriptor), descriptor_filter,
                                  reinterpret_cast<u8*>(descriptor.data()));
-            if (pending.kind == V2::HazardResult::Kind::Wait) {
+            if (pending.kind == V2::HazardResult::Kind::Wait || pending.landing) {
                 split.NoteUnboundedWrite(Producer::Dispatch);
                 return;
             }

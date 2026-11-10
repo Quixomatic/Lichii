@@ -186,7 +186,8 @@ bool ReleasesLandAtOnce() {
 struct ViewCheck {
     V2::AcquireVerdict verdict; ///< Met, MetByQueued, NotMet or Fallback
     Reason reason;
-    bool narrowed; ///< It waited for one producer first
+    bool narrowed;  ///< It waited for one producer first
+    u64 landing{}; ///< MetByQueued on a release still to land: its landing ticket
 };
 
 // EDEN_NX2_V2_ACQUIRE (MASTER_PLAN.md section 6): decides an acquire from the front's semaphore
@@ -213,23 +214,25 @@ ViewCheck CheckWithView(DmaPusher& dma_pusher, GPUVAddr address, u32 value, V2::
     }
     V2::HazardFilter filter;
     filter.ranged = V2::ProducerBit(V2::Producer::Release) | V2::ProducerBit(V2::Producer::Report);
-    u32 forwarded = 0;
+    // Releases queued or run but not landed, fence-flagged or not (class B; the landing rule in
+    // v2/landing.h keeps later CPU-visible writes behind them).
+    const u32 memory_word = memory.Read<u32>(address);
+    u32 forwarded = memory_word;
     const V2::HazardResult word =
         split.FindWrites(*device, sizeof(u32), filter, reinterpret_cast<u8*>(&forwarded));
-    // Fence-flagged releases (queued, or run by the back) whose fence hasn't run: memory gets them
-    // only then, so the drained path doesn't see them either (V2::DecideAcquire never passes on
-    // them).
-    const V2::HazardResult unlanded = split.FindUnlanded(*device, sizeof(u32), nullptr);
-    const u32 memory_word = memory.Read<u32>(address);
     const V2::AcquireDecision decision =
         V2::DecideAcquire(op, value, word, forwarded, memory_word,
-                          split.PendingUnboundedWrite(V2::Producer::QmdRelease), unlanded);
+                          split.PendingUnboundedWrite(V2::Producer::QmdRelease));
     switch (decision.verdict) {
     case V2::AcquireVerdict::Met:
-    case V2::AcquireVerdict::MetByQueued:
         return {decision.verdict, Reason::None, false};
+    case V2::AcquireVerdict::MetByQueued:
+        return {decision.verdict, Reason::None, false, word.landing ? word.position : 0};
     case V2::AcquireVerdict::NotMet:
-        return {decision.verdict, Reason::NotMet, false};
+        return {decision.verdict,
+                word.kind == V2::HazardResult::Kind::Forward ? Reason::QueuedNotMet
+                                                              : Reason::NotMet,
+                false};
     case V2::AcquireVerdict::WaitFor: {
         if (!wait && split.ConsumedNow() < decision.position) {
             return {V2::AcquireVerdict::NotMet, Reason::NotMet, false};
@@ -246,11 +249,7 @@ ViewCheck CheckWithView(DmaPusher& dma_pusher, GPUVAddr address, u32 value, V2::
     case V2::AcquireVerdict::Fallback:
         break;
     }
-    if (unlanded.kind != V2::HazardResult::Kind::Clear) {
-        return {V2::AcquireVerdict::Fallback, Reason::Unlanded, false};
-    }
-    const Reason reason = word.kind == V2::HazardResult::Kind::Forward && word.covered
-                              ? Reason::QueuedNotMet
+    const Reason reason = word.landing ? Reason::Unlanded
                           : word.overflow ? Reason::Overflow
                                           : Reason::UnknownWrite;
     return {V2::AcquireVerdict::Fallback, reason, false};

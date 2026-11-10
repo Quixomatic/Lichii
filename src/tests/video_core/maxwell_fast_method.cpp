@@ -49,6 +49,10 @@ struct GpuSplitTestAccess {
     static u64 End(const GpuSplit& split) {
         return split.write_position;
     }
+    /// As if entries up to `position` were sent.
+    static void SetEnd(GpuSplit& split, u64 position) {
+        split.write_position = position;
+    }
 
     static void Start(GpuSplit& split, Core::System& system) {
         Initialize(split, system);
@@ -2170,17 +2174,124 @@ TEST_CASE("V2 hazard: unknown reports block reads of their bytes until they land
     Access::Initialize(split, f.system, 100);
     V2::Landing::landed.store(0);
     constexpr u64 report = 0x5'0000'0010;
-    split.NoteUnlandedRange(report, 8);
+    const u64 ticket = split.NextLandingTicket();
+    split.NoteUnlandedRange(report, 8, ticket);
     std::array<u8, 8> bytes{};
-    CHECK(split.FindUnlanded(report, 4, bytes.data()).kind == V2::HazardResult::Kind::Wait);
-    CHECK(split.FindUnlanded(report + 4, 4, bytes.data()).kind == V2::HazardResult::Kind::Wait);
+    V2::HazardFilter reports;
+    reports.ranged = V2::ProducerBit(V2::Producer::Report);
+    const V2::HazardResult blocked = split.FindWrites(report, 4, reports, bytes.data());
+    CHECK(blocked.kind == V2::HazardResult::Kind::Wait);
+    CHECK(blocked.landing); // waiting for the back to consume would not settle it
+    CHECK(split.FindWrites(report + 4, 4, reports, bytes.data()).kind ==
+          V2::HazardResult::Kind::Wait);
     // The rest of the page is not a report page for good.
-    CHECK(split.FindUnlanded(report + 0x40, 8, bytes.data()).kind ==
+    CHECK(split.FindWrites(report + 0x40, 8, reports, bytes.data()).kind ==
           V2::HazardResult::Kind::Clear);
-    CHECK(split.FindUnlanded(report - 0x10, 8, bytes.data()).kind ==
+    CHECK(split.FindWrites(report - 0x10, 8, reports, bytes.data()).kind ==
           V2::HazardResult::Kind::Clear);
-    // Its operation ran (landing at its position): memory has it.
-    V2::Landing::Note(Access::End(split));
-    CHECK(split.FindUnlanded(report, 8, bytes.data()).kind == V2::HazardResult::Kind::Clear);
+    // Its operation ran (landing its ticket): memory has it.
+    V2::Landing::Note(ticket);
+    CHECK(split.FindWrites(report, 8, reports, bytes.data()).kind ==
+          V2::HazardResult::Kind::Clear);
+    V2::Landing::landed.store(0);
+}
+
+TEST_CASE("V2 landing: one write table, tickets without IR cuts, ordered landing",
+          "[video_core][gpu_split_dispatch][v2_hazard]") {
+    using Access = VideoCommon::GpuSplitTestAccess;
+    namespace V2 = VideoCommon::V2;
+    using Kind = V2::HazardResult::Kind;
+    Fixture f;
+    f.system.Initialize();
+    VideoCommon::GpuSplit split;
+    Access::Initialize(split, f.system, 100);
+    V2::Landing::landed.store(0);
+    V2::HazardFilter releases;
+    releases.ranged = V2::ProducerBit(V2::Producer::Release);
+    constexpr u64 word_a = 0x7'0000'0100;
+    constexpr u64 word_b = 0x7'0000'0200;
+
+    SECTION("two landing releases in one entry: distinct tickets, landing one keeps the other") {
+        const u32 one = 1;
+        const u32 two = 2;
+        const u64 first = split.NextLandingTicket();
+        split.NoteUnlandedWrite(word_a, &one, 4, first);
+        const u64 second = split.NextLandingTicket();
+        split.NoteUnlandedWrite(word_b, &two, 4, second);
+        CHECK(Access::End(split) == 100); // no IR cut: the same entry
+        CHECK(first != second);
+        CHECK(V2::Landing::RingPosition(first) == 100);
+        CHECK(V2::Landing::RingPosition(second) == 100);
+        CHECK(split.LandingPending());
+        V2::Landing::Note(first);
+        u32 value = 0;
+        CHECK(split.FindWrites(word_a, 4, releases, reinterpret_cast<u8*>(&value)).kind ==
+              Kind::Clear);
+        const V2::HazardResult b =
+            split.FindWrites(word_b, 4, releases, reinterpret_cast<u8*>(&value));
+        CHECK(b.kind == Kind::Forward);
+        CHECK(b.landing);
+        CHECK(value == 2);
+        V2::Landing::Note(second);
+        CHECK(!split.LandingPending());
+        // A new entry starts at index 0 again.
+        Access::SetEnd(split, 120);
+        CHECK(split.NextLandingTicket() == V2::Landing::Ticket(120, 0));
+    }
+
+    SECTION("one table per release: queued stores newer than the landing ones win") {
+        const u32 landing_value = 5;
+        split.NoteUnlandedWrite(word_a, &landing_value, 4, split.NextLandingTicket());
+        Access::SetEnd(split, 110);
+        const u32 queued_value = 9;
+        split.NoteKnownWrite(word_a, &queued_value, 4, V2::Producer::Release);
+        u32 value = 0;
+        const V2::HazardResult newer =
+            split.FindWrites(word_a, 4, releases, reinterpret_cast<u8*>(&value));
+        CHECK(newer.kind == Kind::Forward);
+        CHECK(value == 9);
+        // A landing release in the same entry as a queued store: their order is unknown, so
+        // the answer waits for the queued one (after which only the landing release remains).
+        const u32 later = 7;
+        split.NoteUnlandedWrite(word_a, &later, 4, split.NextLandingTicket());
+        const V2::HazardResult same_entry = split.FindWrites(word_a, 4, releases, nullptr);
+        CHECK(same_entry.kind == Kind::Wait);
+        CHECK(!same_entry.landing);
+        CHECK(same_entry.position == 110);
+    }
+
+    SECTION("back: tickets per entry, deferral behind an unlanded ticket, untracked writes") {
+        namespace Landing = V2::Landing;
+        Landing::tag = 0;
+        CHECK(Landing::Capture() == 0); // the front records nothing: v1 behaviour
+        CHECK(!Landing::MustDefer());
+        Landing::tag = 300;
+        const u64 a = Landing::Capture();
+        const u64 b = Landing::Capture();
+        CHECK(a == Landing::Ticket(300, 0));
+        CHECK(b == Landing::Ticket(300, 1));
+        // A CPU-visible write made now would pass them: it lands behind them instead.
+        CHECK(Landing::MustDefer());
+        {
+            const Landing::Untracked untracked;
+            CHECK(Landing::Capture() == 0);
+        }
+        Landing::tag = 310;
+        CHECK(Landing::Capture() == Landing::Ticket(310, 0));
+        // Operations land in order; the last ticket ends the deferral.
+        Landing::Note(a);
+        CHECK(Landing::MustDefer());
+        Landing::Note(Landing::Ticket(310, 0));
+        CHECK(!Landing::MustDefer());
+        // Landing-order verify: a ticket below one already landed is counted.
+        Landing::verify = true;
+        const u64 violations = Landing::order_violations.load();
+        Landing::Note(b);
+        CHECK(Landing::order_violations.load() == violations + 1);
+        Landing::verify = false;
+        Landing::tag = 0;
+        Landing::captured_tag = 0;
+        Landing::pending = 0;
+    }
     V2::Landing::landed.store(0);
 }

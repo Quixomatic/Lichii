@@ -269,6 +269,14 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
         return;
     }
     DAddr cpu_addr = *cpu_addr_opt;
+    // A payload written at once below High accuracy, unless an earlier write that lands at an
+    // operation hasn't landed yet (v2/landing.h, MASTER_PLAN §6 class B): then it lands at an
+    // operation behind it, so the guest CPU never sees it first.
+    const bool at_once = !is_fence && !Settings::IsGPULevelHigh() &&
+                         counter_type == QueryType::Payload;
+    const bool deferred = at_once && VideoCommon::V2::Landing::MustDefer();
+    const bool immediate = at_once && !deferred;
+    const u64 landing = immediate ? 0 : VideoCommon::V2::Landing::Capture();
     const size_t new_query_id = streamer->WriteCounter(cpu_addr, has_timestamp, payload, subreport);
     auto* query = streamer->GetQuery(new_query_id);
     if (is_fence) {
@@ -285,8 +293,7 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
     u8* pointer_timestamp = impl->device_memory.template GetPointer<u8>(cpu_addr + 8);
     std::function<void()> operation([this, streamer, query_base = query, query_location,
                                      pointer, pointer_timestamp, cpu_addr, addr,
-                                     asid = gpu_memory->GetID(), counter_type,
-                                     landing = VideoCommon::V2::Landing::tag] {
+                                     asid = gpu_memory->GetID(), counter_type, landing] {
         if (True(query_base->flags & QueryFlagBits::IsInvalidated)) {
             if (const u64 trace = QueryTrace::Sample(QueryTrace::Event::Discard)) {
                 LOG_INFO(HW_GPU,
@@ -296,6 +303,10 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
                          static_cast<u32>(query_base->flags));
             }
             impl->pending_unregister.push_back(query_location);
+            if (landing != 0) {
+                // No bytes come: the front reads memory from now on, as a drain would.
+                VideoCommon::V2::Landing::Note(landing);
+            }
             return;
         }
         if (False(query_base->flags & QueryFlagBits::IsFinalValueSynced)) [[unlikely]] {
@@ -309,6 +320,9 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
             LOG_ERROR(HW_GPU,
                       "Query report value not synchronized. Consider increasing GPU accuracy.");
             impl->pending_unregister.push_back(query_location);
+            if (landing != 0) {
+                VideoCommon::V2::Landing::Note(landing);
+            }
             return;
         }
         query_base->value += streamer->GetAmendValue();
@@ -323,7 +337,7 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
         }
         Tegra::Nx2SemaphoreWaiters::Get().OnWrite(cpu_addr, static_cast<u32>(query_base->value));
         if (landing != 0) {
-            // EDEN_NX2_V2_ACQUIRE/HAZARD: the split's front may forward this release until now.
+            // EDEN_NX2_V2_ACQUIRE/HAZARD: the split's front forwards this write until now.
             VideoCommon::V2::Landing::Note(landing);
         }
         if (const u64 trace = QueryTrace::Sample(QueryTrace::Event::Write)) {
@@ -337,12 +351,12 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
         }
         impl->pending_unregister.push_back(query_location);
     });
-    if (is_fence) {
+    if (is_fence || deferred) {
         VideoCore::g_signaling_query_report_fence = true;
         impl->rasterizer.SignalFence(std::move(operation));
         VideoCore::g_signaling_query_report_fence = false;
     } else {
-        if (!Settings::IsGPULevelHigh() && counter_type == QueryType::Payload) {
+        if (immediate) {
             if (has_timestamp) {
                 u64 timestamp = impl->gpu.GetTicks();
                 u64 value = static_cast<u64>(payload);

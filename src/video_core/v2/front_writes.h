@@ -28,10 +28,18 @@ namespace VideoCommon::V2 {
 
 /// A release the front knows the payload of: 4 bytes, or `bytes` 16 (the payload as 64 bits,
 /// then a timestamp). `known` false: a counter report or a reduction, whose value is unknown.
-/// `fenced`: the query cache writes it when its fence runs (QueryPropertiesFlags::IsAFence), so it
-/// is also kept until it lands (GpuSplit::NoteUnlandedWrite).
+/// `fenced`: the query cache writes it when its fence runs (QueryPropertiesFlags::IsAFence).
+/// `reduction`: a compute reduction (KeplerCompute writes it from a fence of its own).
+/// A write that lands at an operation (fenced, a counter, High accuracy, or a write the back
+/// defers behind an earlier one still to land: v2/landing.h) is noted once, by landing ticket,
+/// in the table of writes still to land; any other in the queued table only.
 void NoteReleaseWrite(GpuSplit& split, const Tegra::MemoryManager& memory, GPUVAddr address,
-                      u32 payload, u32 bytes, bool known, Producer producer, bool fenced);
+                      u32 payload, u32 bytes, bool known, Producer producer, bool fenced,
+                      bool reduction = false);
+
+/// Whether fence operations wait for the host GPU (as FenceManager::SignalFence's delay_fence
+/// without a report): accurate GPU, or Balanced/Accurate fences.
+[[nodiscard]] bool FencesDelayed();
 
 /// A write of [address, address + size) whose bytes the front doesn't know. Long or unmapped
 /// ranges become a write the front can't bound.

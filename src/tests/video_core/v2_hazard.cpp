@@ -344,16 +344,17 @@ TEST_CASE("V2 acquire decisions", "[video_core][v2_hazard]") {
         const AcquireDecision met = DecideAcquire(SemaphoreOp::Gequal, 5, forward, 6, 0, 0);
         CHECK(met.verdict == AcquireVerdict::MetByQueued);
         CHECK(met.position == 50);
-        // Memory meets it but the queued release lowers the word: the release decides.
+        // Memory meets it but the queued release lowers the word: the release decides (only a
+        // later release can meet it, so the channel suspends).
         CHECK(DecideAcquire(SemaphoreOp::Gequal, 5, forward, 4, 9, 0).verdict ==
-              AcquireVerdict::Fallback);
+              AcquireVerdict::NotMet);
     }
 
     SECTION("equal and mask acquires: the queued value, unless a dispatch follows it") {
         CHECK(DecideAcquire(SemaphoreOp::Equal, 5, forward, 5, 0, 0).verdict ==
               AcquireVerdict::MetByQueued);
         CHECK(DecideAcquire(SemaphoreOp::Equal, 5, forward, 6, 5, 0).verdict ==
-              AcquireVerdict::Fallback);
+              AcquireVerdict::NotMet);
         CHECK(DecideAcquire(SemaphoreOp::Mask, 1, forward, 1, 0, 49).verdict ==
               AcquireVerdict::MetByQueued); // the dispatch ran before the release
         const AcquireDecision after = DecideAcquire(SemaphoreOp::Mask, 1, forward, 1, 0, 51);
@@ -373,45 +374,49 @@ TEST_CASE("V2 acquire decisions", "[video_core][v2_hazard]") {
               AcquireVerdict::Fallback);
     }
 
-    // Fix pass 1 (Ocarina of Time, "the view passes, the drained path waits (word now 0xe)" for
-    // value 0xf): a fence-flagged release reaches memory only when its fence runs, after the back
-    // ran it. Forwarding it passed acquires the drained path waits on.
-    SECTION("fence-flagged releases never meet an acquire before they land") {
-        HazardTable table;
+    // Fix F3-01 (MASTER_PLAN §6 class B, undoing Fix pass 1's removal): a fence-flagged release
+    // queued, or run but not landed, meets the acquire logically; the landing rule
+    // (v2/landing.h) keeps later CPU-visible writes behind it.
+    SECTION("unlanded fence-flagged releases meet acquires (class B)") {
         HazardTable unlanded;
         const HazardFilter filter{};
         constexpr u64 word_address = 0x2'1070'2a00;
         const u32 payload = 0xf;
-        table.NoteKnown(word_address, &payload, sizeof(payload), 60, Producer::Release);
-        unlanded.NoteKnown(word_address, &payload, sizeof(payload), 60, Producer::Release);
+        const u64 ticket = (u64{60} << LandingSubBits) | 0;
+        unlanded.NoteKnown(word_address, &payload, sizeof(payload), ticket, Producer::Release);
         for (const SemaphoreOp op :
              {SemaphoreOp::Gequal, SemaphoreOp::Equal, SemaphoreOp::CircularGequal}) {
-            // Queued: the main table forwards 0xf, but it is fence-flagged.
-            u32 forwarded = 0;
-            const HazardResult queued = table.Find(word_address, 4, 0, filter,
-                                                   reinterpret_cast<u8*>(&forwarded));
-            REQUIRE(queued.kind == Kind::Forward);
-            REQUIRE(forwarded == 0xf);
-            const HazardResult pending = unlanded.Find(word_address, 4, 0, filter, nullptr);
+            u32 forwarded = 0xe;
+            HazardResult pending = unlanded.Find(word_address, 4, 0, filter,
+                                                 reinterpret_cast<u8*>(&forwarded));
+            pending.landing = true;
             REQUIRE(pending.kind == Kind::Forward);
-            const AcquireVerdict queued_verdict =
-                DecideAcquire(op, 0xf, queued, forwarded, 0xe, 0, pending).verdict;
-            CHECK(queued_verdict != AcquireVerdict::Met);
-            CHECK(queued_verdict != AcquireVerdict::MetByQueued);
-            // Run by the back (retired from the main table), fence not run: memory decides.
-            const HazardResult ran = table.Find(word_address, 4, 60, filter, nullptr);
-            REQUIRE(ran.kind == Kind::Clear);
-            CHECK(DecideAcquire(op, 0xf, ran, 0, 0xe, 0, pending).verdict ==
-                  AcquireVerdict::NotMet);
+            REQUIRE(forwarded == 0xf);
+            const AcquireDecision decision = DecideAcquire(op, 0xf, pending, forwarded, 0xe, 0);
+            CHECK(decision.verdict == AcquireVerdict::MetByQueued);
+            CHECK(decision.position == ticket);
+            // The dispatch rule compares ring positions, not tickets.
+            if (!SemaphoreWaitsToReach(op)) {
+                CHECK(DecideAcquire(op, 0xf, pending, forwarded, 0xe, 59).verdict ==
+                      AcquireVerdict::MetByQueued);
+                CHECK(DecideAcquire(op, 0xf, pending, forwarded, 0xe, 61).verdict ==
+                      AcquireVerdict::WaitFor);
+            }
             // Landed: memory holds it.
-            const HazardResult landed = unlanded.Find(word_address, 4, 60, filter, nullptr);
+            const HazardResult landed = unlanded.Find(word_address, 4, ticket, filter, nullptr);
             REQUIRE(landed.kind == Kind::Clear);
-            CHECK(DecideAcquire(op, 0xf, ran, 0, 0xf, 0, landed).verdict == AcquireVerdict::Met);
+            CHECK(DecideAcquire(op, 0xf, landed, 0, 0xf, 0).verdict == AcquireVerdict::Met);
         }
-        // Without a pending fence-flagged release (a 16-byte release lands when the back runs it)
-        // the queued value still decides.
-        CHECK(DecideAcquire(SemaphoreOp::Gequal, 5, forward, 6, 0, 0, clear).verdict ==
-              AcquireVerdict::MetByQueued);
+        // A newer release that doesn't meet it: the channel suspends.
+        const u32 lower = 0xd;
+        unlanded.NoteKnown(word_address, &lower, sizeof(lower), ticket + 1, Producer::Release);
+        u32 forwarded = 0;
+        HazardResult newest =
+            unlanded.Find(word_address, 4, 0, filter, reinterpret_cast<u8*>(&forwarded));
+        newest.landing = true;
+        CHECK(forwarded == 0xd);
+        CHECK(DecideAcquire(SemaphoreOp::Gequal, 0xf, newest, forwarded, 0xe, 0).verdict ==
+              AcquireVerdict::NotMet);
     }
 }
 

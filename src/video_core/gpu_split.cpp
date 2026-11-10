@@ -197,7 +197,11 @@ void GpuSplit::MaybeStart(Core::System& system_) {
     hazards.Clear();
     pending_cb = {};
     unlanded.Clear();
+    ticket_position = 0;
+    ticket_sub = 0;
+    last_ticket = 0;
     V2::Landing::landed.store(0, std::memory_order_relaxed);
+    V2::Landing::verify = acquire_mode == V2::Mode::Verify || hazard_mode == V2::Mode::Verify;
     // AnyPS5's hand-off spin (HandoffSpin.hpp): spin before a kernel wait only with more than 8
     // logical CPUs, where the waiting thread does not take the other one's core.
     spin_window = V2::On(V2::Switch::Spin);
@@ -279,6 +283,9 @@ void GpuSplit::Stop() {
     hazards.Clear();
     pending_cb = {};
     unlanded.Clear();
+    ticket_position = 0;
+    ticket_sub = 0;
+    last_ticket = 0;
     V2::Landing::landed.store(0, std::memory_order_relaxed);
     SetCpuLaneHook(nullptr, nullptr);
     cpu_lane_requested.store(false, std::memory_order_relaxed);
@@ -377,6 +384,70 @@ void GpuSplit::FlushCbWriteSlow() {
     pending_cb = {};
     V2::NoteRangeWriteGpu(*this, *pending.memory, pending.begin, pending.end - pending.begin,
                           V2::Producer::CbData);
+}
+
+V2::HazardResult GpuSplit::FindWithLanding(u64 device_address, u64 size, u64 done,
+                                            const V2::HazardFilter& filter, u8* out) {
+    using Kind = V2::HazardResult::Kind;
+    const u64 landed = V2::Landing::landed.load(std::memory_order_acquire);
+    unlanded.Retire(landed);
+    V2::HazardFilter landing_filter;
+    landing_filter.ranged = filter.ranged & (V2::ProducerBit(V2::Producer::Release) |
+                                             V2::ProducerBit(V2::Producer::Report));
+    V2::HazardResult landing = unlanded.Find(device_address, size, landed, landing_filter, out);
+    landing.landing = landing.kind != Kind::Clear;
+    const V2::HazardResult queued = hazards.Find(device_address, size, done, filter, out);
+    if (queued.kind == Kind::Wait || landing.kind == Kind::Clear) {
+        return queued;
+    }
+    if (landing.kind == Kind::Wait || queued.kind == Kind::Clear) {
+        return landing;
+    }
+    // Both forwarded: the queued stores went on top. Right only if they are newer than every
+    // landing release applied; otherwise wait for them, after which only those remain.
+    if (queued.position <= V2::RingPositionOf(landing)) {
+        V2::HazardResult wait = queued;
+        wait.kind = Kind::Wait;
+        return wait;
+    }
+    V2::HazardResult merged = queued;
+    merged.covered = queued.covered || landing.covered;
+    merged.producers |= landing.producers;
+    return merged;
+}
+
+bool GpuSplit::WaitLanded(u64 ticket, DrainSite site, u64 timeout_us) {
+    if (V2::Landing::landed.load(std::memory_order_acquire) >= ticket) {
+        return true;
+    }
+    // The back must have run the write before its operation exists.
+    WaitForPosition(V2::Landing::RingPosition(ticket), site);
+    Nx2Profile::Scope scope{Nx2Profile::Zone::WriterWait};
+    const bool v2_stats = V2::Stats::Enabled();
+    const u64 start = Nx2Profile::Enabled() || v2_stats ? Nx2Profile::Ticks() : 0;
+    const auto begin = std::chrono::steady_clock::now();
+    auto next_request = begin;
+    for (u32 spins = 0; V2::Landing::landed.load(std::memory_order_acquire) < ticket; ++spins) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now - begin >= std::chrono::microseconds{timeout_us} || !BackRunning()) {
+            return V2::Landing::landed.load(std::memory_order_acquire) >= ticket;
+        }
+        if (now >= next_request) {
+            // The operation's fence may sit in a deferred submission: ask for it (no drain).
+            RequestIdleHook();
+            next_request = now + std::chrono::milliseconds{1};
+        }
+        if (spins < 64) {
+            Pause();
+        } else {
+            std::this_thread::yield();
+        }
+    }
+    Nx2Profile::AddDrain(site, start);
+    if (v2_stats) [[unlikely]] {
+        V2::Stats::NoteDrain(site, start);
+    }
+    return true;
 }
 
 void GpuSplit::Drain(DrainSite site) {
