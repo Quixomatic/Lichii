@@ -59,14 +59,6 @@ struct FlushParams {
     u64 pass_interval_us = 2000;      ///< ... and this long since the last submission
     u64 request_gap_us = 500;         ///< a waiter's request mid-pass, no sooner than this
     u64 mid_pass_interval_us = 8000;  ///< safety net for passes that never end
-
-    /// F4-X2 (MASTER_PLAN §5.5: strong hints after work the guest will read): a strong hint
-    /// submits only while the GPU is idle (pending 0), a waiter asked, or the guest has been
-    /// waiting on unsubmitted work (fast mode, or at least strong_wait_us a frame on average).
-    /// While the GPU is busy and nobody waits, the work rides until the GPU goes idle (the caller
-    /// arms the finish thread's wake: StrongPending).
-    bool strong_needs_idle = false;
-    u64 strong_wait_us = 200;
 };
 
 /// What the heuristic knows about the GPU and the recording thread at a decision.
@@ -148,8 +140,7 @@ public:
         Decision decision{};
         if (state.requested) {
             decision = {FlushAction::Flush, ReasonRequest};
-        } else if (hint >= FlushHint::Strong && chunks >= params.strong_chunks &&
-                   StrongDue(state)) {
+        } else if (hint >= FlushHint::Strong && chunks >= params.strong_chunks) {
             decision = {FlushAction::Flush, ReasonStrong};
         } else if (fast_mode && !state.back_behind && since >= params.fast_interval_us) {
             decision = {FlushAction::Flush, ReasonFast};
@@ -179,19 +170,29 @@ public:
     }
 
     /// A strong hint decided right away (after work the guest reads back, not on a draw). DXVK's
-    /// ImplicitStrongHint: enough chunks recorded; no idle shortcut (that flushed after 16 draws).
+    /// ImplicitStrongHint: enough chunks recorded, "aggressively to reduce readback latency",
+    /// whether the GPU is busy or not; no idle shortcut (that flushed after 16 draws).
     [[nodiscard]] bool WantsFlushNow() const noexcept {
         return hint >= FlushHint::Strong && draws >= params.strong_chunks * params.chunk_draws;
     }
-    /// F4-X2: a strong hint has enough work behind it but waits for the GPU's idle (StrongDue
-    /// said no): the caller arms the wake.
-    [[nodiscard]] bool StrongPending() const noexcept {
-        return params.strong_needs_idle && WantsFlushNow();
-    }
-    /// F4-X2: whether a strong hint may submit now (FlushParams::strong_needs_idle).
-    [[nodiscard]] bool StrongDue(const FlushState& state) const noexcept {
-        return !params.strong_needs_idle || state.pending == 0 || state.requested || fast_mode ||
-               average_wait_us >= params.strong_wait_us;
+
+    /// F4-X2 (MASTER_PLAN §5.5; DXVK ImplicitSynchronization, util_flush.cpp): the recording
+    /// thread's idle hook with open work no thread blocks on. While fewer than busy_pending
+    /// submissions are in flight the GPU is about to go idle: submit once the work is worth one
+    /// (Ryujinx's pass rule, pass_min_draws and pass_interval_us since the last submission, or
+    /// min_draws). While it is busy: DXVK's threshold, min(20, pending * 3) chunks. Otherwise the
+    /// work waits for the next pass boundary or chunk.
+    [[nodiscard]] bool SyncPointDue(const FlushState& state, u64 now_us) const noexcept {
+        if (draws == 0) {
+            return false;
+        }
+        if (state.pending >= params.busy_pending) {
+            return draws / params.chunk_draws >=
+                   (std::min)(params.max_chunk_threshold, state.pending * 3);
+        }
+        const u64 since = last_submit_us == 0 ? 0 : now_us - last_submit_us;
+        return draws >= params.min_draws ||
+               (draws >= params.pass_min_draws && since >= params.pass_interval_us);
     }
 
     /// Any submission (heuristic or not) resets the counters.
@@ -231,7 +232,7 @@ public:
 private:
     Decision DecideAtChunk(u32 chunks, const FlushState& state, u64 now_us) const noexcept {
         const u64 since = now_us - last_submit_us;
-        if (hint >= FlushHint::Strong && chunks >= params.strong_chunks && StrongDue(state)) {
+        if (hint >= FlushHint::Strong && chunks >= params.strong_chunks) {
             return {FlushAction::Flush, ReasonStrong};
         }
         if (params.pass_boundaries) {

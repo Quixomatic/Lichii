@@ -221,14 +221,26 @@ u64 Scheduler::Flush(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
     if (VideoCommon::GpuSplit::check_owner) [[unlikely]] {
         VideoCommon::GpuSplit::CheckOwner("Scheduler::Flush");
     }
+    if (lazy_fences) [[unlikely]] {
+        NoteBlockedWait();
+    }
     // When flushing, we only send data to the worker thread; no waiting is necessary.
     const u64 signal_value = SubmitExecution(signal_semaphore, wait_semaphore);
     AllocateNewContext();
     last_flush = std::chrono::steady_clock::now();
     flush_pending = false;
     submit_wanted = false;
-    gpu_idle_wake.Disarm();
     return signal_value;
+}
+
+void Scheduler::NoteBlockedWait() {
+    if (blocked_since_us.load(std::memory_order_relaxed) == 0) {
+        return;
+    }
+    const u64 since = blocked_since_us.exchange(0, std::memory_order_relaxed);
+    if (since != 0 && submit_requests.Urgent(CurrentTick())) {
+        blocked_wait_us.fetch_add(NowUs() - since, std::memory_order_relaxed);
+    }
 }
 
 bool Scheduler::LazyFencesHere() const {
@@ -249,52 +261,53 @@ void Scheduler::ServeIdleHook() {
     }
 }
 
-void Scheduler::ServeSplitIdleHook() {
+void Scheduler::ServeSplitIdleHook(bool (*sync_due)(void*), void* argument) {
     if (!lazy_fences) {
         FlushDeferred();
         return;
     }
+    namespace P5b = VideoCommon::V2::P5bStats;
     using IdleAction = VideoCommon::V2::SubmitRequests::IdleAction;
-    // F4-X2: DeferFlush's work and an urgent request (a thread blocks on the open tick: a front
-    // list read, a readback, a guest sync wait) submit now. Everything else (lazy fences and
-    // their bounded-time requests, list ends, list copies, strong hints) keeps the GPU fed: it
-    // goes out at once while the GPU is idle, else when the finish thread sees it go idle. A
-    // wake alone (RequestIdleHook: landing polls, lane requests, the GPU-idle wake) is not a
-    // reason: every such waiter is served by one of the two, so none waits on more than the GPU.
+    // F4-X2 (MASTER_PLAN §5.5, DXVK): DeferFlush's work and an urgent request (a thread blocks on
+    // the open tick: a landing wait, a front list read, a readback, a fence wait past its
+    // escalation) submit now, whether the GPU is busy or not. Everything else (lazy fences and
+    // their bounded-time requests, list ends, list copies) goes out here only by DXVK's
+    // synchronization rule: the GPU is about to go idle (fewer than two submissions in flight)
+    // and the work is worth a submission, or the pending threshold. A wake alone (RequestIdleHook)
+    // is not a reason. Work left here rides the next pass boundary or chunk; no thread waits on
+    // it, and one that starts to files its own urgent request.
+    const u64 open = CurrentTick();
+    if (!submit_requests.IdleSubmits(flush_pending, lazy_fences, submit_wanted,
+                                     lazy_outstanding_tick, open)) {
+        return;
+    }
+    // The heuristic is read only when nothing else decides.
+    const bool due = !flush_pending && !submit_requests.Urgent(open) && sync_due(argument);
     switch (submit_requests.AtIdleHook(flush_pending, lazy_fences, submit_wanted,
-                                       lazy_outstanding_tick, CurrentTick())) {
+                                       lazy_outstanding_tick, open, due)) {
     case IdleAction::None:
         return;
-    case IdleAction::AtGpuIdle:
-        if (DeferUntilGpuIdle()) {
-            VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::IdleDeferred);
-            return;
-        }
+    case IdleAction::Leave:
+        P5b::Add(P5b::Counter::IdleLeft);
+        return;
+    case IdleAction::Deferred:
+        P5b::Add(P5b::Counter::IdleDeferredWork);
         break;
-    case IdleAction::Now:
+    case IdleAction::Urgent:
+        P5b::Add(P5b::Counter::IdleUrgent);
+        break;
+    case IdleAction::Sync:
+        P5b::Add(P5b::Counter::IdleSync);
         break;
     }
-    VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::FlushLazy);
+    P5b::Add(P5b::Counter::FlushLazy);
     Flush();
-}
-
-bool Scheduler::DeferUntilGpuIdle() {
-    if (!finish_publishes_tick || !lazy_fences) {
-        return false;
-    }
-    submit_wanted = true;
-    return gpu_idle_wake.Arm([this] { return GpuBusy(); });
 }
 
 void Scheduler::OnGpuProgress() {
     // Finish thread, a completion published. A front channel suspended on a command list copy
     // (DmaPusher's pending list tick) may go on: end the front's pending sleep (W-01b).
     VideoCommon::V2::FrontWake::Ring();
-    // The GPU went idle with deferred work open.
-    if (gpu_idle_wake.OnProgress([this] { return GpuBusy(); })) {
-        VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::GpuIdleWakes);
-        VideoCommon::GpuSplit::Get().RequestIdleHook();
-    }
 }
 
 bool Scheduler::DeferFlush() {
@@ -350,6 +363,11 @@ bool Scheduler::WaitSubmitted(u64 tick) {
         return true;
     }
     auto& split = VideoCommon::GpuSplit::Get();
+    // F4-X2 (R2-F4-01): this thread blocks on the tick: an urgent request, which the back's next
+    // idle hook submits whether the GPU is busy or not (not after the GPU's queue drained).
+    if (lazy_fences) [[unlikely]] {
+        RequestLazyFlush(tick, true);
+    }
     split.RequestIdleHook();
     // No time limit: the back can spend seconds on one entry (a large shader's translation),
     // and a fence reported as submitted before it is would release its downloads too early.
@@ -390,6 +408,9 @@ void Scheduler::Finish(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
     const u64 presubmit_tick = CurrentTick();
     const bool profile = VideoCommon::Nx2Profile::Enabled();
     const u64 start = profile ? VideoCommon::Nx2Profile::Now() : 0;
+    if (lazy_fences) [[unlikely]] {
+        NoteBlockedWait();
+    }
     SubmitExecution(signal_semaphore, wait_semaphore);
     Wait(presubmit_tick);
     AllocateNewContext();

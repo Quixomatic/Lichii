@@ -64,6 +64,7 @@
 #include "video_core/v2/cbuf_version.h"
 #include "video_core/v2/cbuf_watch.h"
 #include "video_core/v2/continued_draw.h"
+#include "video_core/v2/landing_fence.h"
 #include "core/core.h"
 #include "video_core/v2/p3_stats.h"
 #include "video_core/v2/p5b_stats.h"
@@ -825,8 +826,13 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
             gpu.ForEachPendingCpuWrite(callback);
         });
     VideoCommon::GpuSplit::Get().SetIdleHook(
-        [](void* argument) { static_cast<Scheduler*>(argument)->ServeSplitIdleHook(); },
-        &scheduler);
+        [](void* argument) { static_cast<RasterizerVulkan*>(argument)->ServeSplitIdleHook(); },
+        this);
+    // F4-X2 (R2-F4-01): a thread blocking on a landing asks for the host tick that carries it.
+    VideoCommon::V2::LandingFence::request_argument = &scheduler;
+    VideoCommon::V2::LandingFence::request_hook = [](void* argument, u64 tick) {
+        static_cast<Scheduler*>(argument)->RequestLazyFlush(tick, true);
+    };
     if (scheduler.HasTransferQueue()) {
         // EDEN_NX2_V2_XFERQ: host-level sync positions become timeline joins on the back.
         VideoCommon::GpuSplit::SetTransferJoinHook(
@@ -841,9 +847,6 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
         scheduler.SetLazyFences(true);
         VideoCommon::V2::FlushParams params{};
         params.pass_boundaries = true;
-        // F4-X2: strong hints wait for the GPU's idle while it is busy (needs the finish thread's
-        // wake, EDEN_NX2_V2_SUBMITTHREAD).
-        params.strong_needs_idle = scheduler.FinishThreadPublishesTick();
         flush_heuristic = VideoCommon::V2::FlushHeuristic{params};
     }
     if (VideoCommon::V2::On(VideoCommon::V2::Switch::Bindless)) [[unlikely]] {
@@ -3327,12 +3330,10 @@ void RasterizerVulkan::SubmitNx2ListCopies() {
     if (scheduler.LazyFencesHere() && !VideoCommon::GpuSplit::Get().FrontWaiting()) [[unlikely]] {
         // F4-X2 (MASTER_PLAN §5.5): the front reads most copies long after (or never: ~95% in
         // HW:AoI), so they ride the open submission. A front read that finds the copy unsubmitted
-        // asks for it (IsGpuTickDone / WaitSubmittedTick: RequestLazyFlush + RequestIdleHook);
-        // a front already waiting on the back gets it at once, as before.
+        // asks for it urgently (IsGpuTickDone / WaitSubmittedTick: RequestLazyFlush +
+        // RequestIdleHook); a front already waiting on the back gets it at once, as before.
         VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::ListCopiesRiding);
-        if (!scheduler.DeferUntilGpuIdle()) {
-            scheduler.WantSubmit();
-        }
+        scheduler.WantSubmit();
         return;
     }
     scheduler.Flush();
@@ -4483,8 +4484,9 @@ void RasterizerVulkan::FrameDumpPass(const Framebuffer* framebuffer) {
 void RasterizerVulkan::TickFrame() {
     VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::Frames);
     if (adapt_submit) [[unlikely]] {
-        flush_heuristic.NoteGuestSyncWait(
-            Core::g_nx2_guest_sync_wait_us.exchange(0, std::memory_order_relaxed));
+        // R2-F4-02: the time threads blocked on unsubmitted ticks (urgent requests), not every
+        // wait made while some guest thread waits on something.
+        flush_heuristic.NoteGuestSyncWait(scheduler.TakeBlockedWaitUs());
         flush_heuristic.NoteFrame();
     }
     if (VideoCore::Nx2Debug::HasRequests()) {
@@ -4820,20 +4822,35 @@ void RasterizerVulkan::FlushHint(VideoCommon::V2::FlushHint hint) {
     SyncAdaptiveTick();
     flush_heuristic.Hint(hint);
     if (hint >= VideoCommon::V2::FlushHint::Strong && flush_heuristic.WantsFlushNow()) {
-        // Work the guest reads back: submit now when enough is recorded (DXVK's strong hint),
-        // instead of waiting for a chunk boundary.
-        if (flush_heuristic.StrongPending() && !flush_heuristic.StrongDue(ReadFlushState()) &&
-            scheduler.DeferUntilGpuIdle()) {
-            // F4-X2: the GPU is busy and nobody waits: the work goes when it goes idle.
-            VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::StrongDeferred);
-            return;
-        }
+        // Work the guest reads back: submit now when enough is recorded (DXVK's strong hint,
+        // busy GPU or not), instead of waiting for a chunk boundary.
         scheduler.Flush();
         pending_native_work = false;
         adapt_tick = scheduler.GetMasterSemaphore().CurrentTick();
         flush_heuristic.NoteSubmit(AdaptNowUs());
         VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::FlushStrong);
     }
+}
+
+void RasterizerVulkan::ServeSplitIdleHook() {
+    // F4-X2: the split's idle hook, with DXVK's synchronization rule for open work nobody blocks
+    // on.
+    scheduler.ServeSplitIdleHook(
+        [](void* argument) {
+            auto& self = *static_cast<RasterizerVulkan*>(argument);
+            if (!self.adapt_submit) {
+                return false;
+            }
+            self.SyncAdaptiveTick();
+            const auto state = self.ReadFlushState();
+            if (!self.adaptive_flush_fed) {
+                // Titles without native tiling keep the draw cadence of FlushWork: only the
+                // pending rule applies.
+                return state.pending < self.flush_heuristic.Params().busy_pending;
+            }
+            return self.flush_heuristic.SyncPointDue(state, AdaptNowUs());
+        },
+        this);
 }
 
 u64 RasterizerVulkan::AdaptNowUs() {
@@ -4877,6 +4894,7 @@ void RasterizerVulkan::AdaptiveFlushWork(u32 cost) {
     namespace P5b = VideoCommon::V2::P5bStats;
     using H = VideoCommon::V2::FlushHeuristic;
     const auto& params = flush_heuristic.Params();
+    adaptive_flush_fed = true;
     SyncAdaptiveTick();
     const auto read_state = [this] { return ReadFlushState(); };
     const auto count_reason = [](u8 reason) {
@@ -4926,15 +4944,6 @@ void RasterizerVulkan::AdaptiveFlushWork(u32 cost) {
     case VideoCommon::V2::FlushAction::None:
         break;
     case VideoCommon::V2::FlushAction::Dispatch:
-        if (flush_heuristic.StrongPending() && !scheduler.DeferUntilGpuIdle()) [[unlikely]] {
-            // F4-X2: a strong hint waited for the GPU's idle, and it is idle now.
-            scheduler.Flush();
-            pending_native_work = false;
-            adapt_tick = scheduler.GetMasterSemaphore().CurrentTick();
-            flush_heuristic.NoteSubmit(now_us);
-            count_reason(H::ReasonStrong);
-            return;
-        }
         scheduler.DispatchWork();
         break;
     case VideoCommon::V2::FlushAction::Flush:

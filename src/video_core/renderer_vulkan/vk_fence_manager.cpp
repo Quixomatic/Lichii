@@ -12,6 +12,7 @@
 #include "video_core/renderer_vulkan/vk_query_cache.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
+#include "video_core/v2/landing_fence.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 
 namespace Vulkan {
@@ -34,6 +35,8 @@ void InnerFence::Queue(bool lazy_) {
         adaptive = true;
         queued_at = std::chrono::steady_clock::now();
         scheduler.NoteLazyFence(wait_tick);
+        // F4-X2: a thread blocking on an operation of this fence asks for this tick.
+        VideoCommon::V2::LandingFence::NoteFence(wait_tick);
         return;
     }
     if (lazy_) {

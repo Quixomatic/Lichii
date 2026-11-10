@@ -34,6 +34,7 @@
 #include "video_core/v2/hazard.h"
 #include "video_core/v2/ir_exec.h"
 #include "video_core/v2/landing.h"
+#include "video_core/v2/landing_fence.h"
 #include "video_core/v2/v2_stats.h"
 #include "video_core/v2/versions.h"
 #include "video_core/v2/word_readback.h"
@@ -483,6 +484,8 @@ bool Puller::PollAcquireView(DmaPusher& dma_pusher) {
                 // (SESSION_HANDOFF §5g). The first ask is at once.
                 acquire.submit_requested = true;
                 acquire.last_request = now;
+                // F4-X2 (R2-F4-01): urgently, for the tick of the newest fence still to land.
+                V2::LandingFence::Request(V2::LandingFence::TickForPending());
                 split.RequestIdleHook();
             }
             break;

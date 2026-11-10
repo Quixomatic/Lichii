@@ -37,6 +37,7 @@
 #include "video_core/v2/p5b_stats.h"
 #include "video_core/v2/qmd_front.h"
 #include "video_core/v2/ir_check.h"
+#include "video_core/v2/landing_fence.h"
 #include "video_core/v2/regsem_3d.h"
 #include "video_core/v2/s1_deltas.h"
 #include "video_core/v2/ir_exec.h"
@@ -521,13 +522,20 @@ bool GpuSplit::WaitUntrackedLanded(u64 ticket, DrainSite site, u64 timeout_us) {
     const u64 start = Nx2Profile::Enabled() || v2_stats ? Nx2Profile::Ticks() : 0;
     const auto begin = std::chrono::steady_clock::now();
     auto next_request = begin;
+    u64 requested_tick = 0;
     for (u32 spins = 0; !landed(); ++spins) {
         const auto now = std::chrono::steady_clock::now();
         if (now - begin >= std::chrono::microseconds{timeout_us} || !BackRunning()) {
             return landed();
         }
-        if (now >= next_request) {
-            // Its fence may sit in a deferred submission (F4-02): ask for it, never drain.
+        // Its fence may sit in the open submission (F4-02): never drain. F4-X2 (R2-F4-01): an
+        // urgent request for the fence's tick as soon as it is queued, not the GPU's idle.
+        const u64 fence_tick = V2::LandingFence::TickFor(0, ticket);
+        if (fence_tick > requested_tick || now >= next_request) {
+            if (fence_tick > requested_tick) {
+                V2::LandingFence::Request(fence_tick);
+                requested_tick = fence_tick;
+            }
             RequestIdleHook();
             next_request = now + std::chrono::milliseconds{1};
         }
@@ -555,13 +563,20 @@ bool GpuSplit::WaitLanded(u64 ticket, DrainSite site, u64 timeout_us) {
     const u64 start = Nx2Profile::Enabled() || v2_stats ? Nx2Profile::Ticks() : 0;
     const auto begin = std::chrono::steady_clock::now();
     auto next_request = begin;
+    u64 requested_tick = 0;
     for (u32 spins = 0; V2::Landing::landed.load(std::memory_order_acquire) < ticket; ++spins) {
         const auto now = std::chrono::steady_clock::now();
         if (now - begin >= std::chrono::microseconds{timeout_us} || !BackRunning()) {
             return V2::Landing::landed.load(std::memory_order_acquire) >= ticket;
         }
-        if (now >= next_request) {
-            // The operation's fence may sit in a deferred submission: ask for it (no drain).
+        // The operation's fence may sit in the open submission: ask for it (no drain). F4-X2
+        // (R2-F4-01): urgently, for the fence's tick, as soon as it is queued.
+        const u64 fence_tick = V2::LandingFence::TickFor(ticket, 0);
+        if (fence_tick > requested_tick || now >= next_request) {
+            if (fence_tick > requested_tick) {
+                V2::LandingFence::Request(fence_tick);
+                requested_tick = fence_tick;
+            }
             RequestIdleHook();
             next_request = now + std::chrono::milliseconds{1};
         }

@@ -88,10 +88,11 @@ enum class Counter : u32 {
     WfiBarriers,        ///< F4-X3: wait-for-idle barriers (pending tracked writes folded in)
     WfiDeferred,        ///< F4-X3: wait-for-idles inside a pass, barrier at its end
     WfiPassEnds,        ///< F4-X3: wait-for-idles that ended a pass (stores or XFB in it)
-    IdleDeferred,       ///< F4-X2: idle hooks that left wanted work for the GPU's idle
-    GpuIdleWakes,       ///< F4-X2: finish-thread wakes of the idle hook at the GPU's idle
+    IdleUrgent,         ///< F4-X2: idle-hook submits for a thread blocking on the open tick
+    IdleDeferredWork,   ///< F4-X2: idle-hook submits of DeferFlush's work
+    IdleSync,           ///< F4-X2: idle-hook submits by DXVK's synchronization rule
+    IdleLeft,           ///< F4-X2: idle hooks that left open work for the next boundary
     ListCopiesRiding,   ///< F4-X2: command list copies left in the open submission
-    StrongDeferred,     ///< F4-X2: strong hints left for the GPU's idle (busy, nobody waits)
     Count,
 };
 

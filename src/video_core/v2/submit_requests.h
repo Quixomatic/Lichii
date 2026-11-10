@@ -39,18 +39,30 @@ public:
     }
 
     enum class IdleAction : u8 {
-        None,      ///< nothing to submit
-        Now,       ///< deferred work or a thread blocks on the open tick: submit
-        AtGpuIdle, ///< open work nobody blocks on: submit while the GPU is idle, else at its idle
+        None,     ///< nothing to submit
+        Deferred, ///< DeferFlush's work: submit
+        Urgent,   ///< a thread blocks on the open tick: submit
+        Sync,     ///< DXVK's synchronization rule holds (FlushHeuristic::SyncPointDue): submit
+        Leave,    ///< open work nobody blocks on: the next pass boundary or chunk takes it
     };
-    /// F4-X2: the split's idle hook (Scheduler::ServeSplitIdleHook). Only DeferFlush's work and
-    /// an urgent request submit at once; waking the hook (RequestIdleHook) says nothing by itself.
+    /// F4-X2 (MASTER_PLAN §5.5; DXVK GpuFlushTracker, ImplicitSynchronization): the split's idle
+    /// hook (Scheduler::ServeSplitIdleHook) is a synchronization point. DeferFlush's work and an
+    /// urgent request submit; other open work only when `sync_due` (fewer than two submissions in
+    /// flight and enough work, or DXVK's pending threshold). Waking the hook (RequestIdleHook)
+    /// says nothing by itself (f1d05e9625: 54 idle-hook submits a frame).
     [[nodiscard]] IdleAction AtIdleHook(bool flush_pending, bool lazy_fences, bool wanted,
-                                        u64 lazy_fence_tick, u64 open_tick) const noexcept {
+                                        u64 lazy_fence_tick, u64 open_tick,
+                                        bool sync_due) const noexcept {
         if (!IdleSubmits(flush_pending, lazy_fences, wanted, lazy_fence_tick, open_tick)) {
             return IdleAction::None;
         }
-        return flush_pending || Urgent(open_tick) ? IdleAction::Now : IdleAction::AtGpuIdle;
+        if (flush_pending) {
+            return IdleAction::Deferred;
+        }
+        if (Urgent(open_tick)) {
+            return IdleAction::Urgent;
+        }
+        return sync_due ? IdleAction::Sync : IdleAction::Leave;
     }
 
     /// The idle hook's decision (the recording thread goes idle, or a waiter woke it). Submits
@@ -74,51 +86,6 @@ private:
 
     std::atomic<u64> requested{0};
     std::atomic<u64> urgent_tick{0};
-};
-
-/// F4-X2 (MASTER_PLAN §5.5 adaptive submission; DXVK: submit when the GPU is about to go idle):
-/// open work that nobody waits for is left in the open submission while the GPU is busy, and the
-/// finish thread wakes the recording thread's idle hook (as a request, which submits) once the
-/// GPU has finished everything handed to it. Arm and OnProgress race: each side publishes its
-/// state, fences, then reads the other's, so at least one of them sees the GPU idle with the
-/// wake armed (the recording thread then submits itself, or the finish thread wakes it).
-class GpuIdleWake {
-public:
-    /// Recording thread: open work waits for the GPU to go idle. False when it is idle already:
-    /// the caller submits now.
-    template <typename Busy>
-    [[nodiscard]] bool Arm(Busy&& gpu_busy) noexcept {
-        armed.store(true, std::memory_order_relaxed);
-        std::atomic_thread_fence(std::memory_order_seq_cst);
-        if (gpu_busy()) {
-            return true;
-        }
-        armed.store(false, std::memory_order_relaxed);
-        return false;
-    }
-
-    /// Recording thread: a submission went out (nothing is left for the wake).
-    void Disarm() noexcept {
-        armed.store(false, std::memory_order_relaxed);
-    }
-
-    /// Finish thread, after it published a completed tick: whether to wake the recording thread
-    /// now (once per Arm).
-    template <typename Busy>
-    [[nodiscard]] bool OnProgress(Busy&& gpu_busy) noexcept {
-        std::atomic_thread_fence(std::memory_order_seq_cst);
-        if (!armed.load(std::memory_order_relaxed) || gpu_busy()) {
-            return false;
-        }
-        return armed.exchange(false, std::memory_order_relaxed);
-    }
-
-    [[nodiscard]] bool Armed() const noexcept {
-        return armed.load(std::memory_order_relaxed);
-    }
-
-private:
-    std::atomic<bool> armed{false};
 };
 
 } // namespace VideoCommon::V2

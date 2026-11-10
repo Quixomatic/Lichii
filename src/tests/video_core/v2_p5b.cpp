@@ -21,6 +21,7 @@
 #include "video_core/v2/barrier_tracker.h"
 #include "video_core/v2/flush_heuristic.h"
 #include "video_core/v2/frame_pacer.h"
+#include "video_core/v2/landing_fence.h"
 #include "video_core/v2/p5b_stats.h"
 #include "video_core/v2/submit_requests.h"
 #include "video_core/v2/gpu_unswizzle.h"
@@ -897,172 +898,219 @@ TEST_CASE("V2 P5b flush decisions at pass boundaries", "[video_core][v2_p5b]") {
         REQUIRE(decision.action == FlushAction::Flush);
         REQUIRE(decision.reason == FlushHeuristic::ReasonPending);
     }
-    SECTION("F4-X2: strong hints wait for the GPU's idle while nobody waits") {
-        FlushParams idle_params = params;
-        idle_params.strong_needs_idle = true;
-        FlushHeuristic heuristic{idle_params};
-        const FlushState idle{.pending = 0, .back_behind = true};
+    SECTION("F4-X2: strong hints submit at 3 chunks while the GPU is busy (DXVK)") {
+        FlushHeuristic heuristic{params};
+        const FlushState two{.pending = 2, .back_behind = true};
         heuristic.NoteSubmit(1000);
         heuristic.Hint(FlushHint::Strong);
         FlushHeuristic::Decision decision{};
-        for (u32 i = 0; i < idle_params.strong_chunks * idle_params.chunk_draws; ++i) {
-            decision = heuristic.Advance(1, busy, 1001);
+        for (u32 i = 0; i < params.strong_chunks * params.chunk_draws; ++i) {
+            decision = heuristic.Advance(1, two, 1001);
         }
-        // Busy GPU: no strong submit, mid-pass or at a boundary; the caller arms the wake.
-        REQUIRE(decision.action == FlushAction::Dispatch);
-        REQUIRE(heuristic.StrongPending());
-        REQUIRE(heuristic.AtPassBoundary(FlushHint::Weak, busy, 1002).action == FlushAction::None);
-        // Idle GPU or a waiter: submitted.
-        REQUIRE(heuristic.StrongDue(idle));
-        REQUIRE(heuristic.StrongDue(requested));
-        const auto boundary = heuristic.AtPassBoundary(FlushHint::Weak, idle, 1003);
-        REQUIRE(boundary.action == FlushAction::Flush);
-        REQUIRE(boundary.reason == FlushHeuristic::ReasonStrong);
-        REQUIRE_FALSE(heuristic.StrongPending());
-        // The guest waiting on unsubmitted work (Ryujinx's measure) makes strong hints due again.
-        FlushHeuristic waited{idle_params};
-        REQUIRE_FALSE(waited.StrongDue(busy));
-        for (u32 frame = 0; frame < 20; ++frame) {
-            waited.NoteGuestSyncWait(idle_params.strong_wait_us * 2);
-            waited.NoteFrame();
+        REQUIRE(decision.action == FlushAction::Flush);
+        REQUIRE(decision.reason == FlushHeuristic::ReasonStrong);
+        // FlushHint's immediate form: a strong hint after enough chunks, whatever is in flight.
+        for (u32 i = 0; i < params.strong_chunks * params.chunk_draws - 1; ++i) {
+            heuristic.Advance(1, two, 1002);
         }
-        REQUIRE(waited.StrongDue(busy));
-        // Off (the default): strong hints never wait.
-        REQUIRE(FlushHeuristic{params}.StrongDue(busy));
+        heuristic.Hint(FlushHint::Strong);
+        REQUIRE_FALSE(heuristic.WantsFlushNow());
+        heuristic.Advance(1, two, 1002); // a chunk boundary: the strong hint flushes there
+        REQUIRE(heuristic.Draws() == 0);
+    }
+    SECTION("F4-X2: the idle hook's synchronization rule (DXVK pending < 2, minimum work)") {
+        const FlushState idle{.pending = 0, .back_behind = false};
+        const FlushState one{.pending = 1, .back_behind = false};
+        const FlushState two{.pending = 2, .back_behind = false};
+        FlushHeuristic heuristic{params};
+        heuristic.NoteSubmit(1000);
+        // Nothing recorded: never.
+        REQUIRE_FALSE(heuristic.SyncPointDue(idle, 1'000'000));
+        for (u32 i = 0; i < params.pass_min_draws - 1; ++i) {
+            heuristic.Advance(1, one, 1000);
+        }
+        // Too few draws, however long ago and however idle.
+        REQUIRE_FALSE(heuristic.SyncPointDue(idle, 1000 + 10 * params.pass_interval_us));
+        heuristic.Advance(1, one, 1000);
+        // Enough draws but too soon after the last submission.
+        REQUIRE_FALSE(heuristic.SyncPointDue(one, 1000 + params.pass_interval_us / 2));
+        // The GPU about to go idle (fewer than two in flight), enough work: due.
+        REQUIRE(heuristic.SyncPointDue(one, 1000 + params.pass_interval_us));
+        REQUIRE(heuristic.SyncPointDue(idle, 1000 + params.pass_interval_us));
+        // Busy (two in flight): DXVK's threshold, min(20, pending * 3) = 6 chunks.
+        REQUIRE_FALSE(heuristic.SyncPointDue(two, 1000 + params.pass_interval_us));
+        for (u32 i = heuristic.Draws(); i < 6 * params.chunk_draws; ++i) {
+            heuristic.Advance(1, one, 1000);
+        }
+        REQUIRE(heuristic.SyncPointDue(two, 1001));
+        // min_draws alone is enough while the GPU is about to go idle.
+        FlushHeuristic many{params};
+        many.NoteSubmit(1000);
+        for (u32 i = 0; i < params.min_draws; ++i) {
+            many.Advance(1, one, 1000);
+        }
+        REQUIRE(many.SyncPointDue(one, 1001));
     }
 }
 
 TEST_CASE("V2 P5b the idle hook submits nothing while the GPU is busy and nobody waits",
           "[video_core][v2_p5b]") {
-    // F4-X2 (f1d05e9625: 54 idle-hook submits a frame): waking the hook, wanted work and a lazy
-    // fence's bounded-time request are no reason to submit while the GPU is busy; only
-    // DeferFlush's work or a thread blocking on the open tick (an urgent request) are.
-    using VideoCommon::V2::GpuIdleWake;
+    // F4-X2 (f1d05e9625: 54 idle-hook submits a frame; 0fe48cd86a: the hook waited for the GPU's
+    // idle, 263 wakes/s): waking the hook, wanted work and a lazy fence's bounded-time request
+    // are no reason to submit while the GPU is busy. DeferFlush's work and a thread blocking on
+    // the open tick (an urgent request) are, at once; other work only by DXVK's sync rule.
     using VideoCommon::V2::SubmitRequests;
     using Action = SubmitRequests::IdleAction;
     constexpr u64 open = 10;
-    const auto busy = [] { return true; };
     SubmitRequests requests;
-    GpuIdleWake wake;
     u32 submits = 0;
-    const auto idle_hook = [&](bool flush_pending, bool wanted, u64 lazy_tick) {
-        switch (requests.AtIdleHook(flush_pending, true, wanted, lazy_tick, open)) {
-        case Action::None:
-            return;
-        case Action::AtGpuIdle:
-            if (wake.Arm(busy)) {
-                return;
-            }
-            break;
-        case Action::Now:
-            break;
+    const auto idle_hook = [&](bool flush_pending, bool wanted, u64 lazy_tick, bool sync_due) {
+        const auto action =
+            requests.AtIdleHook(flush_pending, true, wanted, lazy_tick, open, sync_due);
+        if (action != Action::None && action != Action::Leave) {
+            ++submits;
         }
-        ++submits;
-        wake.Disarm();
+        return action;
     };
     // Nothing open: nothing to do.
-    idle_hook(false, false, 0);
-    REQUIRE(requests.AtIdleHook(false, true, false, 0, open) == Action::None);
-    // Wanted work (list copies, list ends, strong hints) and an open lazy fence, woken many times.
-    for (u32 i = 0; i < 100; ++i) {
-        idle_hook(false, true, open);
+    REQUIRE(idle_hook(false, false, 0, true) == Action::None);
+    // The heuristic with two submissions in flight and a few draws: the rule says no.
+    FlushParams params;
+    params.pass_boundaries = true;
+    FlushHeuristic heuristic{params};
+    const FlushState busy{.pending = 2, .back_behind = false};
+    heuristic.NoteSubmit(1000);
+    for (u32 i = 0; i < 40; ++i) {
+        heuristic.Advance(1, busy, 1000);
     }
-    REQUIRE(submits == 0);
-    REQUIRE(wake.Armed());
-    // The lazy fence's window ran out (not urgent): still left for the GPU's idle.
+    REQUIRE_FALSE(heuristic.SyncPointDue(busy, 1'000'000));
+    // Wanted work (list copies, list ends) and an open lazy fence, woken many times.
+    for (u32 i = 0; i < 100; ++i) {
+        REQUIRE(idle_hook(false, true, open, heuristic.SyncPointDue(busy, 1'000'000)) ==
+                Action::Leave);
+    }
+    // The lazy fence's window ran out (not urgent): still left for the next boundary.
     requests.Request(open, false);
     REQUIRE(requests.Open(open));
     REQUIRE_FALSE(requests.Urgent(open));
-    idle_hook(false, true, open);
+    REQUIRE(idle_hook(false, true, open, false) == Action::Leave);
     REQUIRE(submits == 0);
-    // The GPU goes idle: the finish thread wakes the hook, which submits.
-    REQUIRE(wake.OnProgress([] { return false; }));
-    REQUIRE(requests.AtIdleHook(false, true, true, open, open) == Action::AtGpuIdle);
-    REQUIRE_FALSE(wake.Arm([] { return false; }));
+    // One in flight (the GPU is about to go idle) and enough work: DXVK's rule submits.
+    const FlushState one{.pending = 1, .back_behind = false};
+    REQUIRE(heuristic.SyncPointDue(one, 1000 + params.pass_interval_us));
+    REQUIRE(idle_hook(false, true, open, true) == Action::Sync);
     // A thread blocking on the open tick, or DeferFlush's work: at once, GPU busy or not.
     SubmitRequests blocked;
     blocked.Request(open);
     REQUIRE(blocked.Urgent(open));
-    REQUIRE(blocked.AtIdleHook(false, true, false, 0, open) == Action::Now);
-    REQUIRE(requests.AtIdleHook(true, true, false, 0, open) == Action::Now);
+    REQUIRE(blocked.AtIdleHook(false, true, false, 0, open, false) == Action::Urgent);
+    REQUIRE(requests.AtIdleHook(true, true, false, 0, open, false) == Action::Deferred);
     // Submitted ticks are no longer urgent.
     REQUIRE_FALSE(blocked.Urgent(open + 1));
 }
 
-TEST_CASE("V2 P5b work left for the GPU's idle is submitted when it goes idle",
+TEST_CASE("V2 P5b a landing wait asks for its fence's tick and an idle back submits it",
           "[video_core][v2_p5b]") {
-    // F4-X2 / SESSION_HANDOFF §5g: the back's idle hook leaves wanted work open while the GPU is
-    // busy (GpuIdleWake::Arm) and sleeps; nothing else ever arrives. The finish thread publishes
-    // the busy tick's completion and asks for the idle hook (OnProgress), which submits. The two
-    // race; every interleaving must end in exactly one submission.
-    using VideoCommon::V2::GpuIdleWake;
-    std::mt19937 random{1234};
-    for (u32 iteration = 0; iteration < 500; ++iteration) {
-        GpuIdleWake wake;
-        std::atomic<u64> current{3}; // ticks 1 and 2 handed off, 3 open with wanted work
-        std::atomic<u64> gpu{1};     // tick 2 still running
-        const auto busy = [&] { return gpu.load(std::memory_order_acquire) + 1 < current.load(); };
-        std::mutex mutex;
-        std::condition_variable cv;
-        bool woken = false;
-        bool stop = false;
-        std::atomic<u32> submits{0};
-        const u32 finish_delay = random() % 64;
-        std::thread back([&] {
-            // The idle hook, not asked for: submit only if the GPU is idle.
-            bool wanted = true;
-            if (!wake.Arm(busy)) {
-                current.fetch_add(1);
+    // SESSION_HANDOFF §5: a landing wait causes its submit. F4-X2 (R2-F4-01): the waiter files an
+    // urgent request for the host tick its operation's fence rides (LandingFence), and the back's
+    // idle hook submits it although the GPU is busy (the sync rule says no) and no other work
+    // arrives. Before the fence is queued there is no tick to ask for.
+    namespace Landing = VideoCommon::V2::Landing;
+    namespace LandingFence = VideoCommon::V2::LandingFence;
+    using VideoCommon::V2::SubmitRequests;
+    using Action = SubmitRequests::IdleAction;
+    const u64 saved_issued = Landing::issued.load();
+    const u64 saved_landed = Landing::landed.load();
+    const u64 saved_untracked = Landing::untracked_issued.load();
+    SubmitRequests requests;
+    LandingFence::request_argument = &requests;
+    LandingFence::request_hook = [](void* argument, u64 tick) {
+        static_cast<SubmitRequests*>(argument)->Request(tick, true);
+    };
+    std::atomic<u64> current_tick{7}; // 5 and 6 handed off and running; 7 open
+    const u64 ticket = Landing::Ticket(1000, 0);
+    Landing::landed.store(Landing::Ticket(999, 0));
+    Landing::untracked_issued.store(Landing::untracked_landed.load()); // none still to land
+    Landing::issued.store(ticket); // the back captured the write ...
+    REQUIRE(LandingFence::TickFor(ticket, 0) == 0); // ... its fence not queued yet
+    LandingFence::NoteFence(current_tick.load()); // ... then queued its lazy fence in tick 7
+    REQUIRE(LandingFence::TickFor(ticket, 0) == 7);
+    REQUIRE(LandingFence::TickForPending() == 7);
+    REQUIRE(LandingFence::TickFor(ticket + 1, 0) == 0);
+
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool woken = false;
+    bool stop = false;
+    std::atomic<u32> submits{0};
+    std::atomic<u32> left{0};
+    std::thread back([&] {
+        std::unique_lock lock{mutex};
+        while (!stop) {
+            cv.wait(lock, [&] { return woken || stop; });
+            if (!std::exchange(woken, false)) {
+                continue;
+            }
+            // The idle hook: the lazy fence and wanted work are open, the GPU busy.
+            const u64 open = current_tick.load();
+            switch (requests.AtIdleHook(false, true, true, 7, open, false)) {
+            case Action::Urgent:
+                current_tick.fetch_add(1);
                 submits.fetch_add(1);
-                wanted = false;
+                // The GPU runs tick 7, the fencing thread runs the fence's operation.
+                Landing::Note(ticket);
+                break;
+            case Action::Leave:
+                left.fetch_add(1);
+                break;
+            default:
+                break;
             }
-            std::unique_lock lock{mutex};
-            while (!stop) {
-                cv.wait(lock, [&] { return woken || stop; });
-                if (std::exchange(woken, false) && wanted) {
-                    // Asked (RequestIdleHook): submits the wanted work.
-                    current.fetch_add(1);
-                    submits.fetch_add(1);
-                    wake.Disarm();
-                    wanted = false;
-                }
-            }
-        });
-        std::thread finish([&] {
-            for (u32 i = 0; i < finish_delay; ++i) {
-                std::this_thread::yield();
-            }
-            gpu.store(2, std::memory_order_release);
-            if (wake.OnProgress(busy)) {
-                std::scoped_lock lock{mutex};
-                woken = true;
-                cv.notify_one();
-            }
-        });
-        finish.join();
-        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{2};
-        while (submits.load() == 0 && std::chrono::steady_clock::now() < deadline) {
-            std::this_thread::yield();
         }
+    });
+    const auto wake = [&] {
         {
             std::scoped_lock lock{mutex};
-            stop = true;
+            woken = true;
         }
         cv.notify_one();
-        back.join();
-        REQUIRE(submits.load() == 1);
-        REQUIRE(current.load() == 4);
-        REQUIRE_FALSE(wake.Armed());
+    };
+    // A wake alone (no request) leaves the work.
+    wake();
+    while (left.load() == 0) {
+        std::this_thread::yield();
     }
-    // Nothing armed, or the GPU still busy: no wake.
-    GpuIdleWake wake;
-    REQUIRE_FALSE(wake.OnProgress([] { return false; }));
-    REQUIRE(wake.Arm([] { return true; }));
-    REQUIRE_FALSE(wake.OnProgress([] { return true; }));
-    REQUIRE(wake.OnProgress([] { return false; }));
-    REQUIRE_FALSE(wake.OnProgress([] { return false; }));
-    REQUIRE_FALSE(wake.Arm([] { return false; }));
-    REQUIRE_FALSE(wake.Armed());
+    REQUIRE(submits.load() == 0);
+    // GpuSplit::WaitLanded's loop.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{2};
+    u64 requested_tick = 0;
+    while (Landing::landed.load() < ticket && std::chrono::steady_clock::now() < deadline) {
+        const u64 fence_tick = LandingFence::TickFor(ticket, 0);
+        if (fence_tick > requested_tick) {
+            LandingFence::Request(fence_tick);
+            requested_tick = fence_tick;
+            wake();
+        }
+        std::this_thread::yield();
+    }
+    const bool landed = Landing::landed.load() >= ticket;
+    {
+        std::scoped_lock lock{mutex};
+        stop = true;
+    }
+    cv.notify_one();
+    back.join();
+    REQUIRE(landed);
+    REQUIRE(submits.load() == 1);
+    REQUIRE_FALSE(requests.Urgent(current_tick.load()));
+    REQUIRE(LandingFence::TickForPending() == 0);
+
+    LandingFence::request_hook = nullptr;
+    LandingFence::request_argument = nullptr;
+    Landing::issued.store(saved_issued);
+    Landing::landed.store(saved_landed);
+    Landing::untracked_issued.store(saved_untracked);
+    LandingFence::NoteFence(0);
 }
 
 TEST_CASE("V2 P5b staging buffers in recurring use are not released", "[video_core][v2_p5b]") {

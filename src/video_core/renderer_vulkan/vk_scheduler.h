@@ -78,10 +78,21 @@ public:
     void FlushDeferred();
     /// Any thread: a lazy fence (early downloads) waited long enough for `tick` to be submitted;
     /// the back submits it at its next idle hook. Follow with WaitSubmitted.
-    /// `urgent` (F4-X2): the caller blocks on the tick now; a lazy fence's bounded-time request
-    /// passes false and may wait for the GPU's idle at the idle hook.
+    /// `urgent` (F4-X2): the caller blocks on the tick now, and the back's next idle hook submits
+    /// it; a lazy fence's bounded-time request passes false and rides the next pass boundary or
+    /// chunk.
     void RequestLazyFlush(u64 tick, bool urgent = true) {
         submit_requests.Request(tick, urgent);
+        if (urgent && lazy_fences) [[unlikely]] {
+            // Ryujinx's fast-flush input: how long blocked threads wait for submissions.
+            u64 none = 0;
+            blocked_since_us.compare_exchange_strong(none, NowUs(), std::memory_order_relaxed);
+        }
+    }
+    /// F4-X2 (R2-F4-02): microseconds threads blocked on unsubmitted ticks since the last call
+    /// (FlushHeuristic::NoteGuestSyncWait).
+    [[nodiscard]] u64 TakeBlockedWaitUs() noexcept {
+        return blocked_wait_us.exchange(0, std::memory_order_relaxed);
     }
 
     /// F4-02 (EDEN_NX2_V2_ADAPTSUBMIT, MASTER_PLAN §6 classes A/B, Ryujinx SyncManager non-strict
@@ -106,17 +117,11 @@ public:
     /// The idle hook (the back goes idle, or another thread asked with RequestIdleHook): what
     /// FlushDeferred submits, plus with lazy fences any work they or WantSubmit wait for.
     void ServeIdleHook();
-    /// The split's registered idle hook: ServeIdleHook, except that open work no thread blocks on
-    /// (no urgent request, nothing deferred) waits for the GPU to go idle while it is busy
-    /// (F4-X2, SubmitRequests::AtIdleHook, V2::GpuIdleWake; needs the finish thread).
-    void ServeSplitIdleHook();
-    /// F4-X2, recording thread: whether open work may wait for the GPU to go idle (it is busy and
-    /// the finish thread will wake the idle hook then). Marks the work wanted. False: submit now.
-    [[nodiscard]] bool DeferUntilGpuIdle();
-    /// Whether the GPU still runs handed-off work (by the finish thread's published tick).
-    [[nodiscard]] bool GpuBusy() const noexcept {
-        return master_semaphore->KnownGpuTick() + 1 < master_semaphore->CurrentTick();
-    }
+    /// The split's idle hook (RasterizerVulkan registers it): ServeIdleHook, except that open work
+    /// no thread blocks on (no urgent request, nothing deferred) is submitted only when
+    /// `sync_due(argument)` says DXVK's synchronization rule holds (F4-X2,
+    /// SubmitRequests::AtIdleHook, FlushHeuristic::SyncPointDue); it is asked only then.
+    void ServeSplitIdleHook(bool (*sync_due)(void*), void* argument);
     /// Any thread, F4-02/F4-04: `tick` is submitted when this returns. On the split's back it
     /// submits; other threads ask the back (RequestLazyFlush + WaitSubmitted), or submit
     /// themselves once the back stopped.
@@ -549,10 +554,19 @@ public:
     std::mutex submit_mutex;
 
 private:
+    [[nodiscard]] static u64 NowUs() noexcept {
+        return static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                    std::chrono::steady_clock::now().time_since_epoch())
+                                    .count());
+    }
+    /// F4-X2, recording thread, before a submission: adds the time blocked threads waited for it.
+    void NoteBlockedWait();
+
     std::chrono::steady_clock::time_point last_flush{};
     bool flush_pending{};
     VideoCommon::V2::SubmitRequests submit_requests; ///< RequestLazyFlush
-    VideoCommon::V2::GpuIdleWake gpu_idle_wake;      ///< F4-X2: DeferUntilGpuIdle
+    std::atomic<u64> blocked_since_us{}; ///< F4-X2: first urgent request since the last submit
+    std::atomic<u64> blocked_wait_us{};  ///< F4-X2: TakeBlockedWaitUs
     bool lazy_fences{};                 ///< F4-02: SetLazyFences
     bool finish_publishes_tick{};       ///< F4-12: FinishThreadPublishesTick
     bool pass_transform_feedback{};     ///< F4-07: NoteTransformFeedback
