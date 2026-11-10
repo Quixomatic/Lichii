@@ -448,14 +448,20 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
                 // at its fence, behind it, and reports its landing like the delayed ones.
                 const bool deferred =
                     reduction_or_max && !delayed && VideoCommon::V2::Landing::MustDeferUntracked();
-                // F3-X1 (8d31 / 019d hangs: acquires waited on words 19 ADD reductions short,
-                // with no producer the front could see): while the split's front records writes,
-                // every reduction and max release runs at its fence with an untracked ticket and
-                // its range, so a waiting acquire sees it (QmdReleaseMayWrite: submit request,
-                // landing, latch: §6 class C). Without it SignalFence ran it "at once" except when
-                // committed flushes made it a real fence, and then it landed unannounced.
-                const bool tracked = VideoCommon::V2::Landing::untracked_tag != 0;
-                const bool at_fence = reduction_or_max && (delayed || deferred || tracked);
+                // SYNC_SUBMIT_SPEC Step 3 (MP §6 rules: releases with no CPU-visible data behind
+                // them become guest-visible at execute time): at execute time again, unless fences
+                // are delayed or the landing rule defers them. d5e451eebf ran every one at its
+                // fence while the front recorded writes, so the 8d31/019d acquires 0x13 short had
+                // a producer to wait for; S1's semaphore view now knows those reductions' values
+                // (class A/B, Step 2), so no acquire waits for their landing. SignalFence without
+                // a delayed fence runs the operation at once (FenceManager::SignalFence, also when
+                // committed flushes make it a real fence): in memory before `consumed` moves.
+                const bool at_fence = reduction_or_max && (delayed || deferred);
+                if (reduction_or_max) {
+                    VideoCommon::V2::P5bStats::Add(
+                        at_fence ? VideoCommon::V2::P5bStats::Counter::QmdReductionsDeferred
+                                 : VideoCommon::V2::P5bStats::Counter::QmdReductionsAtExecute);
+                }
                 const auto untracked_device =
                     at_fence ? memory_manager.GpuToCpuAddress(address) : std::nullopt;
                 const u64 untracked =
@@ -465,7 +471,7 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
                 const u64 captured_ns =
                     untracked != 0 ? VideoCommon::Nx2Profile::Now() : 0;
                 if (flags & (1U << 26)) {
-                    VideoCore::g_signaling_query_report_fence = deferred || tracked;
+                    VideoCore::g_signaling_query_report_fence = deferred;
                     rasterizer->SignalFence([this, address, payload, flags, untracked,
                                              captured_ns] {
                         const u32 value = ReduceSemaphore((flags >> 20) & 7, (flags >> 24) & 1,
@@ -497,7 +503,7 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
                     // NVN2 tracks QMD completion with a max release (bit 19) into a word other
                     // releases also advance: a plain write would move it backwards and leave
                     // GEQ acquires waiting forever.
-                    VideoCore::g_signaling_query_report_fence = deferred || tracked;
+                    VideoCore::g_signaling_query_report_fence = deferred;
                     rasterizer->SignalFence([this, address, payload, untracked, captured_ns] {
                         const u32 value = (std::max)(memory_manager.Read<u32>(address), payload);
                         memory_manager.Write<u32>(address, value);

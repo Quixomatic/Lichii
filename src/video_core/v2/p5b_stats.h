@@ -116,6 +116,8 @@ enum class Counter : u32 {
     SubmitsWaiter,       ///< rule W: a thread blocks on the open tick (a request served)
     SubmitsDeferred,     ///< DeferFlush's work (FlushDeferred, idle hook)
     SubmitsPresent,      ///< the present's own submission
+    QmdReductionsAtExecute, ///< SYNC Step 3: QMD reduction/max releases run at execute time
+    QmdReductionsDeferred,  ///< ... at their fence (delayed fences, the landing rule)
     Count,
 };
 

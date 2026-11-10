@@ -159,12 +159,15 @@ void Report(const char* thread_name, u64 window_ns) {
         LOG_INFO(HW_GPU,
                  "V2 stats {} SYNC submits by rule (per frame) | B pass boundary {:.2f}, C chunk "
                  "{:.2f}, I idle {:.2f}, W waiter {:.2f}, deferred {:.2f}, present {:.2f}, other "
-                 "{:.2f} | finishes by site: {}",
+                 "{:.2f} | QMD reductions at execute {:.0f}/s, at their fence {:.0f}/s | "
+                 "finishes by site: {}",
                  thread_name, per_frame(at(Counter::SubmitsPassBoundary)),
                  per_frame(at(Counter::SubmitsChunk)), per_frame(at(Counter::SubmitsIdle)),
                  per_frame(at(Counter::SubmitsWaiter)), per_frame(at(Counter::SubmitsDeferred)),
                  per_frame(at(Counter::SubmitsPresent)),
                  per_frame(submits > by_rule ? submits - by_rule : 0),
+                 PerSecond(at(Counter::QmdReductionsAtExecute), seconds),
+                 PerSecond(at(Counter::QmdReductionsDeferred), seconds),
                  finish_list.empty() ? std::string{"none"} : finish_list);
     }
     // F4-06: which untracked operations still flush every pending write.

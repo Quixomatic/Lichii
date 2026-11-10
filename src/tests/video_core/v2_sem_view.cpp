@@ -248,6 +248,32 @@ TEST_CASE("SYNC step 2 idle back: an Equal acquire on a word an unknown QMD writ
     REQUIRE_FALSE(d.request);
 }
 
+TEST_CASE("SYNC step 3 idle back: a QMD reduction deferred behind a landing still answers a "
+          "Gequal acquire by the semaphore view",
+          "[video_core][v2_sem_view]") {
+    // 8d31/019d: acquires 0x13 short of 19 ADD reductions. The front notes each reduction (QMD
+    // writes retire by untracked settlement); one the landing rule defers stays pending at its
+    // fence with the back idle, and the view already holds the value it leaves.
+    SemView view;
+    constexpr u64 word = 0x8000;
+    const u32 memory = 0x100;
+    for (u64 i = 0; i < 0x13; ++i) {
+        view.NoteReduction(word, false, 0, 1, 10 + i, Retire::Untracked, 10 + i,
+                           Kind::QmdReduction, At(0), true, Reduce, [memory] { return memory; });
+    }
+    // The back ran every entry; the last reductions' untracked operations haven't landed.
+    const auto answer = view.Find(word, At(100, 0, 20));
+    REQUIRE(answer.pending);
+    REQUIRE(answer.writer.value == 0x113);
+    SemInputs in;
+    in.memory_word = 0x10a;
+    const auto d = DecideFromView(SemaphoreOp::Gequal, 0x113, answer, in);
+    REQUIRE(d.verdict == AcquireVerdict::MetByQueued);
+    REQUIRE_FALSE(d.request);
+    // Once they landed, memory holds the value and nothing is pending.
+    REQUIRE_FALSE(view.Find(word, At(100, 0, 100)).pending);
+}
+
 TEST_CASE("SYNC step 2 idle back: an acquire met by a fence-flagged release whose fence is not "
           "submitted passes at once (class B)",
           "[video_core][v2_sem_view]") {
