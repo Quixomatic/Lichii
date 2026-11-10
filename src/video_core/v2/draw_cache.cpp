@@ -123,27 +123,35 @@ bool CompareRecipes(const Recipe& hit, const Recipe& fresh, std::string& reasons
 }
 
 bool CompareBufferRecipes(const BufferRecipe& hit, const BufferRecipe& fresh,
-                          std::string& reasons) {
+                          const Versions::Generations& gens, std::string& reasons) {
     if (!hit.valid || !fresh.valid) {
         return true;
     }
+    // F2-X1: only bindings a replay would take from the recipe. A recorded buffer whose slot
+    // moved on (deleted, joined into a larger one, recreated) fails the replay's liveness check,
+    // before or during the draw (a lookup that deletes it reruns UpdateGraphicsBuffers), and is
+    // looked up again. A uniform is replayed only on the path its bind takes now
+    // (BufferCache::UniformBindKind), so a recorded kind other than the fresh one is bound as
+    // the resolve binds it.
+    const auto replayed = [&](const BufferBind& kept, const BufferBind& bind) {
+        return kept.Contains(bind.device_addr, bind.size) && kept.kind == bind.kind &&
+               gens.Get(Versions::Kind::Buffer, kept.buffer_id) == kept.generation;
+    };
     std::string differ;
     const auto check = [&](const char* what, const std::vector<BufferBind>& hits,
                            const std::vector<BufferBind>& fresh_binds) {
         for (const BufferBind& bind : fresh_binds) {
             const BufferBind* const kept = BufferRecipe::Find(hits, bind.stage, bind.index);
-            if (kept == nullptr || !kept->Contains(bind.device_addr, bind.size)) {
+            if (kept == nullptr || !replayed(*kept, bind)) {
                 continue; // the replay takes the sync path for it
             }
-            if (kept->buffer_id != bind.buffer_id ||
-                (kept->kind == BufferBind::Kind::Cached) != (bind.kind == BufferBind::Kind::Cached)) {
+            if (kept->buffer_id != bind.buffer_id) {
                 differ += fmt::format("{}{} {}:{}", differ.empty() ? "" : " ", what, bind.stage,
                                       bind.index);
             }
         }
     };
-    if (hit.has_index && fresh.has_index && hit.index.Contains(fresh.index.device_addr,
-                                                               fresh.index.size) &&
+    if (hit.has_index && fresh.has_index && replayed(hit.index, fresh.index) &&
         hit.index.buffer_id != fresh.index.buffer_id) {
         differ += "index";
     }

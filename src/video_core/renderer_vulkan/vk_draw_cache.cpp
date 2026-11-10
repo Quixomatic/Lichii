@@ -523,7 +523,8 @@ void DrawCacheGlue::Store(DC::RecipeTable& table, u64 key, Recipe& recipe,
         } else {
             std::string reasons;
             const bool buffers_equal =
-                DC::CompareBufferRecipes(decision.recipe->buffers, recipe.buffers, reasons);
+                DC::CompareBufferRecipes(decision.recipe->buffers, recipe.buffers, Versions::Gens(),
+                                         reasons);
             if (!DC::CompareRecipes(*decision.recipe, recipe, reasons) || !buffers_equal) {
                 ++counters.verify_mismatches;
                 DC::LogMismatch(compute, key, reasons);

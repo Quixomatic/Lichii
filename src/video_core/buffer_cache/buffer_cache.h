@@ -1102,26 +1102,10 @@ void BufferCache<P>::RecordGraphicsBuffers(VideoCommon::V2::DrawCache::BufferRec
                 const u32 size = (std::min)(binding.size,
                                             (*channel_state->uniform_buffer_sizes)[stage][index]);
                 bind.size = size;
-                const bool has_host_buffer = binding.buffer_id != NULL_BUFFER_ID;
-                const u32 offset =
-                    has_host_buffer ? slot_buffers[binding.buffer_id].Offset(binding.device_addr)
-                                    : 0;
-                const u32 alignment = runtime.GetUniformBufferAlignment();
-                const bool needs_alignment_stream =
-                    has_host_buffer && alignment > 1 && (offset % alignment) != 0;
-                const bool native_bank =
-                    has_host_buffer &&
-                    (*channel_state->uniform_buffer_sizes)[stage][index] == 0x10000 &&
-                    gpu_memory != nullptr && gpu_memory->UsesNativeTiling();
-                const bool use_fast_buffer =
-                    needs_alignment_stream ||
-                    (has_host_buffer && size <= channel_state->uniform_buffer_skip_cache_size &&
-                     !(memory_tracker.IsRegionGpuModified(binding.device_addr, size) ||
-               (v2_defer && V2PendingGpuWrite(binding.device_addr, size))));
-                if ((index == 17 && maxwell3d->root_tables.loaded && binding.size == 0) ||
-                    native_bank || !has_host_buffer) {
+                const DC::BufferBind::Kind path = UniformBindKind(stage, index, binding);
+                if (path == DC::BufferBind::Kind::Normal) {
                     bind.kind = DC::BufferBind::Kind::Normal;
-                } else if (use_fast_buffer) {
+                } else if (path == DC::BufferBind::Kind::Version) {
                     using Ref = typename Runtime::StreamUniformRef;
                     static_assert(sizeof(Ref) <= sizeof(bind.ref));
                     const Ref* version = nullptr;
@@ -1482,7 +1466,14 @@ void BufferCache<P>::ReplayHostStageBuffers(size_t stage,
                                                                       index);
             const u32 size =
                 (std::min)(binding.size, (*channel_state->uniform_buffer_sizes)[stage][index]);
+            // F2-X1: only on the path the bind takes now. A range the GPU wrote since the recipe
+            // (a version holds guest memory, the host buffer is newer) or one the guest memory
+            // caught up with (the stream path again) is bound as BindHostGraphicsUniformBuffer
+            // binds it.
+            const DC::BufferBind::Kind path =
+                kept != nullptr ? UniformBindKind(stage, index, binding) : DC::BufferBind::Kind::Normal;
             if (kept != nullptr && kept->kind == DC::BufferBind::Kind::Version &&
+                path == DC::BufferBind::Kind::Version &&
                 kept->tick == runtime.CurrentTick() && kept->device_addr == binding.device_addr &&
                 kept->size == size && binding.buffer_id.index == kept->buffer_id &&
                 VideoCommon::V2::Versions::Gens().Get(VideoCommon::V2::Versions::Kind::Buffer,
@@ -1501,7 +1492,7 @@ void BufferCache<P>::ReplayHostStageBuffers(size_t stage,
                 }
             }
             if (kept != nullptr && kept->kind == DC::BufferBind::Kind::Cached &&
-                replayable(kept, binding, size)) {
+                path == DC::BufferBind::Kind::Cached && replayable(kept, binding, size)) {
                 Buffer& buffer = slot_buffers[binding.buffer_id];
                 TouchBuffer(buffer, binding.buffer_id);
                 const u32 offset = buffer.Offset(binding.device_addr);
@@ -1615,6 +1606,34 @@ u32 BufferCache<P>::CountStaleRecipeRanges(const VideoCommon::V2::DrawCache::Buf
         }
     }
     return stale;
+}
+
+template <class P>
+VideoCommon::V2::DrawCache::BufferBind::Kind BufferCache<P>::UniformBindKind(
+    size_t stage, u32 index, const Binding& binding) {
+    using Kind = VideoCommon::V2::DrawCache::BufferBind::Kind;
+    // BindHostGraphicsUniformBuffer's decisions, in its order.
+    const u32 bank_size = (*channel_state->uniform_buffer_sizes)[stage][index];
+    const u32 size = (std::min)(binding.size, bank_size);
+    const bool has_host_buffer = binding.buffer_id != NULL_BUFFER_ID;
+    const bool native_bank = has_host_buffer && bank_size == 0x10000 && gpu_memory != nullptr &&
+                             gpu_memory->UsesNativeTiling();
+    if ((index == 17 && maxwell3d->root_tables.loaded && binding.size == 0) || native_bank ||
+        !has_host_buffer) {
+        return Kind::Normal;
+    }
+    bool needs_alignment_stream = false;
+    if constexpr (!IS_OPENGL) {
+        const u32 offset = slot_buffers[binding.buffer_id].Offset(binding.device_addr);
+        const u32 alignment = runtime.GetUniformBufferAlignment();
+        needs_alignment_stream = alignment > 1 && (offset % alignment) != 0;
+    }
+    const bool use_fast_buffer =
+        needs_alignment_stream ||
+        (size <= channel_state->uniform_buffer_skip_cache_size &&
+         !(memory_tracker.IsRegionGpuModified(binding.device_addr, size) ||
+           (v2_defer && V2PendingGpuWrite(binding.device_addr, size))));
+    return use_fast_buffer ? Kind::Version : Kind::Cached;
 }
 
 template <class P>

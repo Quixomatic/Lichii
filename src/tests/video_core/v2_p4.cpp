@@ -571,27 +571,54 @@ TEST_CASE("V2 P4: buffer recipes compare what a replay would bind", "[video_core
     REQUIRE(DC::BufferRecipe::Find(hit.uniform, 4, 2) != nullptr);
     REQUIRE(DC::BufferRecipe::Find(hit.uniform, 4, 3) == nullptr);
 
+    Versions::Generations gens;
     DC::BufferRecipe fresh = hit;
     std::string reasons;
-    REQUIRE(DC::CompareBufferRecipes(hit, fresh, reasons));
+    REQUIRE(DC::CompareBufferRecipes(hit, fresh, gens, reasons));
     REQUIRE(reasons.empty());
 
     // Fewer indices this draw (a sub-range of the recorded one): same buffer, fine.
     fresh.index.size = 0x300;
-    REQUIRE(DC::CompareBufferRecipes(hit, fresh, reasons));
+    REQUIRE(DC::CompareBufferRecipes(hit, fresh, gens, reasons));
     // A relocated uniform buffer (outside the recorded range): the replay syncs it, not compared.
     fresh.uniform[0].device_addr = 0x40000;
     fresh.uniform[0].buffer_id = 11;
-    REQUIRE(DC::CompareBufferRecipes(hit, fresh, reasons));
+    REQUIRE(DC::CompareBufferRecipes(hit, fresh, gens, reasons));
     // The full resolve found another buffer for a range the replay would take: a mismatch.
     fresh.vertex[0].buffer_id = 8;
-    REQUIRE_FALSE(DC::CompareBufferRecipes(hit, fresh, reasons));
+    REQUIRE_FALSE(DC::CompareBufferRecipes(hit, fresh, gens, reasons));
     REQUIRE(reasons.find("buffers (vertex 0:1)") != std::string::npos);
-    // A cached binding the full resolve now streams: a mismatch in path.
+
+    // F2-X1 (f75c6eac0b DRAWCACHE=verify: 1001 "buffers" mismatches at scene loads). A recorded
+    // buffer that was deleted or joined into a larger one since: the replay's liveness check
+    // looks it up again, so another buffer in the full resolve is no mismatch.
+    gens.Bump(Versions::Kind::Buffer, 7);
+    gens.Bump(Versions::Kind::Buffer, 3);
+    fresh = hit;
+    fresh.vertex[0].buffer_id = 8;
+    fresh.index.buffer_id = 4;
+    reasons.clear();
+    REQUIRE(DC::CompareBufferRecipes(hit, fresh, gens, reasons));
+    REQUIRE(reasons.empty());
+    // ...but a live recorded buffer still must be the one the resolve found.
+    DC::BufferRecipe live = hit;
+    live.vertex[0].generation = 1;
+    live.index.generation = 1;
+    REQUIRE_FALSE(DC::CompareBufferRecipes(live, fresh, gens, reasons));
+    REQUIRE(reasons.find("index") != std::string::npos);
+    REQUIRE(reasons.find("vertex 0:1") != std::string::npos);
+    // A uniform the resolve now binds on another path (the GPU wrote a versioned range, or the
+    // guest memory caught up with a cached one): the replay re-decides the path
+    // (UniformBindKind) and binds it as the resolve does, so a kind difference is no mismatch...
     fresh = hit;
     fresh.uniform[0].kind = Kind::Cached;
+    fresh.uniform[0].buffer_id = 12;
     reasons.clear();
-    REQUIRE_FALSE(DC::CompareBufferRecipes(hit, fresh, reasons));
+    REQUIRE(DC::CompareBufferRecipes(hit, fresh, gens, reasons));
+    // ...while the same path with another buffer is.
+    fresh.uniform[0].kind = Kind::Version;
+    REQUIRE_FALSE(DC::CompareBufferRecipes(hit, fresh, gens, reasons));
+    REQUIRE(reasons.find("uniform 4:2") != std::string::npos);
 
     // Clearing a recipe clears its buffers.
     DC::Recipe recipe;

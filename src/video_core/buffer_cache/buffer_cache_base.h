@@ -376,6 +376,12 @@ public:
     /// CPU-modified (a skipped upload would have been needed).
     [[nodiscard]] u32 CountStaleRecipeRanges(const VideoCommon::V2::DrawCache::BufferRecipe& recipe,
                                              VideoCommon::V2::Versions::EpochMemo& memo);
+    /// F2-X1: the path BindHostGraphicsUniformBuffer takes for this uniform binding now, as a
+    /// recipe kind: Normal (root-table bank, native bank, no host buffer), Version (the stream
+    /// path; a recipe holds Version only when a version was found) or Cached (the host buffer).
+    /// A replay takes a recorded uniform only on the path the binding takes now.
+    [[nodiscard]] VideoCommon::V2::DrawCache::BufferBind::Kind UniformBindKind(
+        size_t stage, u32 index, const Binding& binding);
 
     /// EDEN_NX2_V2_DRAWCACHE: visits the graphics storage buffer bindings of `stage` as
     /// func(index, is_written, binding).

@@ -762,6 +762,66 @@ TEST_CASE("Draw cache buffer replay binds unchanged cached uniforms without sync
     REQUIRE(f.cache->CountStaleRecipeRanges(moved, memo) == 0);
 }
 
+TEST_CASE("Draw cache buffer replay binds a uniform on the path its bind takes now",
+          "[buffer_ports][v2_p4]") {
+    // F2-X1: a recorded uniform is replayed only on the path BindHostGraphicsUniformBuffer
+    // takes for it now (the stream for a small range nobody on the GPU wrote, the host buffer
+    // once the GPU wrote it).
+    namespace V2 = VideoCommon::V2;
+    using Kind = V2::DrawCache::BufferBind::Kind;
+    const auto saved = V2::g_modes;
+    V2::g_modes[static_cast<size_t>(V2::Switch::DrawCache)] = V2::Mode::On;
+    SCOPE_EXIT {
+        V2::g_modes = saved;
+    };
+    Fixture f;
+    Tegra::Control::ChannelState state{0};
+    state.memory_manager = &*f.memory;
+    state.payload.emplace(f.system, *f.memory, state);
+    VideoCommon::BufferCacheChannelInfo channel{state};
+    VideoCommon::UniformBufferSizes sizes{};
+    sizes[0][0] = 0x100; // under the skip-cache size: the stream path while not GPU-modified
+    channel.uniform_buffer_sizes = &sizes;
+    channel.enabled_uniform_buffer_masks[0] = 1;
+    const auto id = Access::Add(*f.cache, 0x20000, 0x10000);
+    Access::UseChannel(*f.cache, channel);
+    const VideoCommon::Binding binding{.device_addr = 0x20000, .size = 0x100, .buffer_id = id};
+    channel.uniform_buffers[0][0] = binding;
+    REQUIRE(f.cache->UniformBindKind(0, 0, binding) == Kind::Version);
+    REQUIRE(f.cache->UniformBindKind(
+                0, 0,
+                VideoCommon::Binding{.device_addr = 0x20000,
+                                     .size = 0x100,
+                                     .buffer_id = VideoCommon::NULL_BUFFER_ID}) == Kind::Normal);
+
+    // A recipe that recorded the host buffer (the range was GPU-modified then).
+    V2::Versions::EpochMemo memo{V2::Versions::Pages()};
+    V2::DrawCache::BufferRecipe recipe;
+    recipe.valid = true;
+    recipe.stamp = V2::Versions::Pages().Stamp();
+    recipe.uniform.push_back({
+        .stage = 0,
+        .index = 0,
+        .kind = Kind::Cached,
+        .buffer_id = id.index,
+        .generation = V2::Versions::Gens().Get(V2::Versions::Kind::Buffer, id.index),
+        .device_addr = 0x20000,
+        .size = 0x100,
+    });
+    recipe.MergeRanges();
+    // Not GPU-modified any more: the resolve streams it, so the replay does too.
+    f.cache->ReplayHostStageBuffers(0, recipe, memo);
+    REQUIRE(f.runtime.uniform_binds == 0);
+    REQUIRE(f.cache->TakeReplayCounts() == std::pair<u32, u32>{0, 1});
+
+    // GPU-modified: the host buffer, from the recipe.
+    Access::Dirty(*f.cache, 0x20000, 0x100);
+    REQUIRE(f.cache->UniformBindKind(0, 0, binding) == Kind::Cached);
+    f.cache->ReplayHostStageBuffers(0, recipe, memo);
+    REQUIRE(f.runtime.uniform_binds == 1);
+    REQUIRE(f.cache->TakeReplayCounts() == std::pair<u32, u32>{1, 0});
+}
+
 namespace {
 namespace Commit = VideoCommon::V2::Commit;
 

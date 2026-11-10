@@ -398,10 +398,11 @@ struct BufferRecipe {
 };
 
 /// Compares the buffer bindings a replay of `hit` would bind with the ones a full resolve bound
-/// (`fresh`): a binding the replay takes from the recipe (its range holds the fresh one) must have
-/// the same buffer. Appends "buffers (...)" to `reasons` on a difference.
+/// (`fresh`): a binding the replay takes from the recipe (its range holds the fresh one, same
+/// path, its buffer's generation unchanged) must have the same buffer. Appends "buffers (...)"
+/// to `reasons` on a difference.
 [[nodiscard]] bool CompareBufferRecipes(const BufferRecipe& hit, const BufferRecipe& fresh,
-                                        std::string& reasons);
+                                        const Versions::Generations& gens, std::string& reasons);
 
 /// Everything a hit needs to record the draw (or dispatch) without resolving it again.
 struct Recipe {
