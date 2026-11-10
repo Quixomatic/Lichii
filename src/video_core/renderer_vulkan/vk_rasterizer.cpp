@@ -477,6 +477,26 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
                      commit_lock_free ? "no cache locks in the draw path" : "cache locks kept");
         }
     }
+    if (VideoCommon::V2::On(VideoCommon::V2::Switch::DrawRec)) [[unlikely]] {
+        // D2: the record path needs the commit stage's lock-free lookups, the draw cache's
+        // versions and generations, and storage buffers bound as the record holds them.
+        namespace V2 = VideoCommon::V2;
+        const char* missing = !commit_lock_free             ? "EDEN_NX2_V2_COMMIT=1 (lock-free)"
+                              : !V2::On(V2::Switch::DrawCache) ? "EDEN_NX2_V2_DRAWCACHE"
+                              : buffer_cache_runtime.ShouldLimitDynamicStorageBuffers()
+                                  ? "no dynamic storage buffer limit"
+                                  : nullptr;
+        if (missing != nullptr) {
+            LOG_WARNING(Render_Vulkan, "EDEN_NX2_V2_DRAWREC needs {}; it stays off", missing);
+            V2::g_modes[static_cast<size_t>(V2::Switch::DrawRec)] = V2::Mode::Off;
+        } else {
+            drawrec = V2::Get(V2::Switch::DrawRec);
+            LOG_INFO(Render_Vulkan, "EDEN_NX2_V2_DRAWREC: {}",
+                     drawrec == V2::Mode::Verify
+                         ? "verify (the old configure runs, the record path is compared)"
+                         : "resolve, apply and encode from draw records");
+        }
+    }
 }
 
 RasterizerVulkan::~RasterizerVulkan() {

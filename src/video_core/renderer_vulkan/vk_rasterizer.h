@@ -29,6 +29,7 @@
 #include "video_core/renderer_vulkan/vk_draw_cache.h"
 #include "video_core/v2/flush_heuristic.h"
 #include "video_core/v2/commit.h"
+#include "video_core/v2/v2_switches.h"
 #include "video_core/renderer_vulkan/vk_fence_manager.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_query_cache.h"
@@ -188,6 +189,9 @@ private:
     /// COMMIT=1 without COMMIT_LOCKED: the draw path takes no cache lock; other threads hand
     /// their cache work to the owner (IMPLEMENTATION_LOG.md, P5a protocol).
     bool commit_lock_free{};
+    /// EDEN_NX2_V2_DRAWREC (P6 Step 0, notes/STEP0_SPEC.md) as the constructor allowed it: off
+    /// unless COMMIT=1 lock-free, DRAWCACHE on and no dynamic storage buffer limit.
+    VideoCommon::V2::Mode drawrec{VideoCommon::V2::Mode::Off};
     /// GPU::CollectedCpuWrites as the owner last applied them.
     u64 commit_collected{};
     u64 commit_batch{~0ULL}; ///< F2-17: the back batch whose start applied the CPU writes

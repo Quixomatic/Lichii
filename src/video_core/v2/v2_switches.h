@@ -58,6 +58,7 @@ enum class Switch : u32 {
     Parallel,     ///< EDEN_NX2_V2_PARALLEL: segmented parallel resolve, ordered merge (P6a)
     MultiFront,   ///< EDEN_NX2_V2_MULTIFRONT: front engines over channel groups (P6b)
     MacroMemo,    ///< EDEN_NX2_V2_MACROMEMO: front macro calls replayed (v2/macro_memo.h, F5)
+    DrawRec,      ///< EDEN_NX2_V2_DRAWREC: ResolveDraw / ApplyDraw / EncodeDraw (P6 Step 0)
     Count,
 };
 
@@ -96,6 +97,7 @@ inline constexpr std::array<const char*, static_cast<size_t>(Switch::Count)> swi
     "PARALLEL",
     "MULTIFRONT",
     "MACROMEMO",
+    "DRAWREC",
 };
 
 namespace Detail {
