@@ -110,7 +110,9 @@ public:
             // operands are read up front. Carry chaining remains explicit between the lanes.
             const auto get = [&](Word reg, Word lane) -> Word {
                 if (reg < 24) {
-                    if (!(initialized & (1U << reg))) fail("uninitialized register read");
+                    if (!(initialized & (1U << reg)) && !allow_uninitialized) {
+                        fail("uninitialized register read");
+                    }
                     return regs[reg];
                 }
                 switch (reg) {
@@ -267,6 +269,8 @@ public:
     using DataRamAccess = std::pair<Word, Word>;
     bool read_registers{};
     bool reread_data_ram{};
+    // Read never-written MME registers as 0, as the JIT does (the v2 macro memo's recording).
+    bool allow_uninitialized{};
     std::vector<DataRamAccess> data_ram_reads;
     std::vector<DataRamAccess> data_ram_writes;
 };

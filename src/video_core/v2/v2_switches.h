@@ -57,6 +57,7 @@ enum class Switch : u32 {
     PresentPace,  ///< EDEN_NX2_V2_PRESENTPACE: bounded frames ahead with present wait (P5b)
     Parallel,     ///< EDEN_NX2_V2_PARALLEL: segmented parallel resolve, ordered merge (P6a)
     MultiFront,   ///< EDEN_NX2_V2_MULTIFRONT: front engines over channel groups (P6b)
+    MacroMemo,    ///< EDEN_NX2_V2_MACROMEMO: front macro calls replayed (v2/macro_memo.h, F5)
     Count,
 };
 
@@ -94,6 +95,7 @@ inline constexpr std::array<const char*, static_cast<size_t>(Switch::Count)> swi
     "PRESENTPACE",
     "PARALLEL",
     "MULTIFRONT",
+    "MACROMEMO",
 };
 
 namespace Detail {

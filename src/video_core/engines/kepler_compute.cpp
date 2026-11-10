@@ -46,7 +46,9 @@
 #include "common/scope_exit.h"
 #include "video_core/v2/shader_writes.h"
 #include "video_core/v2/ir_check.h"
+#include "video_core/v2/macro_memo.h"
 #include "video_core/v2/regsem_3d.h"
+#include "video_core/v2/v2_stats.h"
 #include "video_core/v2/s1_deltas.h"
 
 namespace Tegra::Engines {
@@ -1740,6 +1742,9 @@ struct KeplerCompute::FrontState {
     /// S1 single owner (GpuSplit::S1Exec, REGSEM=1, the native class): classified entries
     /// instead of method words (F1-05).
     bool s1{};
+    /// EDEN_NX2_V2_MACROMEMO: replayed macro calls; EDEN_NX2_V2_STATS: calls per macro (F5).
+    std::unique_ptr<VideoCommon::V2::MacroMemo::Memo> v2_memo;
+    std::unique_ptr<VideoCommon::V2::MacroMemo::CallStats> v2_call_stats;
 };
 
 KeplerCompute::FrontState& KeplerCompute::Front(VideoCommon::GpuSplit& split) {
@@ -2431,6 +2436,14 @@ void KeplerCompute::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& s
     if (native_data_ram) {
         macro.native_interpreter.active_dram = native_data_ram;
     }
+    if (VideoCommon::V2::Stats::Enabled()) [[unlikely]] {
+        if (!fs.v2_call_stats) {
+            fs.v2_call_stats = std::make_unique<VideoCommon::V2::MacroMemo::CallStats>();
+        }
+        fs.v2_call_stats->Note("compute", start, fs.parameters, macro.native_code,
+                               macro.native_code_generation,
+                               fs.v2_memo ? &fs.v2_memo->statistics : nullptr);
+    }
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Macro};
     const auto read = [&fs](u32 address) {
         return address < fs.registers.size() ? fs.registers[address] : 0U;
@@ -2460,17 +2473,52 @@ void KeplerCompute::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& s
         }
         return true;
     };
+    const auto live = [&](auto& live_emit) {
 #ifdef ARCHITECTURE_x86_64
-    if (!macro.native_jit) {
-        macro.native_jit = std::make_shared<TuringMacroJit>();
-    }
-    macro.native_jit->Prepare(macro.native_code, macro.native_code_generation);
-    const auto result = macro.native_jit->Execute(
-        start, fs.parameters, std::span<u32>{*macro.native_interpreter.active_dram}, read, emit);
+        if (!macro.native_jit) {
+            macro.native_jit = std::make_shared<TuringMacroJit>();
+        }
+        macro.native_jit->Prepare(macro.native_code, macro.native_code_generation);
+        return macro.native_jit->Execute(start, fs.parameters,
+                                         std::span<u32>{*macro.native_interpreter.active_dram},
+                                         read, live_emit);
 #else
-    const auto result =
-        macro.native_interpreter.Execute(macro.native_code, start, fs.parameters, read, emit);
+        return macro.native_interpreter.Execute(macro.native_code, start, fs.parameters, read,
+                                                live_emit);
 #endif
+    };
+    const VideoCommon::V2::Mode memo = VideoCommon::V2::Get(VideoCommon::V2::Switch::MacroMemo);
+    Tegra::TuringMacroInterpreter::Result result;
+    if (memo != VideoCommon::V2::Mode::Off) [[unlikely]] {
+        // Fix F5-02, as for 3D macros: compute macros make no MME DMA reads, and a compute
+        // register write changes no other register.
+        namespace MacroMemo = VideoCommon::V2::MacroMemo;
+        if (!fs.v2_memo) {
+            fs.v2_memo = std::make_unique<MacroMemo::Memo>();
+        }
+        // The front switches between two macro engines (FrontMacroEngine), each with its own
+        // generation count.
+        fs.v2_memo->Synchronize(macro.native_code_generation ^
+                                (static_cast<u64>(reinterpret_cast<uintptr_t>(&macro)) << 20));
+        const auto no_dma = [](u32, u32) {};
+        const MacroMemo::CallInfo call{
+            .start = start,
+            .fifo = &fs.parameters,
+            .dram = *macro.native_interpreter.active_dram,
+            .code = macro.native_code,
+            .generation = &macro.native_code_generation,
+            .regs = fs.registers.data(),
+            .num_regs = fs.registers.size(),
+            .side_effects = {},
+            .dma_fifoed = ~0U,
+            .dma_ram = ~0U,
+            .verify = memo == VideoCommon::V2::Mode::Verify,
+        };
+        result = MacroMemo::Call(*fs.v2_memo, macro.native_interpreter, call, live, read, emit,
+                                 no_dma);
+    } else {
+        result = live(emit);
+    }
     if (!result.success) {
         macro.native_execution_failed = true;
         LOG_ERROR(HW_GPU, "Native MME (split front) failed: compute start={:#x}, consumed={}, error={}",
