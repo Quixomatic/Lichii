@@ -1256,14 +1256,15 @@ void GraphicsPipeline::NoteRecordDelta(const DrawApplyOut& out) {
 
 void GraphicsPipeline::NoteRecordPush(const R::ResolvedDraw& record, const DrawApplyOut& out,
                                       std::array<u32, 32>& push, u32& push_words,
-                                      std::vector<u32>& heap_words) const {
+                                      std::vector<u32>& recipe_heap_words) const {
     RenderAreaPushConstant render_area;
     render_area.uses_render_area = record.h.render_area.uses;
     if (record.h.render_area.uses) {
         render_area.words = {record.h.render_area.w, record.h.render_area.h};
     }
     // The heap words as the encode pushed them (texel words interleaved, as the configure's).
-    NoteRecipePush(push, push_words, heap_words, out.rescaling, render_area, heap_push.words);
+    NoteRecipePush(push, push_words, recipe_heap_words, out.rescaling, render_area,
+                   heap_push.words);
 }
 
 void GraphicsPipeline::NoteRecipeDelta(const VideoCommon::V2::DrawCache::Recipe& recipe,

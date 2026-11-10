@@ -540,7 +540,7 @@ public:
     /// record, as a recipe built from it replays them.
     void NoteRecordPush(const VideoCommon::V2::Resolve::ResolvedDraw& record,
                         const DrawApplyOut& out, std::array<u32, 32>& push, u32& push_words,
-                        std::vector<u32>& heap_words) const;
+                        std::vector<u32>& recipe_heap_words) const;
     /// DRAWREC=verify (step 12): ApplyDraw(DeriveOnly) on the observed draw's record, its heap and
     /// rescaling words compared with the ones the configure used.
     void VerifyDrawApply(VideoCommon::V2::Resolve::ResolvedDraw& record,
