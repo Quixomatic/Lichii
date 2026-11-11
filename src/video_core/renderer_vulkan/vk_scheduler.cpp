@@ -207,6 +207,10 @@ Scheduler::~Scheduler() {
 
 u64 Scheduler::Flush(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
                      std::source_location location) {
+    // SYNC §14.7a (a): the back's cost of one submission (this call; the pass re-begin after it
+    // is timed in RequestRenderpass / RequestRendering).
+    const bool cost_stats = VideoCommon::V2::P5bStats::Enabled();
+    const u64 flush_start = cost_stats ? VideoCommon::Nx2Profile::Now() : 0;
     RunPreSubmitHook();
     RunAfterPass(); // SYNC Step 9: the pass's deferred copies go in this submission
     // EDEN_NX2_V2_DRAWCACHE: a submit is an ordering point (collect epoch). F4-08 (§8): with
@@ -240,7 +244,20 @@ u64 Scheduler::Flush(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
     last_flush = std::chrono::steady_clock::now();
     flush_pending = false;
     submit_wanted = false;
+    if (cost_stats) [[unlikely]] {
+        VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::SubmitCostBackNs,
+                                       VideoCommon::Nx2Profile::Now() - flush_start);
+        VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::SubmitCostFlushes);
+        post_submit_pass = true;
+    }
     return signal_value;
+}
+
+void Scheduler::NotePostSubmitPass(u64 start_ns) {
+    // SYNC §14.7a (a): the first pass begin after a submission (its re-begin cost).
+    VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::SubmitCostPassNs,
+                                   VideoCommon::Nx2Profile::Now() - start_ns);
+    post_submit_pass = false;
 }
 
 void Scheduler::NoteBlockedWait() {
@@ -830,9 +847,13 @@ void Scheduler::RequestRenderpass(const Framebuffer* framebuffer, std::source_lo
     if (state.renderpass) {
         CountRenderPassEnd(location.file_name(), location.line());
     }
+    const u64 pass_start = post_submit_pass ? VideoCommon::Nx2Profile::Now() : 0;
     // Ends any active pass and realizes a deferred clear
     EndRenderPass();
     BeginRenderPassImpl(framebuffer, renderpass, nullptr, 0);
+    if (pass_start != 0) [[unlikely]] {
+        NotePostSubmitPass(pass_start);
+    }
 }
 
 void Scheduler::RequestRendering(const Framebuffer* framebuffer, u32 color_count,
@@ -858,10 +879,14 @@ void Scheduler::RequestRendering(const Framebuffer* framebuffer, u32 color_count
     if (deferred_clear.framebuffer == framebuffer) {
         // The deferred clear becomes the pass's clear load ops.
         const DeferredClear dc = std::exchange(deferred_clear, DeferredClear{});
+        const u64 pass_start = post_submit_pass ? VideoCommon::Nx2Profile::Now() : 0;
         EndRenderPass();
         BeginRenderingImpl(framebuffer, color_count, dc.color_clear_mask, dc.color_values,
                            dc.depth_stencil,
                            dc.depth_stencil_value);
+        if (pass_start != 0) [[unlikely]] {
+            NotePostSubmitPass(pass_start);
+        }
         return;
     }
     const VkExtent2D render_area = framebuffer->RenderArea();
@@ -881,8 +906,12 @@ void Scheduler::RequestRendering(const Framebuffer* framebuffer, u32 color_count
             VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::PassColorRestarts);
         }
     }
+    const u64 pass_start = post_submit_pass ? VideoCommon::Nx2Profile::Now() : 0;
     EndRenderPass();
     BeginRenderingImpl(framebuffer, color_count, 0, {}, false, {});
+    if (pass_start != 0) [[unlikely]] {
+        NotePostSubmitPass(pass_start);
+    }
 }
 
 void Scheduler::BeginRenderingImpl(const Framebuffer* framebuffer, u32 color_count,
@@ -1306,7 +1335,14 @@ void Scheduler::WorkerThread(std::stop_token stop_token) {
             // Perform the work, tracking whether the chunk was a submission
             // before executing.
             const bool has_submit = work->HasSubmit();
+            // SYNC §14.7a (a): the worker's time per closed command buffer (all its chunks).
+            const bool cost_stats = VideoCommon::V2::P5bStats::Enabled();
+            const u64 work_start = cost_stats ? VideoCommon::Nx2Profile::Now() : 0;
             work->ExecuteAll(current_cmdbuf, current_upload_cmdbuf);
+            if (cost_stats) [[unlikely]] {
+                VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::SubmitCostWorkerNs,
+                                               VideoCommon::Nx2Profile::Now() - work_start);
+            }
 
             // If the chunk was a submission, reallocate the command buffer.
             if (has_submit) {

@@ -683,6 +683,9 @@ private:
     }
     /// F4-X2, recording thread, before a submission: adds the time blocked threads waited for it.
     void NoteBlockedWait();
+    /// SYNC §14.7a (a, STATS): the first pass begin after a Flush is timed (its re-begin cost).
+    bool post_submit_pass{};
+    void NotePostSubmitPass(u64 start_ns);
 
     std::chrono::steady_clock::time_point last_flush{};
     bool flush_pending{};

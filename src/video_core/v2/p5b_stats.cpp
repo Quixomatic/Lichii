@@ -336,10 +336,16 @@ void Report(const char* thread_name, u64 window_ns) {
         };
         LOG_INFO(HW_GPU,
                  "V2 stats {} SYNC §14.7 | guest-read fence age at submit: {:.0f}/s, p50 {}, "
-                 "p99 {} | HAZARD=verify command lists compared {:.0f}/s, mismatched {}",
+                 "p99 {} | HAZARD=verify command lists compared {:.0f}/s, mismatched {} | cost "
+                 "of one submission (us): back Flush {:.1f}, pass re-begin {:.1f}, worker {:.1f} "
+                 "per command buffer, submit call {:.1f}",
                  thread_name, PerSecond(fences, seconds), percentile(0.5), percentile(0.99),
                  PerSecond(at(Counter::ListVerifyCompared), seconds),
-                 at(Counter::ListVerifyMismatched));
+                 at(Counter::ListVerifyMismatched),
+                 Ratio(at(Counter::SubmitCostBackNs), at(Counter::SubmitCostFlushes)) / 1000.0,
+                 Ratio(at(Counter::SubmitCostPassNs), at(Counter::SubmitCostFlushes)) / 1000.0,
+                 Ratio(at(Counter::SubmitCostWorkerNs), submits) / 1000.0,
+                 Ratio(at(Counter::HandoffSubmitUs), at(Counter::SubmitThreadSubmits)));
     }
     // F4-06: which untracked operations still flush every pending write.
     LOG_INFO(HW_GPU, "V2 stats {} P5b full barriers by site (per frame) | {}", thread_name,

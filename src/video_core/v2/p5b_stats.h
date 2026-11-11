@@ -204,6 +204,13 @@ enum class Counter : u32 {
     GuestFenceAge8,
     ListVerifyCompared,
     ListVerifyMismatched,
+    // SYNC §14.7a (a): the cost of one submission: the back's Scheduler::Flush, the first pass
+    // re-begin after it, the worker's time per closed command buffer (the submit thread's
+    // vkQueueSubmit2 is HandoffSubmitUs).
+    SubmitCostBackNs,
+    SubmitCostFlushes,
+    SubmitCostPassNs,
+    SubmitCostWorkerNs,
     Count,
 };
 

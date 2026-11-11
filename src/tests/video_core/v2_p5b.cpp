@@ -843,8 +843,8 @@ TEST_CASE("V2 P5b flush decisions at pass boundaries", "[video_core][v2_p5b]") {
             }
             return u32{0};
         };
-        // Nothing pending: the first boundary past idle_pass_draws (§14.7 (4)), here chunk 1.
-        CHECK(boundary_at({.pending = 0, .back_behind = true}) == 1); // the recorder behind too
+        // Nothing pending: the first boundary past idle_min_cost (§14.7a, default 64 draws).
+        CHECK(boundary_at({.pending = 0, .back_behind = true}) == 2); // the recorder behind too
         CHECK(boundary_at({.pending = 0, .back_behind = false, .guest_fence = true}) == 1);
         CHECK(boundary_at({.pending = 1, .back_behind = false}) == 3);
         // Two or more pending: rule C reaches the same threshold mid-pass first.
@@ -871,11 +871,15 @@ TEST_CASE("V2 P5b flush decisions at pass boundaries", "[video_core][v2_p5b]") {
         CHECK(heuristic.AtPassBoundary(FlushHint::Weak, FlushState{.pending = 0}, 1001).action ==
               FlushAction::Flush);
     }
-    SECTION("SYNC §14.7 (4): nothing pending, a boundary submits at 10 draws, never before") {
-        FlushHeuristic heuristic{params};
+    SECTION("SYNC §14.7a: nothing pending, a boundary submits at the sweep's minimum, never "
+            "before") {
+        for (const u32 minimum : {10U, 32U, 64U, 128U}) { // EDEN_NX2_SYNC_IDLE_MIN_DRAWS
+        FlushParams sweep = params;
+        sweep.idle_min_cost = minimum;
+        FlushHeuristic heuristic{sweep};
         heuristic.NoteSubmit(1000);
         const FlushState idle{.pending = 0, .back_behind = false};
-        for (u32 i = 0; i < params.idle_pass_draws - 1; ++i) {
+        for (u32 i = 0; i < minimum - 1; ++i) {
             REQUIRE(heuristic.Advance(1, idle, 1000).action != FlushAction::Flush);
         }
         // However long ago the last submission was: no time term.
@@ -892,6 +896,7 @@ TEST_CASE("V2 P5b flush decisions at pass boundaries", "[video_core][v2_p5b]") {
             heuristic.Advance(1, one, 1000);
         }
         REQUIRE(heuristic.AtPassBoundary(FlushHint::Weak, one, 1000).action == FlushAction::None);
+        }
     }
     SECTION("nothing recorded: no boundary submit") {
         FlushHeuristic heuristic{params};
