@@ -256,6 +256,7 @@ public:
         MarkNotedGpuPages(device_address, size);
         hazards.NoteKnown(device_address, bytes, size, write_position, producer);
         if (ListWriter(producer)) {
+            RaiseWriterPosition(write_position);
             PrepareWriterNote(producer);
             writer_notes.NoteKnown(device_address, bytes, size, write_position, producer);
         }
@@ -372,6 +373,7 @@ public:
         PrepareHazardNote();
         hazards.NoteRange(device_address, size, position, producer);
         if (ListWriter(producer)) {
+            RaiseWriterPosition(position);
             if (producer == V2::Producer::Upload &&
                 !UploadMayWriteList(device_address, size)) [[likely]] {
                 // SYNC §15.5: not over a page a list is fetched from (FindListWriters).
@@ -391,6 +393,7 @@ public:
         }
         hazards.NoteUnbounded(producer, write_position);
         if (ListWriter(producer)) {
+            RaiseWriterPosition(write_position);
             writer_notes.NoteUnbounded(producer, write_position);
         }
     }
@@ -423,6 +426,8 @@ public:
         if (size == 0) {
             return;
         }
+        // SYNC §15.9: a list fetch's early-out sees the upload while it is still pending.
+        RaiseWriterPosition(write_position);
         if (&memory == pending_upload.memory && gpu_address >= pending_upload.begin &&
             gpu_address <= pending_upload.end) [[likely]] {
             pending_upload.end = std::max(pending_upload.end, gpu_address + size);
@@ -546,9 +551,17 @@ public:
     [[nodiscard]] u64 SyncedWriterPosition() const {
         return std::min(last_writer_position, last_sync_position);
     }
-    /// Front: the compute/copy work sent so far (WaitForWriters' target).
+    /// Front: the work sent so far that may write a command list (WaitForWriters' target, the
+    /// list fetch's early-out): compute and copy methods (NoteWriter) and, with TracksWrites,
+    /// every Copy/Dispatch/Upload note (SYNC §15.9: 3D inline-to-memory and KeplerMemory
+    /// uploads are no IsMemoryWriter methods, and the early-out skipped them).
     [[nodiscard]] u64 WriterPosition() const {
         return std::min(last_writer_position, write_position);
+    }
+    /// Front (SYNC §15.9, STATS/verify): whether a list fetch takes the early-out (nothing that
+    /// may write a list is queued).
+    [[nodiscard]] bool ListWritersIdle() const {
+        return WriterPosition() <= ConsumedNow();
     }
     /// Front: the last host-level sync sent (NoteSync).
     [[nodiscard]] u64 SyncPosition() const {
@@ -940,6 +953,11 @@ public:
     /// Compute or copy work was just sent: what can write GPU-written command lists.
     void NoteWriter() {
         last_writer_position = write_position;
+    }
+    /// SYNC §15.9 (MP §5.1): a noted Copy/Dispatch/Upload write (at `position`) also moves the
+    /// list fetch's early-out target.
+    void RaiseWriterPosition(u64 position) {
+        last_writer_position = std::max(last_writer_position, position);
     }
     /// Waits until the back executed the compute and copy work sent so far (not what came after).
     /// Returns whether any of it was still queued.
