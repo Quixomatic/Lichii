@@ -1518,28 +1518,32 @@ void Scheduler::TraceGpuSubmission() {
                   results[0].timestamp, results[trace_gpu_count * 2 - 1].timestamp,
                   trace_timestamp_bits)) * trace_timestamp_period / 1e6
             : -1.0;
-        // SYNC §14 #5 / §14.4 (diagnostic): idle gaps between consecutive measured submissions
-        // (only when none of the frame's was dropped), split by recorded unsubmitted work.
+        // SYNC §14 #5 / §14.5 (diagnostic): idle gaps between consecutive measured submissions
+        // (only when none of the frame's was dropped), on the host clock (CalibrateGpuToHost),
+        // intersected with each next submission's recorded-but-unsubmitted interval.
         VideoCommon::V2::IdleGapHistogram gaps;
-        if (trace_gpu_skipped == 0) {
+        s64 calibration_ns = 0;
+        if (trace_gpu_skipped == 0 && trace_gpu_count > 1) {
+            std::array<s64, TraceMaxSubmissions> begin_ns{};
+            std::array<s64, TraceMaxSubmissions> end_ns{};
+            std::array<s64, TraceMaxSubmissions> queued_ns{};
+            const auto relative_ns = [&](u64 timestamp) {
+                return static_cast<s64>(static_cast<double>(Common::DkbFrameTrace::TimestampDelta(
+                                            results[0].timestamp, timestamp,
+                                            trace_timestamp_bits)) *
+                                        trace_timestamp_period);
+            };
+            for (u32 i = 0; i < trace_gpu_count; ++i) {
+                begin_ns[i] = relative_ns(results[i * 2].timestamp);
+                end_ns[i] = relative_ns(results[i * 2 + 1].timestamp);
+                queued_ns[i] = static_cast<s64>(trace_submissions[i].submitted_ns);
+            }
+            calibration_ns = VideoCommon::V2::CalibrateGpuToHost(begin_ns.data(), queued_ns.data(),
+                                                                 trace_gpu_count);
             for (u32 i = 1; i < trace_gpu_count; ++i) {
-                const u64 end = results[(i - 1) * 2 + 1].timestamp;
-                const u64 begin = results[i * 2].timestamp;
-                const u64 mask = trace_timestamp_bits >= 64
-                                     ? ~u64{0}
-                                     : (u64{1} << trace_timestamp_bits) - 1;
-                const u64 delta = (begin - end) & mask;
-                if (delta > mask / 2) {
-                    continue; // overlapping (begin before the previous end)
-                }
-                const double gap_ms =
-                    static_cast<double>(delta) * trace_timestamp_period / 1e6;
                 const SubmissionTrace& next = trace_submissions[i];
-                const double unsubmitted_ms =
-                    next.recorded_ns != 0 && next.submitted_ns > next.recorded_ns
-                        ? static_cast<double>(next.submitted_ns - next.recorded_ns) / 1e6
-                        : 0.0;
-                gaps.Add(gap_ms, unsubmitted_ms);
+                gaps.Add(end_ns[i - 1] + calibration_ns, begin_ns[i] + calibration_ns,
+                         static_cast<s64>(next.recorded_ns), static_cast<s64>(next.submitted_ns));
             }
         }
         LOG_INFO(Render_Vulkan,
@@ -1547,13 +1551,14 @@ void Scheduler::TraceGpuSubmission() {
                  "gpu_frame_span_ms={:.3f} gpu_submission_sum_ms={:.3f} "
                  "measured_submissions={} dropped_submissions={} "
                  "valid_bits={} period_ns={} gpu_idle_with_unsubmitted_work_ms={:.3f} "
+                 "handoff_latency_ms={:.3f} "
                  "idle_gaps_with_work(<0.25/0.25-1/1-3/>3ms)={}/{}/{}/{} "
                  "idle_gaps_without_work={}/{}/{}/{}",
                  trace_sample_frame, trace_gpu_tick, span_ms, total_ms, trace_gpu_count,
                  trace_gpu_skipped, trace_timestamp_bits, trace_timestamp_period,
-                 gaps.idle_with_work_ms, gaps.with_work[0], gaps.with_work[1], gaps.with_work[2],
-                 gaps.with_work[3], gaps.without_work[0], gaps.without_work[1],
-                 gaps.without_work[2], gaps.without_work[3]);
+                 gaps.idle_with_work_ms, gaps.handoff_ms, gaps.with_work[0], gaps.with_work[1],
+                 gaps.with_work[2], gaps.with_work[3], gaps.without_work[0],
+                 gaps.without_work[1], gaps.without_work[2], gaps.without_work[3]);
         for (const auto& [duration_ms, index] : slowest) {
             if (duration_ms < 10.0) {
                 continue;

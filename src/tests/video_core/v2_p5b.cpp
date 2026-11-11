@@ -959,19 +959,43 @@ TEST_CASE("V2 P5b flush decisions at pass boundaries", "[video_core][v2_p5b]") {
     }
 }
 
-// SYNC_SUBMIT_SPEC §14 #5 / §14.4: "GPU idle with recorded but unsubmitted work" (diagnostic).
-TEST_CASE("SYNC §14 #5: idle gaps split by recorded unsubmitted work", "[video_core][v2_p5b]") {
-    VideoCommon::V2::IdleGapHistogram gaps;
-    gaps.Add(0.1, 0.0);  // short, the next work recorded after the GPU drained
-    gaps.Add(0.5, 0.2);  // the last 0.2 ms of the gap held recorded work
-    gaps.Add(2.0, 5.0);  // recorded long before: the whole gap
-    gaps.Add(4.0, 0.0);
-    gaps.Add(0.0, 1.0);  // no gap (back to back)
-    gaps.Add(-1.0, 1.0); // overlapping timestamps
+// SYNC_SUBMIT_SPEC §14 #5 as corrected by §14.5: "GPU idle with recorded but unsubmitted work"
+// is the gap's intersection with [first record, queue time] on one clock (diagnostic).
+TEST_CASE("SYNC §14.5: idle gaps intersected with recorded unsubmitted work",
+          "[video_core][v2_p5b]") {
+    using VideoCommon::V2::IdleGapHistogram;
+    constexpr s64 us = 1000;
+    IdleGapHistogram gaps;
+    // The GPU idles [1000, 1100] us; the next tick's work was recorded at 500 us (before the gap:
+    // 95a344cc12 counted that as the whole gap) and queued at 1050: 50 us of idle with work.
+    gaps.Add(1000 * us, 1100 * us, 500 * us, 1050 * us);
+    // Recorded after the gap began, queued 0.2 ms later, the GPU began 0.1 ms after the queue.
+    gaps.Add(2000 * us, 2500 * us, 2200 * us, 2400 * us);
+    // Recorded and queued inside a 4 ms gap only at its end: the hand-off alone.
+    gaps.Add(3000 * us, 7000 * us, 6990 * us, 6990 * us);
+    // No record known; back to back; overlapping.
+    gaps.Add(8000 * us, 8100 * us, 0, 8050 * us);
+    gaps.Add(9000 * us, 9000 * us, 8000 * us, 9000 * us);
+    gaps.Add(9500 * us, 9400 * us, 8000 * us, 9000 * us);
+    CHECK(gaps.with_work == std::array<u32, 4>{1, 1, 0, 0});
     CHECK(gaps.without_work == std::array<u32, 4>{1, 0, 0, 1});
-    CHECK(gaps.with_work == std::array<u32, 4>{0, 1, 1, 0});
-    CHECK(gaps.idle_with_work_ms > 2.2 - 1e-9);
-    CHECK(gaps.idle_with_work_ms < 2.2 + 1e-9);
+    CHECK(gaps.idle_with_work_ms > 0.25 - 1e-9); // 0.05 + 0.2
+    CHECK(gaps.idle_with_work_ms < 0.25 + 1e-9);
+    // Hand-off: 1050→1100, 2400→2500, 6990→7000, 8050→8100 us.
+    CHECK(gaps.handoff_ms > 0.21 - 1e-9);
+    CHECK(gaps.handoff_ms < 0.21 + 1e-9);
+}
+
+TEST_CASE("SYNC §14.5: GPU timestamps map to the host clock by the tightest queue bound",
+          "[video_core][v2_p5b]") {
+    using VideoCommon::V2::CalibrateGpuToHost;
+    // GPU begins (relative ns) and host queue times: true offset 10'000; hand-off latencies
+    // 30, 500 and 5 ns (the GPU was busy for the second).
+    const std::array<s64, 3> begin{0, 2000, 6000};
+    const std::array<s64, 3> queued{9970, 11500, 15995};
+    CHECK(CalibrateGpuToHost(begin.data(), queued.data(), 3) == 9995); // within 5 ns
+    const std::array<s64, 3> none{0, 0, 0};
+    CHECK(CalibrateGpuToHost(begin.data(), none.data(), 3) == 0);
 }
 
 // SYNC_SUBMIT_SPEC §14 #3 rule I′, with §11.1 W6's storm as the guard: §10 submitted at every

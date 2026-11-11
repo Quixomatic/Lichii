@@ -5138,6 +5138,8 @@ VideoCommon::V2::FlushState RasterizerVulkan::ReadFlushState() {
     // SYNC §14 #1 (MP §5.5 "pending GPU work"): the timeline's value now, not the finish
     // thread's publish (0.5-1 ms late: the GPU looked busy when it had drained). Read only.
     const u64 done = master.GpuValueNow();
+    // SYNC §14.5: the 2 s line's "GPU known tick" (nothing stored it before).
+    VideoCommon::V2::LandingFence::diag_known_tick.store(done, std::memory_order_relaxed);
     state.pending = VideoCommon::V2::PendingSubmissions(current, done);
     state.guest_fence = scheduler.OpenTickHasGuestVisibleFence();
     if (VideoCommon::V2::P5bStats::Enabled()) [[unlikely]] {

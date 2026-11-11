@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <cstddef>
+#include <limits>
 
 #include "common/common_types.h"
 
@@ -67,28 +68,57 @@ struct FlushParams {
     u64 mid_pass_interval_us = 8000;  ///< safety net for passes that never end
 };
 
-/// SYNC §14 #5 / §14.4 (diagnostic only): the GPU's idle gaps between consecutive submissions of
-/// a sampled frame, by length (< 0.25, 0.25-1, 1-3, > 3 ms), split by whether the next
-/// submission's work was already recorded during the gap, and the metric "GPU idle with
-/// recorded but unsubmitted work" (ms): the idle time our own submission rules create.
+/// SYNC §14 #5 / §14.4, corrected by §14.5 (diagnostic only): the GPU's idle gaps between
+/// consecutive submissions of a sampled frame, by length (< 0.25, 0.25-1, 1-3, > 3 ms), split by
+/// whether recorded but unsubmitted work existed during the gap. All times are host
+/// steady-clock ns; GPU timestamps are mapped to it first (CalibrateGpuToHost).
+/// - "GPU idle with recorded but unsubmitted work": |[idle start, idle end] ∩ [the next
+///   submission's first record, its queue time]|, the idle time our submission rules create;
+/// - hand-off latency: [queue time, GPU begin], the submit thread's and driver's share.
+/// 95a344cc12 counted min(gap, queue − record): the back records continuously, so the next
+/// tick's first record usually precedes the GPU going idle and every gap counted as "with work".
 struct IdleGapHistogram {
     std::array<u32, 4> with_work{};
     std::array<u32, 4> without_work{};
     double idle_with_work_ms = 0.0;
+    double handoff_ms = 0.0;
 
-    /// One gap of `gap_ms` before a submission whose first work was recorded `unsubmitted_ms`
-    /// before it went to the queue (the GPU starts an idle-time submission at once, so the gap's
-    /// last `unsubmitted_ms` held recorded work).
-    void Add(double gap_ms, double unsubmitted_ms) {
-        if (gap_ms <= 0.0) {
-            return;
+    /// One gap [idle_begin, idle_end] (the previous submission's GPU end to this one's GPU
+    /// begin) before a submission recorded from `recorded` (0 unknown) and queued at `queued`.
+    void Add(s64 idle_begin, s64 idle_end, s64 recorded, s64 queued) {
+        if (idle_end <= idle_begin) {
+            return; // back to back, or overlapping timestamps
         }
+        const double gap_ms = static_cast<double>(idle_end - idle_begin) / 1e6;
         const size_t bucket = gap_ms < 0.25 ? 0 : gap_ms < 1.0 ? 1 : gap_ms < 3.0 ? 2 : 3;
-        const double overlap = (std::min)(gap_ms, (std::max)(unsubmitted_ms, 0.0));
-        ++(overlap > 0.0 ? with_work : without_work)[bucket];
-        idle_with_work_ms += overlap;
+        s64 overlap = 0;
+        if (recorded != 0 && queued > recorded) {
+            const s64 begin = (std::max)(idle_begin, recorded);
+            const s64 end = (std::min)(idle_end, queued);
+            overlap = end > begin ? end - begin : 0;
+        }
+        ++(overlap > 0 ? with_work : without_work)[bucket];
+        idle_with_work_ms += static_cast<double>(overlap) / 1e6;
+        if (queued != 0 && idle_end > queued) {
+            handoff_ms += static_cast<double>(idle_end - (std::max)(queued, idle_begin)) / 1e6;
+        }
     }
 };
+
+/// SYNC §14.5: the host-clock offset of GPU timestamps (in ns) without VK_EXT_calibrated
+/// timestamps (not wired in this build): a submission can't start on the GPU before it was
+/// queued, so offset ≥ queued − gpu_begin for each; the tightest bound is the largest, exact up
+/// to the smallest hand-off latency of the frame (a submission queued to an idle GPU).
+[[nodiscard]] inline s64 CalibrateGpuToHost(const s64* gpu_begin, const s64* queued,
+                                            size_t count) {
+    s64 offset = (std::numeric_limits<s64>::min)();
+    for (size_t i = 0; i < count; ++i) {
+        if (queued[i] != 0) {
+            offset = (std::max)(offset, queued[i] - gpu_begin[i]);
+        }
+    }
+    return offset == (std::numeric_limits<s64>::min)() ? 0 : offset;
+}
 
 /// SYNC §14 #1: handed-off submissions the GPU has not finished, from the open tick
 /// (`current_tick`, the one being recorded) and the GPU's timeline value (the newest finished).
