@@ -71,6 +71,52 @@ void NoteFinishSite(const char* file, u32 line, u64 ns) {
     FinishSites().Note(file, line, ns);
 }
 
+namespace {
+/// SYNC §14.7 (3): guest CPU blocking waits by what they wait on (event name, object type).
+class GuestWaitTable {
+public:
+    struct Entry {
+        std::string name;
+        u64 count;
+        u64 ns;
+    };
+    void Note(std::string_view name, u64 ns) {
+        std::scoped_lock lock{mutex};
+        for (Entry& entry : entries) {
+            if (entry.name == name) {
+                ++entry.count;
+                entry.ns += ns;
+                return;
+            }
+        }
+        if (entries.size() < 64) {
+            entries.push_back({std::string{name}, 1, ns});
+        }
+    }
+    [[nodiscard]] std::vector<Entry> Take() {
+        std::vector<Entry> taken;
+        {
+            std::scoped_lock lock{mutex};
+            taken.swap(entries);
+        }
+        std::ranges::stable_sort(taken, [](const Entry& a, const Entry& b) { return a.ns > b.ns; });
+        return taken;
+    }
+
+private:
+    std::mutex mutex;
+    std::vector<Entry> entries;
+};
+GuestWaitTable& GuestWaitSites() {
+    static GuestWaitTable sites;
+    return sites;
+}
+} // Anonymous namespace
+
+void NoteGuestWait(std::string_view name, u64 ns) {
+    GuestWaitSites().Note(name, ns);
+}
+
 void Report(const char* thread_name, u64 window_ns) {
     if (!Enabled()) {
         return;
@@ -238,6 +284,35 @@ void Report(const char* thread_name, u64 window_ns) {
                  PerSecond(at(Counter::ResumeParseTick), seconds),
                  PerSecond(at(Counter::ResumeMemoryRing), seconds),
                  PerSecond(at(Counter::ResumeMemoryTick), seconds));
+        const u64 handoffs = at(Counter::SubmitThreadSubmits);
+        const auto guest_waits = GuestWaitSites().Take();
+        std::string guest_list;
+        for (size_t i = 0; i < guest_waits.size() && i < 8; ++i) {
+            guest_list += fmt::format("{}{} {:.0f}/s {:.0f} ms/s", i == 0 ? "" : ", ",
+                                      guest_waits[i].name,
+                                      PerSecond(guest_waits[i].count, seconds),
+                                      PerSecond(guest_waits[i].ns, seconds) / 1e6);
+        }
+        LOG_INFO(HW_GPU,
+                 "V2 stats {} SYNC §14.7 | strong-hint submits by source (per frame): query "
+                 "{:.2f}, buffer download {:.2f}, texture download {:.2f}, both {:.2f} | submit "
+                 "hand-off (mean us): pickup {:.0f}, queue lock {:.0f} (max {:.0f}), submit call "
+                 "{:.0f}; behind a present (lock > 1 ms) {:.2f}/frame | list writer table notes "
+                 "(per s): copy {:.0f}, dispatch {:.0f}, upload {:.0f} | guest CPU waits while "
+                 "the front sleeps on pending channels: {}",
+                 thread_name, per_frame(at(Counter::StrongFromQuery)),
+                 per_frame(at(Counter::StrongFromBuffer)),
+                 per_frame(at(Counter::StrongFromTexture)),
+                 per_frame(at(Counter::StrongFromBoth)),
+                 Ratio(at(Counter::HandoffPickupUs), handoffs),
+                 Ratio(at(Counter::HandoffLockUs), handoffs),
+                 static_cast<double>(at(Counter::HandoffLockMaxUs)),
+                 Ratio(at(Counter::HandoffSubmitUs), handoffs),
+                 per_frame(at(Counter::HandoffBehindPresent)),
+                 PerSecond(at(Counter::WriterNotesCopy), seconds),
+                 PerSecond(at(Counter::WriterNotesDispatch), seconds),
+                 PerSecond(at(Counter::WriterNotesUpload), seconds),
+                 guest_list.empty() ? std::string{"none"} : guest_list);
     }
     // F4-06: which untracked operations still flush every pending write.
     LOG_INFO(HW_GPU, "V2 stats {} P5b full barriers by site (per frame) | {}", thread_name,

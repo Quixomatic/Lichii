@@ -4,6 +4,8 @@
 // SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <chrono>
+
 #include "core/core.h"
 #include "core/hle/kernel/k_hardware_timer.h"
 #include "core/hle/kernel/k_memory_layout.h"
@@ -12,6 +14,7 @@
 #include "core/hle/kernel/svc.h"
 #include "core/hle/kernel/svc_results.h"
 #include "core/hle/kernel/svc_types.h"
+#include "video_core/v2/p5b_stats.h"
 
 namespace Kernel::Svc {
 namespace {
@@ -69,6 +72,20 @@ Result WaitForAddress(Core::System& system, u64 address, ArbitrationType arb_typ
         timeout = timeout_ns;
     }
 
+    // SYNC_SUBMIT_SPEC §14.7 (3) (STATS): guest waits while the GPU front waits on a suspended
+    // channel (guest-internal: another guest thread signals the address).
+    if (VideoCommon::V2::P5bStats::Enabled() && VideoCommon::V2::P5bStats::FrontPending())
+        [[unlikely]] {
+        const auto start = std::chrono::steady_clock::now();
+        const Result result =
+            GetCurrentProcess(system.Kernel()).WaitAddressArbiter(address, arb_type, value, timeout);
+        VideoCommon::V2::P5bStats::NoteGuestWait(
+            result == ResultTimedOut ? "address arbiter (timed out)" : "address arbiter",
+            static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                 std::chrono::steady_clock::now() - start)
+                                 .count()));
+        R_RETURN(result);
+    }
     R_RETURN(
         GetCurrentProcess(system.Kernel()).WaitAddressArbiter(address, arb_type, value, timeout));
 }

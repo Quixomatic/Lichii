@@ -174,6 +174,23 @@ enum class Counter : u32 {
     ResumeParseTick,
     ResumeMemoryRing,
     ResumeMemoryTick,
+    // SYNC §14.7 (2): strong-hint submits (FlushHint → WantsFlushNow) by the source of the hint.
+    StrongFromQuery,     ///< a GPU-result-valued report (class D)
+    StrongFromBuffer,    ///< a fence that committed buffer downloads
+    StrongFromTexture,   ///< ... texture downloads
+    StrongFromBoth,      ///< ... both
+    // ... the submit thread's hand-off (SUBMITTHREAD): handed → picked up, the graphics queue
+    // lock wait (the present holds it), the submit call; and submissions that waited > 1 ms for
+    // the lock (queued behind a present).
+    HandoffPickupUs,
+    HandoffLockUs,
+    HandoffSubmitUs,
+    HandoffLockMaxUs,
+    HandoffBehindPresent,
+    // ... list writer table notes by producer.
+    WriterNotesCopy,
+    WriterNotesDispatch,
+    WriterNotesUpload,
     Count,
 };
 
@@ -270,6 +287,15 @@ void NoteSubmitSite(const char* file, u32 line);
 void NoteFullBarrierSite(const char* file, u32 line);
 /// SYNC Step 0: one Scheduler::Finish at file:line that waited `ns` for the GPU.
 void NoteFinishSite(const char* file, u32 line, u64 ns);
+/// SYNC §14.7 (3): a guest CPU core blocked `ns` on `name` (an event's name, a kernel object
+/// type, the address arbiter) while the GPU front slept on pending channels (FrontPending).
+void NoteGuestWait(std::string_view name, u64 ns);
+
+/// SYNC §14.7 (3): the GPU front runs its pending-channel loop (a channel is suspended).
+inline std::atomic<bool> front_pending{false};
+[[nodiscard]] inline bool FrontPending() {
+    return front_pending.load(std::memory_order_relaxed);
+}
 
 /// Logs and resets once per window (any thread; the first to arrive in a new window reports).
 void Report(const char* thread_name, u64 window_ns);

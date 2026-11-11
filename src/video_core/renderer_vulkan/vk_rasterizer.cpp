@@ -3410,7 +3410,7 @@ void RasterizerVulkan::Query(GPUVAddr gpu_addr, VideoCommon::QueryType type,
         // Perf fix C (MASTER_PLAN §5.5, §6): only a GPU-result-valued report (class D: counters,
         // query results) is work the guest reads back. A payload release is class A/B: S1 owns
         // its value, and its fence submits by itself; a hint there only made small submits.
-        FlushHint(VideoCommon::V2::FlushHint::Strong);
+        FlushHint(VideoCommon::V2::FlushHint::Strong, StrongQuery);
     }
 }
 
@@ -4150,7 +4150,7 @@ void RasterizerVulkan::FlushCommands() {
     }
 }
 
-void RasterizerVulkan::FlushCommandsForFence(bool downloads) {
+void RasterizerVulkan::FlushCommandsForFence(bool downloads, u8 committed) {
     if (!scheduler.LazyFencesHere()) {
         FlushCommands();
         return;
@@ -4162,7 +4162,10 @@ void RasterizerVulkan::FlushCommandsForFence(bool downloads) {
     }
     scheduler.WantSubmit();
     if (downloads) {
-        FlushHint(VideoCommon::V2::FlushHint::Strong);
+        // FenceManager's TextureFlushes (1) and BufferFlushes (2), for the source counters.
+        const u8 source = ((committed & 1) != 0 ? StrongTexture : 0) |
+                          ((committed & 2) != 0 ? StrongBuffer : 0);
+        FlushHint(VideoCommon::V2::FlushHint::Strong, source);
     }
 }
 
@@ -4972,12 +4975,13 @@ void RasterizerVulkan::LoadDiskResources(u64 title_id, std::stop_token stop_load
     pipeline_cache.LoadDiskResources(title_id, stop_loading, callback);
 }
 
-void RasterizerVulkan::FlushHint(VideoCommon::V2::FlushHint hint) {
+void RasterizerVulkan::FlushHint(VideoCommon::V2::FlushHint hint, u8 source) {
     if (!adapt_submit) {
         return;
     }
     SyncAdaptiveTick();
     flush_heuristic.Hint(hint);
+    strong_sources |= source;
     if (hint >= VideoCommon::V2::FlushHint::Strong && flush_heuristic.WantsFlushNow()) {
         // Work the guest reads back: submit now when enough is recorded (DXVK's strong hint,
         // busy GPU or not), instead of waiting for a chunk boundary.
@@ -4985,8 +4989,16 @@ void RasterizerVulkan::FlushHint(VideoCommon::V2::FlushHint hint) {
         pending_native_work = false;
         adapt_tick = scheduler.GetMasterSemaphore().CurrentTick();
         flush_heuristic.NoteSubmit(AdaptNowUs());
-        VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::FlushStrong);
-        VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::SubmitsStrong);
+        namespace P5b = VideoCommon::V2::P5bStats;
+        P5b::Add(P5b::Counter::FlushStrong);
+        P5b::Add(P5b::Counter::SubmitsStrong);
+        // SYNC §14.7 (2): by source (a query wins: it is class D, the rest are downloads).
+        const u8 sources = std::exchange(strong_sources, u8{0});
+        P5b::Add((sources & StrongQuery) != 0 ? P5b::Counter::StrongFromQuery
+                 : (sources & (StrongTexture | StrongBuffer)) == (StrongTexture | StrongBuffer)
+                     ? P5b::Counter::StrongFromBoth
+                 : (sources & StrongTexture) != 0 ? P5b::Counter::StrongFromTexture
+                                                  : P5b::Counter::StrongFromBuffer);
     }
 }
 
@@ -5122,6 +5134,7 @@ void RasterizerVulkan::SyncAdaptiveTick() {
         [[unlikely]] {
         adapt_tick = tick;
         flush_heuristic.NoteSubmit(AdaptNowUs());
+        strong_sources = 0; // their hint went with that submission
     }
 }
 

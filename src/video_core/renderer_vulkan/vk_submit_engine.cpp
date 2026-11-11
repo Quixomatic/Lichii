@@ -204,6 +204,11 @@ SubmitContext* SubmitEngine::Acquire() {
 void SubmitEngine::DoSubmit(SubmitWork& work) {
     SubmitContext& context = *work.context;
     const auto& dld = device.GetDispatchLoader();
+    // SYNC §14.7 (2): the hand-off split (picked up, queue lock, submit call).
+    const bool split_stats = threaded && P5bStats::Enabled();
+    if (split_stats) [[unlikely]] {
+        P5bStats::Add(Counter::HandoffPickupUs, MicrosecondsSince(work.handed));
+    }
     std::array<VkSemaphoreSubmitInfo, 10> waits{};
     u32 num_waits = 0;
     if (work.transfer && transfer != nullptr) {
@@ -247,10 +252,24 @@ void SubmitEngine::DoSubmit(SubmitWork& work) {
     vk::CommandBuffer upload_cmdbuf{context.Upload(), dld};
     VkResult result;
     {
+        const auto lock_start = split_stats ? std::chrono::steady_clock::now()
+                                            : std::chrono::steady_clock::time_point{};
         std::scoped_lock lock{submit_mutex};
+        const auto call_start = split_stats ? std::chrono::steady_clock::now()
+                                            : std::chrono::steady_clock::time_point{};
         result = master.SubmitQueue(cmdbuf, upload_cmdbuf, work.signal_semaphore,
                                     work.wait_semaphore, work.tick,
                                     std::span<const VkSemaphoreSubmitInfo>(waits.data(), num_waits));
+        if (split_stats) [[unlikely]] {
+            // The present holds submit_mutex across its queue present (FIFO can block there).
+            const u64 lock_us = static_cast<u64>(
+                std::chrono::duration_cast<std::chrono::microseconds>(call_start - lock_start)
+                    .count());
+            P5bStats::Add(Counter::HandoffLockUs, lock_us);
+            P5bStats::Max(Counter::HandoffLockMaxUs, lock_us);
+            P5bStats::Add(Counter::HandoffBehindPresent, lock_us > 1000 ? 1 : 0);
+            P5bStats::Add(Counter::HandoffSubmitUs, MicrosecondsSince(call_start));
+        }
     }
     switch (result) {
     case VK_SUCCESS:

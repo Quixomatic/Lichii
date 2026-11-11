@@ -30,6 +30,7 @@
 #include "video_core/renderer_base.h"
 #include "video_core/v2/commit.h"
 #include "video_core/v2/front_wake.h"
+#include "video_core/v2/p5b_stats.h"
 #include "video_core/v2/v2_stats.h"
 
 namespace VideoCommon::GPUThread {
@@ -84,6 +85,11 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
             Profile::Report();
             V2::Stats::Report("GPU thread");
             split.MaybeStart(system);
+            // SYNC §14.7 (3): what the guest cores block on while a channel is suspended.
+            if (V2::P5bStats::Enabled()) [[unlikely]] {
+                V2::P5bStats::front_pending.store(scheduler.HasPendingChannels(),
+                                                  std::memory_order_relaxed);
+            }
             if (scheduler.HasPendingChannels()) {
                 // Suspended channels wait on semaphores the CPU releases: poll them meanwhile.
                 bool resumed = false;

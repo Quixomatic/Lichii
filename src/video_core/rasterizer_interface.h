@@ -242,7 +242,10 @@ public:
 
     /// A fence with work to flush was queued; `downloads`: data the guest reads back (class C).
     /// Backends that let fences ride submissions (Vulkan, F4-02) only hint; others flush.
-    virtual void FlushCommandsForFence([[maybe_unused]] bool downloads) {
+    /// `committed` (SYNC §14.7 counters): the caches that committed downloads (1 texture,
+    /// 2 buffer).
+    virtual void FlushCommandsForFence([[maybe_unused]] bool downloads,
+                                       [[maybe_unused]] u8 committed) {
         FlushCommands();
     }
 

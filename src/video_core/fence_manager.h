@@ -165,7 +165,7 @@ public:
             rasterizer.NoteGuestVisibleFence();
         }
         if (should_flush) {
-            rasterizer.FlushCommandsForFence(downloads);
+            rasterizer.FlushCommandsForFence(downloads, committed_flushes);
         }
         if constexpr (can_async_check) {
             guard.unlock();

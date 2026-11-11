@@ -23,6 +23,7 @@
 #include "video_core/v2/ir_arena.h"
 #include "video_core/v2/ir_trace.h"
 #include "video_core/v2/landing.h"
+#include "video_core/v2/p5b_stats.h"
 #include "video_core/v2/sem_view.h"
 #include "video_core/v2/v2_switches.h"
 
@@ -255,7 +256,7 @@ public:
         MarkNotedGpuPages(device_address, size);
         hazards.NoteKnown(device_address, bytes, size, write_position, producer);
         if (ListWriter(producer)) {
-            PrepareWriterNote();
+            PrepareWriterNote(producer);
             writer_notes.NoteKnown(device_address, bytes, size, write_position, producer);
         }
     }
@@ -349,7 +350,7 @@ public:
         PrepareHazardNote();
         hazards.NoteRange(device_address, size, write_position, producer);
         if (ListWriter(producer)) {
-            PrepareWriterNote();
+            PrepareWriterNote(producer);
             writer_notes.NoteRange(device_address, size, write_position, producer);
         }
     }
@@ -989,9 +990,16 @@ private:
             hazards.Retire(consumed.load(std::memory_order_acquire));
         }
     }
-    void PrepareWriterNote() {
+    void PrepareWriterNote(V2::Producer producer) {
         if (writer_notes.Size() == V2::HazardTable::Capacity) [[unlikely]] {
             writer_notes.Retire(consumed.load(std::memory_order_acquire));
+        }
+        if (V2::P5bStats::Enabled()) [[unlikely]] {
+            // SYNC §14.7 (4): which producer fills the writer table (36-40k overflows/s at 3d25).
+            using Counter = V2::P5bStats::Counter;
+            V2::P5bStats::Add(producer == V2::Producer::Copy       ? Counter::WriterNotesCopy
+                              : producer == V2::Producer::Dispatch ? Counter::WriterNotesDispatch
+                                                                   : Counter::WriterNotesUpload);
         }
     }
     /// SYNC §13.5 #1: the producers a command list fetch waits for (`writer_notes`).

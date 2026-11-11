@@ -159,7 +159,7 @@ public:
     void FragmentBarrier() override;
     void TiledCacheBarrier() override;
     void FlushCommands() override;
-    void FlushCommandsForFence(bool downloads) override;
+    void FlushCommandsForFence(bool downloads, u8 committed) override;
     void RequestHostWaitedFence() override;
     void NoteGuestVisibleFence() override;
     void TickFrame() override;
@@ -345,7 +345,15 @@ private:
     void NoteNonDrawWork(u32 cost);
 
     /// A hint for the adaptive submission heuristic (no-op unless EDEN_NX2_V2_ADAPTSUBMIT).
-    void FlushHint(VideoCommon::V2::FlushHint hint);
+    /// `source` (SYNC §14.7 counters, strong hints): StrongSource bits.
+    void FlushHint(VideoCommon::V2::FlushHint hint, u8 source = 0);
+    /// SYNC §14.7: what asked for the strong hints since the last submission.
+    enum StrongSource : u8 {
+        StrongQuery = 1,
+        StrongTexture = 2,
+        StrongBuffer = 4,
+    };
+    u8 strong_sources{};
     /// Resets the heuristic's counters when any submission happened since it last looked.
     void SyncAdaptiveTick();
     static u64 AdaptNowUs();

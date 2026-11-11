@@ -4,6 +4,9 @@
 // SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <chrono>
+#include <string>
+
 #include "common/scope_exit.h"
 #include "common/scratch_buffer.h"
 #include "core/core.h"
@@ -12,6 +15,8 @@
 #include "core/hle/kernel/k_readable_event.h"
 #include "core/hle/kernel/svc.h"
 #include "core/hle/kernel/svc_results.h"
+#include "core/hle/service/kernel_helpers.h"
+#include "video_core/v2/p5b_stats.h"
 
 namespace Kernel::Svc {
 
@@ -95,7 +100,30 @@ Result WaitSynchronization(Core::System& system, int32_t* out_index, u64 user_ha
     }
 
     // Wait on the objects.
+    // SYNC_SUBMIT_SPEC §14.7 (3) (STATS): what a guest core blocks on while the GPU front waits
+    // on a suspended channel, by the signalled (or first) object: an event's name, else its type.
+    const bool note_wait = num_handles > 0 && VideoCommon::V2::P5bStats::Enabled() &&
+                           VideoCommon::V2::P5bStats::FrontPending();
+    const auto wait_start = note_wait ? std::chrono::steady_clock::now()
+                                      : std::chrono::steady_clock::time_point{};
     Result res = KSynchronizationObject::Wait(system.Kernel(), out_index, objs.data(), num_handles, timeout);
+    if (note_wait) [[unlikely]] {
+        const bool signalled = res == ResultSuccess && *out_index >= 0 && *out_index < num_handles;
+        KSynchronizationObject* const object = objs[signalled ? *out_index : 0];
+        std::string name;
+        if (const auto* event = object->DynamicCast<KReadableEvent*>()) {
+            name = "event " + Service::KernelHelpers::DebugEventName(event);
+        } else {
+            name = object->GetTypeName();
+        }
+        if (!signalled) {
+            name += res == ResultTimedOut ? " (timed out)" : " (other)";
+        }
+        VideoCommon::V2::P5bStats::NoteGuestWait(
+            name, static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                       std::chrono::steady_clock::now() - wait_start)
+                                       .count()));
+    }
 
     R_SUCCEED_IF(res == ResultSessionClosed);
     R_RETURN(res);
