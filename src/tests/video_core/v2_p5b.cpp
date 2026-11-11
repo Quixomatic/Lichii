@@ -824,26 +824,41 @@ TEST_CASE("V2 P5b flush decisions at pass boundaries", "[video_core][v2_p5b]") {
         REQUIRE(last.action == FlushAction::Flush);
         REQUIRE(last.reason == FlushHeuristic::ReasonPending);
     }
-    SECTION("SYNC §14 #2: DXVK's table at chunks, no time terms (0 → 2, 0 + guest fence → 1, "
-            "1 → 3, 2 → 6 chunks)") {
-        // The chunk at which rule C submits mid-pass, for a state, however much time passes.
-        const auto submits_at = [&](const FlushState& state) {
+    SECTION("SYNC §14.6: DXVK's table at pass boundaries, no time terms (0 → 2, 0 + guest "
+            "fence → 1, 1 → 3, 2 → 6 chunks); mid-pass only with two or more pending") {
+        // The first chunk at whose end a pass boundary submits (B), however much time passes.
+        const auto boundary_at = [&](const FlushState& state) {
             FlushHeuristic heuristic{params};
             heuristic.NoteSubmit(1000);
-            for (u32 i = 1; i <= 30 * params.chunk_draws; ++i) {
-                const auto decision = heuristic.Advance(1, state, 1000);
-                if (decision.action == FlushAction::Flush) {
-                    REQUIRE(i % params.chunk_draws == 0);
-                    return i / params.chunk_draws;
+            for (u32 chunk = 1; chunk <= 30; ++chunk) {
+                for (u32 i = 0; i < params.chunk_draws; ++i) {
+                    if (heuristic.Advance(1, state, 1000).action == FlushAction::Flush) {
+                        return 100 + chunk; // rule C mid-pass
+                    }
+                }
+                if (heuristic.AtPassBoundary(FlushHint::Weak, state, 1'000'000).action ==
+                    FlushAction::Flush) {
+                    return chunk;
                 }
             }
             return u32{0};
         };
-        CHECK(submits_at({.pending = 0, .back_behind = true}) == 2); // the recorder behind too
-        CHECK(submits_at({.pending = 0, .back_behind = false, .guest_fence = true}) == 1);
-        CHECK(submits_at({.pending = 1, .back_behind = false}) == 3);
-        CHECK(submits_at({.pending = 2, .back_behind = false}) == 6);
-        CHECK(submits_at({.pending = 9, .back_behind = false}) == 20);
+        CHECK(boundary_at({.pending = 0, .back_behind = true}) == 2); // the recorder behind too
+        CHECK(boundary_at({.pending = 0, .back_behind = false, .guest_fence = true}) == 1);
+        CHECK(boundary_at({.pending = 1, .back_behind = false}) == 3);
+        // Two or more pending: rule C reaches the same threshold mid-pass first.
+        CHECK(boundary_at({.pending = 2, .back_behind = false}) == 106);
+        // Many pending: the boundary's weak hint (6 chunks) comes before C's 20.
+        CHECK(boundary_at({.pending = 9, .back_behind = false}) == params.weak_chunks);
+        // Mid-pass with the GPU idle or about to be: no submit however long the pass.
+        for (const FlushState state : {FlushState{.pending = 0}, FlushState{.pending = 1},
+                                       FlushState{.pending = 0, .guest_fence = true}}) {
+            FlushHeuristic heuristic{params};
+            heuristic.NoteSubmit(1000);
+            for (u32 i = 1; i < params.max_draws; ++i) {
+                REQUIRE(heuristic.Advance(1, state, 1'000'000).action != FlushAction::Flush);
+            }
+        }
         // Dispatches count their cost: 16 dispatches (cost 4) are two chunks.
         FlushHeuristic heuristic{params};
         heuristic.NoteSubmit(1000);
@@ -867,7 +882,8 @@ TEST_CASE("V2 P5b flush decisions at pass boundaries", "[video_core][v2_p5b]") {
         }
         REQUIRE(heuristic.AtPassBoundary(FlushHint::Weak, idle, 10'000'000).action ==
                 FlushAction::None);
-        heuristic.Advance(1, idle, 1000); // the second chunk: rule C mid-pass
+        REQUIRE(heuristic.Advance(1, idle, 1000).action != FlushAction::Flush); // not mid-pass
+        REQUIRE(heuristic.AtPassBoundary(FlushHint::Weak, idle, 1000).action == FlushAction::Flush);
         REQUIRE(heuristic.Draws() == 0);
     }
     SECTION("nothing recorded: no boundary submit") {
@@ -1741,7 +1757,7 @@ TEST_CASE("SYNC step 7 / §11: the back submits for rules B, C, W and S only",
         // point submits the work while one is still in flight.
         REQUIRE(heuristic.SleepSubmitDue(1, true, true));
     }
-    SECTION("rule B at pass boundaries, rule C at chunks, nothing else (SYNC §14 #2 table)") {
+    SECTION("rule B at pass boundaries, rule C at chunks, nothing else (SYNC §14.6 table)") {
         FlushHeuristic heuristic{params};
         heuristic.NoteSubmit(1000);
         const FlushState one{.pending = 1, .back_behind = false};
@@ -1751,9 +1767,11 @@ TEST_CASE("SYNC step 7 / §11: the back submits for rules B, C, W and S only",
         // However long ago the last submission was: no time term.
         REQUIRE(heuristic.AtPassBoundary(FlushHint::Weak, one, 1'000'000).action ==
                 FlushAction::None);
-        const auto chunk = heuristic.Advance(1, one, 1'000'000);
-        REQUIRE(chunk.action == FlushAction::Flush);
-        REQUIRE(chunk.reason == FlushHeuristic::ReasonPending);
+        // The third chunk: not mid-pass with one pending (rule C needs two), at the boundary.
+        REQUIRE(heuristic.Advance(1, one, 1'000'000).action != FlushAction::Flush);
+        const auto boundary = heuristic.AtPassBoundary(FlushHint::Weak, one, 1'000'000);
+        REQUIRE(boundary.action == FlushAction::Flush);
+        REQUIRE(boundary.reason == FlushHeuristic::ReasonPending);
     }
 }
 
