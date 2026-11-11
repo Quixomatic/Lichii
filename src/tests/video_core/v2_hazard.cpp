@@ -762,6 +762,63 @@ TEST_CASE("V2 landing: the back obeys the front's landing verdict", "[video_core
     Landing::ResetVerdicts();
 }
 
+// SYNC_SUBMIT_SPEC §12 R1: the 0x6c3/QMD reduction path classified with MustDeferUntracked on
+// the back; the front's model now decides, and SemView keeps the reduction pending until it
+// lands at its fence.
+TEST_CASE("SYNC §12 R1: a QMD reduction behind a pending ticket lands by the front's verdict",
+          "[video_core][v2_hazard]") {
+    const u64 saved_tag = Landing::tag;
+    const u64 saved_pending = Landing::pending;
+    const u64 saved_landed = Landing::landed.load();
+    Landing::ResetUntracked();
+    Landing::qmd_verdicts_missing.store(0);
+    // The front: a ticket it gave out (Ticket(190, 0)) has not landed when its model launches
+    // the reduction at 200: at its fence.
+    Landing::landed.store(Landing::Ticket(150, 0));
+    Landing::pending = Landing::Ticket(190, 0);
+    Landing::PushQmdVerdict(200, false);
+    Landing::PushQmdVerdict(210, true);
+    // The ticket landed before the back ran 200: its own rule would make it at once.
+    Landing::landed.store(Landing::pending);
+    Landing::tag = 200;
+    u64 ticket = 0;
+    {
+        const Landing::Untracked untracked;
+        CHECK(!Landing::MustDeferUntracked());
+        CHECK(Landing::DeferAtOnceUntracked());
+        ticket = Landing::CaptureUntracked(0x8000, 4);
+    }
+    CHECK(ticket != 0);
+    // SemView retires the reduction by its untracked operation, not by `consumed`.
+    SemView view;
+    const SemProgress before{.consumed = 200,
+                             .landed = Landing::landed.load(),
+                             .untracked_settled = Landing::UntrackedSettled(200)};
+    view.Note(0x8000, 0x13, true, 200, SemView::Retire::Untracked, 200, SemView::Kind::QmdReduction,
+              before);
+    CHECK(view.Find(0x8000, before).pending);
+    Landing::NoteUntracked(ticket);
+    const SemProgress after{.consumed = 200,
+                            .landed = Landing::landed.load(),
+                            .untracked_settled = Landing::UntrackedSettled(200)};
+    CHECK(!view.Find(0x8000, after).pending);
+    // The next one: at once by the front's verdict; one without a verdict falls back.
+    Landing::tag = 210;
+    {
+        const Landing::Untracked untracked;
+        CHECK(!Landing::DeferAtOnceUntracked());
+        Landing::pending = Landing::Ticket(215, 0);
+        CHECK(Landing::DeferAtOnceUntracked()); // no verdict left: MustDeferUntracked
+    }
+    CHECK(Landing::qmd_verdicts_missing.load() == 1);
+    // Outside an Untracked scope nothing reads the QMD queue.
+    CHECK(!Landing::DeferAtOnceUntracked());
+    Landing::tag = saved_tag;
+    Landing::pending = saved_pending;
+    Landing::landed.store(saved_landed);
+    Landing::ResetUntracked();
+}
+
 // Fix F3h (W-01c, R2-F3-02): one release patched into a scheduled QMD (NVN2), still to land,
 // made the front's QMD model unknown until the next drain (~23 unknown signals each); and the
 // model's resync rode the unmapped-acquire drain, which is gone.

@@ -136,10 +136,7 @@ inline void PushVerdict(u64 position, bool at_once) {
 }
 
 /// The split (re)starts: no verdict is queued.
-inline void ResetVerdicts() {
-    verdict_head.store(0, std::memory_order_relaxed);
-    verdict_tail.store(0, std::memory_order_relaxed);
-}
+inline void ResetVerdicts();
 
 inline void Note(u64 ticket) {
     u64 current = landed.load(std::memory_order_relaxed);
@@ -163,6 +160,66 @@ inline thread_local u64 untracked_captured_sub = 0;
 /// an earlier ticketed write still to land (the landing rule; MustDefer outside the scope).
 [[nodiscard]] inline bool MustDeferUntracked() {
     return untracked_tag != 0 && pending > landed.load(std::memory_order_acquire);
+}
+
+// SYNC_SUBMIT_SPEC §12 R1 (R2-F3-04 / F3-X6b for QMD writes): the front's model decides where
+// each QMD reduction or max release lands (at once, or at its fence behind a ticket still to
+// land) and the back obeys it. A queue of its own: the front's model may launch more or fewer
+// QMD writes in an entry than the back does (an unknown signal pushes none), and a mismatch must
+// not shift the verdicts of the entry's ticketed writes. Either verdict is safe for a QMD write
+// (SemView retires it by its untracked operations either way).
+inline std::array<std::atomic<u64>, VerdictSlots> qmd_verdicts{}; ///< position << 1 | at once
+inline std::atomic<u64> qmd_verdict_head{0};
+inline std::atomic<u64> qmd_verdict_tail{0};
+/// Back: QMD writes without a verdict (the front's model didn't know the signal) that the
+/// landing rule deferred. Expected only with unknown signals; not a verify failure.
+inline std::atomic<u64> qmd_verdicts_missing{0};
+
+/// Front: the verdict for a QMD reduction or max release its model launched at ring `position`.
+inline void PushQmdVerdict(u64 position, bool at_once) {
+    const u64 head = qmd_verdict_head.load(std::memory_order_relaxed);
+    if (head - qmd_verdict_tail.load(std::memory_order_acquire) >= VerdictSlots) [[unlikely]] {
+        verdicts_lost.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    qmd_verdicts[head % VerdictSlots].store((position << 1) | (at_once ? 1 : 0),
+                                            std::memory_order_relaxed);
+    qmd_verdict_head.store(head + 1, std::memory_order_release);
+}
+
+/// Back, inside an Untracked scope: whether a QMD reduction or max release it could make at once
+/// lands at its fence instead: the front's verdict, else MustDeferUntracked.
+[[nodiscard]] inline bool DeferAtOnceUntracked() {
+    if (untracked_tag == 0) {
+        return false;
+    }
+    u64 tail = qmd_verdict_tail.load(std::memory_order_relaxed);
+    const u64 head = qmd_verdict_head.load(std::memory_order_acquire);
+    for (; tail != head; ++tail) {
+        const u64 word = qmd_verdicts[tail % VerdictSlots].load(std::memory_order_relaxed);
+        const u64 position = word >> 1;
+        if (position < untracked_tag) {
+            continue;
+        }
+        if (position > untracked_tag) {
+            break;
+        }
+        qmd_verdict_tail.store(tail + 1, std::memory_order_release);
+        return (word & 1) == 0;
+    }
+    qmd_verdict_tail.store(tail, std::memory_order_release);
+    const bool defer = MustDeferUntracked();
+    if (defer) [[unlikely]] {
+        qmd_verdicts_missing.fetch_add(1, std::memory_order_relaxed);
+    }
+    return defer;
+}
+
+inline void ResetVerdicts() {
+    verdict_head.store(0, std::memory_order_relaxed);
+    verdict_tail.store(0, std::memory_order_relaxed);
+    qmd_verdict_head.store(0, std::memory_order_relaxed);
+    qmd_verdict_tail.store(0, std::memory_order_relaxed);
 }
 /// Writes the front never notes by ticket (QMD releases) that land at a delayed operation
 /// (F3F5b-5): the newest untracked ticket queued, and the newest whose operation ran. The front

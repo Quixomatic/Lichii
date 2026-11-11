@@ -310,10 +310,12 @@ void GpuSplit::Stop() {
     if (V2::Landing::verify) {
         LOG_INFO(HW_GPU,
                  "V2 landing verify: {} tickets landed out of order; front landing verdicts "
-                 "lost {}, back writes deferred without one {} (F3-X6b: both 0 expected)",
+                 "lost {}, back writes deferred without one {} (F3-X6b: both 0 expected); QMD "
+                 "writes of signals the front's model didn't know, deferred {}",
                  V2::Landing::order_violations.load(std::memory_order_relaxed),
                  V2::Landing::verdicts_lost.load(std::memory_order_relaxed),
-                 V2::Landing::verdicts_missing.load(std::memory_order_relaxed));
+                 V2::Landing::verdicts_missing.load(std::memory_order_relaxed),
+                 V2::Landing::qmd_verdicts_missing.load(std::memory_order_relaxed));
         V2::Landing::verify = false;
     }
     V2::Landing::landed.store(0, std::memory_order_relaxed);

@@ -446,8 +446,9 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
                 // Fix F3h (R2-F3-04): the landing rule (v2/landing.h) holds for these too: one
                 // that would land at once while an earlier ticketed write is still to land runs
                 // at its fence, behind it, and reports its landing like the delayed ones.
-                const bool deferred =
-                    reduction_or_max && !delayed && VideoCommon::V2::Landing::MustDeferUntracked();
+                // SYNC §12 R1: the front's model decided which (Landing::PushQmdVerdict).
+                const bool deferred = reduction_or_max && !delayed &&
+                                      VideoCommon::V2::Landing::DeferAtOnceUntracked();
                 // SYNC_SUBMIT_SPEC Step 3 (MP §6 rules: releases with no CPU-visible data behind
                 // them become guest-visible at execute time): at execute time again, unless fences
                 // are delayed or the landing rule defers them. d5e451eebf ran every one at its
@@ -2243,6 +2244,12 @@ void RememberQmdRelease(VideoCommon::GpuSplit& split, const Tegra::MemoryManager
     constexpr auto retire = V2::SemView::Retire::Untracked;
     const bool reduction = (flags & (1U << 26)) != 0;
     const bool max = !reduction && (flags & (1U << 19)) != 0 && (flags >> 30) != 0;
+    // SYNC §12 R1: where the back makes a reduction or max release it could make at once
+    // (KeplerCompute's release callback, outside delayed fences): at once, or at its fence
+    // while a ticket the front gave out may still land (the landing rule, decided here).
+    if ((reduction || max) && (flags >> 30) != 0 && !V2::FencesDelayed()) {
+        V2::Landing::PushQmdVerdict(position, !split.LandingPending());
+    }
     if (reduction || max) {
         const bool is_signed = ((flags >> 24) & 1) != 0;
         view.NoteReduction(
