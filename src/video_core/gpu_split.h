@@ -13,7 +13,6 @@
 #include <span>
 #include <thread>
 #include <type_traits>
-#include <unordered_map>
 #include <utility>
 
 #include "common/common_types.h"
@@ -254,7 +253,6 @@ public:
         }
         PrepareHazardNote();
         MarkNotedGpuPages(device_address, size);
-        NoteListPageWriter(device_address, size, producer);
         hazards.NoteKnown(device_address, bytes, size, write_position, producer);
     }
     /// Front (SYNC §12 R2a, MP §5.1/§6 class C): whether a GPU write the front noted (any ranged
@@ -303,36 +301,24 @@ public:
         }
         return filter;
     }
-    /// Front (SYNC §13.5 #5, MP §6 class C "a targeted wait on the producer"): the writers a
-    /// GPU-written command list page waits for. The back copies the page right after each write
-    /// it runs (BufferCache::Nx2CopyListPages) and runs work in ring order. If the page's newest
-    /// write the back ran (`writer_position`, the copy record's) came from a writer the front
-    /// noted over the page (ListPageNote), its writers are ranged ones: the fetch waits for the
-    /// ranged notes over the page only. Otherwise (`page_unbounded`: an unbounded writer wrote
-    /// it last, or nothing is known) it waits for every writer as before (ListFetchFilter(false,
-    /// ...)). An unbounded writer's first write to a page ranged writers fill is the counted
-    /// residual (MP §11; HAZARD=verify compares the copies read after both waits).
+    /// Front (SYNC §13.5 #5 as corrected by §14.5, MP §6 class C / §11): the writers a
+    /// GPU-written command list page waits for: every queued Copy/Dispatch/Upload that may reach
+    /// it. Ranged ones whose noted range misses the page are excluded (the ranged lookup);
+    /// unbounded ones (Unknown write ranges) are always waited for. 9c43454877 also narrowed by
+    /// the kind of the page's last *executed* writer, which says nothing about a queued one: it
+    /// skipped OoT's queued culling dispatch and read last frame's lists (95a3 hang).
+    /// `unbounded`: the wait's newest position came from an unbounded writer (counters).
     [[nodiscard]] V2::HazardResult FindGpuListWriters(u64 device_address, u64 size,
-                                                      u64 writer_position, bool& page_unbounded) {
-        const u64 note = ListPageNote(device_address);
-        page_unbounded = note == 0 || writer_position == 0 || writer_position > note;
-        if (page_unbounded) {
-            return FindWrites(device_address, size, ListFetchFilter(false, true));
-        }
-        V2::HazardFilter ranged = ListFetchFilter(false, true);
-        ranged.unbounded = 0;
-        return FindWrites(device_address, size, ranged);
-    }
-    /// Front (SYNC §13.5 #5): the write position of the newest Copy/Dispatch/Upload note over a
-    /// command list page (0: none since it became one).
-    [[nodiscard]] u64 ListPageNote(u64 device_address) const {
-        const auto it = list_page_notes.find(device_address >> NotedPageBits);
-        return it != list_page_notes.end() ? it->second : 0;
+                                                      bool& unbounded) {
+        const V2::HazardResult result =
+            FindWrites(device_address, size, ListFetchFilter(false, true));
+        unbounded = result.kind == V2::HazardResult::Kind::Wait &&
+                    result.cause == V2::CauseUnbounded;
+        return result;
     }
     void NoteRangeWrite(u64 device_address, u64 size, V2::Producer producer) {
         MarkNotedGpuPages(device_address, size);
         if (producer != V2::Producer::CbData) {
-            NoteListPageWriter(device_address, size, producer);
             FlushCbWrite();
             if (producer == V2::Producer::QmdRelease) {
                 last_qmd_release = write_position;
@@ -975,29 +961,6 @@ private:
             hazards.Retire(consumed.load(std::memory_order_acquire));
         }
     }
-    /// SYNC §13.5 #5: a Copy/Dispatch/Upload note over command list pages (ListPageNote).
-    void NoteListPageWriter(u64 device_address, u64 size, V2::Producer producer) {
-        if (size == 0 || !Tegra::g_nx2_has_command_list_pages.load(std::memory_order_relaxed) ||
-            (producer != V2::Producer::Copy && producer != V2::Producer::Dispatch &&
-             producer != V2::Producer::Upload)) [[likely]] {
-            return;
-        }
-        const u64 last = std::min<u64>((device_address + size - 1) >> NotedPageBits,
-                                       Tegra::g_nx2_command_list_pages.size() * 64 - 1);
-        for (u64 page = device_address >> NotedPageBits; page <= last;) {
-            const u64 word =
-                Tegra::g_nx2_command_list_pages[page / 64].load(std::memory_order_relaxed) >>
-                (page % 64);
-            if (word == 0) {
-                page = (page / 64 + 1) * 64; // no list page in the rest of this word
-                continue;
-            }
-            if (word & 1) {
-                list_page_notes[page] = write_position;
-            }
-            ++page;
-        }
-    }
     void MarkNotedGpuPages(u64 device_address, u64 size) {
         if (size == 0) {
             return;
@@ -1260,8 +1223,6 @@ private:
     static constexpr u64 NotedPageBits = 12;
     std::unique_ptr<std::array<u64, (u64{1} << (36 - NotedPageBits)) / 64>> noted_gpu_pages{
         std::make_unique<std::array<u64, (u64{1} << (36 - NotedPageBits)) / 64>>()};
-    /// Front (SYNC §13.5 #5): command list page → write position of its newest writer note.
-    std::unordered_map<u64, u64> list_page_notes;
     u64 back_entry_position{}; ///< Back: ring position of the entry it runs (TracksWrites)
 
     // Back side.

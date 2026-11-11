@@ -3484,10 +3484,6 @@ void RasterizerVulkan::NoteGpuWrittenCommandListSynced(DAddr page) {
     buffer_cache.Nx2NoteListSynced(page);
 }
 
-u64 RasterizerVulkan::GpuWrittenListWriterPosition(DAddr page) {
-    return buffer_cache.Nx2ListWriterPosition(page); // its own lock, as Nx2ReadListCopy
-}
-
 void RasterizerVulkan::FlushGpuWrittenCommandListPages(std::span<const DAddr> pages) {
     gpu.InvalidateGPUCache();
     if (commit_lock_free) [[unlikely]] {

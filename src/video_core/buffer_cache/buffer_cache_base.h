@@ -489,9 +489,6 @@ public:
     /// instead of waiting for it.
     Nx2ListRead Nx2ReadListCopy(DAddr device_addr, std::span<u8> out, bool past_sync,
                                 u64* pending_tick = nullptr);
-    /// Any thread (SYNC §13.5 #5): the split's ring position of the newest GPU write the back
-    /// ran to a command list page (0: unknown or none).
-    [[nodiscard]] u64 Nx2ListWriterPosition(DAddr page);
     /// Front thread, the split drained: the command list page was flushed to guest memory.
     void Nx2NoteListSynced(DAddr page);
 
@@ -1139,9 +1136,6 @@ private:
         u64 writes{};      ///< GPU writes noted to the page
         u64 copy_writes{}; ///< `writes` when the copy was made: the copy is current while equal
         u64 copy_tick{};   ///< GPU tick that completes the copy
-        /// SYNC §13.5 #5: the split's ring position of the newest write (Landing::BackPosition,
-        /// 0 unknown), for the front's choice of which writers a list fetch waits for.
-        u64 writer_position{};
         /// `writes` when the front last flushed the page: guest memory holds it while equal
         u64 synced_writes{~u64{0}};
         u32 copy_begin{};  ///< Bytes of the page the copy holds (a buffer can end inside it)

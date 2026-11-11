@@ -2359,9 +2359,11 @@ TEST_CASE("SYNC §12 R2: a CPU-written list waits only for its exact producer",
     }
 }
 
-// SYNC_SUBMIT_SPEC §13.5 #5 (1f66: GPU-written list fetches 8.3% of front samples, ~2 ms each):
-// they waited for the newest unbounded Copy/Dispatch/Upload on any channel, a writer drain.
-TEST_CASE("SYNC §13.5 #5: a GPU-written list waits only for its page's producer",
+// SYNC_SUBMIT_SPEC §13.5 #5 as corrected by §14.5 (95a3 quiet deadlock): 9c43454877 narrowed a
+// GPU-written list's wait by the kind of the page's last executed writer and skipped a queued
+// unbounded writer, so OoT's culling lists were read a frame stale and its QMD launches went
+// missing (waiters 0x13 short). A fetch waits for every queued writer that may reach the page.
+TEST_CASE("SYNC §14.5: a GPU-written list waits for every queued writer that may reach it",
           "[video_core][gpu_split_dispatch][v2_hazard]") {
     using Access = VideoCommon::GpuSplitTestAccess;
     using VideoCommon::GpuSplit;
@@ -2372,42 +2374,50 @@ TEST_CASE("SYNC §13.5 #5: a GPU-written list waits only for its page's producer
     GpuSplit split;
     Access::Initialize(split, f.system, 100);
     Access::SetTracksWrites(split, true);
-    constexpr u64 list = 0x7'6000'0000;  // culling output: a command list page
-    constexpr u64 other = 0x7'6100'0000; // a list page no noted writer covers
+    constexpr u64 list = 0x7'6000'0000;     // culling output: a command list page
+    constexpr u64 elsewhere = 0x7'6200'0000; // a buffer far from it
     Tegra::Nx2MarkCommandListPage(list);
-    Tegra::Nx2MarkCommandListPage(other);
     Access::SetEnd(split, 110);
-    split.NoteUnboundedWrite(V2::Producer::Dispatch); // an unrelated unknown dispatch
+    split.NoteUnboundedWrite(V2::Producer::Dispatch); // an unknown dispatch
     Access::SetEnd(split, 120);
-    split.NoteRangeWrite(list + 0x40, 0x20, V2::Producer::Dispatch); // its QMD's storage range
+    split.NoteRangeWrite(list + 0x40, 0x20, V2::Producer::Dispatch); // a ranged writer
     Access::SetEnd(split, 130);
     split.NoteUnboundedWrite(V2::Producer::Copy);
-    REQUIRE(split.ListPageNote(list) == 120);
-    REQUIRE(split.ListPageNote(other) == 0);
-    bool page_unbounded = true;
-    SECTION("the page's last write came from a noted writer: only the page's producer") {
-        const V2::HazardResult result = split.FindGpuListWriters(list, 0x100, 120, page_unbounded);
-        CHECK_FALSE(page_unbounded);
-        REQUIRE(result.kind == Kind::Wait);
-        CHECK(result.position == 120);
-        // The full wait (before #5) waited for the newest unbounded writer.
-        CHECK(split.FindWrites(list, 0x100, GpuSplit::ListFetchFilter(false, true)).position ==
-              130);
-        // Idle back: once it ran the producer the fetch reads its copy, whatever else is queued.
-        Access::SetBack(split, 120, false);
-        CHECK(split.FindGpuListWriters(list, 0x100, 120, page_unbounded).kind == Kind::Clear);
-    }
-    SECTION("its last write came from a writer the front didn't note over it: every writer") {
-        const V2::HazardResult result = split.FindGpuListWriters(list, 0x100, 125, page_unbounded);
-        CHECK(page_unbounded);
+    bool unbounded = false;
+    SECTION("a queued unbounded writer after a ranged one: waits for the unbounded one") {
+        const V2::HazardResult result = split.FindGpuListWriters(list, 0x100, unbounded);
         REQUIRE(result.kind == Kind::Wait);
         CHECK(result.position == 130);
+        CHECK(unbounded);
     }
-    SECTION("no note over the page, or no writer position known: every writer") {
-        CHECK(split.FindGpuListWriters(other, 0x100, 90, page_unbounded).position == 130);
-        CHECK(page_unbounded);
-        CHECK(split.FindGpuListWriters(list, 0x100, 0, page_unbounded).position == 130);
-        CHECK(page_unbounded);
+    SECTION("the page's last executed writer was ranged, an unbounded dispatch still queued") {
+        // The back ran the ranged copy over the page (its copy record's newest write); the
+        // culling dispatch that rewrites the page is queued, unbounded.
+        Access::SetBack(split, 130, false);
+        Access::SetEnd(split, 140);
+        split.NoteRangeWrite(list, 0x1000, V2::Producer::Copy);
+        Access::SetBack(split, 140, false);
+        Access::SetEnd(split, 150);
+        split.NoteUnboundedWrite(V2::Producer::Dispatch);
+        const V2::HazardResult result = split.FindGpuListWriters(list, 0x100, unbounded);
+        REQUIRE(result.kind == Kind::Wait);
+        CHECK(result.position == 150);
+        CHECK(unbounded);
+        // The idle back runs it: then the fetch reads the copy.
+        Access::SetBack(split, 150, false);
+        CHECK(split.FindGpuListWriters(list, 0x100, unbounded).kind == Kind::Clear);
+    }
+    SECTION("only ranged writers whose range misses the page are excluded") {
+        Access::SetBack(split, 130, false);
+        Access::SetEnd(split, 140);
+        split.NoteRangeWrite(elsewhere, 0x1000, V2::Producer::Dispatch);
+        CHECK(split.FindGpuListWriters(list, 0x100, unbounded).kind == Kind::Clear);
+        Access::SetEnd(split, 150);
+        split.NoteRangeWrite(list + 0x80, 0x10, V2::Producer::Copy);
+        const V2::HazardResult result = split.FindGpuListWriters(list, 0x100, unbounded);
+        REQUIRE(result.kind == Kind::Wait);
+        CHECK(result.position == 150);
+        CHECK_FALSE(unbounded);
     }
 }
 

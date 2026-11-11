@@ -716,18 +716,13 @@ bool DmaPusher::WaitForListWriters(GPUVAddr address, size_t size, bool cpu_writt
         }
         const bool gpu_page = !cpu_written || split.MayBeGpuWrittenPage(*device, chunk_end - chunk);
         gpu_pages |= gpu_page;
-        // SYNC §13.5 #5: a GPU-written page waits for its newest writer note only.
+        // SYNC §14.5: a GPU-written page waits for every queued writer that may reach it.
         bool page_unbounded = false;
         const V2::HazardResult result =
             cpu_written
                 ? split.FindWrites(*device, chunk_end - chunk,
                                    VideoCommon::GpuSplit::ListFetchFilter(true, gpu_page))
-                : split.FindGpuListWriters(
-                      *device, chunk_end - chunk,
-                      rasterizer != nullptr
-                          ? rasterizer->GpuWrittenListWriterPosition(*device & ~u64{0xfff})
-                          : 0,
-                      page_unbounded);
+                : split.FindGpuListWriters(*device, chunk_end - chunk, page_unbounded);
         gpu_unbounded |= page_unbounded;
         if (result.kind == V2::HazardResult::Kind::Wait) {
             if (result.position > target) {
