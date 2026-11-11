@@ -2289,6 +2289,70 @@ TEST_CASE("V2 hazard: unknown reports block reads of their bytes until they land
     V2::Landing::landed.store(0);
 }
 
+// SYNC_SUBMIT_SPEC §12 R2 (df94: the front's list-writer wait was 22% of its samples): every
+// MetByQueued acquire moves the last sync forward, and a CPU-written list fetched after it
+// waited for every unbounded dispatch sent before it.
+TEST_CASE("SYNC §12 R2: a CPU-written list waits only for its exact producer",
+          "[video_core][gpu_split_dispatch][v2_hazard]") {
+    using Access = VideoCommon::GpuSplitTestAccess;
+    using VideoCommon::GpuSplit;
+    namespace V2 = VideoCommon::V2;
+    using Kind = V2::HazardResult::Kind;
+    Fixture f;
+    f.system.Initialize();
+    GpuSplit split;
+    Access::Initialize(split, f.system, 100);
+    constexpr u64 list = 0x7'4000'0000;     // CPU-written command memory
+    constexpr u64 data = 0x7'4800'0000;     // a buffer GPU work writes
+    constexpr u64 elsewhere = 0x7'4900'0000; // another buffer
+    REQUIRE(!split.MayBeGpuWrittenPage(list, 0x100));
+    // An unbounded dispatch, then a MetByQueued acquire's sync (NoteSyncAt).
+    Access::SetEnd(split, 110);
+    split.NoteUnboundedWrite(V2::Producer::Dispatch);
+    Access::SetEnd(split, 120);
+    split.NoteSync();
+    const auto fetch = [&](u64 address) {
+        return split.FindWrites(address, 0x100,
+                                GpuSplit::ListFetchFilter(true,
+                                                          split.MayBeGpuWrittenPage(address, 0x100)));
+    };
+    SECTION("an unbounded dispatch to other pages: no wait") {
+        CHECK(fetch(list).kind == Kind::Clear);
+        // The full wait (before R2) would have waited for it.
+        CHECK(split.FindWrites(list, 0x100, GpuSplit::ListFetchFilter(true, true)).kind ==
+              Kind::Wait);
+    }
+    SECTION("a dispatch whose QMD range overlaps the list: waits for that dispatch only") {
+        Access::SetEnd(split, 130);
+        split.NoteRangeWrite(list + 0x40, 0x20, V2::Producer::Dispatch);
+        Access::SetEnd(split, 140);
+        split.NoteRangeWrite(elsewhere, 0x1000, V2::Producer::Dispatch);
+        const V2::HazardResult result = fetch(list);
+        CHECK(result.kind == Kind::Wait);
+        CHECK(result.position == 130);
+        // The back ran it: the fetch reads memory (an idle back has consumed what was sent).
+        Access::SetBack(split, 130, false);
+        CHECK(fetch(list).kind == Kind::Clear);
+    }
+    SECTION("pages GPU work wrote: unbounded dispatches before the sync still count") {
+        split.NoteRangeWrite(data, 0x10, V2::Producer::Copy);
+        const V2::HazardResult result = fetch(data + 0x200);
+        CHECK(result.kind == Kind::Wait);
+        CHECK(result.position <= 120);
+    }
+    SECTION("unbounded copies and uploads mark no page: they always count") {
+        Access::SetEnd(split, 150);
+        split.NoteUnboundedWrite(V2::Producer::Copy);
+        Access::SetEnd(split, 160);
+        split.NoteSync();
+        CHECK(fetch(list).kind == Kind::Wait);
+    }
+    SECTION("GPU-written lists wait for every unbounded writer still queued") {
+        CHECK(split.FindWrites(list, 0x100, GpuSplit::ListFetchFilter(false, true)).kind ==
+              Kind::Wait);
+    }
+}
+
 TEST_CASE("V2 landing: the front remembers its releases, the back's captured operations count",
           "[video_core][gpu_split_dispatch][v2_hazard]") {
     using Access = VideoCommon::GpuSplitTestAccess;

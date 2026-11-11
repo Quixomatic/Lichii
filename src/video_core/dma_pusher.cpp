@@ -28,6 +28,7 @@
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_cmdpage_diag.h"
+#include "video_core/v2/p5b_stats.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/v2/versions.h"
 
@@ -656,23 +657,16 @@ bool DmaPusher::WaitForListWriters(GPUVAddr address, size_t size, bool cpu_writt
     if (old_target <= consumed) {
         return false; // Nothing queued writes it either way
     }
-    // The fetch of a GP entry is ordered after earlier engine work only by a host-level wait in
-    // between (83d6c8d78b): compute and copy work sent before the last one, plus queued copies
-    // (and dispatches whose writes are bounded) that overlap the list. A list on GPU-written
-    // pages waits for every writer that may reach it: the copy path needs the writer recorded.
-    V2::HazardFilter filter;
-    constexpr u32 writers = V2::ProducerBit(V2::Producer::Copy) |
-                            V2::ProducerBit(V2::Producer::Dispatch) |
-                            V2::ProducerBit(V2::Producer::Upload);
-    filter.ranged = writers;
+    // The writers per page: GpuSplit::ListFetchFilter. SYNC §12 R2a (MP §5.1 "if not overlapping
+    // it reads directly", §6 class C "only for exactly that producer"): a CPU-written list waits
+    // for unbounded dispatches sent before the last sync only on pages a GPU write may reach; a
+    // shader store into never GPU-written command memory is the counted residual (MP §11;
+    // HAZARD=verify still compares every fetch with the full wait).
     u64 target = 0;
     u32 producers = 0;
-    if (cpu_written) {
-        // Unbounded ones before the last sync (bounded ones only if they overlap).
-        filter.unbounded_synced = writers;
-    } else {
-        filter.unbounded = writers;
-    }
+    bool gpu_pages = false;
+    bool residual = false;
+    const bool stats = V2::P5bStats::Enabled();
     for (GPUVAddr chunk = address; chunk < address + size;) {
         const GPUVAddr chunk_end =
             std::min<GPUVAddr>(address + size, (chunk & ~GPUVAddr{0xfff}) + 0x1000);
@@ -681,14 +675,32 @@ bool DmaPusher::WaitForListWriters(GPUVAddr address, size_t size, bool cpu_writt
             target = old_target; // As before
             break;
         }
+        const bool gpu_page = !cpu_written || split.MayBeGpuWrittenPage(*device, chunk_end - chunk);
+        gpu_pages |= gpu_page;
+        const V2::HazardFilter filter = VideoCommon::GpuSplit::ListFetchFilter(cpu_written, gpu_page);
         const V2::HazardResult result = split.FindWrites(*device, chunk_end - chunk, filter);
         if (result.kind == V2::HazardResult::Kind::Wait) {
             target = std::max(target, result.position);
             producers |= result.producers;
         }
+        if (!gpu_page && stats && !residual) [[unlikely]] {
+            V2::HazardFilter skipped;
+            skipped.ranged = 0;
+            skipped.unbounded_synced = V2::ProducerBit(V2::Producer::Dispatch);
+            const V2::HazardResult other = split.FindWrites(*device, chunk_end - chunk, skipped);
+            residual = other.kind == V2::HazardResult::Kind::Wait && other.position > consumed &&
+                       other.position > target;
+        }
         chunk = chunk_end;
     }
     target = std::min(target, old_target);
+    if (cpu_written && stats) [[unlikely]] {
+        using V2::P5bStats::Counter;
+        V2::P5bStats::Add(residual            ? Counter::ListFetchResidual
+                          : target <= consumed ? Counter::ListFetchNoWait
+                          : gpu_pages          ? Counter::ListFetchGpuPages
+                                               : Counter::ListFetchRanged);
+    }
     V2::Stats::NoteDecision(site, target <= consumed  ? Decision::Avoided
                                   : target < old_target ? Decision::Narrowed
                                                         : Decision::Waited);

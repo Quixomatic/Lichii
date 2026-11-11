@@ -188,6 +188,14 @@ void Report(const char* thread_name, u64 window_ns) {
                  PerSecond(at(Counter::DmaReadsSemClear), seconds),
                  per_frame(at(Counter::SleepWakeSubmits)), per_frame(at(Counter::BackSleeps)),
                  finish_list.empty() ? std::string{"none"} : finish_list);
+        LOG_INFO(HW_GPU,
+                 "V2 stats {} SYNC §12 | CPU-written list fetches (per s): no wait {:.0f}, "
+                 "ranged writers {:.0f}, GPU pages (unbounded before the sync) {:.0f}, residual "
+                 "(unbounded skipped on CPU pages) {:.0f}",
+                 thread_name, PerSecond(at(Counter::ListFetchNoWait), seconds),
+                 PerSecond(at(Counter::ListFetchRanged), seconds),
+                 PerSecond(at(Counter::ListFetchGpuPages), seconds),
+                 PerSecond(at(Counter::ListFetchResidual), seconds));
     }
     // F4-06: which untracked operations still flush every pending write.
     LOG_INFO(HW_GPU, "V2 stats {} P5b full barriers by site (per frame) | {}", thread_name,

@@ -2226,6 +2226,19 @@ void KeplerCompute::FrontDispatchRecord(VideoCommon::GpuSplit& split, FrontState
 }
 
 namespace {
+/// SYNC §12 R2b: the unbounded writers a storage buffer descriptor in a QMD's constant buffer
+/// at `device` is ordered against. Shader stores (dispatches, draws) reach only pages a GPU
+/// write may reach (GpuSplit::MayBeGpuWrittenPage), so on others they can't change it; unbounded
+/// uploads and copies mark no page and always count. A store into never GPU-written memory is
+/// the MP §11 residual, as for command lists (DmaPusher::WaitForListWriters).
+u32 DescriptorUnboundedWriters(const VideoCommon::GpuSplit& split, u64 device) {
+    using VideoCommon::V2::Producer;
+    using VideoCommon::V2::ProducerBit;
+    constexpr u32 copies = ProducerBit(Producer::Upload) | ProducerBit(Producer::Copy);
+    constexpr u32 stores = ProducerBit(Producer::Dispatch) | ProducerBit(Producer::Draw);
+    return split.MayBeGpuWrittenPage(device, 16) ? copies | stores : copies;
+}
+
 /// A QMD release the front's model read (payload, reduction or max), into S1's semaphore view.
 void RememberQmdRelease(VideoCommon::GpuSplit& split, const Tegra::MemoryManager& memory,
                         GPUVAddr address, u32 payload, u32 flags) {
@@ -2507,6 +2520,7 @@ bool KeplerCompute::FrontQmdWriteRanges(VideoCommon::GpuSplit& split, const u32*
             }
             std::array<u32, 4> descriptor;
             memory_manager.ReadBlockUnsafe(cbuf + offset, descriptor.data(), sizeof(descriptor));
+            descriptor_filter.unbounded = DescriptorUnboundedWriters(split, *device);
             const V2::HazardResult pending =
                 split.FindWrites(*device, sizeof(descriptor), descriptor_filter,
                                  reinterpret_cast<u8*>(descriptor.data()));
@@ -2589,6 +2603,7 @@ void KeplerCompute::FrontNoteInlineQmd(VideoCommon::GpuSplit& split, FrontState&
             }
             std::array<u32, 4> descriptor;
             memory_manager.ReadBlockUnsafe(cbuf + offset, descriptor.data(), sizeof(descriptor));
+            descriptor_filter.unbounded = DescriptorUnboundedWriters(split, *device);
             const V2::HazardResult pending =
                 split.FindWrites(*device, sizeof(descriptor), descriptor_filter,
                                  reinterpret_cast<u8*>(descriptor.data()));

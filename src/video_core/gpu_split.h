@@ -16,6 +16,7 @@
 #include <utility>
 
 #include "common/common_types.h"
+#include "video_core/nx2.h"
 #include "video_core/v2/front_wake.h"
 #include "video_core/v2/hazard.h"
 #include "video_core/v2/ir.h"
@@ -251,9 +252,52 @@ public:
             range_write_listener(range_write_context, device_address, size);
         }
         PrepareHazardNote();
+        MarkNotedGpuPages(device_address, size);
         hazards.NoteKnown(device_address, bytes, size, write_position, producer);
     }
+    /// Front (SYNC §12 R2a, MP §5.1/§6 class C): whether a GPU write the front noted (any ranged
+    /// or known note), or one the buffer cache recorded (Nx2MayBeGpuWritten), may have reached
+    /// a page of the range. A CPU-written command list on pages where neither holds is ordered
+    /// only against the writers noted over it, not against every unbounded dispatch.
+    [[nodiscard]] bool MayBeGpuWrittenPage(u64 device_address, u64 size) const {
+        if (size == 0) {
+            return false;
+        }
+        const u64 first = device_address >> NotedPageBits;
+        const u64 last = (device_address + size - 1) >> NotedPageBits;
+        if (last < first || last >= noted_gpu_pages->size() * 64) {
+            return true;
+        }
+        for (u64 page = first; page <= last; ++page) {
+            if (((*noted_gpu_pages)[page / 64] >> (page % 64)) & 1) {
+                return true;
+            }
+        }
+        return Tegra::Nx2MayBeGpuWritten(device_address, size);
+    }
+    /// SYNC §12 R2a: the writers a command list fetch of one page waits for (DmaPusher::
+    /// WaitForListWriters). The fetch is ordered after earlier engine work only by a host-level
+    /// wait in between (83d6c8d78b): queued copies, uploads and bounded dispatches overlapping
+    /// the list, and unbounded ones sent before the last sync. A GPU-written list waits for every
+    /// unbounded writer still queued (the copy path needs the writer recorded). A CPU-written one
+    /// skips unbounded dispatches on pages no GPU write may reach (`gpu_page` false): shader
+    /// stores mark their pages when bound (MayBeGpuWrittenPage); copies and uploads mark none.
+    [[nodiscard]] static V2::HazardFilter ListFetchFilter(bool cpu_written, bool gpu_page) {
+        constexpr u32 writers = V2::ProducerBit(V2::Producer::Copy) |
+                                V2::ProducerBit(V2::Producer::Dispatch) |
+                                V2::ProducerBit(V2::Producer::Upload);
+        V2::HazardFilter filter;
+        filter.ranged = writers;
+        if (!cpu_written) {
+            filter.unbounded = writers;
+        } else {
+            filter.unbounded_synced =
+                gpu_page ? writers : writers & ~V2::ProducerBit(V2::Producer::Dispatch);
+        }
+        return filter;
+    }
     void NoteRangeWrite(u64 device_address, u64 size, V2::Producer producer) {
+        MarkNotedGpuPages(device_address, size);
         if (producer != V2::Producer::CbData) {
             FlushCbWrite();
             if (producer == V2::Producer::QmdRelease) {
@@ -890,6 +934,20 @@ private:
             hazards.Retire(consumed.load(std::memory_order_acquire));
         }
     }
+    void MarkNotedGpuPages(u64 device_address, u64 size) {
+        if (size == 0) {
+            return;
+        }
+        auto& pages = *noted_gpu_pages;
+        const u64 last =
+            std::min<u64>((device_address + size - 1) >> NotedPageBits, pages.size() * 64 - 1);
+        for (u64 page = device_address >> NotedPageBits; page <= last;) {
+            const u64 first_bit = page % 64;
+            const u64 bits = std::min<u64>(64 - first_bit, last - page + 1);
+            pages[page / 64] |= (bits == 64 ? ~u64{0} : (u64{1} << bits) - 1) << first_bit;
+            page += bits;
+        }
+    }
     void WaitForSpace(size_t words);
     void SelectEngine(Tegra::Engines::EngineInterface* engine) {
         if (engine != front_engine) [[unlikely]] {
@@ -1133,6 +1191,11 @@ private:
     /// operations ran (V2::Landing::UntrackedSettled), not only until the back consumed them.
     V2::HazardTable qmd_release_notes;
     V2::SemView sem_view; ///< Front: S1's semaphore view (SYNC_SUBMIT_SPEC §2.1)
+    /// Front (SYNC §12 R2a): device pages a noted GPU write may reach, one bit per 4 KiB of the
+    /// 36-bit device space. Set by every ranged or known write note; never cleared.
+    static constexpr u64 NotedPageBits = 12;
+    std::unique_ptr<std::array<u64, (u64{1} << (36 - NotedPageBits)) / 64>> noted_gpu_pages{
+        std::make_unique<std::array<u64, (u64{1} << (36 - NotedPageBits)) / 64>>()};
     u64 back_entry_position{}; ///< Back: ring position of the entry it runs (TracksWrites)
 
     // Back side.

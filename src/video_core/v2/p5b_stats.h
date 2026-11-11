@@ -135,6 +135,11 @@ enum class Counter : u32 {
     SleepWakeSubmits,     ///< ... S submits after a completion came between the check and the sleep
     SubmitsStrong,        ///< SYNC §11.6 item 7: rule B's strong hint (DXVK, readback latency)
     SubmitsReadback,      ///< ... a readback's own submission (background readback)
+    // SYNC §12 R2: CPU-written command list fetches by decision (DmaPusher::WaitForListWriters).
+    ListFetchNoWait,      ///< no writer to wait for
+    ListFetchRanged,      ///< waited for noted writers over the list (its pages never GPU-written)
+    ListFetchGpuPages,    ///< pages may be GPU-written: unbounded writers before the sync count
+    ListFetchResidual,    ///< ...never GPU-written pages: unbounded writers skipped (MP §11)
     Count,
 };
 
