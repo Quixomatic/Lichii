@@ -64,6 +64,8 @@ struct FlushParams {
     u32 idle_chunks = 2;
     u32 idle_guest_chunks = 1;
     u32 one_pending_chunks = 3;
+    /// SYNC §14.7 (4): rule B with nothing pending submits at a pass boundary at this many draws.
+    u32 idle_pass_draws = 10;
     u64 request_gap_us = 500;         ///< a waiter's request mid-pass, no sooner than this
     u64 mid_pass_interval_us = 8000;  ///< safety net for passes that never end
 };
@@ -209,6 +211,11 @@ public:
             decision = {FlushAction::Flush, ReasonRequest};
         } else if (hint >= FlushHint::Strong && chunks >= params.strong_chunks) {
             decision = {FlushAction::Flush, ReasonStrong};
+        } else if (state.pending == 0 && draws >= params.idle_pass_draws) {
+            // SYNC §14.7 (4) (Ryujinx's attachment-change rule, MP §5.5 AutoFlushCounter): with
+            // nothing pending the GPU idles while the front feeds the next 64 draws over several
+            // ms (3d25: 22.8 ms/f idle with recorded work). No time term.
+            decision = {FlushAction::Flush, ReasonIdle};
         } else if (RecordedChunks() >= TableChunks(state)) {
             decision = {FlushAction::Flush, state.pending == 0 ? ReasonIdle : ReasonPending};
         } else if (hint >= FlushHint::Weak && chunks >= params.weak_chunks) {

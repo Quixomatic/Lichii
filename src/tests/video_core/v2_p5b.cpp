@@ -843,7 +843,8 @@ TEST_CASE("V2 P5b flush decisions at pass boundaries", "[video_core][v2_p5b]") {
             }
             return u32{0};
         };
-        CHECK(boundary_at({.pending = 0, .back_behind = true}) == 2); // the recorder behind too
+        // Nothing pending: the first boundary past idle_pass_draws (§14.7 (4)), here chunk 1.
+        CHECK(boundary_at({.pending = 0, .back_behind = true}) == 1); // the recorder behind too
         CHECK(boundary_at({.pending = 0, .back_behind = false, .guest_fence = true}) == 1);
         CHECK(boundary_at({.pending = 1, .back_behind = false}) == 3);
         // Two or more pending: rule C reaches the same threshold mid-pass first.
@@ -870,21 +871,27 @@ TEST_CASE("V2 P5b flush decisions at pass boundaries", "[video_core][v2_p5b]") {
         CHECK(heuristic.AtPassBoundary(FlushHint::Weak, FlushState{.pending = 0}, 1001).action ==
               FlushAction::Flush);
     }
-    SECTION("SYNC §14 #2: a boundary below the table never submits, however long ago") {
+    SECTION("SYNC §14.7 (4): nothing pending, a boundary submits at 10 draws, never before") {
         FlushHeuristic heuristic{params};
         heuristic.NoteSubmit(1000);
         const FlushState idle{.pending = 0, .back_behind = false};
-        heuristic.Advance(1, idle, 1000);
-        REQUIRE(heuristic.AtPassBoundary(FlushHint::Weak, idle, 10'000'000).action ==
-                FlushAction::None);
-        for (u32 i = 1; i < params.idle_chunks * params.chunk_draws - 1; ++i) {
-            heuristic.Advance(1, idle, 1000);
+        for (u32 i = 0; i < params.idle_pass_draws - 1; ++i) {
+            REQUIRE(heuristic.Advance(1, idle, 1000).action != FlushAction::Flush);
         }
+        // However long ago the last submission was: no time term.
         REQUIRE(heuristic.AtPassBoundary(FlushHint::Weak, idle, 10'000'000).action ==
                 FlushAction::None);
         REQUIRE(heuristic.Advance(1, idle, 1000).action != FlushAction::Flush); // not mid-pass
-        REQUIRE(heuristic.AtPassBoundary(FlushHint::Weak, idle, 1000).action == FlushAction::Flush);
+        const auto boundary = heuristic.AtPassBoundary(FlushHint::Weak, idle, 1000);
+        REQUIRE(boundary.action == FlushAction::Flush);
+        REQUIRE(boundary.reason == FlushHeuristic::ReasonIdle);
         REQUIRE(heuristic.Draws() == 0);
+        // One pending: still DXVK's 3 chunks.
+        const FlushState one{.pending = 1, .back_behind = false};
+        for (u32 i = 0; i < params.chunk_draws; ++i) {
+            heuristic.Advance(1, one, 1000);
+        }
+        REQUIRE(heuristic.AtPassBoundary(FlushHint::Weak, one, 1000).action == FlushAction::None);
     }
     SECTION("nothing recorded: no boundary submit") {
         FlushHeuristic heuristic{params};
