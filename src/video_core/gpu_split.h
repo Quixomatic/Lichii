@@ -354,6 +354,25 @@ public:
         }
         return result;
     }
+    /// Front (SYNC §15.10, STATS): whether an Upload over the range is still queued in the
+    /// list-writer table (an Upload-only lookup; an overflow or scan-cap answer doesn't count).
+    /// Marks no list page.
+    [[nodiscard]] bool ListUploadQueued(u64 device_address, u64 size) {
+        FlushUploadWrite();
+        const u64 done = ConsumedNow();
+        writer_notes.Retire(done);
+        V2::HazardFilter uploads;
+        uploads.ranged = V2::ProducerBit(V2::Producer::Upload);
+        uploads.unbounded = V2::ProducerBit(V2::Producer::Upload);
+        const V2::HazardResult result = writer_notes.Find(device_address, size, done, uploads);
+        return result.kind == V2::HazardResult::Kind::Wait && !result.overflow &&
+               (result.producers & V2::ProducerBit(V2::Producer::Upload)) != 0 &&
+               result.position > done;
+    }
+    /// Front (SYNC §15.10, STATS context): the general table's overflow marker is pending.
+    [[nodiscard]] bool HazardOverflowPending() const {
+        return hazards.OverflowPending(ConsumedNow());
+    }
     /// `position`: the ring position the write is ordered at (0: the write just sent).
     void NoteRangeWrite(u64 device_address, u64 size, V2::Producer producer, u64 position = 0) {
         if (position == 0) {

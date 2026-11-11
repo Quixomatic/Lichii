@@ -873,22 +873,22 @@ void DmaPusher::CheckListEarlyOut(GPUVAddr address, size_t size, bool cpu_writte
     auto& split = VideoCommon::GpuSplit::Get();
     if (V2::P5bStats::Enabled()) {
         V2::P5bStats::Add(Counter::ListEarlyOuts);
-        V2::HazardFilter uploads;
-        uploads.ranged = V2::ProducerBit(V2::Producer::Upload);
-        uploads.unbounded = V2::ProducerBit(V2::Producer::Upload);
+        // SYNC §15.10: the list-writer table, Upload only. The general table's overflow marker
+        // (CbData notes) answers Wait to any filter: it is context, not a queued upload.
         bool queued = false;
         for (GPUVAddr chunk = address; chunk < address + size && !queued;) {
             const GPUVAddr chunk_end =
                 std::min<GPUVAddr>(address + size, (chunk & ~GPUVAddr{0xfff}) + 0x1000);
             if (const auto device = memory_manager.GpuToCpuAddress(chunk)) {
-                const V2::HazardResult result =
-                    split.FindWrites(*device, chunk_end - chunk, uploads);
-                queued = result.kind == V2::HazardResult::Kind::Wait;
+                queued = split.ListUploadQueued(*device, chunk_end - chunk);
             }
             chunk = chunk_end;
         }
         if (queued) {
             V2::P5bStats::Add(Counter::ListEarlyOutUploadQueued);
+        }
+        if (split.HazardOverflowPending()) {
+            V2::P5bStats::Add(Counter::ListEarlyOutHazardOverflow);
         }
     }
     static std::atomic<u32> sample{};

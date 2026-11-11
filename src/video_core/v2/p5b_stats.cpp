@@ -303,7 +303,8 @@ void Report(const char* thread_name, u64 window_ns) {
                  "(per s): copy {:.0f}, dispatch {:.0f}, upload {:.0f}; §15.5 upload words "
                  "merged {:.0f}, upload notes left out {:.0f}, first list fetches that waited "
                  "for them {:.0f}; §15.9 list fetches at the writers' early-out {:.0f}, with an "
-                 "upload over the list still queued {:.0f} (must be 0) | guest CPU waits while "
+                 "upload over the list still queued {:.0f} (must be 0), while the general "
+                 "table's overflow marker was pending {:.0f} (context) | guest CPU waits while "
                  "the front sleeps on pending channels: {}",
                  thread_name, per_frame(at(Counter::StrongFromQuery)),
                  per_frame(at(Counter::StrongFromBuffer)),
@@ -324,6 +325,7 @@ void Report(const char* thread_name, u64 window_ns) {
                  PerSecond(at(Counter::UploadFirstFetchWaits), seconds),
                  PerSecond(at(Counter::ListEarlyOuts), seconds),
                  PerSecond(at(Counter::ListEarlyOutUploadQueued), seconds),
+                 PerSecond(at(Counter::ListEarlyOutHazardOverflow), seconds),
                  guest_list.empty() ? std::string{"none"} : guest_list);
         // §14.7 (5): guest-read fence age at submit, p50/p99 as the bucket's upper bound.
         u64 fences = 0;

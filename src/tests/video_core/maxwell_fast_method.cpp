@@ -2648,6 +2648,58 @@ TEST_CASE("SYNC §15.9: an upload alone keeps a list fetch from the writers' ear
     Tegra::Nx2ClearGpuWrittenPages();
 }
 
+// SYNC_SUBMIT_SPEC §15.10 (fc1f: 4.3-10k/s "early-outs with an upload queued"): the general
+// table's overflow marker answers Wait to an Upload-only filter; the gate counter asks the
+// list-writer table and counts only Upload answers that aren't overflow.
+TEST_CASE("SYNC §15.10: the early-out upload check ignores the general table's overflow",
+          "[video_core][gpu_split_dispatch][v2_hazard]") {
+    using Access = VideoCommon::GpuSplitTestAccess;
+    using VideoCommon::GpuSplit;
+    namespace V2 = VideoCommon::V2;
+    using Kind = V2::HazardResult::Kind;
+    Fixture f;
+    f.system.Initialize();
+    Tegra::Nx2ClearGpuWrittenPages();
+    GpuSplit split;
+    Access::Initialize(split, f.system, 100);
+    Access::SetTracksWrites(split, true);
+    constexpr u64 list = 0x7'6a00'0000;
+    // More constant buffer notes than the general table holds, none consumed; no writer queued.
+    for (u64 i = 0; i <= V2::HazardTable::Capacity; ++i) {
+        Access::SetEnd(split, 110 + i);
+        split.NoteRangeWrite(0x7'7000'0000 + i * 0x1000, 16, V2::Producer::CbData);
+    }
+    REQUIRE(split.HazardOverflows() >= 1);
+    REQUIRE(split.ListWritersIdle());
+    V2::HazardFilter uploads;
+    uploads.ranged = V2::ProducerBit(V2::Producer::Upload);
+    uploads.unbounded = V2::ProducerBit(V2::Producer::Upload);
+    // d303's check: the general table answers Wait (its overflow marker).
+    const V2::HazardResult old_check = split.FindWrites(list, 0x100, uploads);
+    CHECK(old_check.kind == Kind::Wait);
+    CHECK(old_check.cause == V2::CauseOverflow);
+    // The corrected check: no queued upload; the overflow is context only.
+    CHECK_FALSE(split.ListUploadQueued(list, 0x100));
+    CHECK(split.HazardOverflowPending());
+
+    // Positive control: one inline upload to the page ends the early-out and the fetch waits.
+    Access::SetEnd(split, 9000);
+    split.NoteRangeWrite(list + 0x40, 0x20, V2::Producer::Upload);
+    CHECK_FALSE(split.ListWritersIdle());
+    const V2::HazardResult fetch =
+        split.FindListWriters(list, 0x100, GpuSplit::ListFetchFilter(true, false));
+    REQUIRE(fetch.kind == Kind::Wait);
+    CHECK(fetch.position == 9000);
+    // Now a list page: a later upload over it is in the list-writer table, and the check finds
+    // it.
+    Access::SetEnd(split, 9010);
+    split.NoteRangeWrite(list + 0x80, 0x20, V2::Producer::Upload);
+    CHECK(split.ListUploadQueued(list, 0x100));
+    Access::SetBack(split, 9010, false);
+    CHECK_FALSE(split.ListUploadQueued(list, 0x100));
+    CHECK(split.ListWritersIdle());
+}
+
 TEST_CASE("V2 landing: the front remembers its releases, the back's captured operations count",
           "[video_core][gpu_split_dispatch][v2_hazard]") {
     using Access = VideoCommon::GpuSplitTestAccess;

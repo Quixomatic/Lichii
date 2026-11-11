@@ -167,6 +167,11 @@ public:
     [[nodiscard]] u64 Overflows() const {
         return overflows;
     }
+    /// Whether the overflow marker still holds entries the back hasn't consumed (every lookup
+    /// then answers Wait, whatever its filter).
+    [[nodiscard]] bool OverflowPending(u64 consumed) const {
+        return overflow_position > consumed;
+    }
 
 private:
     /// An entry by index and position: stale once the slot holds a newer entry.

@@ -203,6 +203,7 @@ enum class Counter : u32 {
     // an Upload note over the list still queued (the 0x13 hole; must be 0).
     ListEarlyOuts,
     ListEarlyOutUploadQueued,
+    ListEarlyOutHazardOverflow, ///< §15.10 context: the general table's overflow marker pending
     // SYNC §14.7 (5): the age of the oldest guest-read fence (§12.4 set) in a submission, by
     // bucket (GuestFenceAgeBoundsUs), and HAZARD=verify's command list compares.
     GuestFenceAge0,
