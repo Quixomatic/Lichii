@@ -254,6 +254,10 @@ public:
         PrepareHazardNote();
         MarkNotedGpuPages(device_address, size);
         hazards.NoteKnown(device_address, bytes, size, write_position, producer);
+        if (ListWriter(producer)) {
+            PrepareWriterNote();
+            writer_notes.NoteKnown(device_address, bytes, size, write_position, producer);
+        }
     }
     /// Front (SYNC §12 R2a, MP §5.1/§6 class C): whether a GPU write the front noted (any ranged
     /// or known note), or one the buffer cache recorded (Nx2MayBeGpuWritten), may have reached
@@ -279,6 +283,9 @@ public:
     /// its overflow marker).
     [[nodiscard]] u64 HazardOverflows() const {
         return hazards.Overflows();
+    }
+    [[nodiscard]] u64 WriterTableOverflows() const {
+        return writer_notes.Overflows();
     }
     /// SYNC §12 R2a: the writers a command list fetch of one page waits for (DmaPusher::
     /// WaitForListWriters). The fetch is ordered after earlier engine work only by a host-level
@@ -311,10 +318,21 @@ public:
     [[nodiscard]] V2::HazardResult FindGpuListWriters(u64 device_address, u64 size,
                                                       bool& unbounded) {
         const V2::HazardResult result =
-            FindWrites(device_address, size, ListFetchFilter(false, true));
+            FindListWriters(device_address, size, ListFetchFilter(false, true));
         unbounded = result.kind == V2::HazardResult::Kind::Wait &&
                     result.cause == V2::CauseUnbounded;
         return result;
+    }
+    /// Front (SYNC §13.5 #1 / §14.6, MP §5.1 "if not overlapping it reads directly"): a command
+    /// list fetch's lookup in a table of Copy/Dispatch/Upload notes only (`filter` names no other
+    /// producer). In the shared table constant buffer data notes (thousands per frame) folded
+    /// real entries into the overflow marker (95a3: 78,664 overflows/s), and every CPU-written
+    /// list wait was that marker, not a writer over the list.
+    [[nodiscard]] V2::HazardResult FindListWriters(u64 device_address, u64 size,
+                                                   const V2::HazardFilter& filter) {
+        const u64 done = ConsumedNow();
+        writer_notes.Retire(done);
+        return writer_notes.Find(device_address, size, done, filter);
     }
     void NoteRangeWrite(u64 device_address, u64 size, V2::Producer producer) {
         MarkNotedGpuPages(device_address, size);
@@ -330,6 +348,10 @@ public:
         }
         PrepareHazardNote();
         hazards.NoteRange(device_address, size, write_position, producer);
+        if (ListWriter(producer)) {
+            PrepareWriterNote();
+            writer_notes.NoteRange(device_address, size, write_position, producer);
+        }
     }
     void NoteUnboundedWrite(V2::Producer producer) {
         if (producer == V2::Producer::QmdRelease) {
@@ -338,6 +360,9 @@ public:
             sem_view.NoteUnboundedUnknown(write_position);
         }
         hazards.NoteUnbounded(producer, write_position);
+        if (ListWriter(producer)) {
+            writer_notes.NoteUnbounded(producer, write_position);
+        }
     }
     /// Front, TracksWrites: constant buffer words just sent to a GPU range. Words that continue
     /// the pending range on its GPU page join it (no translation, no table entry per word);
@@ -847,6 +872,7 @@ public:
     /// Front: the channel whose commands follow (Scheduler::BindChannel).
     void SetFrontChannel(u32 channel) {
         hazards.SetChannel(channel);
+        writer_notes.SetChannel(channel);
     }
     /// A sync that orders only the work sent up to `position` (F3-X5: an acquire met by a
     /// queued release orders what came before that release, not what the front sent since).
@@ -869,8 +895,10 @@ public:
         if (tracks_writes) [[unlikely]] {
             if (channel_only) {
                 hazards.NoteChannelSync(at);
+                writer_notes.NoteChannelSync(at);
             } else {
                 hazards.NoteSync(at);
+                writer_notes.NoteSync(at);
             }
         }
     }
@@ -960,6 +988,16 @@ private:
         if (hazards.Size() == V2::HazardTable::Capacity) [[unlikely]] {
             hazards.Retire(consumed.load(std::memory_order_acquire));
         }
+    }
+    void PrepareWriterNote() {
+        if (writer_notes.Size() == V2::HazardTable::Capacity) [[unlikely]] {
+            writer_notes.Retire(consumed.load(std::memory_order_acquire));
+        }
+    }
+    /// SYNC §13.5 #1: the producers a command list fetch waits for (`writer_notes`).
+    [[nodiscard]] static constexpr bool ListWriter(V2::Producer producer) {
+        return producer == V2::Producer::Copy || producer == V2::Producer::Dispatch ||
+               producer == V2::Producer::Upload;
     }
     void MarkNotedGpuPages(u64 device_address, u64 size) {
         if (size == 0) {
@@ -1208,6 +1246,8 @@ private:
     u32 map_epoch{};        ///< MapEpoch
     u64 front_spin_start{};
     V2::HazardTable hazards;
+    /// SYNC §13.5 #1: Copy/Dispatch/Upload notes only, for command list fetches (FindListWriters).
+    V2::HazardTable writer_notes;
     V2::HazardTable unlanded; ///< Writes that land at an operation, by landing ticket (Landing)
     u64 ticket_position{};    ///< NextLandingTicket: the entry and index of the last ticket
     u64 ticket_sub{};

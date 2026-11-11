@@ -207,6 +207,7 @@ void GpuSplit::MaybeStart(Core::System& system_) {
     tracks_writes = acquire_mode != V2::Mode::Off || hazard_mode != V2::Mode::Off;
     feed_idle_back = acquire_mode != V2::Mode::Off;
     hazards.Clear();
+    writer_notes.Clear();
     pending_cb = {};
     cb_translations.fill({});
     unlanded.Clear();
@@ -299,6 +300,7 @@ void GpuSplit::Stop() {
     acquire_mode = V2::Mode::Off;
     hazard_mode = V2::Mode::Off;
     hazards.Clear();
+    writer_notes.Clear();
     pending_cb = {};
     unlanded.Clear();
     sem_view.Clear();

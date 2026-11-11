@@ -649,15 +649,21 @@ void DmaPusher::CallMultiMethod(const u32* base_start, u32 num_methods) {
 namespace {
 /// SYNC_SUBMIT_SPEC §13.5 #1 (STATS, front thread): a list fetch's wait by the cause of the
 /// position it waited for (HazardResult::cause), CPU- and GPU-written lists apart, and the hazard
-/// table's overflows since the previous fetch.
-void NoteListWaitCause(bool cpu_written, bool waited, u8 cause, u64 overflows) {
+/// table's and the list writer table's (§14.6) overflows since the previous fetch.
+void NoteListWaitCause(bool cpu_written, bool waited, u8 cause, u64 overflows,
+                       u64 writer_overflows) {
     namespace P5b = VideoCommon::V2::P5bStats;
     using P5b::Counter;
     static u64 seen_overflows = 0;
+    static u64 seen_writer_overflows = 0;
     if (overflows > seen_overflows) {
         P5b::Add(Counter::HazardOverflows, overflows - seen_overflows);
     }
     seen_overflows = overflows;
+    if (writer_overflows > seen_writer_overflows) {
+        P5b::Add(Counter::WriterTableOverflows, writer_overflows - seen_writer_overflows);
+    }
+    seen_writer_overflows = writer_overflows;
     if (!waited) {
         return;
     }
@@ -720,8 +726,8 @@ bool DmaPusher::WaitForListWriters(GPUVAddr address, size_t size, bool cpu_writt
         bool page_unbounded = false;
         const V2::HazardResult result =
             cpu_written
-                ? split.FindWrites(*device, chunk_end - chunk,
-                                   VideoCommon::GpuSplit::ListFetchFilter(true, gpu_page))
+                ? split.FindListWriters(*device, chunk_end - chunk,
+                                        VideoCommon::GpuSplit::ListFetchFilter(true, gpu_page))
                 : split.FindGpuListWriters(*device, chunk_end - chunk, page_unbounded);
         gpu_unbounded |= page_unbounded;
         if (result.kind == V2::HazardResult::Kind::Wait) {
@@ -735,7 +741,8 @@ bool DmaPusher::WaitForListWriters(GPUVAddr address, size_t size, bool cpu_writt
             V2::HazardFilter skipped;
             skipped.ranged = 0;
             skipped.unbounded_synced = V2::ProducerBit(V2::Producer::Dispatch);
-            const V2::HazardResult other = split.FindWrites(*device, chunk_end - chunk, skipped);
+            const V2::HazardResult other =
+                split.FindListWriters(*device, chunk_end - chunk, skipped);
             residual = other.kind == V2::HazardResult::Kind::Wait && other.position > consumed &&
                        other.position > target;
         }
@@ -750,7 +757,8 @@ bool DmaPusher::WaitForListWriters(GPUVAddr address, size_t size, bool cpu_writt
                                                : Counter::ListFetchRanged);
     }
     if (stats) [[unlikely]] {
-        NoteListWaitCause(cpu_written, target > consumed, wait_cause, split.HazardOverflows());
+        NoteListWaitCause(cpu_written, target > consumed, wait_cause, split.HazardOverflows(),
+                          split.WriterTableOverflows());
         if (!cpu_written) {
             using V2::P5bStats::Counter;
             V2::P5bStats::Add(target <= consumed ? Counter::GpuListNoWait

@@ -212,11 +212,12 @@ void Report(const char* thread_name, u64 window_ns) {
         };
         LOG_INFO(HW_GPU,
                  "V2 stats {} SYNC §13 list-fetch waits by cause (per s) | CPU-written: {} | "
-                 "GPU-written: {} | hazard table overflows {:.0f}/s | GPU-written fetches (per "
-                 "s): no wait {:.0f}, waited for a ranged writer {:.0f}, for an unbounded one "
-                 "{:.0f}",
+                 "GPU-written: {} | hazard table overflows {:.0f}/s, list writer table {:.0f}/s "
+                 "| GPU-written fetches (per s): no wait {:.0f}, waited for a ranged writer "
+                 "{:.0f}, for an unbounded one {:.0f}",
                  thread_name, causes(Counter::ListWaitCpuOther), causes(Counter::ListWaitGpuOther),
                  PerSecond(at(Counter::HazardOverflows), seconds),
+                 PerSecond(at(Counter::WriterTableOverflows), seconds),
                  PerSecond(at(Counter::GpuListNoWait), seconds),
                  PerSecond(at(Counter::GpuListPageProducer), seconds),
                  PerSecond(at(Counter::GpuListUnboundedNewer), seconds));

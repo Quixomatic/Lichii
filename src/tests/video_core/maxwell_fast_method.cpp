@@ -2421,6 +2421,46 @@ TEST_CASE("SYNC §14.5: a GPU-written list waits for every queued writer that ma
     }
 }
 
+// SYNC_SUBMIT_SPEC §13.5 #1 / §14.6 (95a3: 78,664 hazard table overflows/s; every CPU-written
+// list wait was the overflow marker): list fetches look writers up in their own table.
+TEST_CASE("SYNC §14.6: constant buffer notes don't make list fetches wait on the overflow marker",
+          "[video_core][gpu_split_dispatch][v2_hazard]") {
+    using Access = VideoCommon::GpuSplitTestAccess;
+    using VideoCommon::GpuSplit;
+    namespace V2 = VideoCommon::V2;
+    using Kind = V2::HazardResult::Kind;
+    Fixture f;
+    f.system.Initialize();
+    GpuSplit split;
+    Access::Initialize(split, f.system, 100);
+    Access::SetTracksWrites(split, true);
+    constexpr u64 list = 0x7'6800'0000;
+    // More constant buffer data notes than the shared table holds, none consumed.
+    for (u64 i = 0; i <= V2::HazardTable::Capacity; ++i) {
+        Access::SetEnd(split, 110 + i);
+        split.NoteRangeWrite(0x7'7000'0000 + i * 0x1000, 16, V2::Producer::CbData);
+    }
+    REQUIRE(split.HazardOverflows() >= 1);
+    const V2::HazardFilter filter = GpuSplit::ListFetchFilter(true, false);
+    // The shared table answers the overflow marker; the writer table holds no writer.
+    const V2::HazardResult shared = split.FindWrites(list, 0x100, filter);
+    REQUIRE(shared.kind == Kind::Wait);
+    CHECK(shared.cause == V2::CauseOverflow);
+    CHECK(split.FindListWriters(list, 0x100, filter).kind == Kind::Clear);
+    CHECK(split.WriterTableOverflows() == 0);
+    // A writer over the list is still found, at its position.
+    Access::SetEnd(split, 9000);
+    split.NoteRangeWrite(list + 0x20, 0x20, V2::Producer::Dispatch);
+    const V2::HazardResult writer = split.FindListWriters(list, 0x100, filter);
+    REQUIRE(writer.kind == Kind::Wait);
+    CHECK(writer.position == 9000);
+    CHECK(writer.cause == V2::CauseRanged);
+    // GPU-written lists use the same table (FindGpuListWriters).
+    bool unbounded = true;
+    CHECK(split.FindGpuListWriters(list, 0x100, unbounded).position == 9000);
+    CHECK_FALSE(unbounded);
+}
+
 TEST_CASE("V2 landing: the front remembers its releases, the back's captured operations count",
           "[video_core][gpu_split_dispatch][v2_hazard]") {
     using Access = VideoCommon::GpuSplitTestAccess;

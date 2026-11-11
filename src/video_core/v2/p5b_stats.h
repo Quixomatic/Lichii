@@ -156,6 +156,7 @@ enum class Counter : u32 {
     ListWaitGpuFoundCap,
     ListWaitGpuOverflow,
     HazardOverflows,
+    WriterTableOverflows, ///< SYNC §14.6: the list writer table's (GpuSplit::writer_notes)
     // SYNC §13.5 #5 / §14.5: GPU-written list fetches by decision.
     GpuListNoWait,         ///< every queued writer that may reach the page ran
     GpuListPageProducer,   ///< waited; the newest writer was a ranged one over the page
