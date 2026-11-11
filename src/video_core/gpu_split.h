@@ -445,9 +445,29 @@ public:
         }
     }
     /// Front (Fix F3h, R2-F3-03 / SYNC §15.5): a Map record is about to be sent: the pending
-    /// upload is translated with the mapping its words were sent under.
-    void FlushBeforeMap() {
-        FlushUploadWrite();
+    /// upload is translated with the mapping its words were sent under, and (§15.8 (1)) the
+    /// device pages the map unmaps or remaps are no longer "already fetched" list pages, so a
+    /// reused page's first fetch waits again.
+    void FlushBeforeMap(const V2::Ir::MapBody& map);
+    /// SYNC §15.8: clears the list_pages marks of a device range (more is safe: one more
+    /// first-fetch wait).
+    void ForgetListPages(u64 device_address, u64 size) {
+        if (size == 0) {
+            return;
+        }
+        auto& pages = *list_pages;
+        const u64 first = device_address >> NotedPageBits;
+        if (first >= pages.size() * 64) {
+            return;
+        }
+        const u64 last =
+            std::min<u64>((device_address + size - 1) >> NotedPageBits, pages.size() * 64 - 1);
+        for (u64 page = first; page <= last;) {
+            const u64 first_bit = page % 64;
+            const u64 bits = std::min<u64>(64 - first_bit, last - page + 1);
+            pages[page / 64] &= ~((bits == 64 ? ~u64{0} : (u64{1} << bits) - 1) << first_bit);
+            page += bits;
+        }
     }
     /// Front: the writes to a device range that `filter` orders against (V2::HazardTable): the
     /// queued ones and, for releases and reports, those still to land (one table each: a

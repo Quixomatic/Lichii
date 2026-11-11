@@ -2539,6 +2539,34 @@ TEST_CASE("SYNC §15.5: upload notes merge and stay out of the list writer table
     CHECK(written.position == 130);
     Access::SetBack(split, 130, false);
     CHECK(split.FindListWriters(device + 0x1800, 0x10, filter).kind == Kind::Clear);
+
+    // §15.8 (1): an unmap of the first page's GPU range makes it a new page again: an upload
+    // there is left out of the table, and the page's next fetch is a first fetch that waits.
+    V2::Ir::MapBody unmap{};
+    unmap.op = V2::Ir::MapOp::GmmuUnmap;
+    unmap.gpu_address = gpu;
+    unmap.size = 0x1000;
+    unmap.object = reinterpret_cast<u64>(&f.memory);
+    split.FlushBeforeMap(unmap);
+    Access::SetEnd(split, 140);
+    split.NoteUploadWrite(f.memory, gpu + 0x20, 0x10);
+    Access::SetEnd(split, 145);
+    const V2::HazardResult again = split.FindListWriters(device + 0x800, 0x10, filter);
+    REQUIRE(again.kind == Kind::Wait);
+    CHECK(again.position == 140);
+    // A device range a release frees is forgotten too.
+    Access::SetBack(split, 145, false);
+    V2::Ir::MapBody release{};
+    release.op = V2::Ir::MapOp::SmmuRelease;
+    release.device_address = device;
+    release.size = 0x1000;
+    split.FlushBeforeMap(release);
+    Access::SetEnd(split, 150);
+    split.NoteUploadWrite(f.memory, gpu + 0x40, 0x10);
+    const V2::HazardResult released = split.FindListWriters(device, 0x10, filter);
+    REQUIRE(released.kind == Kind::Wait);
+    CHECK(released.position == 150);
+    CHECK((released.producers & V2::ProducerBit(V2::Producer::Upload)) != 0);
     Tegra::Nx2ClearGpuWrittenPages();
 }
 

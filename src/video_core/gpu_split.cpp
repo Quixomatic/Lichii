@@ -430,6 +430,29 @@ void GpuSplit::ParallelPublish() {
     parallel->OnPublish(published_local);
 }
 
+void GpuSplit::FlushBeforeMap(const V2::Ir::MapBody& map) {
+    FlushUploadWrite();
+    if (map.size == 0) {
+        return;
+    }
+    using V2::Ir::MapOp;
+    // SYNC §15.8 (1): device ranges a release or tile reassigns, and the device pages a GMMU
+    // range maps now (translated before the record runs, so with the mapping it replaces).
+    if (map.device_address != 0) {
+        ForgetListPages(map.device_address, map.size);
+    }
+    const bool gmmu = map.op == MapOp::GmmuMap || map.op == MapOp::GmmuUnmap ||
+                      map.op == MapOp::SparseRelease;
+    if (gmmu && map.object != 0) {
+        const auto& memory = *reinterpret_cast<const Tegra::MemoryManager*>(map.object);
+        std::array<std::pair<u64, u64>, 8> ranges;
+        const size_t count = V2::DeviceRanges(memory, map.gpu_address, map.size, ranges);
+        for (size_t i = 0; i < count; ++i) {
+            ForgetListPages(ranges[i].first, ranges[i].second - ranges[i].first);
+        }
+    }
+}
+
 void GpuSplit::NoteUploadWriteSlow(const Tegra::MemoryManager& memory, u64 gpu_address, u64 size,
                                    u64 position) {
     V2::NoteRangeWriteGpu(*this, memory, gpu_address, size, V2::Producer::Upload, position);
