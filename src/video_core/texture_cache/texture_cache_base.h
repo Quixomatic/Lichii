@@ -8,7 +8,9 @@
 
 #include <atomic>
 #include <deque>
+#include <functional>
 #include <limits>
+#include <memory>
 #include <map>
 #include <mutex>
 #include <optional>
@@ -399,6 +401,12 @@ public:
 
     /// Download contents of host images to guest memory in a region
     void DownloadMemory(DAddr cpu_addr, size_t size);
+
+    /// SYNC §12 R4 (MP §6: guest CPU reads of GPU-written memory are served on the reading
+    /// thread): DownloadMemory with the copies recorded into the open submission and `land` set
+    /// for the reader, which waits for their tick and swizzles into guest memory itself. False
+    /// (nothing done) when the backend or the size needs the synchronous path.
+    bool DownloadMemoryAsync(DAddr cpu_addr, size_t size, std::function<void()>& land);
 
     std::optional<VideoCore::RasterizerDownloadArea> GetFlushArea(DAddr cpu_addr, u64 size);
 
@@ -939,6 +947,12 @@ private:
 
     Common::ScratchBuffer<u8> swizzle_data_buffer;
     Common::ScratchBuffer<u8> unswizzle_data_buffer;
+
+    /// SYNC §12 R4: image downloads a reader lands (DownloadMemoryAsync); their staging memory
+    /// is freed by the owner once landed.
+    struct ReadbackState;
+    std::vector<std::shared_ptr<ReadbackState>> readbacks_in_flight;
+    void FreeLandedReadbacks();
     Tegra::Texture::UnswizzleWorker unswizzle_worker;
 
     u64 modification_tick = 0;

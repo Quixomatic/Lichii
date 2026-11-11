@@ -6,6 +6,7 @@
 #include <bit>
 #include <chrono>
 #include <condition_variable>
+#include <functional>
 #include <mutex>
 #include <thread>
 #include <utility>
@@ -20,6 +21,7 @@
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 #include "video_core/v2/after_pass.h"
 #include "video_core/v2/barrier_tracker.h"
+#include "video_core/v2/cpu_readback.h"
 #include "video_core/v2/flush_heuristic.h"
 #include "video_core/v2/frame_pacer.h"
 #include "video_core/v2/landing_fence.h"
@@ -410,18 +412,18 @@ TEST_CASE("V2 P5b timeline join bookkeeping", "[video_core][v2_p5b]") {
 TEST_CASE("V2 P5b fence-tracked ring never waits", "[video_core][v2_p5b]") {
     VideoCommon::V2::TickRing ring{1024, 64};
     // Tick 1 and 2 allocations; nothing completed.
-    REQUIRE(ring.Allocate(256, 1, 0) == 0);
-    REQUIRE(ring.Allocate(256, 1, 0) == 256);
-    REQUIRE(ring.Allocate(256, 2, 0) == 512);
-    REQUIRE(ring.Allocate(256, 2, 0) == 768);
+    REQUIRE(ring.Allocate(256, 1, 0) == u64{0});
+    REQUIRE(ring.Allocate(256, 1, 0) == u64{256});
+    REQUIRE(ring.Allocate(256, 2, 0) == u64{512});
+    REQUIRE(ring.Allocate(256, 2, 0) == u64{768});
     // Full: fails instead of waiting.
     REQUIRE_FALSE(ring.Allocate(64, 3, 0).has_value());
     // Tick 1 done: its 512 bytes come back, allocation wraps to the start.
-    REQUIRE(ring.Allocate(300, 3, 1) == 0);
+    REQUIRE(ring.Allocate(300, 3, 1) == u64{0});
     REQUIRE_FALSE(ring.Allocate(300, 3, 1).has_value()); // 512-320 = 192 free before tick 2's
-    REQUIRE(ring.Allocate(128, 3, 1) == 320);
+    REQUIRE(ring.Allocate(128, 3, 1) == u64{320});
     // Everything done: empty again.
-    REQUIRE(ring.Allocate(1024, 4, 3) == 0);
+    REQUIRE(ring.Allocate(1024, 4, 3) == u64{0});
     REQUIRE_FALSE(ring.Allocate(2048, 5, 4).has_value()); // larger than the ring
 
     // Random model: live allocations never overlap.
@@ -1777,6 +1779,90 @@ TEST_CASE("V2 P5b a landing wait asks for its fence's tick and an idle back subm
     Landing::landed.store(saved_landed);
     Landing::untracked_issued.store(saved_untracked);
     LandingFence::NoteFence(0);
+}
+
+// SYNC_SUBMIT_SPEC §12 R4: df94's back blocked in Finish for guest CPU reads (buffer_cache.h
+// DownloadMemory 15-18 ms/s, vk_texture_cache.cpp:1507 25.7 ms/s). The reader now lands them.
+TEST_CASE("SYNC §12 R4: a guest CPU read lands on the reader; an idle back submits, never finishes",
+          "[video_core][v2_p5b]") {
+    namespace CpuReadback = VideoCommon::V2::CpuReadback;
+    using VideoCommon::V2::SubmitRequests;
+    using Action = SubmitRequests::IdleAction;
+    SECTION("guest memory keeps FlushRegion's order: images, then buffers") {
+        REQUIRE(CpuReadback::ImagesOnReader(false, false, false)); // no buffer data owed
+        REQUIRE(CpuReadback::ImagesOnReader(false, true, true));   // buffers land on it too
+        REQUIRE_FALSE(CpuReadback::ImagesOnReader(false, true, false)); // buffers written now
+        REQUIRE_FALSE(CpuReadback::ImagesOnReader(true, false, false)); // verify
+        std::string order;
+        CpuReadback::Chain([&] { order += 'i'; }, [&] { order += 'b'; })();
+        REQUIRE(order == "ib");
+        order.clear();
+        CpuReadback::Chain({}, [&] { order += 'b'; })();
+        REQUIRE(order == "b");
+        order.clear();
+        CpuReadback::Chain([&] { order += 'i'; }, {})();
+        REQUIRE(order == "i");
+    }
+    SECTION("idle back, the writer's tick unsubmitted: the reader's request submits it") {
+        SubmitRequests requests;
+        std::atomic<u64> open_tick{7}; // the writer and its download copy are in tick 7
+        std::atomic<u64> gpu_done{6};
+        std::atomic<u32> staging{0};
+        std::atomic<u32> submits{0};
+        std::atomic<u32> finishes{0};
+        std::mutex mutex;
+        std::condition_variable cv;
+        bool woken = false;
+        bool stop = false;
+        std::thread back([&] {
+            std::unique_lock lock{mutex};
+            while (!stop) {
+                cv.wait(lock, [&] { return woken || stop; });
+                if (!std::exchange(woken, false)) {
+                    continue;
+                }
+                // The back's idle hook (lazy fences, nothing wanted): only a request submits.
+                if (requests.AtIdleHook(false, true, false, 0, open_tick.load()) ==
+                    Action::Urgent) {
+                    open_tick.fetch_add(1);
+                    submits.fetch_add(1);
+                    staging.store(0x1234); // the GPU runs the writer and the copy
+                    gpu_done.store(7);
+                }
+            }
+        });
+        const auto wake = [&] {
+            {
+                std::scoped_lock lock{mutex};
+                woken = true;
+            }
+            cv.notify_one();
+        };
+        // A wake without a request leaves the tick open.
+        wake();
+        u32 guest = 0;
+        // The reader's land (WaitForHostRead: EnsureSubmitted, then the timeline wait).
+        const std::function<void()> land = [&] {
+            requests.Request(7, true);
+            wake();
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{2};
+            while (gpu_done.load() < 7 && std::chrono::steady_clock::now() < deadline) {
+                std::this_thread::yield();
+            }
+            guest = staging.load();
+        };
+        CpuReadback::Chain({}, land)();
+        {
+            std::scoped_lock lock{mutex};
+            stop = true;
+        }
+        cv.notify_one();
+        back.join();
+        REQUIRE(guest == 0x1234);
+        REQUIRE(submits.load() == 1);
+        REQUIRE(finishes.load() == 0);
+        REQUIRE_FALSE(requests.Urgent(open_tick.load()));
+    }
 }
 
 TEST_CASE("V2 P5b staging buffers in recurring use are not released", "[video_core][v2_p5b]") {

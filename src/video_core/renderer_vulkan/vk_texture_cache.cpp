@@ -1496,7 +1496,7 @@ void TextureCacheRuntime::EncodeDecodes(vk::CommandBuffer cmdbuf,
     }
 }
 
-void TextureCacheRuntime::Finish() {
+void TextureCacheRuntime::Finish(std::source_location location) {
     BackgroundReadback* const readback = scheduler.GetBackgroundReadback();
     if (readback != nullptr && !readback->Empty()) [[unlikely]] {
         // The job waits for the graphics tick it flushes: its completion covers the copies the
@@ -1504,7 +1504,32 @@ void TextureCacheRuntime::Finish() {
         readback->Wait(readback->Submit());
         return;
     }
-    scheduler.Finish();
+    scheduler.Finish({}, {}, location);
+}
+
+u64 TextureCacheRuntime::SubmitForHostRead() {
+    scheduler.RecordBufferOperation([](vk::CommandBuffer cmdbuf) {
+        const VkMemoryBarrier barrier{
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .pNext = nullptr,
+            .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_HOST_READ_BIT,
+        };
+        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0,
+                               barrier);
+    });
+    const u64 tick = scheduler.CurrentTick();
+    if (scheduler.LazyFencesHere()) {
+        scheduler.WantSubmit(); // the reader asks for it only while it is open (WaitForHostRead)
+        return tick;
+    }
+    scheduler.Flush();
+    return tick;
+}
+
+void TextureCacheRuntime::WaitForHostRead(u64 tick) {
+    scheduler.EnsureSubmitted(tick);
+    scheduler.GetMasterSemaphore().Wait(tick);
 }
 
 bool TextureCacheRuntime::TryTransferDownload(Image& image, const StagingBufferRef& map,

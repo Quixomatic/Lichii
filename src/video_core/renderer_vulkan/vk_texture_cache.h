@@ -10,6 +10,7 @@
 #include <deque>
 #include <memory>
 #include <optional>
+#include <source_location>
 #include <span>
 
 #include "video_core/v2/tick_ring.h"
@@ -87,7 +88,14 @@ public:
                                  DescriptorPool& descriptor_pool,
                                  ComputePassDescriptorQueue& compute_pass_descriptor_queue);
 
-    void Finish();
+    /// SYNC §12 R4: named by the caller in "finishes by site".
+    void Finish(std::source_location location = std::source_location::current());
+
+    /// SYNC §12 R4 (MP §6: guest CPU reads served on the reading thread): image downloads
+    /// recorded for a reader ride the open submission; the reader asks for it (rule W) and
+    /// waits for the tick itself.
+    [[nodiscard]] u64 SubmitForHostRead();
+    void WaitForHostRead(u64 tick);
 
     /// EDEN_NX2_V2_XREADBACK: a synchronous image download on the transfer queue (Finish waits
     /// for it). False when the image must take the graphics path.

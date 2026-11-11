@@ -1686,6 +1686,112 @@ void TextureCache<P>::DownloadMemory(DAddr cpu_addr, size_t size) {
 }
 
 template <class P>
+struct TextureCache<P>::ReadbackState {
+    using Map = decltype(std::declval<Runtime&>().DownloadStagingBuffer(size_t{}, true));
+    using Copies = decltype(FullDownloadCopies(std::declval<const ImageInfo&>()));
+    struct Entry {
+        GPUVAddr gpu_addr;
+        DAddr cpu_addr;
+        size_t guest_size_bytes;
+        ImageInfo info;
+        Map map;
+        Copies copies;
+    };
+    std::vector<Entry> entries;
+    Tegra::MemoryManager* gpu_memory{};
+    u64 tick{};
+    std::atomic<bool> landed{};
+};
+
+template <class P>
+void TextureCache<P>::FreeLandedReadbacks() {
+    if constexpr (requires(typename ReadbackState::Map& ref) {
+                      runtime.FreeDeferredStagingBuffer(ref);
+                  }) {
+        std::erase_if(readbacks_in_flight, [this](const std::shared_ptr<ReadbackState>& state) {
+            if (!state->landed.load(std::memory_order_acquire)) {
+                return false;
+            }
+            for (auto& entry : state->entries) {
+                runtime.FreeDeferredStagingBuffer(entry.map);
+            }
+            return true;
+        });
+    }
+}
+
+template <class P>
+bool TextureCache<P>::DownloadMemoryAsync(DAddr cpu_addr, size_t size,
+                                          std::function<void()>& land) {
+    // SYNC §12 R4: vk_texture_cache.cpp:1507's Finish (df94: 18/s, 25.7 ms/s on the back) came
+    // from DownloadMemory under a reader's request. As DownloadMemory, but the copies ride the
+    // open submission (graphics queue, in order after their writers) and the reader waits for
+    // their tick (rule W through EnsureSubmitted) and swizzles into guest memory on its own
+    // thread. The cache's state changes (GpuModified, stale pages) are made here, by the owner.
+    if constexpr (!requires {
+                      runtime.SubmitForHostRead();
+                      runtime.WaitForHostRead(u64{});
+                  } ||
+                  !requires(typename ReadbackState::Map& ref) {
+                      runtime.FreeDeferredStagingBuffer(ref);
+                  }) {
+        return false;
+    } else {
+        FreeLandedReadbacks();
+        if (readbacks_in_flight.size() >= 64) {
+            return false;
+        }
+        constexpr size_t MaxBytes = 64_MiB;
+        boost::container::small_vector<ImageId, 16> images;
+        size_t total_bytes = 0;
+        ForEachImageInRegion(cpu_addr, size, [&](ImageId image_id, ImageBase& image) {
+            if (IsDownloadable(image)) {
+                images.push_back(image_id);
+                total_bytes += image.unswizzled_size_bytes;
+            }
+        });
+        if (images.empty()) {
+            return true; // Nothing GPU-written to land
+        }
+        if (total_bytes > MaxBytes) {
+            return false;
+        }
+        std::ranges::sort(images, [this](ImageId lhs, ImageId rhs) {
+            return slot_images[lhs].modification_tick < slot_images[rhs].modification_tick;
+        });
+        auto state = std::make_shared<ReadbackState>();
+        state->gpu_memory = gpu_memory;
+        state->entries.reserve(images.size());
+        for (const ImageId image_id : images) {
+            Image& image = slot_images[image_id];
+            image.flags &= ~ImageFlagBits::GpuModified;
+            auto map = runtime.DownloadStagingBuffer(image.unswizzled_size_bytes, true);
+            auto copies = FullDownloadCopies(image.info);
+            image.DownloadMemory(map, copies);
+            ClearStaleImage(image);
+            state->entries.push_back({image.gpu_addr, image.cpu_addr, image.guest_size_bytes,
+                                      image.info, map, std::move(copies)});
+        }
+        BumpPrepareEpoch(); // their next render target use marks them modified again
+        state->tick = runtime.SubmitForHostRead();
+        readbacks_in_flight.push_back(state);
+        land = [state, runtime_ptr = &runtime] {
+            runtime_ptr->WaitForHostRead(state->tick);
+            Common::ScratchBuffer<u8> scratch;
+            for (const auto& entry : state->entries) {
+                V2::Versions::HookWrite(entry.cpu_addr, entry.guest_size_bytes,
+                                        V2::Versions::Source::Gpu);
+                V2::CbufWatch::HookForeign(entry.cpu_addr, entry.guest_size_bytes);
+                SwizzleImage(*state->gpu_memory, entry.gpu_addr, entry.info, entry.copies,
+                             entry.map.mapped_span, scratch);
+            }
+            state->landed.store(true, std::memory_order_release);
+        };
+        return true;
+    }
+}
+
+template <class P>
 std::optional<VideoCore::RasterizerDownloadArea> TextureCache<P>::GetFlushArea(DAddr cpu_addr,
                                                                                u64 size) {
     std::optional<VideoCore::RasterizerDownloadArea> area{};

@@ -64,6 +64,7 @@
 #include "video_core/v2/cbuf_version.h"
 #include "video_core/v2/cbuf_watch.h"
 #include "video_core/v2/continued_draw.h"
+#include "video_core/v2/cpu_readback.h"
 #include "video_core/v2/landing_fence.h"
 #include "core/core.h"
 #include "video_core/v2/p3_stats.h"
@@ -3533,35 +3534,58 @@ bool RasterizerVulkan::FlushRegionForRead(DAddr addr, u64 size, std::function<vo
     }
     gpu.InvalidateGPUCache();
     bool submitted = false;
+    // SYNC §12 R4 (MP §6): images too land on the reading thread, so the back never waits for
+    // the GPU here. Guest memory gets FlushRegion's order (images, then buffers) on every path:
+    // the images go asynchronously only when the buffers do or have nothing to write; verify
+    // keeps the synchronous image download (the buffer side compares its own).
+    const bool verify = VideoCommon::V2::Verify(VideoCommon::V2::Switch::Readback);
+    bool buffer_data = false;
+    std::function<void()> image_land;
+    const auto download_buffers_async = [&] {
+        buffer_data = buffer_cache.IsRegionGpuModified(addr, size);
+        if (buffer_data && !HasPendingQueries(addr, size)) {
+            submitted = buffer_cache.DownloadMemoryAsync(addr, size, land, verify);
+        }
+    };
+    const auto download_images = [&] {
+        namespace CpuReadback = VideoCommon::V2::CpuReadback;
+        if (!CpuReadback::ImagesOnReader(verify, buffer_data, submitted) ||
+            !texture_cache.DownloadMemoryAsync(addr, size, image_land)) {
+            texture_cache.DownloadMemory(addr, size);
+        }
+    };
+    const auto chain_lands = [&] {
+        if (image_land) {
+            land = VideoCommon::V2::CpuReadback::Chain(std::move(image_land), std::move(land));
+            submitted = true;
+        }
+    };
     if (commit_lock_free) [[unlikely]] {
         WithCaches([&] {
-            texture_cache.DownloadMemory(addr, size);
-            if (!HasPendingQueries(addr, size)) {
-                submitted = buffer_cache.DownloadMemoryAsync(
-                    addr, size, land, VideoCommon::V2::Verify(VideoCommon::V2::Switch::Readback));
-            }
+            download_buffers_async();
+            download_images();
             if (!submitted) {
                 buffer_cache.DownloadMemory(addr, size);
             }
         });
         query_cache.FlushRegion(addr, size);
+        chain_lands();
         return submitted;
     }
     {
-        std::scoped_lock lock{texture_cache.mutex};
-        texture_cache.DownloadMemory(addr, size);
+        std::scoped_lock lock{buffer_cache.mutex};
+        download_buffers_async();
     }
     {
+        std::scoped_lock lock{texture_cache.mutex};
+        download_images();
+    }
+    if (!submitted) {
         std::scoped_lock lock{buffer_cache.mutex};
-        if (!HasPendingQueries(addr, size)) {
-            submitted = buffer_cache.DownloadMemoryAsync(
-                addr, size, land, VideoCommon::V2::Verify(VideoCommon::V2::Switch::Readback));
-        }
-        if (!submitted) {
-            buffer_cache.DownloadMemory(addr, size);
-        }
+        buffer_cache.DownloadMemory(addr, size);
     }
     query_cache.FlushRegion(addr, size);
+    chain_lands();
     return submitted;
 }
 

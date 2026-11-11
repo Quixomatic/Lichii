@@ -354,9 +354,16 @@ std::optional<VideoCore::RasterizerDownloadArea> BufferCache<P>::GetFlushArea(DA
                 // Early downloads: pages the guest keeps reading back become Preflushable.
                 LearnReadback(device_addr_start_aligned, device_addr_end_aligned);
             }
+            // SYNC §12 R4: with EDEN_NX2_V2_READBACK each read lands its own range on the
+            // reading thread; the batch of every range read so far (DownloadMemory) would run
+            // at the next synchronous download with a Finish on the back (df94: buffer_cache.h
+            // DownloadMemory, 6.7-8/s, 15-18 ms/s).
             if constexpr (USE_MEMORY_MAPS) {
-                cpu_read_ranges.Add(area->start_address, area->end_address - area->start_address);
-                download_cpu_read_ranges = true;
+                if (!VideoCommon::V2::On(VideoCommon::V2::Switch::Readback)) {
+                    cpu_read_ranges.Add(area->start_address,
+                                        area->end_address - area->start_address);
+                    download_cpu_read_ranges = true;
+                }
             }
             // The core consumed this trap before GetFlushArea. Forget it so the next GPU write
             // really rearms the core instead of being skipped by the deduplication cache.
