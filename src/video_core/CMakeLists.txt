@@ -139,6 +139,7 @@ add_library(video_core STATIC
     v2/cbuf_watch.h
     v2/cbuf_version.h
     v2/continued_draw.h
+    v2/cpu_readback.h
     v2/desc_cache.h
     v2/draw_cache.cpp
     v2/draw_cache.h
@@ -163,6 +164,7 @@ add_library(video_core STATIC
     v2/p5b_stats.h
     v2/barrier_tracker.h
     v2/flush_heuristic.h
+    v2/frame_causes.h
     v2/frame_pacer.h
     v2/gpu_unswizzle.h
     v2/qmd_front.h

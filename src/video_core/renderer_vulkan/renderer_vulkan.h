@@ -74,6 +74,8 @@ private:
     Common::DkbFrameTrace::RateLimit trace_cpu_rate;
     std::chrono::steady_clock::time_point trace_last_frame{};
     u64 trace_frame{};
+    /// SYNC §12 R5: the frame causes' maxima since the last DKB renderer line.
+    VideoCommon::V2::FrameCauses::Frame trace_causes_window{};
 
     void InterpolateFrames(Frame* prev_frame, Frame* curr_frame);
     Frame* previous_frame = nullptr;  // Store the previous frame for interpolation

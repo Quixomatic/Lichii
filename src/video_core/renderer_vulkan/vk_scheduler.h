@@ -28,6 +28,7 @@
 #include "common/polyfill_thread.h"
 #include "common/settings.h"
 #include "video_core/gpu_split.h"
+#include "video_core/v2/frame_causes.h"
 #include "video_core/renderer_vulkan/fragment_barrier_state.h"
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
 #include "video_core/v2/barrier_tracker.h"
@@ -699,8 +700,13 @@ private:
     /// SYNC §7.3 counters and the 2 s line's state, at a lazy-fence-mode submission.
     void NoteOpenTickSubmitted() {
         if (open_since_us != 0) {
+            const u64 age_us = NowUs() - open_since_us;
             VideoCommon::V2::P5bStats::Max(VideoCommon::V2::P5bStats::Counter::OpenTickAgeMaxUs,
-                                           NowUs() - open_since_us);
+                                           age_us);
+            if (VideoCommon::V2::FrameCauses::Enabled()) [[unlikely]] {
+                VideoCommon::V2::FrameCauses::Note(VideoCommon::V2::FrameCauses::Cause::OpenTickAge,
+                                                   age_us * 1000);
+            }
             open_since_us = 0;
         }
         VideoCommon::V2::LandingFence::diag_submit_wanted.store(false, std::memory_order_relaxed);

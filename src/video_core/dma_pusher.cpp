@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <cstdio>
 #include <span>
@@ -28,6 +29,7 @@
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_cmdpage_diag.h"
+#include "video_core/v2/frame_causes.h"
 #include "video_core/v2/p5b_stats.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/v2/versions.h"
@@ -709,7 +711,21 @@ bool DmaPusher::WaitForListWriters(GPUVAddr address, size_t size, bool cpu_writt
         V2::Stats::NoteNarrowedBy(site, producers);
     }
     if (mode == V2::Mode::On) {
-        return target > consumed && split.WaitForPosition(target, site);
+        if (target <= consumed) {
+            return false;
+        }
+        if (V2::FrameCauses::Enabled()) [[unlikely]] {
+            // SYNC §12 R5: the frame's longest list-writer wait.
+            const auto begin = std::chrono::steady_clock::now();
+            const bool waited = split.WaitForPosition(target, site);
+            V2::FrameCauses::Note(V2::FrameCauses::Cause::ListWriterWait,
+                                  static_cast<u64>(std::chrono::duration_cast<
+                                                       std::chrono::nanoseconds>(
+                                                       std::chrono::steady_clock::now() - begin)
+                                                       .count()));
+            return waited;
+        }
+        return split.WaitForPosition(target, site);
     }
     if (!cpu_written) {
         return split.WaitForWriters(); // Verify: GPU-written lists are read from their copies

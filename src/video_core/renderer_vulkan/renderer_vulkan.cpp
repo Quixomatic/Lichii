@@ -282,7 +282,32 @@ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebu
         const auto ms = [](auto duration) {
             return std::chrono::duration<double, std::milli>(duration).count();
         };
+        // SYNC §12 R5: name every long frame (> 80 ms between presents) by its worst latency
+        // paths, and keep the window's maxima for the once-a-second line.
+        namespace FrameCauses = VideoCommon::V2::FrameCauses;
+        const FrameCauses::Frame causes = FrameCauses::Take();
+        FrameCauses::Fold(trace_causes_window, causes);
+        const auto causes_text = [](const FrameCauses::Frame& frame) {
+            std::string text;
+            for (size_t i = 0; i < frame.ns.size(); ++i) {
+                text += fmt::format(" {}={:.2f}", FrameCauses::names[i],
+                                    static_cast<double>(frame.ns[i]) / 1e6);
+            }
+            text += fmt::format(" acquire_wake={}",
+                                FrameCauses::wake_names[frame.wake < FrameCauses::wake_names.size()
+                                                            ? frame.wake
+                                                            : FrameCauses::wake_names.size() - 1]);
+            return text;
+        };
+        if (trace_last_frame != std::chrono::steady_clock::time_point{} &&
+            entered - trace_last_frame > std::chrono::milliseconds{80}) {
+            LOG_INFO(Render_Vulkan, "DKB long frame renderer_frame={} interval_ms={:.1f}{}",
+                     trace_frame, ms(entered - trace_last_frame), causes_text(causes));
+        }
         if (trace_cpu_rate.Ready(end)) {
+            LOG_INFO(Render_Vulkan, "DKB frame causes renderer_frame={} window maxima:{}",
+                     trace_frame, causes_text(trace_causes_window));
+            trace_causes_window = {};
             LOG_INFO(Render_Vulkan,
                      "DKB renderer renderer_frame={} host_pacing_mode={} vsync_mode={} "
                      "cpu_frame_wall_ms={:.3f} "

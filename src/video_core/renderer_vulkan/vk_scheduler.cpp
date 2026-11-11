@@ -454,7 +454,9 @@ void Scheduler::Finish(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
     const u64 presubmit_tick = CurrentTick();
     const bool p5b_stats = VideoCommon::V2::P5bStats::Enabled();
     const bool profile = VideoCommon::Nx2Profile::Enabled();
-    const u64 start = profile || p5b_stats ? VideoCommon::Nx2Profile::Now() : 0;
+    const bool frame_causes = VideoCommon::V2::FrameCauses::Enabled();
+    const u64 start =
+        profile || p5b_stats || frame_causes ? VideoCommon::Nx2Profile::Now() : 0;
     if (lazy_fences) [[unlikely]] {
         NoteBlockedWait();
         NoteOpenTickSubmitted();
@@ -476,6 +478,10 @@ void Scheduler::Finish(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
         // SYNC Step 0: which Finish calls block their thread on the GPU, and for how long.
         VideoCommon::V2::P5bStats::NoteFinishSite(location.file_name(), location.line(),
                                                   VideoCommon::Nx2Profile::Now() - start);
+    }
+    if (frame_causes) [[unlikely]] {
+        VideoCommon::V2::FrameCauses::Note(VideoCommon::V2::FrameCauses::Cause::Finish,
+                                           VideoCommon::Nx2Profile::Now() - start);
     }
     if (profile) {
         g_profile_finishes.fetch_add(1, std::memory_order_relaxed);

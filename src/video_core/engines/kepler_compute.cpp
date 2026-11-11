@@ -40,6 +40,7 @@
 #endif
 #include "video_core/rasterizer_interface.h"
 #include "video_core/textures/decoders.h"
+#include "video_core/v2/frame_causes.h"
 #include "video_core/v2/p5b_stats.h"
 #include "video_core/v2/qmd_front.h"
 #include "video_core/v2/front_writes.h"
@@ -131,6 +132,10 @@ void NoteReductionLatency(u64 captured_ns) {
     static std::atomic<u64> total_ns{};
     static std::atomic<u64> max_ns{};
     const u64 waited = VideoCommon::Nx2Profile::Now() - captured_ns;
+    if (VideoCommon::V2::FrameCauses::Enabled()) [[unlikely]] {
+        VideoCommon::V2::FrameCauses::Note(VideoCommon::V2::FrameCauses::Cause::LandingLatency,
+                                           waited); // SYNC §12 R5
+    }
     total_ns.fetch_add(waited, std::memory_order_relaxed);
     u64 seen = max_ns.load(std::memory_order_relaxed);
     while (seen < waited && !max_ns.compare_exchange_weak(seen, waited)) {
