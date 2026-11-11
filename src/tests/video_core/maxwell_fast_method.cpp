@@ -28,6 +28,7 @@
 #include "video_core/gpu.h"
 #include "video_core/gpu_split.h"
 #include "video_core/native_qmd.h"
+#include "video_core/v2/front_writes.h"
 #include "video_core/gpu_thread.h"
 #include "video_core/memory_manager.h"
 #include "video_core/renderer_null/null_rasterizer.h"
@@ -2567,6 +2568,83 @@ TEST_CASE("SYNC §15.5: upload notes merge and stay out of the list writer table
     REQUIRE(released.kind == Kind::Wait);
     CHECK(released.position == 150);
     CHECK((released.producers & V2::ProducerBit(V2::Producer::Upload)) != 0);
+    Tegra::Nx2ClearGpuWrittenPages();
+}
+
+// SYNC_SUBMIT_SPEC §15.9 (bc80 diag hang, 0x13 family): WaitForListWriters returned at once when
+// no compute or copy method was queued (IsMemoryWriter), so a CPU-written list whose only queued
+// writer was a 3D inline-to-memory or KeplerMemory upload was read before the upload ran.
+TEST_CASE("SYNC §15.9: an upload alone keeps a list fetch from the writers' early-out",
+          "[video_core][gpu_split_dispatch][v2_hazard]") {
+    using Access = VideoCommon::GpuSplitTestAccess;
+    using VideoCommon::GpuSplit;
+    namespace V2 = VideoCommon::V2;
+    using Kind = V2::HazardResult::Kind;
+    Fixture f;
+    f.system.Initialize();
+    constexpr GPUVAddr gpu = 0x2000'0000;
+    constexpr u64 device = 0x10000;
+    Kernel::KProcess process{f.system.Kernel()};
+    SCOPE_EXIT { f.system.Kernel().UnregisterKernelObject(&process); };
+    auto& table = process.GetPageTable().GetImpl();
+    table.Resize(20, 12);
+    for (u64 page = 0; page < 2; ++page) {
+        auto* backing = f.physical.GetPointerFromRaw<u8>(0x10000 + page * 0x1000);
+        table.entries.GetAndFault(4 + page).Store(false, Common::PageType::Memory, 1,
+                                                  reinterpret_cast<uintptr_t>(backing) -
+                                                      (0x4000 + page * 0x1000));
+    }
+    process.GetMemory().SetCurrentPageTable(process);
+    const auto asid = f.device_memory.RegisterProcess(&process.GetMemory());
+    f.device_memory.BindInterface(&f.rasterizer);
+    SCOPE_EXIT {
+        f.device_memory.Unmap(device, 0x2000);
+        f.device_memory.UnregisterProcess(asid);
+    };
+    f.device_memory.Map(device, 0x4000, 0x2000, asid);
+    f.memory.BindRasterizer(&f.rasterizer);
+    f.memory.Map(gpu, device, 0x2000, Tegra::PTEKind::PITCH, false);
+    Tegra::Nx2ClearGpuWrittenPages();
+    GpuSplit split;
+    Access::Initialize(split, f.system, 100);
+    Access::SetTracksWrites(split, true);
+    const V2::HazardFilter filter = GpuSplit::ListFetchFilter(true, false);
+    REQUIRE(split.ListWritersIdle());
+
+    // (a) A 3D inline upload to a list page never fetched; no compute or copy queued.
+    Access::SetEnd(split, 110);
+    split.NoteUploadWrite(f.memory, gpu + 0x100, 0x40);
+    Access::SetEnd(split, 112);
+    CHECK_FALSE(split.ListWritersIdle());
+    CHECK(split.WriterPosition() == 110);
+    const V2::HazardResult first = split.FindListWriters(device + 0x100, 0x40, filter);
+    REQUIRE(first.kind == Kind::Wait);
+    CHECK(first.position == 110);
+    // Idle-back progress: the back reaching the upload ends the wait; nothing else is waited
+    // for (the target is a position already sent).
+    Access::SetBack(split, 110, false);
+    CHECK(split.ListWritersIdle());
+    CHECK(split.FindListWriters(device + 0x100, 0x40, filter).kind == Kind::Clear);
+
+    // (b) A KeplerMemory (I2M) upload to the page, now a list page: linear, one 0x40-byte line.
+    V2::UploadWriteTracker kepler_memory;
+    kepler_memory.registers[0x60] = 0x40;                          // line length in
+    kepler_memory.registers[0x61] = 1;                             // line count
+    kepler_memory.registers[0x62] = static_cast<u32>(gpu >> 32);   // offset out high
+    kepler_memory.registers[0x63] = static_cast<u32>(gpu + 0x100); // offset out low
+    kepler_memory.registers[0x64] = 0x40;                          // pitch out
+    Access::SetEnd(split, 120);
+    kepler_memory.Note(split, f.memory, 0x6c, 1); // launch: linear
+    Access::SetEnd(split, 121);
+    kepler_memory.Note(split, f.memory, 0x6d, 0xdeadbeef); // data word
+    Access::SetEnd(split, 125);
+    CHECK_FALSE(split.ListWritersIdle());
+    const V2::HazardResult listed = split.FindListWriters(device + 0x100, 0x40, filter);
+    REQUIRE(listed.kind == Kind::Wait);
+    CHECK(listed.position == 121);
+    CHECK((listed.producers & V2::ProducerBit(V2::Producer::Upload)) != 0);
+    Access::SetBack(split, 121, false);
+    CHECK(split.ListWritersIdle());
     Tegra::Nx2ClearGpuWrittenPages();
 }
 
