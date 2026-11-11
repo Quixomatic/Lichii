@@ -164,16 +164,18 @@ enum class Counter : u32 {
     DecisionsPending0,
     DecisionsPending1,
     DecisionsPending2, ///< two or more
+    SubmitsBatchEnd,   ///< SYNC §14 #3 rule I′: batch end, GPU drained, guest-visible fence open
     Count,
 };
 
 /// SYNC_SUBMIT_SPEC §11.6 item 7: the submission rules. Every Flush/Finish adds one of these;
 /// what no rule claims is printed as "other" (expected 0). Deferred and idle are the non-split
 /// and non-lazy paths (DeferFlush, Scheduler::ServeIdleHook).
-inline constexpr std::array<Counter, 9> SubmitRuleCounters{
-    Counter::SubmitsPassBoundary, Counter::SubmitsStrong, Counter::SubmitsChunk,
-    Counter::SubmitsWaiter,       Counter::SubmitsSleep,  Counter::SubmitsPresent,
+inline constexpr std::array<Counter, 10> SubmitRuleCounters{
+    Counter::SubmitsPassBoundary, Counter::SubmitsStrong,   Counter::SubmitsChunk,
+    Counter::SubmitsWaiter,       Counter::SubmitsSleep,    Counter::SubmitsPresent,
     Counter::SubmitsReadback,     Counter::SubmitsDeferred, Counter::SubmitsIdle,
+    Counter::SubmitsBatchEnd,
 };
 
 struct Data {

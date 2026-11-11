@@ -1462,6 +1462,16 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
                 // The front publishes what it holds after a few more words from now on.
                 back_idle_at.store(read_position, std::memory_order_relaxed);
             }
+            // SYNC_SUBMIT_SPEC §14 #3 rule I′: the ring ran empty; with the GPU drained and a
+            // guest-visible fence in the open tick, submit it before spinning (at most once per
+            // completed submission: it needs nothing pending).
+            if (batch_end_hook != nullptr) [[unlikely]] {
+                batch_end_hook(batch_end_argument);
+                available = published.load(std::memory_order_acquire);
+                if (available != read_position) {
+                    continue;
+                }
+            }
             // The front usually sends more within microseconds: spin briefly before sleeping.
             // EDEN_NX2_V2_SPIN: the window decides when the back sleeps; the idle hook still
             // runs after the old spin's time (OldIdleSpinNs), so submits keep their cadence.

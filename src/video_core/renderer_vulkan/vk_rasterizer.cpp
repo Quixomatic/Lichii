@@ -871,6 +871,9 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
                 return static_cast<RasterizerVulkan*>(argument)->ServeIdleSleep(prepare);
             },
             this);
+        VideoCommon::GpuSplit::Get().SetBatchEndHook(
+            [](void* argument) { static_cast<RasterizerVulkan*>(argument)->ServeBatchEnd(); },
+            this);
         accelerate_dma.SetWorkHook(
             [](void* argument) { static_cast<RasterizerVulkan*>(argument)->NoteNonDrawWork(1); },
             this);
@@ -929,6 +932,7 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
 RasterizerVulkan::~RasterizerVulkan() {
     VideoCommon::GpuSplit::Get().SetIdleHook(nullptr, nullptr);
     VideoCommon::GpuSplit::Get().SetIdleSleepHook(nullptr, nullptr);
+    VideoCommon::GpuSplit::Get().SetBatchEndHook(nullptr, nullptr);
     VideoCommon::GpuSplit::SetTransferJoinHook(nullptr, nullptr);
     scheduler.WaitWorker();
     scheduler.Finish();
@@ -5030,6 +5034,31 @@ bool RasterizerVulkan::FenceUnfenced(bool owed_writebacks) {
     VideoCommon::V2::LandingFence::diag_query_flushes.store(query_cache.HasUncommittedFlushes(),
                                                             std::memory_order_relaxed);
     return true;
+}
+
+void RasterizerVulkan::ServeBatchEnd() {
+    // SYNC_SUBMIT_SPEC §14 #3 rule I′ (MP §5.5 strong hints after work the guest will read; §6
+    // "an interrupt forces a submit if the sync is not yet submitted"): the back's ring ran
+    // empty, the GPU has drained (measured pending, §14 #1) and the open tick holds a result the
+    // guest paces on: submit it now instead of after the spin window (S) or the next chunk.
+    if (!adapt_submit || !scheduler.LazyFencesHere() ||
+        !scheduler.OpenTickHasGuestVisibleFence()) [[likely]] {
+        return;
+    }
+    auto& master = scheduler.GetMasterSemaphore();
+    const u32 pending =
+        VideoCommon::V2::PendingSubmissions(master.CurrentTick(), master.GpuValueNow());
+    if (!VideoCommon::V2::FlushHeuristic::BatchEndSubmitDue(
+            pending, scheduler.RecordedSinceSubmit(), scheduler.OpenTickHasGuestVisibleFence())) {
+        return;
+    }
+    namespace P5b = VideoCommon::V2::P5bStats;
+    SyncAdaptiveTick();
+    P5b::Add(P5b::Counter::SubmitsBatchEnd);
+    scheduler.Flush();
+    pending_native_work = false;
+    adapt_tick = scheduler.GetMasterSemaphore().CurrentTick();
+    flush_heuristic.NoteSubmit(AdaptNowUs());
 }
 
 bool RasterizerVulkan::ServeIdleSleep(bool prepare) {

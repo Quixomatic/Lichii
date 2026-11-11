@@ -205,6 +205,16 @@ public:
         return open_work && (!wake_guaranteed || pending < params.busy_pending);
     }
 
+    /// SYNC_SUBMIT_SPEC §14 #3 rule I′ (MP §5.5 "strong hints after work the guest will read",
+    /// DXVK's "GPU idle → flush"): at the back's batch end (its ring ran empty) the open tick is
+    /// due when it holds a guest-visible fence and nothing is pending. Bounded: after it, pending
+    /// is 1 until that submission completes, so at most once per completed submission (§10's
+    /// batch-end rule fired at every ring-empty moment, 27-29/f).
+    [[nodiscard]] static constexpr bool BatchEndSubmitDue(u32 pending, bool open_work,
+                                                          bool guest_fence) noexcept {
+        return open_work && guest_fence && pending == 0;
+    }
+
     /// Any submission (heuristic or not) resets the counters.
     void NoteSubmit(u64 now_us) noexcept {
         draws = 0;

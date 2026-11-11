@@ -357,6 +357,8 @@ private:
     /// SYNC_SUBMIT_SPEC §11.2 invariant S, the split's idle-sleep hook (GpuSplit::SetIdleSleepHook):
     /// `prepare` fences the unfenced and submits a due open tick; otherwise only says if one is due.
     bool ServeIdleSleep(bool prepare);
+    /// SYNC_SUBMIT_SPEC §14 #3 rule I′, the split's batch-end hook (GpuSplit::SetBatchEndHook).
+    void ServeBatchEnd();
     /// §11.2 step 1: puts operations with no fence, uncommitted query flushes and (with
     /// `owed_writebacks`) the caches' uncommitted downloads on an observable fence. True if it made one.
     bool FenceUnfenced(bool owed_writebacks);

@@ -943,6 +943,59 @@ TEST_CASE("V2 P5b flush decisions at pass boundaries", "[video_core][v2_p5b]") {
     }
 }
 
+// SYNC_SUBMIT_SPEC §14 #3 rule I′, with §11.1 W6's storm as the guard: §10 submitted at every
+// ring-empty moment (27-29/f, 3fd8's 55 submits/f).
+TEST_CASE("SYNC §14 #3: rule I′ submits a guest-visible fence at a batch end once per completion",
+          "[video_core][v2_p5b]") {
+    using H = FlushHeuristic;
+    using VideoCommon::V2::PendingSubmissions;
+    SECTION("the rule") {
+        REQUIRE(H::BatchEndSubmitDue(0, true, true));
+        REQUIRE_FALSE(H::BatchEndSubmitDue(1, true, true));  // GPU busy: B/C/S take it
+        REQUIRE_FALSE(H::BatchEndSubmitDue(0, true, false)); // nothing the guest reads
+        REQUIRE_FALSE(H::BatchEndSubmitDue(0, false, true)); // nothing recorded
+    }
+    SECTION("a front publishing every 5 us: exactly one submit per completed submission") {
+        // Simulated time in us. The back drains each publish at once (its ring runs empty after
+        // every one), each holds work and a guest-visible fence; a submission takes 120 us of GPU.
+        constexpr u64 gpu_time = 120;
+        u64 current_tick = 1; // the open tick
+        u64 gpu_value = 0;
+        u64 busy_until = 0;
+        u32 submits = 0;
+        u32 completions = 0;
+        bool guest_fence = false;
+        for (u64 now = 0; now < 10'000; now += 5) {
+            if (busy_until != 0 && now >= busy_until) {
+                gpu_value = current_tick - 1; // the submitted tick completed
+                busy_until = 0;
+                ++completions;
+            }
+            guest_fence = true; // the publish carried a release the guest paces on
+            const u32 pending = PendingSubmissions(current_tick, gpu_value);
+            if (H::BatchEndSubmitDue(pending, true, guest_fence)) {
+                ++submits;
+                ++current_tick;
+                guest_fence = false;
+                busy_until = now + gpu_time;
+            }
+        }
+        // Never more than one per completion (plus the first, on an idle GPU).
+        REQUIRE(submits <= completions + 1);
+        REQUIRE(submits >= completions);
+        REQUIRE(submits < 10'000 / 5 / 10); // far from a submit per publish
+    }
+    SECTION("storm guard: the GPU stays busy, no batch-end submit at all") {
+        u32 submits = 0;
+        for (u32 publish = 0; publish < 2000; ++publish) {
+            if (H::BatchEndSubmitDue(PendingSubmissions(12, 9), true, true)) {
+                ++submits;
+            }
+        }
+        REQUIRE(submits == 0);
+    }
+}
+
 // SYNC_SUBMIT_SPEC §14 #1: pending came from the finish thread's publish, 0.5-1 ms after the
 // GPU finished, so the GPU looked busy while it had drained.
 TEST_CASE("SYNC §14 #1: pending is measured from the timeline value", "[video_core][v2_p5b]") {
@@ -1477,10 +1530,11 @@ TEST_CASE("SYNC §11.6 item 7: submits by rule are only B/C/W/S/present/readback
         REQUIRE(has(rule));
     }
     // DeferFlush's and Scheduler::ServeIdleHook's own submits exist only without lazy fences or
-    // the split; nothing else may be a submit rule.
-    REQUIRE(P5b::SubmitRuleCounters.size() == 9);
+    // the split; SYNC §14 #3 adds rule I′ (batch end); nothing else may be a submit rule.
+    REQUIRE(P5b::SubmitRuleCounters.size() == 10);
     REQUIRE(has(Counter::SubmitsDeferred));
     REQUIRE(has(Counter::SubmitsIdle));
+    REQUIRE(has(Counter::SubmitsBatchEnd));
     // No counter is listed twice (the "other" figure would go negative).
     for (size_t i = 0; i < P5b::SubmitRuleCounters.size(); ++i) {
         for (size_t j = i + 1; j < P5b::SubmitRuleCounters.size(); ++j) {

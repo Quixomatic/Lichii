@@ -655,6 +655,13 @@ public:
         idle_sleep_hook = hook;
         idle_sleep_argument = argument;
     }
+    /// SYNC_SUBMIT_SPEC §14 #3 rule I′, set by the renderer before the back starts: called once
+    /// each time the back's ring runs empty, before it spins (submits the open tick when the GPU
+    /// has drained and it holds a guest-visible fence).
+    void SetBatchEndHook(void (*hook)(void*), void* argument) {
+        batch_end_hook = hook;
+        batch_end_argument = argument;
+    }
     /// Any thread: has the back call the idle hook soon, between entries or at once if it sleeps.
     void RequestIdleHook() {
         idle_hook_requested.store(true, std::memory_order_seq_cst);
@@ -1269,6 +1276,8 @@ private:
     bool hook_between_entries{}; ///< Back: HookBetweenEntries
     bool (*idle_sleep_hook)(void*, bool){}; ///< SetIdleSleepHook
     void* idle_sleep_argument{};
+    void (*batch_end_hook)(void*){}; ///< SetBatchEndHook
+    void* batch_end_argument{};
     void (*cpu_lane_hook)(void*){};
     void* cpu_lane_argument{};
     std::atomic<bool> cpu_lane_requested{};
