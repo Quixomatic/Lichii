@@ -4,6 +4,7 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 
 #include "common/common_types.h"
@@ -64,6 +65,29 @@ struct FlushParams {
     u32 one_pending_chunks = 3;
     u64 request_gap_us = 500;         ///< a waiter's request mid-pass, no sooner than this
     u64 mid_pass_interval_us = 8000;  ///< safety net for passes that never end
+};
+
+/// SYNC §14 #5 / §14.4 (diagnostic only): the GPU's idle gaps between consecutive submissions of
+/// a sampled frame, by length (< 0.25, 0.25-1, 1-3, > 3 ms), split by whether the next
+/// submission's work was already recorded during the gap, and the metric "GPU idle with
+/// recorded but unsubmitted work" (ms): the idle time our own submission rules create.
+struct IdleGapHistogram {
+    std::array<u32, 4> with_work{};
+    std::array<u32, 4> without_work{};
+    double idle_with_work_ms = 0.0;
+
+    /// One gap of `gap_ms` before a submission whose first work was recorded `unsubmitted_ms`
+    /// before it went to the queue (the GPU starts an idle-time submission at once, so the gap's
+    /// last `unsubmitted_ms` held recorded work).
+    void Add(double gap_ms, double unsubmitted_ms) {
+        if (gap_ms <= 0.0) {
+            return;
+        }
+        const size_t bucket = gap_ms < 0.25 ? 0 : gap_ms < 1.0 ? 1 : gap_ms < 3.0 ? 2 : 3;
+        const double overlap = (std::min)(gap_ms, (std::max)(unsubmitted_ms, 0.0));
+        ++(overlap > 0.0 ? with_work : without_work)[bucket];
+        idle_with_work_ms += overlap;
+    }
 };
 
 /// SYNC §14 #1: handed-off submissions the GPU has not finished, from the open tick

@@ -34,6 +34,7 @@
 #include "video_core/renderer_vulkan/vk_background_readback.h"
 #include "video_core/renderer_vulkan/vk_submit_engine.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
+#include "video_core/v2/flush_heuristic.h"
 #include "video_core/v2/front_wake.h"
 #include "video_core/v2/landing_fence.h"
 #include "video_core/v2/p5b_stats.h"
@@ -1517,13 +1518,42 @@ void Scheduler::TraceGpuSubmission() {
                   results[0].timestamp, results[trace_gpu_count * 2 - 1].timestamp,
                   trace_timestamp_bits)) * trace_timestamp_period / 1e6
             : -1.0;
+        // SYNC §14 #5 / §14.4 (diagnostic): idle gaps between consecutive measured submissions
+        // (only when none of the frame's was dropped), split by recorded unsubmitted work.
+        VideoCommon::V2::IdleGapHistogram gaps;
+        if (trace_gpu_skipped == 0) {
+            for (u32 i = 1; i < trace_gpu_count; ++i) {
+                const u64 end = results[(i - 1) * 2 + 1].timestamp;
+                const u64 begin = results[i * 2].timestamp;
+                const u64 mask = trace_timestamp_bits >= 64
+                                     ? ~u64{0}
+                                     : (u64{1} << trace_timestamp_bits) - 1;
+                const u64 delta = (begin - end) & mask;
+                if (delta > mask / 2) {
+                    continue; // overlapping (begin before the previous end)
+                }
+                const double gap_ms =
+                    static_cast<double>(delta) * trace_timestamp_period / 1e6;
+                const SubmissionTrace& next = trace_submissions[i];
+                const double unsubmitted_ms =
+                    next.recorded_ns != 0 && next.submitted_ns > next.recorded_ns
+                        ? static_cast<double>(next.submitted_ns - next.recorded_ns) / 1e6
+                        : 0.0;
+                gaps.Add(gap_ms, unsubmitted_ms);
+            }
+        }
         LOG_INFO(Render_Vulkan,
                  "DKB gpu_frame renderer_frame={} last_submission_tick={} "
                  "gpu_frame_span_ms={:.3f} gpu_submission_sum_ms={:.3f} "
                  "measured_submissions={} dropped_submissions={} "
-                 "valid_bits={} period_ns={}",
+                 "valid_bits={} period_ns={} gpu_idle_with_unsubmitted_work_ms={:.3f} "
+                 "idle_gaps_with_work(<0.25/0.25-1/1-3/>3ms)={}/{}/{}/{} "
+                 "idle_gaps_without_work={}/{}/{}/{}",
                  trace_sample_frame, trace_gpu_tick, span_ms, total_ms, trace_gpu_count,
-                 trace_gpu_skipped, trace_timestamp_bits, trace_timestamp_period);
+                 trace_gpu_skipped, trace_timestamp_bits, trace_timestamp_period,
+                 gaps.idle_with_work_ms, gaps.with_work[0], gaps.with_work[1], gaps.with_work[2],
+                 gaps.with_work[3], gaps.without_work[0], gaps.without_work[1],
+                 gaps.without_work[2], gaps.without_work[3]);
         for (const auto& [duration_ms, index] : slowest) {
             if (duration_ms < 10.0) {
                 continue;
@@ -1600,7 +1630,8 @@ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_se
         return signal_value;
     }
     auto_flush = false; // The submit closure touches no image: pending writes stay pending
-    RecordWithUploadBuffer([signal_semaphore, wait_semaphore, signal_value,
+    const u64 recorded_ns = std::exchange(open_work_since_ns, 0); // SYNC §14 #5
+    RecordWithUploadBuffer([signal_semaphore, wait_semaphore, signal_value, recorded_ns,
                             this](vk::CommandBuffer cmdbuf, vk::CommandBuffer upload_cmdbuf) {
         static constexpr VkMemoryBarrier WRITE_BARRIER{
             .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
@@ -1615,6 +1646,8 @@ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_se
                                  trace_gpu_count * 2 + 1);
             trace_gpu_tick = signal_value;
             trace_work.tick = signal_value;
+            trace_work.recorded_ns = recorded_ns;
+            trace_work.submitted_ns = TraceNowNs();
             trace_submissions[trace_gpu_count] = trace_work;
             ++trace_gpu_count;
             trace_gpu_recording = false;
@@ -1673,7 +1706,8 @@ void Scheduler::SubmitExecutionEngine(VkSemaphore signal_semaphore, VkSemaphore 
     // recording thread decided) goes to the submit engine: the submit thread, or inline.
     const VideoCommon::V2::TimelineJoin::Batch batch = timeline_join.Close(signal_value);
     auto_flush = false; // The submit closure touches no image: pending writes stay pending
-    RecordWithUploadBuffer([signal_semaphore, wait_semaphore, signal_value, batch,
+    const u64 recorded_ns = std::exchange(open_work_since_ns, 0); // SYNC §14 #5
+    RecordWithUploadBuffer([signal_semaphore, wait_semaphore, signal_value, batch, recorded_ns,
                             this](vk::CommandBuffer cmdbuf, vk::CommandBuffer upload_cmdbuf) {
         static constexpr VkMemoryBarrier WRITE_BARRIER{
             .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
@@ -1689,6 +1723,8 @@ void Scheduler::SubmitExecutionEngine(VkSemaphore signal_semaphore, VkSemaphore 
                                   trace_gpu_count * 2 + 1);
             trace_gpu_tick = signal_value;
             trace_work.tick = signal_value;
+            trace_work.recorded_ns = recorded_ns;
+            trace_work.submitted_ns = TraceNowNs();
             trace_submissions[trace_gpu_count] = trace_work;
             ++trace_gpu_count;
             trace_gpu_recording = false;

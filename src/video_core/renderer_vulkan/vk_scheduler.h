@@ -705,6 +705,12 @@ private:
     u64 open_since_us{}; ///< SYNC §7.3: when the open tick first held a lazy fence (0: none)
     bool recorded_since_submit{}; ///< SYNC §10: RecordedSinceSubmit (recording thread)
     bool guest_visible_fence{};   ///< SYNC §14: OpenTickHasGuestVisibleFence (recording thread)
+    u64 open_work_since_ns{};     ///< SYNC §14 #5: the open tick's first recorded work (trace)
+    [[nodiscard]] static u64 TraceNowNs() {
+        return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                    std::chrono::steady_clock::now().time_since_epoch())
+                                    .count());
+    }
     bool deferred_hint{};         ///< SYNC §11.6 item 7: TakeDeferredHint
     std::atomic<bool> open_tick_nonempty{}; ///< ... for the finish thread's progress wake
     /// SYNC §7.3 counters and the 2 s line's state, at a lazy-fence-mode submission.
@@ -723,6 +729,9 @@ private:
     }
     /// SYNC §11.2: the open tick holds work (a command or a lazy fence).
     void NoteOpenTickWork() {
+        if (!recorded_since_submit && trace_query_pool) [[unlikely]] {
+            open_work_since_ns = TraceNowNs(); // SYNC §14 #5: the idle-gap split
+        }
         recorded_since_submit = true;
         open_tick_nonempty.store(true, std::memory_order_seq_cst);
         VideoCommon::V2::LandingFence::diag_recorded.store(true, std::memory_order_relaxed);
@@ -932,6 +941,10 @@ private:
         u32 num_shaders{};
         u32 untracked_uses{};
         std::array<ShaderUse, 32> shaders{};
+        /// SYNC §14 #5 (host steady clock, ns): when the tick first held recorded work
+        /// (lazy fences; 0 unknown) and when it went to the queue.
+        u64 recorded_ns{};
+        u64 submitted_ns{};
     };
     SubmissionTrace trace_work;
     std::vector<SubmissionTrace> trace_submissions;

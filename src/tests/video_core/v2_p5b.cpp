@@ -943,6 +943,21 @@ TEST_CASE("V2 P5b flush decisions at pass boundaries", "[video_core][v2_p5b]") {
     }
 }
 
+// SYNC_SUBMIT_SPEC §14 #5 / §14.4: "GPU idle with recorded but unsubmitted work" (diagnostic).
+TEST_CASE("SYNC §14 #5: idle gaps split by recorded unsubmitted work", "[video_core][v2_p5b]") {
+    VideoCommon::V2::IdleGapHistogram gaps;
+    gaps.Add(0.1, 0.0);  // short, the next work recorded after the GPU drained
+    gaps.Add(0.5, 0.2);  // the last 0.2 ms of the gap held recorded work
+    gaps.Add(2.0, 5.0);  // recorded long before: the whole gap
+    gaps.Add(4.0, 0.0);
+    gaps.Add(0.0, 1.0);  // no gap (back to back)
+    gaps.Add(-1.0, 1.0); // overlapping timestamps
+    CHECK(gaps.without_work == std::array<u32, 4>{1, 0, 0, 1});
+    CHECK(gaps.with_work == std::array<u32, 4>{0, 1, 1, 0});
+    CHECK(gaps.idle_with_work_ms > 2.2 - 1e-9);
+    CHECK(gaps.idle_with_work_ms < 2.2 + 1e-9);
+}
+
 // SYNC_SUBMIT_SPEC §14 #3 rule I′, with §11.1 W6's storm as the guard: §10 submitted at every
 // ring-empty moment (27-29/f, 3fd8's 55 submits/f).
 TEST_CASE("SYNC §14 #3: rule I′ submits a guest-visible fence at a batch end once per completion",
