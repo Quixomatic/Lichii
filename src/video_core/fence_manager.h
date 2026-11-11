@@ -141,12 +141,14 @@ public:
         if constexpr (can_async_check) {
             guard.lock();
         }
-        // SYNC §14 #2/#3: a fence carrying a result the guest reads (an operation that lands at
-        // it, or committed downloads) marks the open tick (DXVK's GPU-idle rule weighs it).
-        bool guest_visible = delay_fence || committed_flushes != 0;
+        // SYNC §14.7 (3) (§12.4's guest-read set): a fence carrying committed downloads marks the
+        // open tick for rule I′ and the table's pending-0 row; host-waited syncpoints mark it in
+        // SignalSyncPoint. Operations that land at the fence (deferred reductions, fence-flagged
+        // releases, reports, SyncOperations) don't: 3d25's I′ took 11.9 submits/f on them and
+        // the front's pending sleep didn't move.
+        const bool guest_visible = committed_flushes != 0;
         {
             std::scoped_lock lock{uncommitted_guard};
-            guest_visible |= !uncommitted_operations.empty();
             if (delay_fence) {
                 uncommitted_operations.emplace_back(std::move(func));
             }
@@ -190,7 +192,9 @@ public:
         SignalFence(std::move(func));
         if (FencesDelayed() && syncpoint_manager.HasHostWaiters()) {
             // SYNC §12.4 R3 (2): a guest thread blocks on a host syncpoint whose increment rides
-            // this fence (an undelayed one ran at once): rule W for the fence's tick.
+            // this fence (an undelayed one ran at once): rule W for the fence's tick, and the
+            // open tick is guest-read work (§14.7 (3): rule I′).
+            rasterizer.NoteGuestVisibleFence();
             rasterizer.RequestHostWaitedFence();
         }
     }
