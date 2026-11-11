@@ -16,6 +16,7 @@
 #include "common/logging.h"
 #include "common/settings.h"
 #include "core/core.h"
+#include "core/hle/kernel/guest_wait_debug.h"
 #include "video_core/v2/resolve/multifront.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/control/channel_state.h"
@@ -466,6 +467,13 @@ namespace {
 /// suspended acquire pass, and whether the pass came only after a timer tick ended the front's
 /// sleep (it then waited for the tick: the front spin of §13.5 #6 ships only if these dominate).
 enum class ResumeCause : u8 { Latch, Parse, Memory };
+
+/// SYNC_SUBMIT_SPEC §14.8 H-14.8 step 1: with a 2 s semaphore waiter, which guest threads block
+/// and on what (the producer of the release may be guest-side: a stubbed event, a syncpoint).
+void LogGuestWaits() {
+    LOG_WARNING(HW_GPU, "Guest threads blocked at this 2 s waiter:{}",
+                ::Kernel::GuestWaitDebug::Dump());
+}
 void NoteResumeCause(ResumeCause cause) {
     namespace P5b = V2::P5bStats;
     if (!P5b::Enabled()) [[likely]] {
@@ -648,6 +656,7 @@ bool Puller::PollAcquireView(DmaPusher& dma_pusher) {
                         V2::LandingFence::diag_known_tick.load(std::memory_order_relaxed),
                         V2::LandingFence::diag_recorded.load(std::memory_order_relaxed),
                         split.BackIdle());
+            LogGuestWaits();
             if (acquire.sem_execute) {
                 return SemExecuteGiveUp(acquire);
             }
@@ -790,6 +799,7 @@ bool Puller::PollAcquire(DmaPusher& dma_pusher) {
                     dma_pusher.memory_manager.Read<u32>((pending_acquire->address & ~GPUVAddr{0xf}) + 4),
                     dma_pusher.memory_manager.Read<u32>((pending_acquire->address & ~GPUVAddr{0xf}) + 8),
                     dma_pusher.memory_manager.Read<u32>((pending_acquire->address & ~GPUVAddr{0xf}) + 12));
+        LogGuestWaits();
     }
     return false;
 }

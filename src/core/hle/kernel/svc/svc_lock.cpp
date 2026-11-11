@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "core/core.h"
+#include "core/hle/kernel/guest_wait_debug.h"
 #include "core/hle/kernel/k_memory_layout.h"
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/kernel/svc.h"
@@ -20,6 +21,9 @@ Result ArbitrateLock(Core::System& system, Handle thread_handle, u64 address, u3
     R_UNLESS(!IsKernelAddress(address), ResultInvalidCurrentMemory);
     R_UNLESS(Common::IsAligned(address, sizeof(u32)), ResultInvalidAddress);
 
+    // SYNC §14.8 H-14.8: named in the GPU front's 2 s waiter dump while it waits.
+    const GuestWaitDebug::Scope wait_debug{GetCurrentThreadPointer(system.Kernel()),
+                                           GuestWaitDebug::Kind::Lock, address};
     R_RETURN(KConditionVariable::WaitForAddress(system.Kernel(), thread_handle, address, tag));
 }
 

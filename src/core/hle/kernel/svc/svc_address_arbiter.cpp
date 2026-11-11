@@ -7,6 +7,7 @@
 #include <chrono>
 
 #include "core/core.h"
+#include "core/hle/kernel/guest_wait_debug.h"
 #include "core/hle/kernel/k_hardware_timer.h"
 #include "core/hle/kernel/k_memory_layout.h"
 #include "core/hle/kernel/k_process.h"
@@ -72,6 +73,9 @@ Result WaitForAddress(Core::System& system, u64 address, ArbitrationType arb_typ
         timeout = timeout_ns;
     }
 
+    // SYNC §14.8 H-14.8: named in the GPU front's 2 s waiter dump while it waits.
+    const GuestWaitDebug::Scope wait_debug{GetCurrentThreadPointer(system.Kernel()),
+                                           GuestWaitDebug::Kind::Address, address};
     // SYNC_SUBMIT_SPEC §14.7 (3) (STATS): guest waits while the GPU front waits on a suspended
     // channel (guest-internal: another guest thread signals the address).
     if (VideoCommon::V2::P5bStats::Enabled() && VideoCommon::V2::P5bStats::FrontPending())

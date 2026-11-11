@@ -1,10 +1,13 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <cstring>
+#include <string_view>
 #include <random>
 #include <thread>
 #include <vector>
@@ -13,6 +16,7 @@
 
 #include <exception>
 
+#include "core/hle/kernel/guest_wait_debug.h"
 #include "shader_recompiler/shader_info.h"
 #include "video_core/gpu_split.h"
 #include "video_core/rasterizer_interface.h"
@@ -1167,6 +1171,40 @@ TEST_CASE("V2 front wake: a ring ends the suspended front's sleep", "[video_core
     }
     CHECK(std::chrono::steady_clock::now() - begin < std::chrono::seconds{2});
     stop.store(true);
+}
+
+// SYNC_SUBMIT_SPEC §14.8 H-14.8 step 1: the blocking SVCs register their thread for the wait so
+// the GPU front's 2 s waiter line can name what each guest thread blocks on.
+TEST_CASE("SYNC §14.8: guest waits are registered for their duration only",
+          "[video_core][v2_hazard]") {
+    namespace GuestWaitDebug = Kernel::GuestWaitDebug;
+    // Placeholder thread identities: the registry never dereferences them (only Dump does).
+    auto* const first = reinterpret_cast<Kernel::KThread*>(std::uintptr_t{0x1000});
+    auto* const second = reinterpret_cast<Kernel::KThread*>(std::uintptr_t{0x2000});
+    const auto count_for = [](Kernel::KThread* thread) {
+        size_t count = 0;
+        for (const auto& entry : GuestWaitDebug::Entries()) {
+            count += entry.thread == thread ? 1 : 0;
+        }
+        return count;
+    };
+    {
+        const GuestWaitDebug::Scope address{first, GuestWaitDebug::Kind::Address, 0x8000};
+        {
+            const GuestWaitDebug::Scope sleep{second, GuestWaitDebug::Kind::Sleep, 1'000'000};
+            CHECK(count_for(first) == 1);
+            CHECK(count_for(second) == 1);
+        }
+        CHECK(count_for(second) == 0); // woken: gone before its objects close
+        const auto entries = GuestWaitDebug::Entries();
+        const auto it = std::ranges::find_if(
+            entries, [first](const auto& entry) { return entry.thread == first; });
+        REQUIRE(it != entries.end());
+        CHECK(it->kind == GuestWaitDebug::Kind::Address);
+        CHECK(it->address == 0x8000);
+        CHECK(std::string_view{GuestWaitDebug::KindName(it->kind)} == "WaitForAddress");
+    }
+    CHECK(count_for(first) == 0);
 }
 
 // SYNC_SUBMIT_SPEC §14 #4: the resume-cause counter tells passes found after a timer tick from

@@ -10,6 +10,7 @@
 #include "common/scope_exit.h"
 #include "common/scratch_buffer.h"
 #include "core/core.h"
+#include "core/hle/kernel/guest_wait_debug.h"
 #include "core/hle/kernel/k_hardware_timer.h"
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/kernel/k_readable_event.h"
@@ -106,6 +107,11 @@ Result WaitSynchronization(Core::System& system, int32_t* out_index, u64 user_ha
                            VideoCommon::V2::P5bStats::FrontPending();
     const auto wait_start = note_wait ? std::chrono::steady_clock::now()
                                       : std::chrono::steady_clock::time_point{};
+    // SYNC §14.8 H-14.8: named in the GPU front's 2 s waiter dump while it waits (removed before
+    // the objects are closed).
+    const GuestWaitDebug::Scope wait_debug{
+        GetCurrentThreadPointer(system.Kernel()), GuestWaitDebug::Kind::Synchronization, 0,
+        std::span<KSynchronizationObject* const>(objs.data(), static_cast<size_t>(num_handles))};
     Result res = KSynchronizationObject::Wait(system.Kernel(), out_index, objs.data(), num_handles, timeout);
     if (note_wait) [[unlikely]] {
         const bool signalled = res == ResultSuccess && *out_index >= 0 && *out_index < num_handles;
