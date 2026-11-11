@@ -698,7 +698,13 @@ bool DmaPusher::WaitForListWriters(GPUVAddr address, size_t size, bool cpu_writt
     const u64 consumed = split.ConsumedNow();
     const u64 old_target = split.WriterPosition();
     if (old_target <= consumed) {
-        return false; // Nothing queued writes it either way
+        // Nothing queued writes it either way (SYNC §15.9: every Copy/Dispatch/Upload note
+        // moves the target). STATS: an Upload note over the list still queued here would be the
+        // 0x13 hole again (must be 0); verify compares a sample against a read after a drain.
+        if (V2::P5bStats::Enabled() || mode == V2::Mode::Verify) [[unlikely]] {
+            CheckListEarlyOut(address, size, cpu_written, mode == V2::Mode::Verify);
+        }
+        return false;
     }
     // The writers per page: GpuSplit::ListFetchFilter. SYNC §12 R2a (MP §5.1 "if not overlapping
     // it reads directly", §6 class C "only for exactly that producer"): a CPU-written list waits
@@ -859,6 +865,53 @@ bool DmaPusher::WaitForListWriters(GPUVAddr address, size_t size, bool cpu_writt
         }
     }
     return waited || waited_old;
+}
+
+void DmaPusher::CheckListEarlyOut(GPUVAddr address, size_t size, bool cpu_written, bool verify) {
+    namespace V2 = VideoCommon::V2;
+    using V2::P5bStats::Counter;
+    auto& split = VideoCommon::GpuSplit::Get();
+    if (V2::P5bStats::Enabled()) {
+        V2::P5bStats::Add(Counter::ListEarlyOuts);
+        V2::HazardFilter uploads;
+        uploads.ranged = V2::ProducerBit(V2::Producer::Upload);
+        uploads.unbounded = V2::ProducerBit(V2::Producer::Upload);
+        bool queued = false;
+        for (GPUVAddr chunk = address; chunk < address + size && !queued;) {
+            const GPUVAddr chunk_end =
+                std::min<GPUVAddr>(address + size, (chunk & ~GPUVAddr{0xfff}) + 0x1000);
+            if (const auto device = memory_manager.GpuToCpuAddress(chunk)) {
+                const V2::HazardResult result =
+                    split.FindWrites(*device, chunk_end - chunk, uploads);
+                queued = result.kind == V2::HazardResult::Kind::Wait;
+            }
+            chunk = chunk_end;
+        }
+        if (queued) {
+            V2::P5bStats::Add(Counter::ListEarlyOutUploadQueued);
+        }
+    }
+    static std::atomic<u32> sample{};
+    if (!verify || !cpu_written || (sample.fetch_add(1, std::memory_order_relaxed) & 15) != 0) {
+        return;
+    }
+    // Verify: the early-out read, then the read after the back ran everything sent.
+    std::vector<u32> early(size / sizeof(u32));
+    memory_manager.ReadBlockUnsafe(address, early.data(), early.size() * sizeof(u32));
+    split.WaitForPosition(split.WritePosition(), VideoCommon::DrainSite::ListWriters);
+    std::vector<u32> drained(early.size());
+    memory_manager.ReadBlockUnsafe(address, drained.data(), drained.size() * sizeof(u32));
+    V2::P5bStats::NoteListVerify(true, early != drained);
+    if (early != drained) {
+        V2::Stats::NoteMismatch(VideoCommon::DrainSite::ListWriters);
+        static std::atomic<u32> logged{};
+        if (logged.fetch_add(1) < 32) {
+            LOG_WARNING(HW_GPU,
+                        "V2 hazard verify: command list {:#x} ({} words) read at the writers' "
+                        "early-out differs from the read after the back ran everything sent",
+                        address, early.size());
+        }
+    }
 }
 
 void DmaPusher::NoteCopyRecord(Engines::EngineTypes type, u32 method, const u32* arguments,

@@ -200,6 +200,10 @@ private:
     /// `cpu_written`: CPU-written lists, which only work before the last host-level sync orders (else
     /// GPU-written ones, whose writers the copy path needs recorded).
     bool WaitForListWriters(GPUVAddr address, size_t size, bool cpu_written = true);
+    /// SYNC §15.9: a fetch that took WaitForListWriters' early-out. STATS: counts it when an
+    /// Upload note over the list is still queued. `verify`: a sample of CPU-written fetches is
+    /// read again after the back ran everything sent and compared.
+    void CheckListEarlyOut(GPUVAddr address, size_t size, bool cpu_written, bool verify);
     /// EDEN_NX2_V2_ACQUIRE/HAZARD: records the guest memory writes of an engine method just sent
     /// to the split's back (GpuSplit::TracksWrites). `writer`: IsMemoryWriter.
     /// EDEN_NX2_V2_IR_DRAWS: Copy records for copy engine launches and 2D blits being sent.

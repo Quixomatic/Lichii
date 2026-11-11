@@ -199,6 +199,10 @@ enum class Counter : u32 {
     UploadNotesMerged,
     UploadNotesLeftOut,
     UploadFirstFetchWaits,
+    // SYNC §15.9: list fetches that took WaitForListWriters' early-out, and those of them with
+    // an Upload note over the list still queued (the 0x13 hole; must be 0).
+    ListEarlyOuts,
+    ListEarlyOutUploadQueued,
     // SYNC §14.7 (5): the age of the oldest guest-read fence (§12.4 set) in a submission, by
     // bucket (GuestFenceAgeBoundsUs), and HAZARD=verify's command list compares.
     GuestFenceAge0,
