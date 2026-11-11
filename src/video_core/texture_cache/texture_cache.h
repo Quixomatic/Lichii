@@ -2238,9 +2238,10 @@ bool TextureCache<P>::UncommittedFlushesCpuRead() {
             continue;
         }
         const BufferDownload& buffer = slot_buffer_downloads[download.object_id];
-        const auto device = gpu_memory != nullptr ? gpu_memory->GpuToCpuAddress(buffer.address)
-                                                  : std::nullopt;
-        if (!device || Tegra::Nx2IsCpuReadPage(*device, buffer.size)) {
+        const auto buffer_device = gpu_memory != nullptr
+                                       ? gpu_memory->GpuToCpuAddress(buffer.address)
+                                       : std::nullopt;
+        if (!buffer_device || Tegra::Nx2IsCpuReadPage(*buffer_device, buffer.size)) {
             return true;
         }
     }

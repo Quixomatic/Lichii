@@ -3416,9 +3416,9 @@ void RasterizerVulkan::Query(GPUVAddr gpu_addr, VideoCommon::QueryType type,
         // render-enable evaluation). DXVK hints at the query *read*; OoT's results are mostly
         // consumed on the GPU (bd24: 13 strong submits/f, all queries). The rest ride their tick;
         // a thread that blocks on one files rule W.
-        const auto device = gpu_memory != nullptr ? gpu_memory->GpuToCpuAddress(gpu_addr)
-                                                  : std::nullopt;
-        if (device && Tegra::Nx2IsCpuReadPage(*device, 16)) {
+        const auto report_device = gpu_memory != nullptr ? gpu_memory->GpuToCpuAddress(gpu_addr)
+                                                         : std::nullopt;
+        if (report_device && Tegra::Nx2IsCpuReadPage(*report_device, 16)) {
             FlushHint(VideoCommon::V2::FlushHint::Strong, StrongQuery);
         } else {
             VideoCommon::V2::P5bStats::Add(

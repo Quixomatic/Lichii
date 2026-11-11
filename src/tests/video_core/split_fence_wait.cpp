@@ -27,6 +27,7 @@ struct Cache {
     bool early = false;
     bool HasUncommittedFlushes() const { return uncommitted; }
     bool FlushesAreEarlyDownloads() const { return early; }
+    bool UncommittedFlushesCpuRead() const { return true; }
     bool HasAsyncFlushWork() const { return true; }
     bool ShouldWaitAsyncFlushes() const { return true; }
     void AccumulateFlushes() {}
