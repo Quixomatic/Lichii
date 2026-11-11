@@ -158,8 +158,9 @@ void Report(const char* thread_name, u64 window_ns) {
                                        PerSecond(finishes[i].sum, seconds) / 1e6);
         }
         LOG_INFO(HW_GPU,
-                 "V2 stats {} SYNC submits by rule (per frame) | B pass boundary {:.2f} (strong "
-                 "hint {:.2f}), C chunk {:.2f}, W waiter {:.2f}, S sleep point {:.2f}, present "
+                 "V2 stats {} SYNC submits by rule (per frame, additive) | B pass boundary "
+                 "{:.2f}, strong hint {:.2f}, C chunk {:.2f}, W waiter {:.2f}, S sleep point "
+                 "{:.2f}, I′ batch end {:.2f}, present "
                  "{:.2f}, readback {:.2f}, deferred {:.2f}, idle (non-split) {:.2f}, other "
                  "{:.2f} | QMD reductions at execute {:.0f}/s, at their fence {:.0f}/s | "
                  "requests by origin (per s): acquires {:.0f}, landing waits {:.0f}, fencing "
@@ -171,6 +172,7 @@ void Report(const char* thread_name, u64 window_ns) {
                  thread_name, per_frame(at(Counter::SubmitsPassBoundary)),
                  per_frame(at(Counter::SubmitsStrong)), per_frame(at(Counter::SubmitsChunk)),
                  per_frame(at(Counter::SubmitsWaiter)), per_frame(at(Counter::SubmitsSleep)),
+                 per_frame(at(Counter::SubmitsBatchEnd)),
                  per_frame(at(Counter::SubmitsPresent)), per_frame(at(Counter::SubmitsReadback)),
                  per_frame(at(Counter::SubmitsDeferred)), per_frame(at(Counter::SubmitsIdle)),
                  per_frame(submits > by_rule ? submits - by_rule : 0),
