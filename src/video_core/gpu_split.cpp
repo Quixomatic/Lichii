@@ -21,6 +21,7 @@
 #include "common/logging.h"
 #include "common/settings.h"
 #include "common/thread.h"
+#include "core/hle/kernel/guest_wait_debug_flag.h"
 #include "core/core.h"
 #include "video_core/engines/engine_interface.h"
 #include "video_core/engines/kepler_compute.h"
@@ -206,6 +207,10 @@ void GpuSplit::MaybeStart(Core::System& system_) {
     hazard_mode = V2::Get(V2::Switch::Hazard);
     tracks_writes = acquire_mode != V2::Mode::Off || hazard_mode != V2::Mode::Off;
     feed_idle_back = acquire_mode != V2::Mode::Off;
+    // SYNC §14.8 H-14.8: guest waits are registered for the 2 s waiter dump only while the
+    // acquire view runs or STATS is on (v1: one relaxed load per blocking SVC, no lock).
+    ::Kernel::GuestWaitDebug::enabled.store(
+        acquire_mode != V2::Mode::Off || V2::P5bStats::Enabled(), std::memory_order_relaxed);
     hazards.Clear();
     writer_notes.Clear();
     pending_cb = {};
@@ -299,6 +304,7 @@ void GpuSplit::Stop() {
     spin_window = false;
     acquire_mode = V2::Mode::Off;
     hazard_mode = V2::Mode::Off;
+    ::Kernel::GuestWaitDebug::enabled.store(false, std::memory_order_relaxed);
     hazards.Clear();
     writer_notes.Clear();
     pending_cb = {};

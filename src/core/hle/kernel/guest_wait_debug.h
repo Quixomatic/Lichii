@@ -15,6 +15,7 @@
 
 #include "common/common_types.h"
 #include "core/arm/debug.h"
+#include "core/hle/kernel/guest_wait_debug_flag.h"
 #include "core/hle/kernel/k_readable_event.h"
 #include "core/hle/kernel/k_synchronization_object.h"
 #include "core/hle/kernel/k_thread.h"
@@ -25,7 +26,7 @@
 // unnamed: nothing is pending anywhere in the GPU pipeline). The blocking SVCs register the waiting
 // thread for the duration of the wait; the dump names each one's SVC, its waited objects (an
 // event's debug name, else its type) or address, its PC and how long it has waited. Debugging
-// bookkeeping only: no wait or wake changes.
+// bookkeeping only, and only while `enabled` (guest_wait_debug_flag.h): no wait or wake changes.
 namespace Kernel::GuestWaitDebug {
 
 enum class Kind : u8 {
@@ -71,13 +72,17 @@ struct Registry {
     return registry;
 }
 
-/// Registers the calling guest thread's wait for the scope's life. Declared after the objects'
-/// close guard, so it is removed before they are closed (a dump holding the lock keeps them alive).
+/// Registers the calling guest thread's wait for the scope's life, only while `enabled` (one
+/// relaxed load and no lock otherwise). Declared after the objects' close guard, so it is
+/// removed before they are closed (a dump holding the lock keeps them alive).
 class Scope {
 public:
     Scope(KThread* thread, Kind kind, u64 address,
-          std::span<KSynchronizationObject* const> objects = {})
-        : thread_{thread} {
+          std::span<KSynchronizationObject* const> objects = {}) {
+        if (!enabled.load(std::memory_order_relaxed)) [[likely]] {
+            return;
+        }
+        thread_ = thread;
         Entry entry{.thread = thread,
                     .kind = kind,
                     .address = address,
@@ -90,6 +95,9 @@ public:
         registry.entries.push_back(entry);
     }
     ~Scope() {
+        if (thread_ == nullptr) [[likely]] {
+            return;
+        }
         auto& registry = Get();
         std::scoped_lock lock{registry.mutex};
         std::erase_if(registry.entries, [this](const Entry& entry) {
@@ -100,7 +108,7 @@ public:
     Scope& operator=(const Scope&) = delete;
 
 private:
-    KThread* thread_;
+    KThread* thread_{};
 };
 
 /// The registered waits now (tests, and the dump's source).
