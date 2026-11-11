@@ -318,6 +318,10 @@ void GpuSplit::Stop() {
                  V2::Landing::verdicts_lost.load(std::memory_order_relaxed),
                  V2::Landing::verdicts_missing.load(std::memory_order_relaxed),
                  V2::Landing::qmd_verdicts_missing.load(std::memory_order_relaxed));
+        // SYNC §14.7 (5): 0 mismatches is only evidence if lists were compared (HAZARD=verify).
+        LOG_INFO(HW_GPU, "V2 hazard verify: command lists compared {}, mismatched {}",
+                 V2::P5bStats::list_verify_compared.load(std::memory_order_relaxed),
+                 V2::P5bStats::list_verify_mismatched.load(std::memory_order_relaxed));
         V2::Landing::verify = false;
     }
     V2::Landing::landed.store(0, std::memory_order_relaxed);

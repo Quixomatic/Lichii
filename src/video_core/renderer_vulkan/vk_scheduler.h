@@ -174,6 +174,9 @@ public:
         return guest_visible_fence;
     }
     void NoteGuestVisibleFence() noexcept {
+        if (!guest_visible_fence && VideoCommon::V2::P5bStats::Enabled()) [[unlikely]] {
+            guest_fence_since_us = NowUs(); // SYNC §14.7 (5): its age at the submit
+        }
         guest_visible_fence = true;
     }
     /// The idle hook (the back goes idle, or another thread asked with RequestIdleHook): what
@@ -705,6 +708,7 @@ private:
     u64 open_since_us{}; ///< SYNC §7.3: when the open tick first held a lazy fence (0: none)
     bool recorded_since_submit{}; ///< SYNC §10: RecordedSinceSubmit (recording thread)
     bool guest_visible_fence{};   ///< SYNC §14: OpenTickHasGuestVisibleFence (recording thread)
+    u64 guest_fence_since_us{};   ///< SYNC §14.7 (5): when the open tick got its first one
     u64 open_work_since_ns{};     ///< SYNC §14 #5: the open tick's first recorded work (trace)
     [[nodiscard]] static u64 TraceNowNs() {
         return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -740,6 +744,10 @@ private:
     /// with it), the new open tick is empty.
     void NoteOpenTickEmpty() {
         recorded_since_submit = false;
+        if (guest_visible_fence && guest_fence_since_us != 0) [[unlikely]] {
+            VideoCommon::V2::P5bStats::NoteGuestFenceAge(NowUs() - guest_fence_since_us);
+            guest_fence_since_us = 0;
+        }
         guest_visible_fence = false;
         open_tick_nonempty.store(false, std::memory_order_seq_cst);
         VideoCommon::V2::LandingFence::diag_recorded.store(false, std::memory_order_relaxed);

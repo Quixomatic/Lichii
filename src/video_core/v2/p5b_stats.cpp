@@ -313,6 +313,33 @@ void Report(const char* thread_name, u64 window_ns) {
                  PerSecond(at(Counter::WriterNotesDispatch), seconds),
                  PerSecond(at(Counter::WriterNotesUpload), seconds),
                  guest_list.empty() ? std::string{"none"} : guest_list);
+        // §14.7 (5): guest-read fence age at submit, p50/p99 as the bucket's upper bound.
+        u64 fences = 0;
+        for (size_t i = 0; i < GuestFenceAgeBoundsUs.size(); ++i) {
+            fences += at(static_cast<Counter>(static_cast<u32>(Counter::GuestFenceAge0) + i));
+        }
+        const auto percentile = [&](double fraction) -> std::string {
+            if (fences == 0) {
+                return "-";
+            }
+            const u64 rank = static_cast<u64>(fraction * static_cast<double>(fences - 1)) + 1;
+            u64 seen = 0;
+            for (size_t i = 0; i < GuestFenceAgeBoundsUs.size(); ++i) {
+                seen += at(static_cast<Counter>(static_cast<u32>(Counter::GuestFenceAge0) + i));
+                if (seen >= rank) {
+                    return i + 1 < GuestFenceAgeBoundsUs.size()
+                               ? fmt::format("< {} us", GuestFenceAgeBoundsUs[i])
+                               : fmt::format(">= {} us", GuestFenceAgeBoundsUs[i - 1]);
+                }
+            }
+            return "-";
+        };
+        LOG_INFO(HW_GPU,
+                 "V2 stats {} SYNC §14.7 | guest-read fence age at submit: {:.0f}/s, p50 {}, "
+                 "p99 {} | HAZARD=verify command lists compared {:.0f}/s, mismatched {}",
+                 thread_name, PerSecond(fences, seconds), percentile(0.5), percentile(0.99),
+                 PerSecond(at(Counter::ListVerifyCompared), seconds),
+                 at(Counter::ListVerifyMismatched));
     }
     // F4-06: which untracked operations still flush every pending write.
     LOG_INFO(HW_GPU, "V2 stats {} P5b full barriers by site (per frame) | {}", thread_name,

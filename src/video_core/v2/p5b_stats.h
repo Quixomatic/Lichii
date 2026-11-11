@@ -191,8 +191,25 @@ enum class Counter : u32 {
     WriterNotesCopy,
     WriterNotesDispatch,
     WriterNotesUpload,
+    // SYNC §14.7 (5): the age of the oldest guest-read fence (§12.4 set) in a submission, by
+    // bucket (GuestFenceAgeBoundsUs), and HAZARD=verify's command list compares.
+    GuestFenceAge0,
+    GuestFenceAge1,
+    GuestFenceAge2,
+    GuestFenceAge3,
+    GuestFenceAge4,
+    GuestFenceAge5,
+    GuestFenceAge6,
+    GuestFenceAge7,
+    GuestFenceAge8,
+    ListVerifyCompared,
+    ListVerifyMismatched,
     Count,
 };
+
+/// Upper bounds (us) of the GuestFenceAge buckets; the last is open.
+inline constexpr std::array<u64, 9> GuestFenceAgeBoundsUs{100,  250,   500,   1000, 2000,
+                                                          5000, 10000, 20000, ~u64{0}};
 
 /// SYNC_SUBMIT_SPEC §11.6 item 7: the submission rules. Every Flush/Finish adds one of these;
 /// what no rule claims is printed as "other" (expected 0). Deferred and idle are the non-split
@@ -228,6 +245,30 @@ inline void Max(Counter counter, u64 value) {
                !slot.compare_exchange_weak(current, value, std::memory_order_relaxed)) {
         }
     }
+}
+
+/// SYNC §14.7 (5): HAZARD=verify's command list compares (narrowed read vs the full wait), for
+/// the session (the landing verify line at split stop) and per window (STATS).
+inline std::atomic<u64> list_verify_compared{0};
+inline std::atomic<u64> list_verify_mismatched{0};
+inline void NoteListVerify(bool compared, bool mismatched) {
+    if (compared) {
+        list_verify_compared.fetch_add(1, std::memory_order_relaxed);
+        Add(Counter::ListVerifyCompared);
+    }
+    if (mismatched) {
+        list_verify_mismatched.fetch_add(1, std::memory_order_relaxed);
+        Add(Counter::ListVerifyMismatched);
+    }
+}
+
+/// SYNC §14.7 (5): a submission whose oldest guest-read fence waited `age_us` in the open tick.
+inline void NoteGuestFenceAge(u64 age_us) {
+    size_t bucket = 0;
+    while (bucket + 1 < GuestFenceAgeBoundsUs.size() && age_us >= GuestFenceAgeBoundsUs[bucket]) {
+        ++bucket;
+    }
+    Add(static_cast<Counter>(static_cast<u32>(Counter::GuestFenceAge0) + bucket));
 }
 
 /// F4-01: submissions counted by the call site Scheduler::Flush/Finish was given (its

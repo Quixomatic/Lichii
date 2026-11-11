@@ -822,7 +822,9 @@ bool DmaPusher::WaitForListWriters(GPUVAddr address, size_t size, bool cpu_writt
         const bool narrow_read = read_copies(narrow);
         const bool waited_old = split.WaitForWriters();
         const bool full_read = read_copies(full);
-        if (narrow_read && full_read && narrow != full) {
+        const bool compared = narrow_read && full_read;
+        V2::P5bStats::NoteListVerify(compared, compared && narrow != full);
+        if (compared && narrow != full) {
             V2::Stats::NoteMismatch(site);
             static std::atomic<u32> logged{};
             if (logged.fetch_add(1) < 32) {
@@ -844,6 +846,7 @@ bool DmaPusher::WaitForListWriters(GPUVAddr address, size_t size, bool cpu_writt
     std::vector<u32> full(narrow.size());
     memory_manager.ReadBlockUnsafe(address, full.data(), full.size() * sizeof(u32));
     const bool full_written = IsGpuWrittenCommands(address, size);
+    V2::P5bStats::NoteListVerify(true, narrow != full || narrow_written != full_written);
     if (narrow != full || narrow_written != full_written) {
         V2::Stats::NoteMismatch(site);
         static std::atomic<u32> logged{};
