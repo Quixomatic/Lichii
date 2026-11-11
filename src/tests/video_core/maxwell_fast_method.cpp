@@ -87,6 +87,11 @@ struct GpuSplitTestAccess {
         split.ServeHookRequests();
     }
 
+    /// The front records writes (EDEN_NX2_V2_HAZARD on): syncs reach the hazard table.
+    static void SetTracksWrites(GpuSplit& split, bool on) {
+        split.tracks_writes = on;
+    }
+
     static void SetIr(GpuSplit& split, bool ir) {
         split.ir = ir;
         split.ir_verify = ir;
@@ -2302,6 +2307,7 @@ TEST_CASE("SYNC §12 R2: a CPU-written list waits only for its exact producer",
     f.system.Initialize();
     GpuSplit split;
     Access::Initialize(split, f.system, 100);
+    Access::SetTracksWrites(split, true);
     constexpr u64 list = 0x7'4000'0000;     // CPU-written command memory
     constexpr u64 data = 0x7'4800'0000;     // a buffer GPU work writes
     constexpr u64 elsewhere = 0x7'4900'0000; // another buffer
