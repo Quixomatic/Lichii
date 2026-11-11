@@ -264,10 +264,11 @@ public:
     /// or known note), or one the buffer cache recorded (Nx2MayBeGpuWritten), may have reached
     /// a page of the range. A CPU-written command list on pages where neither holds is ordered
     /// only against the writers noted over it, not against every unbounded dispatch.
-    [[nodiscard]] bool MayBeGpuWrittenPage(u64 device_address, u64 size) const {
+    [[nodiscard]] bool MayBeGpuWrittenPage(u64 device_address, u64 size) {
         if (size == 0) {
             return false;
         }
+        FlushUploadWrite(); // SYNC §15.5: its pages are marked when noted
         const u64 first = device_address >> NotedPageBits;
         const u64 last = (device_address + size - 1) >> NotedPageBits;
         if (last < first || last >= noted_gpu_pages->size() * 64) {
@@ -329,13 +330,34 @@ public:
     /// producer). In the shared table constant buffer data notes (thousands per frame) folded
     /// real entries into the overflow marker (95a3: 78,664 overflows/s), and every CPU-written
     /// list wait was that marker, not a writer over the list.
+    /// SYNC §15.5: uploads enter this table only over pages a list may be fetched from
+    /// (UploadMayWriteList). The first fetch from a page not fetched before also waits for every
+    /// upload left out so far, so one noted before the page became a list page is covered.
     [[nodiscard]] V2::HazardResult FindListWriters(u64 device_address, u64 size,
                                                    const V2::HazardFilter& filter) {
+        FlushUploadWrite();
         const u64 done = ConsumedNow();
         writer_notes.Retire(done);
-        return writer_notes.Find(device_address, size, done, filter);
+        V2::HazardResult result = writer_notes.Find(device_address, size, done, filter);
+        if (MarkListPages(device_address, size) && excluded_upload_position > done &&
+            (filter.ranged & V2::ProducerBit(V2::Producer::Upload)) != 0) [[unlikely]] {
+            if (result.kind != V2::HazardResult::Kind::Wait ||
+                result.position < excluded_upload_position) {
+                result.kind = V2::HazardResult::Kind::Wait;
+                result.position = excluded_upload_position;
+                result.cause = V2::CauseRanged;
+            }
+            result.causes |= V2::CauseRanged;
+            result.producers |= V2::ProducerBit(V2::Producer::Upload);
+            V2::P5bStats::Add(V2::P5bStats::Counter::UploadFirstFetchWaits);
+        }
+        return result;
     }
-    void NoteRangeWrite(u64 device_address, u64 size, V2::Producer producer) {
+    /// `position`: the ring position the write is ordered at (0: the write just sent).
+    void NoteRangeWrite(u64 device_address, u64 size, V2::Producer producer, u64 position = 0) {
+        if (position == 0) {
+            position = write_position;
+        }
         MarkNotedGpuPages(device_address, size);
         if (producer != V2::Producer::CbData) {
             FlushCbWrite();
@@ -348,10 +370,17 @@ public:
             }
         }
         PrepareHazardNote();
-        hazards.NoteRange(device_address, size, write_position, producer);
+        hazards.NoteRange(device_address, size, position, producer);
         if (ListWriter(producer)) {
+            if (producer == V2::Producer::Upload &&
+                !UploadMayWriteList(device_address, size)) [[likely]] {
+                // SYNC §15.5: not over a page a list is fetched from (FindListWriters).
+                excluded_upload_position = std::max(excluded_upload_position, position);
+                V2::P5bStats::Add(V2::P5bStats::Counter::UploadNotesLeftOut);
+                return;
+            }
             PrepareWriterNote(producer);
-            writer_notes.NoteRange(device_address, size, write_position, producer);
+            writer_notes.NoteRange(device_address, size, position, producer);
         }
     }
     void NoteUnboundedWrite(V2::Producer producer) {
@@ -378,9 +407,47 @@ public:
         pending_cb = {&memory, gpu_address, gpu_address + size};
     }
     void FlushCbWrite() {
+        // The pending upload first: its position is older than the constant buffer note's (the
+        // tables' positions grow in insertion order).
+        FlushUploadWrite();
         if (pending_cb.memory != nullptr) [[unlikely]] {
             FlushCbWriteSlow();
         }
+    }
+    /// Front, TracksWrites (SYNC §15.5): an inline upload's data words were just sent to a GPU
+    /// range (each word re-notes the upload's whole range; its bytes land as the words run).
+    /// Words of the same upload and contiguous uploads join the pending range at the newest
+    /// word's position, noted once before any lookup, other write note or map (FlushCbWrite).
+    /// With a range write listener (F2-03) every word is noted at once, as before.
+    void NoteUploadWrite(const Tegra::MemoryManager& memory, u64 gpu_address, u64 size) {
+        if (size == 0) {
+            return;
+        }
+        if (&memory == pending_upload.memory && gpu_address >= pending_upload.begin &&
+            gpu_address <= pending_upload.end) [[likely]] {
+            pending_upload.end = std::max(pending_upload.end, gpu_address + size);
+            pending_upload.position = write_position;
+            V2::P5bStats::Add(V2::P5bStats::Counter::UploadNotesMerged);
+            return;
+        }
+        FlushCbWrite();
+        if (range_write_listener != nullptr) [[unlikely]] {
+            NoteUploadWriteSlow(memory, gpu_address, size, 0);
+            return;
+        }
+        pending_upload = {&memory, gpu_address, gpu_address + size, write_position};
+    }
+    void FlushUploadWrite() {
+        if (pending_upload.memory != nullptr) [[unlikely]] {
+            const PendingUpload pending = std::exchange(pending_upload, PendingUpload{});
+            NoteUploadWriteSlow(*pending.memory, pending.begin, pending.end - pending.begin,
+                                pending.position);
+        }
+    }
+    /// Front (Fix F3h, R2-F3-03 / SYNC §15.5): a Map record is about to be sent: the pending
+    /// upload is translated with the mapping its words were sent under.
+    void FlushBeforeMap() {
+        FlushUploadWrite();
     }
     /// Front: the writes to a device range that `filter` orders against (V2::HazardTable): the
     /// queued ones and, for releases and reports, those still to land (one table each: a
@@ -1007,6 +1074,43 @@ private:
         return producer == V2::Producer::Copy || producer == V2::Producer::Dispatch ||
                producer == V2::Producer::Upload;
     }
+    /// SYNC §15.5 (MP §5.1 "if not overlapping it reads directly"): whether an upload to the
+    /// range may write a command list a fetch reads: a page a list was fetched from (list_pages;
+    /// Nx2IsCommandListPage for GPU-written ones) or one the GPU writes (Nx2MayBeGpuWritten).
+    [[nodiscard]] bool UploadMayWriteList(u64 device_address, u64 size) const {
+        const u64 first = device_address >> NotedPageBits;
+        const u64 last = (device_address + size - 1) >> NotedPageBits;
+        if (last < first || last >= list_pages->size() * 64) {
+            return true;
+        }
+        for (u64 page = first; page <= last; ++page) {
+            if ((((*list_pages)[page / 64] >> (page % 64)) & 1) != 0 ||
+                Tegra::Nx2IsCommandListPage(page << NotedPageBits)) {
+                return true;
+            }
+        }
+        return Tegra::Nx2MayBeGpuWritten(device_address, size);
+    }
+    /// Marks the pages of a list fetch; whether one was not marked before.
+    bool MarkListPages(u64 device_address, u64 size) {
+        if (size == 0) {
+            return false;
+        }
+        auto& pages = *list_pages;
+        const u64 last =
+            std::min<u64>((device_address + size - 1) >> NotedPageBits, pages.size() * 64 - 1);
+        bool marked = false;
+        for (u64 page = device_address >> NotedPageBits; page <= last; ++page) {
+            const u64 bit = u64{1} << (page % 64);
+            if ((pages[page / 64] & bit) == 0) {
+                pages[page / 64] |= bit;
+                marked = true;
+            }
+        }
+        return marked;
+    }
+    void NoteUploadWriteSlow(const Tegra::MemoryManager& memory, u64 gpu_address, u64 size,
+                             u64 position);
     void MarkNotedGpuPages(u64 device_address, u64 size) {
         if (size == 0) {
             return;
@@ -1241,6 +1345,15 @@ private:
         u64 end;
     };
     PendingCb pending_cb{}; ///< NoteCbWrite
+    struct PendingUpload {
+        const Tegra::MemoryManager* memory;
+        u64 begin; ///< GPU range
+        u64 end;
+        u64 position; ///< The newest data word's
+    };
+    PendingUpload pending_upload{}; ///< NoteUploadWrite (at most one of it and pending_cb is set)
+    /// SYNC §15.5: the newest upload note left out of `writer_notes` (FindListWriters).
+    u64 excluded_upload_position{};
     struct CbTranslation {
         const Tegra::MemoryManager* memory;
         u64 page;   ///< GPU page (4 KiB)
@@ -1270,6 +1383,10 @@ private:
     /// 36-bit device space. Set by every ranged or known write note; never cleared.
     static constexpr u64 NotedPageBits = 12;
     std::unique_ptr<std::array<u64, (u64{1} << (36 - NotedPageBits)) / 64>> noted_gpu_pages{
+        std::make_unique<std::array<u64, (u64{1} << (36 - NotedPageBits)) / 64>>()};
+    /// Front (SYNC §15.5): device pages a command list was fetched from (FindListWriters), CPU-
+    /// or GPU-written. Never cleared.
+    std::unique_ptr<std::array<u64, (u64{1} << (36 - NotedPageBits)) / 64>> list_pages{
         std::make_unique<std::array<u64, (u64{1} << (36 - NotedPageBits)) / 64>>()};
     u64 back_entry_position{}; ///< Back: ring position of the entry it runs (TracksWrites)
 

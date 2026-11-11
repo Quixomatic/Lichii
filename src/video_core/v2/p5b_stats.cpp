@@ -300,8 +300,10 @@ void Report(const char* thread_name, u64 window_ns) {
                  "| submit "
                  "hand-off (mean us): pickup {:.0f}, queue lock {:.0f} (max {:.0f}), submit call "
                  "{:.0f}; behind a present (lock > 1 ms) {:.2f}/frame | list writer table notes "
-                 "(per s): copy {:.0f}, dispatch {:.0f}, upload {:.0f} | guest CPU waits while "
-                 "the front sleeps on pending channels: {}",
+                 "(per s): copy {:.0f}, dispatch {:.0f}, upload {:.0f}; §15.5 upload words "
+                 "merged {:.0f}, upload notes left out {:.0f}, first list fetches that waited "
+                 "for them {:.0f} | guest CPU waits while the front sleeps on pending channels: "
+                 "{}",
                  thread_name, per_frame(at(Counter::StrongFromQuery)),
                  per_frame(at(Counter::StrongFromBuffer)),
                  per_frame(at(Counter::StrongFromTexture)),
@@ -316,6 +318,9 @@ void Report(const char* thread_name, u64 window_ns) {
                  PerSecond(at(Counter::WriterNotesCopy), seconds),
                  PerSecond(at(Counter::WriterNotesDispatch), seconds),
                  PerSecond(at(Counter::WriterNotesUpload), seconds),
+                 PerSecond(at(Counter::UploadNotesMerged), seconds),
+                 PerSecond(at(Counter::UploadNotesLeftOut), seconds),
+                 PerSecond(at(Counter::UploadFirstFetchWaits), seconds),
                  guest_list.empty() ? std::string{"none"} : guest_list);
         // §14.7 (5): guest-read fence age at submit, p50/p99 as the bucket's upper bound.
         u64 fences = 0;

@@ -262,6 +262,7 @@ void ThreadManager::SendToBack(CpuRecord& record, VideoCore::RasterizerInterface
         V2::Ir::MapBody body = record.map;
         body.object = split.Ref(reinterpret_cast<const void*>(record.map.object));
         body.object2 = split.Ref(reinterpret_cast<const void*>(record.map.object2));
+        split.FlushBeforeMap();
         split.Emit(V2::Ir::Kind::Map, body,
                    [gpu = &system.GPU(), map = record.map] { gpu->ExecuteMap(map); });
         split.NoteMapSent();

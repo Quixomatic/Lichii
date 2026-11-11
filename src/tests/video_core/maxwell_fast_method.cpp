@@ -2461,6 +2461,87 @@ TEST_CASE("SYNC §14.6: constant buffer notes don't make list fetches wait on th
     CHECK_FALSE(unbounded);
 }
 
+// SYNC_SUBMIT_SPEC §15.5 (bd24: 190-251k upload notes/s, 28-64k writer table overflows/s): an
+// upload's data words make one note, and it enters the list writer table only over pages a list
+// is fetched from; the first fetch from a page waits for the uploads left out before it.
+TEST_CASE("SYNC §15.5: upload notes merge and stay out of the list writer table off list pages",
+          "[video_core][gpu_split_dispatch][v2_hazard]") {
+    using Access = VideoCommon::GpuSplitTestAccess;
+    using VideoCommon::GpuSplit;
+    namespace V2 = VideoCommon::V2;
+    using Kind = V2::HazardResult::Kind;
+    Fixture f;
+    f.system.Initialize();
+    constexpr GPUVAddr gpu = 0x2000'0000;
+    constexpr u64 device = 0x10000;
+    Kernel::KProcess process{f.system.Kernel()};
+    SCOPE_EXIT { f.system.Kernel().UnregisterKernelObject(&process); };
+    auto& table = process.GetPageTable().GetImpl();
+    table.Resize(20, 12);
+    for (u64 page = 0; page < 2; ++page) {
+        auto* backing = f.physical.GetPointerFromRaw<u8>(0x10000 + page * 0x1000);
+        table.entries.GetAndFault(4 + page).Store(false, Common::PageType::Memory, 1,
+                                                  reinterpret_cast<uintptr_t>(backing) -
+                                                      (0x4000 + page * 0x1000));
+    }
+    process.GetMemory().SetCurrentPageTable(process);
+    const auto asid = f.device_memory.RegisterProcess(&process.GetMemory());
+    f.device_memory.BindInterface(&f.rasterizer);
+    SCOPE_EXIT {
+        f.device_memory.Unmap(device, 0x2000);
+        f.device_memory.UnregisterProcess(asid);
+    };
+    f.device_memory.Map(device, 0x4000, 0x2000, asid);
+    f.memory.BindRasterizer(&f.rasterizer);
+    f.memory.Map(gpu, device, 0x2000, Tegra::PTEKind::PITCH, false);
+    Tegra::Nx2ClearGpuWrittenPages();
+    GpuSplit split;
+    Access::Initialize(split, f.system, 100);
+    Access::SetTracksWrites(split, true);
+    // Three data words of one upload, then a contiguous upload: one pending note.
+    Access::SetEnd(split, 110);
+    split.NoteUploadWrite(f.memory, gpu, 0x100);
+    Access::SetEnd(split, 111);
+    split.NoteUploadWrite(f.memory, gpu, 0x100);
+    Access::SetEnd(split, 112);
+    split.NoteUploadWrite(f.memory, gpu + 0x100, 0x100);
+    Access::SetEnd(split, 115); // later work: the note keeps the newest word's position
+    V2::HazardFilter uploads;
+    uploads.ranged = V2::ProducerBit(V2::Producer::Upload);
+    const V2::HazardResult shared = split.FindWrites(device + 0x180, 8, uploads);
+    REQUIRE(shared.kind == Kind::Wait);
+    CHECK(shared.position == 112);
+    CHECK(split.FindWrites(device + 0x200, 8, uploads).kind == Kind::Clear);
+    // Not a list page and not GPU-written: the writer table holds nothing, but the first fetch
+    // from the page waits for the upload left out.
+    const V2::HazardFilter filter = GpuSplit::ListFetchFilter(true, false);
+    const V2::HazardResult first = split.FindListWriters(device, 0x100, filter);
+    REQUIRE(first.kind == Kind::Wait);
+    CHECK(first.position == 112);
+    CHECK((first.producers & V2::ProducerBit(V2::Producer::Upload)) != 0);
+    CHECK(split.FindListWriters(device, 0x100, filter).kind == Kind::Clear);
+    CHECK(split.WriterTableOverflows() == 0);
+    // Now a list page: later uploads over it are list writers.
+    Access::SetEnd(split, 120);
+    split.NoteUploadWrite(f.memory, gpu + 0x10, 0x10);
+    const V2::HazardResult listed = split.FindListWriters(device, 0x100, filter);
+    REQUIRE(listed.kind == Kind::Wait);
+    CHECK(listed.position == 120);
+    Access::SetBack(split, 120, false);
+    CHECK(split.FindListWriters(device, 0x100, filter).kind == Kind::Clear);
+    // An upload to a GPU-written page goes to the writer table at once (the page's first fetch
+    // comes after the uploads left out ran: only the table's writer is waited for).
+    Access::SetEnd(split, 130);
+    Tegra::Nx2MarkGpuWritten(device + 0x1000, 0x1000);
+    split.NoteUploadWrite(f.memory, gpu + 0x1800, 0x20);
+    const V2::HazardResult written = split.FindListWriters(device + 0x1800, 0x10, filter);
+    REQUIRE(written.kind == Kind::Wait);
+    CHECK(written.position == 130);
+    Access::SetBack(split, 130, false);
+    CHECK(split.FindListWriters(device + 0x1800, 0x10, filter).kind == Kind::Clear);
+    Tegra::Nx2ClearGpuWrittenPages();
+}
+
 TEST_CASE("V2 landing: the front remembers its releases, the back's captured operations count",
           "[video_core][gpu_split_dispatch][v2_hazard]") {
     using Access = VideoCommon::GpuSplitTestAccess;

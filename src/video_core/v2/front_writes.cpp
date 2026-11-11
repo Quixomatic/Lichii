@@ -152,7 +152,7 @@ size_t DeviceRanges(const Tegra::MemoryManager& memory, GPUVAddr address, u64 si
 }
 
 void NoteRangeWriteGpu(GpuSplit& split, const Tegra::MemoryManager& memory, GPUVAddr address,
-                       u64 size, Producer producer) {
+                       u64 size, Producer producer, u64 position) {
     if (size == 0) {
         return;
     }
@@ -166,7 +166,8 @@ void NoteRangeWriteGpu(GpuSplit& split, const Tegra::MemoryManager& memory, GPUV
         std::array<std::pair<u64, u64>, 8> ranges;
         const size_t count = DeviceRanges(memory, address, size, ranges);
         for (size_t i = 0; i < count; ++i) {
-            split.NoteRangeWrite(ranges[i].first, ranges[i].second - ranges[i].first, producer);
+            split.NoteRangeWrite(ranges[i].first, ranges[i].second - ranges[i].first, producer,
+                                 position);
         }
         return;
     }
@@ -174,7 +175,7 @@ void NoteRangeWriteGpu(GpuSplit& split, const Tegra::MemoryManager& memory, GPUV
     for (GPUVAddr begin = address; begin < end;) {
         const GPUVAddr page_end = std::min<GPUVAddr>((begin & ~(PageSize - 1)) + PageSize, end);
         if (const auto device = memory.GpuToCpuAddress(begin)) {
-            split.NoteRangeWrite(*device, page_end - begin, producer);
+            split.NoteRangeWrite(*device, page_end - begin, producer, position);
         }
         begin = page_end;
     }
@@ -222,7 +223,8 @@ void NoteUploadMethod(GpuSplit& split, const Tegra::MemoryManager& memory, const
         split.NoteUnboundedWrite(Producer::Upload);
         return;
     }
-    NoteRangeWriteGpu(split, memory, pending->first, pending->second, Producer::Upload);
+    // SYNC §15.5: the words of one upload (and contiguous uploads) make one note.
+    split.NoteUploadWrite(memory, pending->first, pending->second);
 }
 
 void NoteReport3D(GpuSplit& split, const Tegra::MemoryManager& memory, const u32* regs) {

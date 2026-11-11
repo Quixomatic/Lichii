@@ -194,6 +194,11 @@ enum class Counter : u32 {
     WriterNotesCopy,
     WriterNotesDispatch,
     WriterNotesUpload,
+    // SYNC §15.5: upload data words joined to the pending note; upload notes left out of the
+    // writer table (no list page under them); first fetches from a page that waited for those.
+    UploadNotesMerged,
+    UploadNotesLeftOut,
+    UploadFirstFetchWaits,
     // SYNC §14.7 (5): the age of the oldest guest-read fence (§12.4 set) in a submission, by
     // bucket (GuestFenceAgeBoundsUs), and HAZARD=verify's command list compares.
     GuestFenceAge0,

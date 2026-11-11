@@ -214,6 +214,8 @@ void GpuSplit::MaybeStart(Core::System& system_) {
     hazards.Clear();
     writer_notes.Clear();
     pending_cb = {};
+    pending_upload = {};
+    excluded_upload_position = 0;
     cb_translations.fill({});
     unlanded.Clear();
     sem_view.Clear();
@@ -308,6 +310,8 @@ void GpuSplit::Stop() {
     hazards.Clear();
     writer_notes.Clear();
     pending_cb = {};
+    pending_upload = {};
+    excluded_upload_position = 0;
     unlanded.Clear();
     sem_view.Clear();
     ticket_position = 0;
@@ -424,6 +428,11 @@ void GpuSplit::ParallelBarrier(u32 op) {
 
 void GpuSplit::ParallelPublish() {
     parallel->OnPublish(published_local);
+}
+
+void GpuSplit::NoteUploadWriteSlow(const Tegra::MemoryManager& memory, u64 gpu_address, u64 size,
+                                   u64 position) {
+    V2::NoteRangeWriteGpu(*this, memory, gpu_address, size, V2::Producer::Upload, position);
 }
 
 void GpuSplit::FlushCbWriteSlow() {

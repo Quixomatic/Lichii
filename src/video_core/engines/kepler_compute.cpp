@@ -2236,7 +2236,7 @@ namespace {
 /// write may reach (GpuSplit::MayBeGpuWrittenPage), so on others they can't change it; unbounded
 /// uploads and copies mark no page and always count. A store into never GPU-written memory is
 /// the MP §11 residual, as for command lists (DmaPusher::WaitForListWriters).
-u32 DescriptorUnboundedWriters(const VideoCommon::GpuSplit& split, u64 device) {
+u32 DescriptorUnboundedWriters(VideoCommon::GpuSplit& split, u64 device) {
     using VideoCommon::V2::Producer;
     using VideoCommon::V2::ProducerBit;
     constexpr u32 copies = ProducerBit(Producer::Upload) | ProducerBit(Producer::Copy);

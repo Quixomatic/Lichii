@@ -48,9 +48,10 @@ void NoteReleaseWrite(GpuSplit& split, const Tegra::MemoryManager& memory, GPUVA
 [[nodiscard]] bool FencesDelayed();
 
 /// A write of [address, address + size) whose bytes the front doesn't know. Long or unmapped
-/// ranges become a write the front can't bound.
+/// ranges become a write the front can't bound. `position`: GpuSplit::NoteRangeWrite's (0: the
+/// write just sent).
 void NoteRangeWriteGpu(GpuSplit& split, const Tegra::MemoryManager& memory, GPUVAddr address,
-                       u64 size, Producer producer);
+                       u64 size, Producer producer, u64 position = 0);
 
 /// A 3D report semaphore was triggered (report_semaphore.query sent), with the front's copy of
 /// the 3D registers.
