@@ -1188,6 +1188,14 @@ TEST_CASE("SYNC §14.8: guest waits are registered for their duration only",
         }
         return count;
     };
+    const bool saved_enabled = GuestWaitDebug::enabled.load();
+    // Off (v1, ACQUIRE and STATS off): nothing is registered, no lock taken.
+    GuestWaitDebug::enabled.store(false);
+    {
+        const GuestWaitDebug::Scope off{first, GuestWaitDebug::Kind::Address, 0x8000};
+        CHECK(count_for(first) == 0);
+    }
+    GuestWaitDebug::enabled.store(true);
     {
         const GuestWaitDebug::Scope address{first, GuestWaitDebug::Kind::Address, 0x8000};
         {
@@ -1205,6 +1213,7 @@ TEST_CASE("SYNC §14.8: guest waits are registered for their duration only",
         CHECK(std::string_view{GuestWaitDebug::KindName(it->kind)} == "WaitForAddress");
     }
     CHECK(count_for(first) == 0);
+    GuestWaitDebug::enabled.store(saved_enabled);
 }
 
 // SYNC_SUBMIT_SPEC §14 #4: the resume-cause counter tells passes found after a timer tick from
