@@ -63,3 +63,27 @@ TEST_CASE("Nx2MarkGpuWritten marks exactly the pages a range touches", "[video_c
     CHECK(Tegra::g_nx2_gpu_written_pages.back().load() == u64{7} << 61);
     Tegra::Nx2ClearGpuWrittenPages();
 }
+
+TEST_CASE("SYNC §15.2: the CPU-read set holds only pages a CPU consumer registered",
+          "[video_core][nx2][v2_p5b]") {
+    constexpr u64 page = u64{1} << Tegra::Nx2WrittenPageBits;
+    constexpr u64 base = 0x30000000;
+    Tegra::Nx2ClearGpuWrittenPages();
+    // Off (v1, no ADAPTSUBMIT): marking does nothing.
+    Tegra::g_nx2_cpu_read_hints.store(false);
+    Tegra::Nx2MarkCpuReadPage(base, 16);
+    CHECK_FALSE(Tegra::Nx2IsCpuReadPage(base, 16));
+
+    Tegra::g_nx2_cpu_read_hints.store(true);
+    Tegra::Nx2MarkCpuReadPage(base + 2 * page + 8, 16);
+    CHECK(Tegra::Nx2IsCpuReadPage(base + 2 * page, 8));
+    CHECK(Tegra::Nx2IsCpuReadPage(base, 3 * page));
+    CHECK_FALSE(Tegra::Nx2IsCpuReadPage(base, 2 * page));
+    CHECK_FALSE(Tegra::Nx2IsCpuReadPage(base + 3 * page, page));
+    CHECK_FALSE(Tegra::Nx2IsCpuReadPage(base + 2 * page, 0));
+    // A query result on another page rides its tick; a new session forgets the set.
+    CHECK_FALSE(Tegra::Nx2IsCpuReadPage(base + 7 * page, 16));
+    Tegra::Nx2ClearGpuWrittenPages();
+    CHECK_FALSE(Tegra::Nx2IsCpuReadPage(base + 2 * page, 8));
+    Tegra::g_nx2_cpu_read_hints.store(false);
+}

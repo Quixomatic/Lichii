@@ -89,12 +89,53 @@ inline void Nx2MarkCommandListPage(u64 device_address) {
     return (g_nx2_command_list_pages[page / 64].load(std::memory_order_relaxed) >> (page % 64)) & 1;
 }
 
+// SYNC_SUBMIT_SPEC §15.2 (MP §5.5 "strong hints after work the guest will read", §6 "predicted
+// readbacks"): device pages a CPU consumer reads GPU results from: guest CPU reads of GPU-written
+// memory (GPU::OnCPURead) and CPU-side consumers that register (render-enable evaluation). A
+// query result or download raises a strong hint only on these pages. Never cleared in a session.
+inline std::array<std::atomic<u64>, (u64{1} << (36 - Nx2WrittenPageBits)) / 64> g_nx2_cpu_read_pages{};
+/// Set by the Vulkan rasterizer with EDEN_NX2_V2_ADAPTSUBMIT (the only user of the set): off, the
+/// marking sites cost one relaxed load.
+inline std::atomic<bool> g_nx2_cpu_read_hints{false};
+
+inline void Nx2MarkCpuReadPage(u64 device_address, u64 size) {
+    if (size == 0 || !g_nx2_cpu_read_hints.load(std::memory_order_relaxed)) {
+        return;
+    }
+    const u64 last = std::min<u64>((device_address + size - 1) >> Nx2WrittenPageBits,
+                                   g_nx2_cpu_read_pages.size() * 64 - 1);
+    for (u64 page = device_address >> Nx2WrittenPageBits; page <= last; ++page) {
+        auto& word = g_nx2_cpu_read_pages[page / 64];
+        const u64 bit = u64{1} << (page % 64);
+        if ((word.load(std::memory_order_relaxed) & bit) == 0) {
+            word.fetch_or(bit, std::memory_order_relaxed);
+        }
+    }
+}
+
+[[nodiscard]] inline bool Nx2IsCpuReadPage(u64 device_address, u64 size) {
+    if (size == 0) {
+        return false;
+    }
+    const u64 last = (device_address + size - 1) >> Nx2WrittenPageBits;
+    for (u64 page = device_address >> Nx2WrittenPageBits;
+         page <= last && page < g_nx2_cpu_read_pages.size() * 64; ++page) {
+        if ((g_nx2_cpu_read_pages[page / 64].load(std::memory_order_relaxed) >> (page % 64)) & 1) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /// A new emulation session starts: no page has been written by its GPU yet.
 inline void Nx2ClearGpuWrittenPages() {
     for (auto& word : g_nx2_gpu_written_pages) {
         word.store(0, std::memory_order_relaxed);
     }
     for (auto& word : g_nx2_command_list_pages) {
+        word.store(0, std::memory_order_relaxed);
+    }
+    for (auto& word : g_nx2_cpu_read_pages) {
         word.store(0, std::memory_order_relaxed);
     }
     g_nx2_has_command_list_pages.store(false, std::memory_order_relaxed);

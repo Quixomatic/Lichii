@@ -295,7 +295,9 @@ void Report(const char* thread_name, u64 window_ns) {
         }
         LOG_INFO(HW_GPU,
                  "V2 stats {} SYNC §14.7 | strong-hint submits by source (per frame): query "
-                 "{:.2f}, buffer download {:.2f}, texture download {:.2f}, both {:.2f} | submit "
+                 "{:.2f}, buffer download {:.2f}, texture download {:.2f}, both {:.2f}; not "
+                 "raised, no CPU consumer reads it (§15.2): query {:.2f}, download fence {:.2f} "
+                 "| submit "
                  "hand-off (mean us): pickup {:.0f}, queue lock {:.0f} (max {:.0f}), submit call "
                  "{:.0f}; behind a present (lock > 1 ms) {:.2f}/frame | list writer table notes "
                  "(per s): copy {:.0f}, dispatch {:.0f}, upload {:.0f} | guest CPU waits while "
@@ -304,6 +306,8 @@ void Report(const char* thread_name, u64 window_ns) {
                  per_frame(at(Counter::StrongFromBuffer)),
                  per_frame(at(Counter::StrongFromTexture)),
                  per_frame(at(Counter::StrongFromBoth)),
+                 per_frame(at(Counter::StrongSkippedQueryNotCpuRead)),
+                 per_frame(at(Counter::StrongSkippedDownloadNotCpuRead)),
                  Ratio(at(Counter::HandoffPickupUs), handoffs),
                  Ratio(at(Counter::HandoffLockUs), handoffs),
                  static_cast<double>(at(Counter::HandoffLockMaxUs)),

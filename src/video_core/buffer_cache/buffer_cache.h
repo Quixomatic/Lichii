@@ -2377,6 +2377,25 @@ bool BufferCache<P>::HasUncommittedFlushes() const noexcept {
 }
 
 template <class P>
+bool BufferCache<P>::UncommittedFlushesCpuRead() const {
+    if (!AsyncBufferDownloads()) {
+        return true; // QueueFenceDownload queued only Preflushable (guest-read) ranges
+    }
+    bool cpu_read = false;
+    const auto check = [&cpu_read](DAddr begin, DAddr end) {
+        cpu_read = cpu_read || Tegra::Nx2IsCpuReadPage(begin, end - begin);
+    };
+    uncommitted_gpu_modified_ranges.ForEach(check);
+    for (const auto& ranges : committed_gpu_modified_ranges) {
+        if (cpu_read) {
+            break;
+        }
+        ranges.ForEach(check);
+    }
+    return cpu_read;
+}
+
+template <class P>
 bool BufferCache<P>::FlushesAreEarlyDownloads() const {
     return Tegra::g_nx2_ampere.load(std::memory_order_relaxed) && !AsyncBufferDownloads();
 }

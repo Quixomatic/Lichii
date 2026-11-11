@@ -517,6 +517,10 @@ struct GPU::Impl {
             return raster_area;
         }
         raster_area.preemtive = true;
+        // SYNC §15.2: the guest CPU reads GPU results here: later downloads and query results on
+        // these pages are work the guest will read (strong hints, rule I′).
+        Tegra::Nx2MarkCpuReadPage(raster_area.start_address,
+                                  raster_area.end_address - raster_area.start_address);
         // A guest CPU read of GPU-written memory (reactive flushing): count them, they decide
         // whether buffer data must be copied back at every fence (EDEN_NX2_BUFFER_DOWNLOADS).
         if (static std::atomic<u64> reads{}; (reads.fetch_add(1, std::memory_order_relaxed) & 63) == 0) {

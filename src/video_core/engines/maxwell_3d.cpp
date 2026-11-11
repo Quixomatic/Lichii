@@ -1474,6 +1474,14 @@ void Maxwell3D::ProcessQueryCondition() {
         break;
     }
     }
+    if (operands_read && Tegra::g_nx2_cpu_read_hints.load(std::memory_order_relaxed))
+        [[unlikely]] {
+        // SYNC §15.2: a CPU-side consumer of query results (render-enable evaluation): the
+        // reports written here are work a CPU reads (strong hints, rule I′).
+        if (const auto device = memory_manager.GpuToCpuAddress(condition_address)) {
+            Tegra::Nx2MarkCpuReadPage(*device, sizeof(cmp));
+        }
+    }
     if (const u64 trace =
             VideoCommon::QueryTrace::Sample(VideoCommon::QueryTrace::Event::CpuCondition)) {
         LOG_INFO(HW_GPU,

@@ -2228,6 +2228,26 @@ bool TextureCache<P>::HasUncommittedFlushes() const noexcept {
 }
 
 template <class P>
+bool TextureCache<P>::UncommittedFlushesCpuRead() {
+    for (const PendingDownload& download : uncommitted_downloads) {
+        if (download.is_swizzle) {
+            const ImageBase& image = download.GetImage(slot_images);
+            if (Tegra::Nx2IsCpuReadPage(image.cpu_addr, image.guest_size_bytes)) {
+                return true;
+            }
+            continue;
+        }
+        const BufferDownload& buffer = slot_buffer_downloads[download.object_id];
+        const auto device = gpu_memory != nullptr ? gpu_memory->GpuToCpuAddress(buffer.address)
+                                                  : std::nullopt;
+        if (!device || Tegra::Nx2IsCpuReadPage(*device, buffer.size)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+template <class P>
 bool TextureCache<P>::HasAsyncFlushWork() const noexcept {
     return !uncommitted_downloads.empty() || !uncommitted_async_buffers.empty();
 }

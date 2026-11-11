@@ -441,6 +441,10 @@ public:
     /// Return true when there are uncommitted images to be downloaded
     [[nodiscard]] bool HasUncommittedFlushes() const noexcept;
 
+    /// SYNC §15.2: whether an uncommitted download lands on a page a CPU consumer reads
+    /// (Nx2IsCpuReadPage; unknown translations count).
+    [[nodiscard]] bool UncommittedFlushesCpuRead();
+
     /// Whether CommitAsyncFlushes would commit anything (downloads or their buffers).
     [[nodiscard]] bool HasAsyncFlushWork() const noexcept;
 

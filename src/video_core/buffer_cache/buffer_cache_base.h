@@ -447,6 +447,10 @@ public:
     /// Return true when there are uncommitted buffers to be downloaded
     [[nodiscard]] bool HasUncommittedFlushes() const noexcept;
 
+    /// SYNC §15.2: whether a queued fence download is a range a CPU consumer reads: always for
+    /// Preflushable-only downloads (ranges the guest read), else per Tegra::Nx2IsCpuReadPage.
+    [[nodiscard]] bool UncommittedFlushesCpuRead() const;
+
     /// Whether the fence downloads queued are all learned early downloads (EDEN_NX2_V2_READBACK):
     /// Switch 2 titles without async buffer downloads mark pages Preflushable only by learning.
     [[nodiscard]] bool FlushesAreEarlyDownloads() const;

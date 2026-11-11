@@ -863,6 +863,8 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
     if (adapt_submit) {
         // F4-02/F4-03: fences ride the open submission; flushes are decided at pass boundaries.
         scheduler.SetLazyFences(true);
+        // SYNC §15.2: strong hints and rule I′ only for results a CPU consumer reads.
+        Tegra::g_nx2_cpu_read_hints.store(true, std::memory_order_relaxed);
         VideoCommon::V2::FlushParams params{};
         params.pass_boundaries = true;
         flush_heuristic = VideoCommon::V2::FlushHeuristic{params};
@@ -3410,7 +3412,18 @@ void RasterizerVulkan::Query(GPUVAddr gpu_addr, VideoCommon::QueryType type,
         // Perf fix C (MASTER_PLAN §5.5, §6): only a GPU-result-valued report (class D: counters,
         // query results) is work the guest reads back. A payload release is class A/B: S1 owns
         // its value, and its fence submits by itself; a hint there only made small submits.
-        FlushHint(VideoCommon::V2::FlushHint::Strong, StrongQuery);
+        // SYNC §15.2: and only a result a CPU consumer reads (a guest CPU read of the page, or
+        // render-enable evaluation). DXVK hints at the query *read*; OoT's results are mostly
+        // consumed on the GPU (bd24: 13 strong submits/f, all queries). The rest ride their tick;
+        // a thread that blocks on one files rule W.
+        const auto device = gpu_memory != nullptr ? gpu_memory->GpuToCpuAddress(gpu_addr)
+                                                  : std::nullopt;
+        if (device && Tegra::Nx2IsCpuReadPage(*device, 16)) {
+            FlushHint(VideoCommon::V2::FlushHint::Strong, StrongQuery);
+        } else {
+            VideoCommon::V2::P5bStats::Add(
+                VideoCommon::V2::P5bStats::Counter::StrongSkippedQueryNotCpuRead);
+        }
     }
 }
 
@@ -4161,8 +4174,14 @@ void RasterizerVulkan::FlushCommandsForFence(bool downloads, u8 committed) {
         return;
     }
     scheduler.WantSubmit();
-    if (downloads) {
-        // FenceManager's TextureFlushes (1) and BufferFlushes (2), for the source counters.
+    if (downloads && committed == 0) {
+        // SYNC §15.2: downloads no CPU consumer reads ride their tick; a thread that blocks on
+        // one files rule W.
+        VideoCommon::V2::P5bStats::Add(
+            VideoCommon::V2::P5bStats::Counter::StrongSkippedDownloadNotCpuRead);
+    } else if (downloads) {
+        // FenceManager's TextureFlushes (1) and BufferFlushes (2) with downloads a CPU consumer
+        // reads (SYNC §15.2), for the source counters.
         const u8 source = ((committed & 1) != 0 ? StrongTexture : 0) |
                           ((committed & 2) != 0 ? StrongBuffer : 0);
         FlushHint(VideoCommon::V2::FlushHint::Strong, source);

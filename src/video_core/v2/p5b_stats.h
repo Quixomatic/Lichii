@@ -179,6 +179,9 @@ enum class Counter : u32 {
     StrongFromBuffer,    ///< a fence that committed buffer downloads
     StrongFromTexture,   ///< ... texture downloads
     StrongFromBoth,      ///< ... both
+    // SYNC §15.2: hints not raised: no CPU consumer reads the range (they ride their tick).
+    StrongSkippedQueryNotCpuRead,
+    StrongSkippedDownloadNotCpuRead,
     // ... the submit thread's hand-off (SUBMITTHREAD): handed → picked up, the graphics queue
     // lock wait (the present holds it), the submit call; and submissions that waited > 1 ms for
     // the lock (queued behind a present).

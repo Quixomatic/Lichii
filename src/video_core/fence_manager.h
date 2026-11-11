@@ -28,6 +28,7 @@
 #include "video_core/gpu.h"
 #include "video_core/host1x/host1x.h"
 #include "video_core/host1x/syncpoint_manager.h"
+#include "video_core/nx2.h"
 #include "video_core/nx2_fast_draw.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/rasterizer_interface.h"
@@ -117,7 +118,7 @@ public:
             [[unlikely]] {
             V2::Commit::Stats::Count(V2::Commit::Stats::Get().writeback_queued);
         }
-        auto [should_flush, committed_flushes, early_only] =
+        auto [should_flush, committed_flushes, early_only, cpu_read_flushes] =
             defer ? CacheFlushes{} : CommitCacheFlushes();
         if (Nx2Profile::Enabled()) {
             NoteFenceDecision(delay_fence, committed_flushes);
@@ -145,8 +146,9 @@ public:
         // open tick for rule I′ and the table's pending-0 row; host-waited syncpoints mark it in
         // SignalSyncPoint. Operations that land at the fence (deferred reductions, fence-flagged
         // releases, reports, SyncOperations) don't: 3d25's I′ took 11.9 submits/f on them and
-        // the front's pending sleep didn't move.
-        const bool guest_visible = committed_flushes != 0;
+        // the front's pending sleep didn't move. SYNC §15.2: only downloads a CPU consumer reads
+        // (texture downloads to pages no CPU reads ride their tick).
+        const bool guest_visible = cpu_read_flushes != 0;
         {
             std::scoped_lock lock{uncommitted_guard};
             if (delay_fence) {
@@ -167,7 +169,8 @@ public:
             rasterizer.NoteGuestVisibleFence();
         }
         if (should_flush) {
-            rasterizer.FlushCommandsForFence(downloads, committed_flushes);
+            // SYNC §15.2: the strong hint only for downloads a CPU consumer reads.
+            rasterizer.FlushCommandsForFence(downloads, cpu_read_flushes);
         }
         if constexpr (can_async_check) {
             guard.unlock();
@@ -535,6 +538,9 @@ private:
         bool should_flush;  ///< Downloads to wait for: the fence must reach the host GPU
         u8 committed;       ///< TextureFlushes, BufferFlushes: the caches that committed downloads
         bool early_only;    ///< The buffer downloads are all learned early downloads
+        /// SYNC §15.2: TextureFlushes / BufferFlushes with a download a CPU consumer reads
+        /// (Tegra::Nx2IsCpuReadPage, or the buffer cache's learned preflushable ranges).
+        u8 cpu_read;
     };
 
     /// Commits the texture and buffer caches' downloads for a new fence (the query cache's are
@@ -545,9 +551,15 @@ private:
     /// waited for it).
     CacheFlushes CommitCacheFlushes() {
         CacheFlushes flushes{};
+        // SYNC §15.2: only EDEN_NX2_V2_ADAPTSUBMIT reads `cpu_read`; off, it is `committed`.
+        const bool cpu_read_hints = Tegra::g_nx2_cpu_read_hints.load(std::memory_order_relaxed);
         {
             std::scoped_lock lock{texture_cache.mutex};
             flushes.should_flush = texture_cache.HasUncommittedFlushes();
+            if (flushes.should_flush &&
+                (!cpu_read_hints || texture_cache.UncommittedFlushesCpuRead())) {
+                flushes.cpu_read |= TextureFlushes;
+            }
             if (texture_cache.HasAsyncFlushWork()) {
                 texture_cache.CommitAsyncFlushes();
                 flushes.committed |= TextureFlushes;
@@ -559,6 +571,9 @@ private:
                 // Learned early downloads never make a submission of their own: they ride the
                 // next one (a lazy fence), unless something else here needs the fence flushed.
                 const bool early = buffer_cache.FlushesAreEarlyDownloads();
+                if (!cpu_read_hints || buffer_cache.UncommittedFlushesCpuRead()) {
+                    flushes.cpu_read |= BufferFlushes;
+                }
                 buffer_cache.CommitAsyncFlushes();
                 flushes.early_only = early;
                 flushes.should_flush |= !early;
