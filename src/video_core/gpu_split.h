@@ -275,6 +275,11 @@ public:
         }
         return Tegra::Nx2MayBeGpuWritten(device_address, size);
     }
+    /// Front (SYNC §13.5 #1, STATS): the hazard table's overflows so far (entries folded into
+    /// its overflow marker).
+    [[nodiscard]] u64 HazardOverflows() const {
+        return hazards.Overflows();
+    }
     /// SYNC §12 R2a: the writers a command list fetch of one page waits for (DmaPusher::
     /// WaitForListWriters). The fetch is ordered after earlier engine work only by a host-level
     /// wait in between (83d6c8d78b): queued copies, uploads and bounded dispatches overlapping

@@ -305,6 +305,61 @@ TEST_CASE("V2 hazard table: overlap, forwarding and retirement", "[video_core][v
     }
 }
 
+// SYNC_SUBMIT_SPEC §13.5 #1: a Wait names its cause, so list-fetch waits can be told apart
+// (overlapping producer, unbounded write, scan cap, found cap, overflow marker).
+TEST_CASE("SYNC §13 hazard waits name their cause", "[video_core][v2_hazard]") {
+    HazardTable table;
+    HazardFilter all{};
+    SECTION("an overlapping unknown write") {
+        table.NoteRange(0x4000, 16, 8, Producer::Dispatch);
+        const HazardResult result = table.Find(0x4000, 8, 0, all);
+        REQUIRE(result.kind == Kind::Wait);
+        CHECK(result.cause == CauseRanged);
+        CHECK(result.causes == CauseRanged);
+    }
+    SECTION("an unbounded write, newer than an overlapping one") {
+        table.NoteRange(0x4000, 16, 8, Producer::Dispatch);
+        table.NoteUnbounded(Producer::Copy, 9);
+        all.unbounded = ProducerBit(Producer::Copy);
+        const HazardResult result = table.Find(0x4000, 8, 0, all);
+        REQUIRE(result.kind == Kind::Wait);
+        CHECK(result.position == 9);
+        CHECK(result.cause == CauseUnbounded);
+        CHECK(result.causes == (CauseUnbounded | CauseRanged));
+    }
+    SECTION("the scan cap: more known stores on the page than a lookup visits") {
+        for (u64 i = 0; i <= HazardTable::MaxScan; ++i) {
+            const u32 value = static_cast<u32>(i);
+            table.NoteKnown(0x10004 + i * 4, &value, 4, 10 + i, Producer::Copy);
+        }
+        const HazardResult result = table.Find(0x10000, 4, 0, all);
+        REQUIRE(result.kind == Kind::Wait);
+        CHECK(result.cause == CauseScanCap);
+        CHECK(result.overflow);
+    }
+    SECTION("the found cap: more known stores overlap than a lookup forwards") {
+        for (u64 i = 0; i < 65; ++i) {
+            const u32 value = static_cast<u32>(i);
+            table.NoteKnown(0x20000 + i * 4, &value, 4, 10 + i, Producer::Copy);
+        }
+        const HazardResult result = table.Find(0x20000, 0x200, 0, all);
+        REQUIRE(result.kind == Kind::Wait);
+        CHECK(result.cause == CauseFoundCap);
+    }
+    SECTION("the overflow marker: more pending entries than the table holds") {
+        for (u64 i = 0; i <= HazardTable::Capacity; ++i) {
+            table.NoteRange(0x100000 + i * 0x1000, 16, 10 + i, Producer::CbData);
+        }
+        CHECK(table.Overflows() >= 1);
+        HazardFilter dispatches;
+        dispatches.ranged = ProducerBit(Producer::Dispatch);
+        const HazardResult result = table.Find(0x9000'0000, 4, 0, dispatches);
+        REQUIRE(result.kind == Kind::Wait);
+        CHECK(result.cause == CauseOverflow);
+        CHECK(result.producers == 0); // no writer overlaps the read
+    }
+}
+
 TEST_CASE("V2 hazard table: lookups match a model on random writes", "[video_core][v2_hazard]") {
     struct Write {
         u64 address;

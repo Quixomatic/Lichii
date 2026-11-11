@@ -141,6 +141,21 @@ enum class Counter : u32 {
     ListFetchGpuPages,    ///< pages may be GPU-written: unbounded writers before the sync count
     ListFetchResidual,    ///< ...never GPU-written pages: unbounded writers skipped (MP §11)
     HostSyncpointRequests,///< SYNC §12.4 R3: rule W requests for host-waited syncpoint fences
+    // SYNC §13.5 #1: list fetches that waited, by the cause of the position waited for
+    // (V2::WaitCause), CPU-written lists, then GPU-written ones; hazard table overflows.
+    ListWaitCpuOther,
+    ListWaitCpuRanged,
+    ListWaitCpuUnbounded,
+    ListWaitCpuScanCap,
+    ListWaitCpuFoundCap,
+    ListWaitCpuOverflow,
+    ListWaitGpuOther,
+    ListWaitGpuRanged,
+    ListWaitGpuUnbounded,
+    ListWaitGpuScanCap,
+    ListWaitGpuFoundCap,
+    ListWaitGpuOverflow,
+    HazardOverflows,
     Count,
 };
 

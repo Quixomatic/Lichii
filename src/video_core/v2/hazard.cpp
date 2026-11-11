@@ -13,6 +13,17 @@ namespace {
 constexpr u64 PageBits = 12;
 constexpr size_t NumProducers = static_cast<size_t>(Producer::Count);
 
+/// Raises the wait to `position` for `cause` (SYNC §13.5 #1: HazardResult::causes / cause).
+void Raise(HazardResult& result, u64& wait, u64 position, u8 cause) {
+    result.causes |= cause;
+    if (position >= wait) {
+        if (position > wait || result.cause == 0) {
+            result.cause = cause;
+        }
+        wait = position;
+    }
+}
+
 } // Anonymous namespace
 
 HazardTable::HazardTable() = default;
@@ -228,7 +239,8 @@ void HazardTable::Linear(u64 address, u64 end, u64 consumed, u32 ranged, HazardR
             return; // Older entries ran too
         }
         if (++visited > MaxScan) {
-            wait = std::max(wait, entries[(head + count - 1) & (Capacity - 1)].position);
+            Raise(result, wait, entries[(head + count - 1) & (Capacity - 1)].position,
+                  CauseScanCap);
             result.overflow = true;
             return;
         }
@@ -238,11 +250,11 @@ void HazardTable::Linear(u64 address, u64 end, u64 consumed, u32 ranged, HazardR
         }
         result.producers |= bit;
         if (entry.known == 0) {
-            wait = std::max(wait, entry.position);
+            Raise(result, wait, entry.position, CauseRanged);
             return;
         }
         if (num_found == found.size()) {
-            wait = std::max(wait, entry.position);
+            Raise(result, wait, entry.position, CauseFoundCap);
             result.overflow = true;
             return;
         }
@@ -276,12 +288,12 @@ HazardResult HazardTable::Find(u64 address, u64 size, u64 consumed, const Hazard
                                 channel_synced[current_channel % ChannelSlots][p]);
         }
         if (position > consumed) {
-            wait = std::max(wait, position);
+            Raise(result, wait, position, CauseUnbounded);
             result.producers |= bit;
         }
     }
     if (overflow_position > consumed) {
-        wait = std::max(wait, overflow_position);
+        Raise(result, wait, overflow_position, CauseOverflow);
         result.overflow = true;
     }
     const u64 end = address + size;
@@ -323,7 +335,7 @@ HazardResult HazardTable::Find(u64 address, u64 size, u64 consumed, const Hazard
                 }
                 // Wide writes are not forwarded (their order against the chains' is unknown).
                 result.producers |= bit;
-                wait = std::max(wait, entry.position);
+                Raise(result, wait, entry.position, CauseRanged);
             }
             for (u64 page = first_page; page <= last_page; ++page) {
                 // The read's bytes on this page: once newer known stores cover them, older
@@ -337,7 +349,7 @@ HazardResult HazardTable::Find(u64 address, u64 size, u64 consumed, const Hazard
                 while (Live(link, consumed)) {
                     const Entry& entry = entries[link.index];
                     if (++visited > MaxScan) {
-                        wait = std::max(wait, (*slots)[Slot(page)].position);
+                        Raise(result, wait, (*slots)[Slot(page)].position, CauseScanCap);
                         result.overflow = true;
                         break;
                     }
@@ -345,11 +357,11 @@ HazardResult HazardTable::Find(u64 address, u64 size, u64 consumed, const Hazard
                     if ((filter.ranged & bit) != 0 && entry.end > address && entry.begin < end) {
                         result.producers |= bit;
                         if (entry.known == 0) {
-                            wait = std::max(wait, entry.position);
+                            Raise(result, wait, entry.position, CauseRanged);
                             break; // Older ones on this page are behind the wait
                         }
                         if (num_found == found.size()) {
-                            wait = std::max(wait, entry.position);
+                            Raise(result, wait, entry.position, CauseFoundCap);
                             result.overflow = true;
                             break;
                         }

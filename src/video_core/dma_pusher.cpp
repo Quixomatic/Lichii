@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
@@ -645,6 +646,40 @@ void DmaPusher::CallMultiMethod(const u32* base_start, u32 num_methods) {
     }
 }
 
+namespace {
+/// SYNC_SUBMIT_SPEC §13.5 #1 (STATS, front thread): a list fetch's wait by the cause of the
+/// position it waited for (HazardResult::cause), CPU- and GPU-written lists apart, and the hazard
+/// table's overflows since the previous fetch.
+void NoteListWaitCause(bool cpu_written, bool waited, u8 cause, u64 overflows) {
+    namespace P5b = VideoCommon::V2::P5bStats;
+    using P5b::Counter;
+    static u64 seen_overflows = 0;
+    if (overflows > seen_overflows) {
+        P5b::Add(Counter::HazardOverflows, overflows - seen_overflows);
+    }
+    seen_overflows = overflows;
+    if (!waited) {
+        return;
+    }
+    static constexpr std::array<Counter, 6> cpu{
+        Counter::ListWaitCpuOther,    Counter::ListWaitCpuRanged,  Counter::ListWaitCpuUnbounded,
+        Counter::ListWaitCpuScanCap,  Counter::ListWaitCpuFoundCap, Counter::ListWaitCpuOverflow,
+    };
+    static constexpr std::array<Counter, 6> gpu{
+        Counter::ListWaitGpuOther,    Counter::ListWaitGpuRanged,  Counter::ListWaitGpuUnbounded,
+        Counter::ListWaitGpuScanCap,  Counter::ListWaitGpuFoundCap, Counter::ListWaitGpuOverflow,
+    };
+    using namespace VideoCommon::V2;
+    const size_t index = cause == CauseRanged      ? 1
+                         : cause == CauseUnbounded ? 2
+                         : cause == CauseScanCap   ? 3
+                         : cause == CauseFoundCap  ? 4
+                         : cause == CauseOverflow  ? 5
+                                                   : 0;
+    P5b::Add((cpu_written ? cpu : gpu)[index]);
+}
+} // Anonymous namespace
+
 bool DmaPusher::WaitForListWriters(GPUVAddr address, size_t size, bool cpu_written) {
     namespace V2 = VideoCommon::V2;
     using V2::Stats::Decision;
@@ -668,6 +703,7 @@ bool DmaPusher::WaitForListWriters(GPUVAddr address, size_t size, bool cpu_writt
     u32 producers = 0;
     bool gpu_pages = false;
     bool residual = false;
+    u8 wait_cause = 0; ///< SYNC §13.5 #1: the cause of the newest position waited for
     const bool stats = V2::P5bStats::Enabled();
     for (GPUVAddr chunk = address; chunk < address + size;) {
         const GPUVAddr chunk_end =
@@ -682,6 +718,9 @@ bool DmaPusher::WaitForListWriters(GPUVAddr address, size_t size, bool cpu_writt
         const V2::HazardFilter filter = VideoCommon::GpuSplit::ListFetchFilter(cpu_written, gpu_page);
         const V2::HazardResult result = split.FindWrites(*device, chunk_end - chunk, filter);
         if (result.kind == V2::HazardResult::Kind::Wait) {
+            if (result.position > target) {
+                wait_cause = result.cause;
+            }
             target = std::max(target, result.position);
             producers |= result.producers;
         }
@@ -702,6 +741,9 @@ bool DmaPusher::WaitForListWriters(GPUVAddr address, size_t size, bool cpu_writt
                           : target <= consumed ? Counter::ListFetchNoWait
                           : gpu_pages          ? Counter::ListFetchGpuPages
                                                : Counter::ListFetchRanged);
+    }
+    if (stats) [[unlikely]] {
+        NoteListWaitCause(cpu_written, target > consumed, wait_cause, split.HazardOverflows());
     }
     V2::Stats::NoteDecision(site, target <= consumed  ? Decision::Avoided
                                   : target < old_target ? Decision::Narrowed

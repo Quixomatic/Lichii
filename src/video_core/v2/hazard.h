@@ -80,6 +80,19 @@ struct HazardResult {
     /// back consumed may still be to land at its operation; `position` is the ring position of
     /// its entry. Waiting for the back to consume doesn't settle it (GpuSplit::CompleteLanding).
     bool untracked = false;
+    /// SYNC_SUBMIT_SPEC §13.5 #1 (HazardTable::Find, Wait): what made the wait (WaitCause bits),
+    /// and the cause of the newest position waited for (`position`).
+    u8 causes = 0;
+    u8 cause = 0;
+};
+
+/// Why HazardTable::Find answered Wait (HazardResult::causes / cause).
+enum WaitCause : u8 {
+    CauseRanged = 1,    ///< a pending write of a filtered producer overlaps the range
+    CauseUnbounded = 2, ///< an unbounded write of a filtered producer (queued, or before the sync)
+    CauseScanCap = 4,   ///< a lookup visited MaxScan entries
+    CauseFoundCap = 8,  ///< more known stores overlap than a lookup forwards
+    CauseOverflow = 16, ///< the table's overflow marker (more than Capacity entries pending)
 };
 
 /// Landing tickets (v2/landing.h): ring position << LandingSubBits | index within the entry.

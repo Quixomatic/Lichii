@@ -198,6 +198,23 @@ void Report(const char* thread_name, u64 window_ns) {
                  PerSecond(at(Counter::ListFetchGpuPages), seconds),
                  PerSecond(at(Counter::ListFetchResidual), seconds),
                  PerSecond(at(Counter::HostSyncpointRequests), seconds));
+        const auto causes = [&](Counter first) {
+            std::string text;
+            static constexpr std::array<const char*, 6> names{
+                "other", "ranged", "unbounded", "scan cap", "found cap", "overflow marker"};
+            for (size_t i = 0; i < names.size(); ++i) {
+                text += fmt::format("{}{} {:.0f}", i == 0 ? "" : ", ", names[i],
+                                    PerSecond(at(static_cast<Counter>(
+                                                  static_cast<u32>(first) + i)),
+                                              seconds));
+            }
+            return text;
+        };
+        LOG_INFO(HW_GPU,
+                 "V2 stats {} SYNC §13 list-fetch waits by cause (per s) | CPU-written: {} | "
+                 "GPU-written: {} | hazard table overflows {:.0f}/s",
+                 thread_name, causes(Counter::ListWaitCpuOther), causes(Counter::ListWaitGpuOther),
+                 PerSecond(at(Counter::HazardOverflows), seconds));
     }
     // F4-06: which untracked operations still flush every pending write.
     LOG_INFO(HW_GPU, "V2 stats {} P5b full barriers by site (per frame) | {}", thread_name,
