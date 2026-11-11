@@ -222,11 +222,19 @@ void Report(const char* thread_name, u64 window_ns) {
                  PerSecond(at(Counter::GpuListUnboundedNewer), seconds));
         LOG_INFO(HW_GPU,
                  "V2 stats {} SYNC §14 | decisions by measured pending (per frame): 0 {:.1f}, "
-                 "1 {:.1f}, 2+ {:.1f} | I′ batch-end submits {:.2f}/frame",
+                 "1 {:.1f}, 2+ {:.1f} | I′ batch-end submits {:.2f}/frame | acquire passes by "
+                 "cause (per s, without a tick / at a tick): latch {:.0f} / {:.0f}, parse "
+                 "{:.0f} / {:.0f}, memory {:.0f} / {:.0f}",
                  thread_name, per_frame(at(Counter::DecisionsPending0)),
                  per_frame(at(Counter::DecisionsPending1)),
                  per_frame(at(Counter::DecisionsPending2)),
-                 per_frame(at(Counter::SubmitsBatchEnd)));
+                 per_frame(at(Counter::SubmitsBatchEnd)),
+                 PerSecond(at(Counter::ResumeLatchRing), seconds),
+                 PerSecond(at(Counter::ResumeLatchTick), seconds),
+                 PerSecond(at(Counter::ResumeParseRing), seconds),
+                 PerSecond(at(Counter::ResumeParseTick), seconds),
+                 PerSecond(at(Counter::ResumeMemoryRing), seconds),
+                 PerSecond(at(Counter::ResumeMemoryTick), seconds));
     }
     // F4-06: which untracked operations still flush every pending write.
     LOG_INFO(HW_GPU, "V2 stats {} P5b full barriers by site (per frame) | {}", thread_name,

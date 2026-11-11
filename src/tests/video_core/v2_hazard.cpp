@@ -1169,6 +1169,25 @@ TEST_CASE("V2 front wake: a ring ends the suspended front's sleep", "[video_core
     stop.store(true);
 }
 
+// SYNC_SUBMIT_SPEC §14 #4: the resume-cause counter tells passes found after a timer tick from
+// those a ring (or a yield poll) brought; the front spin ships only if the first dominate.
+TEST_CASE("SYNC §14 #4: a pass after a tick-ended sleep is told from a rung one",
+          "[video_core][v2_hazard]") {
+    namespace FrontWake = VideoCommon::V2::FrontWake;
+    // A sleep no ring ended (gpu_thread: the ring epoch didn't move during it).
+    u64 before = FrontWake::Epoch();
+    FrontWake::NoteSleepEnd(FrontWake::Epoch() == before);
+    CHECK(FrontWake::PassAfterTick());
+    // The pass ran: the next one counts as without a tick until another tick-ended sleep.
+    FrontWake::NoteSleepEnd(false);
+    CHECK_FALSE(FrontWake::PassAfterTick());
+    // A ring during the sleep (a CPU store has none; a latch or a landing does).
+    before = FrontWake::Epoch();
+    FrontWake::Ring();
+    FrontWake::NoteSleepEnd(FrontWake::Epoch() == before);
+    CHECK_FALSE(FrontWake::PassAfterTick());
+}
+
 TEST_CASE("SYNC step 5: each wake source rings the front's sleep until a ring",
           "[video_core][v2_hazard]") {
     namespace FrontWake = VideoCommon::V2::FrontWake;

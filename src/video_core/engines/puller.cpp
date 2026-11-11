@@ -461,6 +461,25 @@ bool Puller::PendingAcquire::Matches(u32 current) const {
     }
 }
 
+namespace {
+/// SYNC_SUBMIT_SPEC §14 #4 (§13.5 #3, MP §13 "every miss records a reason"): what let a
+/// suspended acquire pass, and whether the pass came only after a timer tick ended the front's
+/// sleep (it then waited for the tick: the front spin of §13.5 #6 ships only if these dominate).
+enum class ResumeCause : u8 { Latch, Parse, Memory };
+void NoteResumeCause(ResumeCause cause) {
+    namespace P5b = V2::P5bStats;
+    if (!P5b::Enabled()) [[likely]] {
+        return;
+    }
+    static constexpr std::array<std::array<P5b::Counter, 2>, 3> counters{{
+        {P5b::Counter::ResumeLatchRing, P5b::Counter::ResumeLatchTick},
+        {P5b::Counter::ResumeParseRing, P5b::Counter::ResumeParseTick},
+        {P5b::Counter::ResumeMemoryRing, P5b::Counter::ResumeMemoryTick},
+    }};
+    P5b::Add(counters[static_cast<size_t>(cause)][V2::FrontWake::PassAfterTick() ? 1 : 0]);
+}
+} // Anonymous namespace
+
 bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
     if (pending_acquire && VideoCommon::GpuSplit::Get().AcquireMode() != V2::Mode::Off)
         [[unlikely]] {
@@ -530,9 +549,12 @@ bool Puller::PollAcquireView(DmaPusher& dma_pusher) {
         decided = true;
         passes = true;
         NoteViewDecision(check);
+        NoteResumeCause(check.verdict == V2::AcquireVerdict::MetByQueued ? ResumeCause::Parse
+                                                                           : ResumeCause::Memory);
     } else if (Nx2SemaphoreWaiters::Get().Latched(this)) {
         decided = true;
         passes = true;
+        NoteResumeCause(ResumeCause::Latch);
     } else if (!verify && SuspendsOnView(check)) {
         decided = true;
         const bool gpu_written = check.reason == Reason::GpuWritten;

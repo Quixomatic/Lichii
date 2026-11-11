@@ -165,6 +165,14 @@ enum class Counter : u32 {
     DecisionsPending1,
     DecisionsPending2, ///< two or more
     SubmitsBatchEnd,   ///< SYNC §14 #3 rule I′: batch end, GPU drained, guest-visible fence open
+    // SYNC §14 #4: suspended acquires' passes by cause, found without a tick (a ring, a yield
+    // poll) or right after a timer tick ended the front's sleep.
+    ResumeLatchRing,
+    ResumeLatchTick,
+    ResumeParseRing,
+    ResumeParseTick,
+    ResumeMemoryRing,
+    ResumeMemoryTick,
     Count,
 };
 

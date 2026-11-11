@@ -106,6 +106,7 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                         Profile::Scope scope{Profile::Zone::ResumePending};
                         resumed = scheduler.ResumePending(system.GPU());
                     }
+                    V2::FrontWake::NoteSleepEnd(false); // SYNC §14 #4: only this pass counts it
                     last_event_epoch = event_epoch;
                     last_pass = now;
                     resume_due = resumed;
@@ -139,11 +140,15 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                         // (spec §2.2): one tick only while a guest CPU waiter polls memory;
                         // otherwise every wake source rings, so sleep until one does.
                         if (cpu_waiter_due || V2::FrontWake::TakeTickWaiter()) {
+                            const u64 rings_before = V2::FrontWake::Epoch();
                             V2::FrontWake::Sleep();
+                            // SYNC §14 #4: no ring during the sleep: the tick ended it.
+                            V2::FrontWake::NoteSleepEnd(V2::FrontWake::Epoch() == rings_before);
                             V2::Stats::NoteFrontSleep(static_cast<u8>(V2::FrontWake::SleepEnd::Tick));
                         } else {
-                            V2::Stats::NoteFrontSleep(
-                                static_cast<u8>(V2::FrontWake::SleepUntilRing(ring_epoch)));
+                            const auto end = V2::FrontWake::SleepUntilRing(ring_epoch);
+                            V2::FrontWake::NoteSleepEnd(end != V2::FrontWake::SleepEnd::Ring);
+                            V2::Stats::NoteFrontSleep(static_cast<u8>(end));
                         }
                     } else if (waited < std::chrono::seconds{2}) {
 #ifdef _WIN32

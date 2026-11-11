@@ -46,6 +46,18 @@ enum class SleepEnd : u8 {
 /// by a liveness backstop (a missing ring source would show as Timeout, never as a hang).
 SleepEnd SleepUntilRing(u64 seen);
 
+/// Front (SYNC §14 #4, the resume-cause counter): whether the pass about to run follows a sleep
+/// that a timer tick (or the liveness bound) ended, no ring: a resume found then waited for it.
+namespace Detail {
+inline bool after_tick = false;
+}
+inline void NoteSleepEnd(bool by_tick) {
+    Detail::after_tick = by_tick;
+}
+[[nodiscard]] inline bool PassAfterTick() {
+    return Detail::after_tick;
+}
+
 /// Front: the suspended channels' polls of this pass found a guest CPU waiter (re-armed per pass).
 inline void NoteTickWaiter() {
     Detail::tick_waiter = true;
