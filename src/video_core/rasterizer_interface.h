@@ -152,6 +152,12 @@ public:
     /// Switch 2: the front flushed this command list page with the split drained.
     virtual void NoteGpuWrittenCommandListSynced([[maybe_unused]] DAddr page) {}
 
+    /// SYNC §13.5 #5: the split's ring position of the newest GPU write the back ran to this
+    /// command list page (0: unknown, the fetch then waits for every writer).
+    [[nodiscard]] virtual u64 GpuWrittenListWriterPosition([[maybe_unused]] DAddr page) {
+        return 0;
+    }
+
     virtual void FlushGpuWrittenCommandListPages(std::span<const DAddr> pages) {
         for (const DAddr page : pages) {
             FlushRegion(page, 0x1000, VideoCommon::CacheType::BufferCache);

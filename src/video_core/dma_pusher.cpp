@@ -704,6 +704,7 @@ bool DmaPusher::WaitForListWriters(GPUVAddr address, size_t size, bool cpu_writt
     bool gpu_pages = false;
     bool residual = false;
     u8 wait_cause = 0; ///< SYNC §13.5 #1: the cause of the newest position waited for
+    bool gpu_unbounded = false; ///< §13.5 #5: a page's last writer wasn't a note over it
     const bool stats = V2::P5bStats::Enabled();
     for (GPUVAddr chunk = address; chunk < address + size;) {
         const GPUVAddr chunk_end =
@@ -715,8 +716,19 @@ bool DmaPusher::WaitForListWriters(GPUVAddr address, size_t size, bool cpu_writt
         }
         const bool gpu_page = !cpu_written || split.MayBeGpuWrittenPage(*device, chunk_end - chunk);
         gpu_pages |= gpu_page;
-        const V2::HazardFilter filter = VideoCommon::GpuSplit::ListFetchFilter(cpu_written, gpu_page);
-        const V2::HazardResult result = split.FindWrites(*device, chunk_end - chunk, filter);
+        // SYNC §13.5 #5: a GPU-written page waits for its newest writer note only.
+        bool page_unbounded = false;
+        const V2::HazardResult result =
+            cpu_written
+                ? split.FindWrites(*device, chunk_end - chunk,
+                                   VideoCommon::GpuSplit::ListFetchFilter(true, gpu_page))
+                : split.FindGpuListWriters(
+                      *device, chunk_end - chunk,
+                      rasterizer != nullptr
+                          ? rasterizer->GpuWrittenListWriterPosition(*device & ~u64{0xfff})
+                          : 0,
+                      page_unbounded);
+        gpu_unbounded |= page_unbounded;
         if (result.kind == V2::HazardResult::Kind::Wait) {
             if (result.position > target) {
                 wait_cause = result.cause;
@@ -744,6 +756,12 @@ bool DmaPusher::WaitForListWriters(GPUVAddr address, size_t size, bool cpu_writt
     }
     if (stats) [[unlikely]] {
         NoteListWaitCause(cpu_written, target > consumed, wait_cause, split.HazardOverflows());
+        if (!cpu_written) {
+            using V2::P5bStats::Counter;
+            V2::P5bStats::Add(target <= consumed ? Counter::GpuListNoWait
+                              : gpu_unbounded    ? Counter::GpuListUnboundedNewer
+                                                 : Counter::GpuListPageProducer);
+        }
     }
     V2::Stats::NoteDecision(site, target <= consumed  ? Decision::Avoided
                                   : target < old_target ? Decision::Narrowed
@@ -770,7 +788,49 @@ bool DmaPusher::WaitForListWriters(GPUVAddr address, size_t size, bool cpu_writt
         return split.WaitForPosition(target, site);
     }
     if (!cpu_written) {
-        return split.WaitForWriters(); // Verify: GPU-written lists are read from their copies
+        // Verify (SYNC §13.5 #5): GPU-written lists are read from their page copies; read them
+        // after the narrow wait, then after the full one, and compare.
+        const bool waited = target > consumed && split.WaitForPosition(target, site);
+        using GpuWrittenList = VideoCore::RasterizerInterface::GpuWrittenList;
+        const auto read_copies = [&](std::vector<u8>& bytes) {
+            bytes.resize(size);
+            for (GPUVAddr chunk = address; chunk < address + size;) {
+                const GPUVAddr chunk_end =
+                    std::min<GPUVAddr>(address + size, (chunk & ~GPUVAddr{0xfff}) + 0x1000);
+                const std::span<u8> part{bytes.data() + (chunk - address),
+                                         static_cast<size_t>(chunk_end - chunk)};
+                const auto device = memory_manager.GpuToCpuAddress(chunk);
+                if (!device || rasterizer == nullptr) {
+                    return false;
+                }
+                const GpuWrittenList where =
+                    rasterizer->ReadGpuWrittenCommandList(*device, part, true, nullptr);
+                if (where == GpuWrittenList::Synced) {
+                    memory_manager.ReadBlockUnsafe(chunk, part.data(), part.size());
+                } else if (where != GpuWrittenList::Copied) {
+                    return false; // The fetch falls back to the flush path
+                }
+                chunk = chunk_end;
+            }
+            return true;
+        };
+        std::vector<u8> narrow;
+        std::vector<u8> full;
+        const bool narrow_read = read_copies(narrow);
+        const bool waited_old = split.WaitForWriters();
+        const bool full_read = read_copies(full);
+        if (narrow_read && full_read && narrow != full) {
+            V2::Stats::NoteMismatch(site);
+            static std::atomic<u32> logged{};
+            if (logged.fetch_add(1) < 32) {
+                LOG_WARNING(HW_GPU,
+                            "V2 hazard verify: GPU-written command list {:#x} ({} bytes) read "
+                            "from its copy after a wait for {} differs from the read after the "
+                            "writers {}",
+                            address, size, target, old_target);
+            }
+        }
+        return waited || waited_old;
     }
     // Verify: read the words after the narrow wait, then wait as before and compare.
     const bool waited = target > consumed && split.WaitForPosition(target, site);

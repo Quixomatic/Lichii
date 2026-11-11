@@ -212,9 +212,14 @@ void Report(const char* thread_name, u64 window_ns) {
         };
         LOG_INFO(HW_GPU,
                  "V2 stats {} SYNC §13 list-fetch waits by cause (per s) | CPU-written: {} | "
-                 "GPU-written: {} | hazard table overflows {:.0f}/s",
+                 "GPU-written: {} | hazard table overflows {:.0f}/s | GPU-written fetches (per "
+                 "s): no wait {:.0f}, page producer only {:.0f}, unbounded page (full wait) "
+                 "{:.0f}",
                  thread_name, causes(Counter::ListWaitCpuOther), causes(Counter::ListWaitGpuOther),
-                 PerSecond(at(Counter::HazardOverflows), seconds));
+                 PerSecond(at(Counter::HazardOverflows), seconds),
+                 PerSecond(at(Counter::GpuListNoWait), seconds),
+                 PerSecond(at(Counter::GpuListPageProducer), seconds),
+                 PerSecond(at(Counter::GpuListUnboundedNewer), seconds));
     }
     // F4-06: which untracked operations still flush every pending write.
     LOG_INFO(HW_GPU, "V2 stats {} P5b full barriers by site (per frame) | {}", thread_name,

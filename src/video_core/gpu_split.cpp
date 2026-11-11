@@ -211,6 +211,7 @@ void GpuSplit::MaybeStart(Core::System& system_) {
     cb_translations.fill({});
     unlanded.Clear();
     sem_view.Clear();
+    list_page_notes.clear(); // ring positions start again
     ticket_position = 0;
     ticket_sub = 0;
     last_ticket = 0;
@@ -302,6 +303,7 @@ void GpuSplit::Stop() {
     pending_cb = {};
     unlanded.Clear();
     sem_view.Clear();
+    list_page_notes.clear();
     ticket_position = 0;
     ticket_sub = 0;
     last_ticket = 0;

@@ -290,6 +290,12 @@ inline void ResetUntracked() {
     untracked_evicted.store(0, std::memory_order_relaxed);
 }
 
+/// Back (SYNC §13.5 #5): the ring position of the entry it runs, inside an Untracked scope too
+/// (QMD-launched dispatches); 0 when the front doesn't record writes.
+[[nodiscard]] inline u64 BackPosition() {
+    return tag != 0 ? tag : untracked_tag;
+}
+
 /// Back: an untracked write of [address, address + size) (device) about to land at a delayed
 /// operation: its ticket (0 outside an Untracked scope, or when the front doesn't record). Only
 /// operations that wait for their fence take one: one run at once is in memory before the back

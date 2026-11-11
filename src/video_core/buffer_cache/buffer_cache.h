@@ -31,6 +31,7 @@
 #include "video_core/texture_cache/util.h"
 #include "video_core/v2/cbuf_ring.h"
 #include "video_core/v2/cbuf_version.h"
+#include "video_core/v2/landing.h"
 #include "video_core/v2/p3_stats.h"
 #include "video_core/v2/v2_stats.h"
 #include "video_core/v2/versions.h"
@@ -4264,6 +4265,7 @@ void BufferCache<P>::Nx2NoteListWrite(BufferId buffer_id, DAddr device_addr, u64
                     std::scoped_lock lock{nx2_list_mutex};
                     Nx2ListPage& entry = nx2_list_pages[page_addr];
                     ++entry.writes;
+                    entry.writer_position = VideoCommon::V2::Landing::BackPosition();
                     if (!nx2_collect_list_copies && !entry.draw_written) {
                         entry.draw_written = true;
                         LOG_INFO(HW_GPU, "Command list page {:#x} is written by draws too: its "
@@ -4415,6 +4417,17 @@ void BufferCache<P>::Nx2NoteListSynced(DAddr page) {
         std::scoped_lock lock{nx2_list_mutex};
         Nx2ListPage& entry = nx2_list_pages[page];
         entry.synced_writes = entry.writes;
+    }
+}
+
+template <class P>
+u64 BufferCache<P>::Nx2ListWriterPosition(DAddr page) {
+    if constexpr (IS_OPENGL) {
+        return 0;
+    } else {
+        std::scoped_lock lock{nx2_list_mutex};
+        const auto it = nx2_list_pages.find(page);
+        return it != nx2_list_pages.end() ? it->second.writer_position : 0;
     }
 }
 

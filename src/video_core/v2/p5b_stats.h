@@ -156,6 +156,10 @@ enum class Counter : u32 {
     ListWaitGpuFoundCap,
     ListWaitGpuOverflow,
     HazardOverflows,
+    // SYNC §13.5 #5: GPU-written list fetches by decision.
+    GpuListNoWait,         ///< the page's writers ran
+    GpuListPageProducer,   ///< waited for the page's newest ranged writer only
+    GpuListUnboundedNewer, ///< the page's last writer wasn't noted over it: the full wait
     Count,
 };
 

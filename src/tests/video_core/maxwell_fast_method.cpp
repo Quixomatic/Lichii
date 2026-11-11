@@ -2359,6 +2359,58 @@ TEST_CASE("SYNC §12 R2: a CPU-written list waits only for its exact producer",
     }
 }
 
+// SYNC_SUBMIT_SPEC §13.5 #5 (1f66: GPU-written list fetches 8.3% of front samples, ~2 ms each):
+// they waited for the newest unbounded Copy/Dispatch/Upload on any channel, a writer drain.
+TEST_CASE("SYNC §13.5 #5: a GPU-written list waits only for its page's producer",
+          "[video_core][gpu_split_dispatch][v2_hazard]") {
+    using Access = VideoCommon::GpuSplitTestAccess;
+    using VideoCommon::GpuSplit;
+    namespace V2 = VideoCommon::V2;
+    using Kind = V2::HazardResult::Kind;
+    Fixture f;
+    f.system.Initialize();
+    GpuSplit split;
+    Access::Initialize(split, f.system, 100);
+    Access::SetTracksWrites(split, true);
+    constexpr u64 list = 0x7'6000'0000;  // culling output: a command list page
+    constexpr u64 other = 0x7'6100'0000; // a list page no noted writer covers
+    Tegra::Nx2MarkCommandListPage(list);
+    Tegra::Nx2MarkCommandListPage(other);
+    Access::SetEnd(split, 110);
+    split.NoteUnboundedWrite(V2::Producer::Dispatch); // an unrelated unknown dispatch
+    Access::SetEnd(split, 120);
+    split.NoteRangeWrite(list + 0x40, 0x20, V2::Producer::Dispatch); // its QMD's storage range
+    Access::SetEnd(split, 130);
+    split.NoteUnboundedWrite(V2::Producer::Copy);
+    REQUIRE(split.ListPageNote(list) == 120);
+    REQUIRE(split.ListPageNote(other) == 0);
+    bool page_unbounded = true;
+    SECTION("the page's last write came from a noted writer: only the page's producer") {
+        const V2::HazardResult result = split.FindGpuListWriters(list, 0x100, 120, page_unbounded);
+        CHECK_FALSE(page_unbounded);
+        REQUIRE(result.kind == Kind::Wait);
+        CHECK(result.position == 120);
+        // The full wait (before #5) waited for the newest unbounded writer.
+        CHECK(split.FindWrites(list, 0x100, GpuSplit::ListFetchFilter(false, true)).position ==
+              130);
+        // Idle back: once it ran the producer the fetch reads its copy, whatever else is queued.
+        Access::SetBack(split, 120, false);
+        CHECK(split.FindGpuListWriters(list, 0x100, 120, page_unbounded).kind == Kind::Clear);
+    }
+    SECTION("its last write came from a writer the front didn't note over it: every writer") {
+        const V2::HazardResult result = split.FindGpuListWriters(list, 0x100, 125, page_unbounded);
+        CHECK(page_unbounded);
+        REQUIRE(result.kind == Kind::Wait);
+        CHECK(result.position == 130);
+    }
+    SECTION("no note over the page, or no writer position known: every writer") {
+        CHECK(split.FindGpuListWriters(other, 0x100, 90, page_unbounded).position == 130);
+        CHECK(page_unbounded);
+        CHECK(split.FindGpuListWriters(list, 0x100, 0, page_unbounded).position == 130);
+        CHECK(page_unbounded);
+    }
+}
+
 TEST_CASE("V2 landing: the front remembers its releases, the back's captured operations count",
           "[video_core][gpu_split_dispatch][v2_hazard]") {
     using Access = VideoCommon::GpuSplitTestAccess;
