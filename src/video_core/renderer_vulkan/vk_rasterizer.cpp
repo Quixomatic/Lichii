@@ -5102,8 +5102,16 @@ VideoCommon::V2::FlushState RasterizerVulkan::ReadFlushState() {
         master.Refresh();
     }
     const u64 current = master.CurrentTick();
-    const u64 done = master.KnownGpuTick();
-    state.pending = static_cast<u32>(current > done + 1 ? current - done - 1 : 0);
+    // SYNC §14 #1 (MP §5.5 "pending GPU work"): the timeline's value now, not the finish
+    // thread's publish (0.5-1 ms late: the GPU looked busy when it had drained). Read only.
+    const u64 done = master.GpuValueNow();
+    state.pending = VideoCommon::V2::PendingSubmissions(current, done);
+    if (VideoCommon::V2::P5bStats::Enabled()) [[unlikely]] {
+        namespace P5b = VideoCommon::V2::P5bStats;
+        P5b::Add(state.pending == 0   ? P5b::Counter::DecisionsPending0
+                 : state.pending == 1 ? P5b::Counter::DecisionsPending1
+                                      : P5b::Counter::DecisionsPending2);
+    }
     state.back_behind =
         VideoCommon::GpuSplit::OnBackThread() && VideoCommon::GpuSplit::Get().BackBehind();
     state.requested = scheduler.SubmitRequested();

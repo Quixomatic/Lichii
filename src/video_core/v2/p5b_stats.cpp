@@ -220,6 +220,12 @@ void Report(const char* thread_name, u64 window_ns) {
                  PerSecond(at(Counter::GpuListNoWait), seconds),
                  PerSecond(at(Counter::GpuListPageProducer), seconds),
                  PerSecond(at(Counter::GpuListUnboundedNewer), seconds));
+        LOG_INFO(HW_GPU,
+                 "V2 stats {} SYNC §14 | decisions by measured pending (per frame): 0 {:.1f}, "
+                 "1 {:.1f}, 2+ {:.1f}",
+                 thread_name, per_frame(at(Counter::DecisionsPending0)),
+                 per_frame(at(Counter::DecisionsPending1)),
+                 per_frame(at(Counter::DecisionsPending2)));
     }
     // F4-06: which untracked operations still flush every pending write.
     LOG_INFO(HW_GPU, "V2 stats {} P5b full barriers by site (per frame) | {}", thread_name,

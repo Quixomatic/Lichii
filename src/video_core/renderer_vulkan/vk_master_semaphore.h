@@ -52,6 +52,18 @@ public:
     /// Refresh the known GPU tick
     void Refresh();
 
+    /// SYNC §14 #1 (MP §5.5 "pending GPU work", "timeline semaphores"): the GPU's progress as
+    /// the timeline semaphore holds it now (one counter read), without publishing it (the finish
+    /// thread's KnownGpuTick lags it by its wake-up, and its publish keeps the §11.2 handshake).
+    [[nodiscard]] u64 GpuValueNow() const {
+        const u64 known = KnownGpuTick();
+        if (!semaphore) {
+            return known;
+        }
+        const u64 counter = semaphore.GetCounter();
+        return counter > known ? counter : known;
+    }
+
     /// Waits for a tick to be hit on the GPU
     void Wait(u64 tick);
 

@@ -160,6 +160,10 @@ enum class Counter : u32 {
     GpuListNoWait,         ///< the page's writers ran
     GpuListPageProducer,   ///< waited for the page's newest ranged writer only
     GpuListUnboundedNewer, ///< the page's last writer wasn't noted over it: the full wait
+    // SYNC §14 #1: submission decisions by the measured pending count (timeline value).
+    DecisionsPending0,
+    DecisionsPending1,
+    DecisionsPending2, ///< two or more
     Count,
 };
 

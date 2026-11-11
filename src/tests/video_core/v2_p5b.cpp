@@ -932,6 +932,20 @@ TEST_CASE("V2 P5b flush decisions at pass boundaries", "[video_core][v2_p5b]") {
     }
 }
 
+// SYNC_SUBMIT_SPEC §14 #1: pending came from the finish thread's publish, 0.5-1 ms after the
+// GPU finished, so the GPU looked busy while it had drained.
+TEST_CASE("SYNC §14 #1: pending is measured from the timeline value", "[video_core][v2_p5b]") {
+    using VideoCommon::V2::PendingSubmissions;
+    // Ticks 5 and 6 handed off, 7 open.
+    REQUIRE(PendingSubmissions(7, 4) == 2);
+    REQUIRE(PendingSubmissions(7, 5) == 1);
+    // The GPU's timeline reached the newest handed-off tick: 0 at once, whatever the finish
+    // thread has published (it may still say 4).
+    REQUIRE(PendingSubmissions(7, 6) == 0);
+    REQUIRE(PendingSubmissions(7, 7) == 0);
+    REQUIRE(PendingSubmissions(1, 0) == 0); // nothing handed off yet
+}
+
 // SYNC_SUBMIT_SPEC §12.4: 9acdba08ad made every fence with an operation a one-chunk strong hint
 // (6829: 2-3k such fences/s, 23-25 of ~50 submits/f). Only committed downloads hint (strong,
 // DXVK's strong_chunks, at pass boundaries), and a host-waited syncpoint files rule W; deferred

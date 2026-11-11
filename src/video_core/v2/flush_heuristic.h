@@ -61,6 +61,12 @@ struct FlushParams {
     u64 mid_pass_interval_us = 8000;  ///< safety net for passes that never end
 };
 
+/// SYNC §14 #1: handed-off submissions the GPU has not finished, from the open tick
+/// (`current_tick`, the one being recorded) and the GPU's timeline value (the newest finished).
+[[nodiscard]] constexpr u32 PendingSubmissions(u64 current_tick, u64 gpu_value) noexcept {
+    return static_cast<u32>(current_tick > gpu_value + 1 ? current_tick - gpu_value - 1 : 0);
+}
+
 /// What the heuristic knows about the GPU and the recording thread at a decision.
 struct FlushState {
     u32 pending = 1;           ///< handed-off submissions the GPU has not finished
