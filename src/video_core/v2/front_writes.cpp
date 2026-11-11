@@ -128,7 +128,8 @@ size_t DeviceRanges(const Tegra::MemoryManager& memory, GPUVAddr address, u64 si
     if (out.empty() || size == 0) {
         return 0;
     }
-    const auto segments = memory.GetSubmappedRange(address, static_cast<size_t>(size));
+    // Device addresses: GetSubmappedRange returns the GPU address of each segment.
+    const auto segments = memory.GetSubmappedDeviceRange(address, static_cast<size_t>(size));
     size_t count = 0;
     for (const auto& [device, length] : segments) {
         const std::pair<u64, u64> range{device, device + length};
