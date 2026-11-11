@@ -257,6 +257,10 @@ public:
     /// submit request for its tick (rule W); others submit fences anyway.
     virtual void RequestHostWaitedFence() {}
 
+    /// SYNC §14 #2/#3: a fence just queued carries a result the guest reads (an operation that
+    /// lands at it, committed downloads). Vulkan's adaptive submission notes it on the open tick.
+    virtual void NoteGuestVisibleFence() {}
+
     /// Notify rasterizer that a frame is about to finish
     virtual void TickFrame() = 0;
 

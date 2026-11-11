@@ -167,6 +167,15 @@ public:
     [[nodiscard]] bool RecordedSinceSubmit() const noexcept {
         return recorded_since_submit;
     }
+    /// Recording thread (SYNC §14 #2/#3, MP §5.5 "strong hints after work the guest will read"):
+    /// the open tick holds a fence carrying a guest-visible result (an operation landing at it,
+    /// committed downloads). Cleared when the tick is submitted.
+    [[nodiscard]] bool OpenTickHasGuestVisibleFence() const noexcept {
+        return guest_visible_fence;
+    }
+    void NoteGuestVisibleFence() noexcept {
+        guest_visible_fence = true;
+    }
     /// The idle hook (the back goes idle, or another thread asked with RequestIdleHook): what
     /// FlushDeferred submits, plus with lazy fences any work they or WantSubmit wait for.
     void ServeIdleHook();
@@ -695,6 +704,7 @@ private:
     }
     u64 open_since_us{}; ///< SYNC §7.3: when the open tick first held a lazy fence (0: none)
     bool recorded_since_submit{}; ///< SYNC §10: RecordedSinceSubmit (recording thread)
+    bool guest_visible_fence{};   ///< SYNC §14: OpenTickHasGuestVisibleFence (recording thread)
     bool deferred_hint{};         ///< SYNC §11.6 item 7: TakeDeferredHint
     std::atomic<bool> open_tick_nonempty{}; ///< ... for the finish thread's progress wake
     /// SYNC §7.3 counters and the 2 s line's state, at a lazy-fence-mode submission.
@@ -721,6 +731,7 @@ private:
     /// with it), the new open tick is empty.
     void NoteOpenTickEmpty() {
         recorded_since_submit = false;
+        guest_visible_fence = false;
         open_tick_nonempty.store(false, std::memory_order_seq_cst);
         VideoCommon::V2::LandingFence::diag_recorded.store(false, std::memory_order_relaxed);
     }

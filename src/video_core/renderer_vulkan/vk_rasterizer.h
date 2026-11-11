@@ -162,6 +162,7 @@ public:
     void FlushCommands() override;
     void FlushCommandsForFence(bool downloads) override;
     void RequestHostWaitedFence() override;
+    void NoteGuestVisibleFence() override;
     void TickFrame() override;
     bool AccelerateConditionalRendering() override;
     bool HasDrawTransformFeedback() override;

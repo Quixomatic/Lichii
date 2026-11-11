@@ -55,8 +55,13 @@ struct FlushParams {
     /// keep only the safety nets: max draws, the cost cap, strong hints, a waiter's request and a
     /// long mid-pass interval.
     bool pass_boundaries = false;
-    u32 pass_min_draws = 10;          ///< Ryujinx ShouldFlushAttachmentChange: at least 10 draws
-    u64 pass_interval_us = 2000;      ///< ... and this long since the last submission
+    /// SYNC §14 #2 (MP §5.5 "chunk count, pending GPU work"; DXVK GpuFlushTracker), in pass
+    /// mode at every chunk (rule C) and pass boundary (rule B): chunks recorded before a
+    /// submission with the GPU idle (with a guest-visible fence open: idle_guest_chunks), with
+    /// one submission pending, and min(max_chunk_threshold, 3 × pending) with more.
+    u32 idle_chunks = 2;
+    u32 idle_guest_chunks = 1;
+    u32 one_pending_chunks = 3;
     u64 request_gap_us = 500;         ///< a waiter's request mid-pass, no sooner than this
     u64 mid_pass_interval_us = 8000;  ///< safety net for passes that never end
 };
@@ -78,6 +83,8 @@ struct FlushState {
     /// mid-chunk; a lazy fence's bounded-time request waits for the pass boundary (019d:
     /// 18.7 chunk submits/f).
     bool urgent = false;
+    /// SYNC §14 #2: the open submission holds a fence carrying a guest-visible result.
+    bool guest_fence = false;
 };
 
 class FlushHeuristic {
@@ -135,42 +142,44 @@ public:
 
     /// F4-03: the next item ends the active pass (`level`: Weak for a render target change,
     /// Strong for RT0, DXVK's D3D9 rule). Called before that item is recorded, so a submission here
-    /// cuts no pass. Ryujinx: at least pass_min_draws and pass_interval_us since the last
-    /// submission; DXVK: the pending rule and the idle rule; any waiter's request.
+    /// cuts no pass. A waiter's request, a strong hint after strong_chunks, then SYNC §14 #2's
+    /// DXVK table (TableChunks), then a weak hint after weak_chunks. No time terms.
     Decision AtPassBoundary(FlushHint level, const FlushState& state, u64 now_us) noexcept {
         hint = (std::max)(hint, level);
         if (draws == 0) {
             return {};
         }
-        if (last_submit_us == 0) {
-            last_submit_us = now_us;
-        }
-        const u64 since = now_us - last_submit_us;
         const u32 chunks = draws / params.chunk_draws;
         Decision decision{};
         if (state.requested) {
             decision = {FlushAction::Flush, ReasonRequest};
         } else if (hint >= FlushHint::Strong && chunks >= params.strong_chunks) {
             decision = {FlushAction::Flush, ReasonStrong};
-        } else if (fast_mode && !state.back_behind && since >= params.fast_interval_us) {
-            decision = {FlushAction::Flush, ReasonFast};
-        } else if (draws >= params.pass_min_draws && since >= params.pass_interval_us) {
-            decision = {FlushAction::Flush, ReasonPass};
-        } else if (draws >= params.min_draws) {
-            if (hint >= FlushHint::Weak && chunks >= params.weak_chunks) {
-                decision = {FlushAction::Flush, ReasonWeak};
-            } else if (state.pending >= params.busy_pending &&
-                       chunks >= (std::min)(params.max_chunk_threshold, state.pending * 3)) {
-                decision = {FlushAction::Flush, ReasonPending};
-            } else if (state.pending == 0 && !state.back_behind &&
-                       since >= params.idle_min_interval_us) {
-                decision = {FlushAction::Flush, ReasonIdle};
-            }
+        } else if (RecordedChunks() >= TableChunks(state)) {
+            decision = {FlushAction::Flush, state.pending == 0 ? ReasonIdle : ReasonPending};
+        } else if (hint >= FlushHint::Weak && chunks >= params.weak_chunks) {
+            decision = {FlushAction::Flush, ReasonWeak};
         }
         if (decision.action == FlushAction::Flush) {
             NoteSubmit(now_us);
         }
         return decision;
+    }
+
+    /// SYNC §14 #2 (DXVK GpuFlushTracker): the chunks a submission needs with `state.pending`
+    /// handed-off submissions unfinished.
+    [[nodiscard]] u32 TableChunks(const FlushState& state) const noexcept {
+        if (state.pending == 0) {
+            return state.guest_fence ? params.idle_guest_chunks : params.idle_chunks;
+        }
+        if (state.pending == 1) {
+            return params.one_pending_chunks;
+        }
+        return (std::min)(params.max_chunk_threshold, state.pending * 3);
+    }
+    /// Chunks recorded since the last submission, in cost units (a dispatch counts 4 draws).
+    [[nodiscard]] u32 RecordedChunks() const noexcept {
+        return cost_units / params.chunk_draws;
     }
 
     /// A hint from the work just recorded; it is weighed at the next chunk boundary (or now for
@@ -234,21 +243,14 @@ private:
     Decision DecideAtChunk(u32 chunks, const FlushState& state, u64 now_us) const noexcept {
         const u64 since = now_us - last_submit_us;
         if (params.pass_boundaries) {
-            // SYNC_SUBMIT_SPEC §2.5 rule C (MP §5.5, DXVK GpuFlushTracker): mid-pass only the
-            // pending rule. With busy_pending submissions in flight, min(20, pending × 3) chunks;
-            // with fewer (the GPU is about to go idle) once the work is worth one (min_draws,
-            // and Ryujinx's AutoFlushCounter interval since the last submission, so a pass is
-            // cut at most once per pass_interval_us). No waiter's request (rule W is served at
-            // the back's entry boundary), no hint (rule B weighs hints at the pass boundary).
-            // Max draws and cost stay in Advance.
-            if (state.pending >= params.busy_pending) {
-                if (chunks >= (std::min)(params.max_chunk_threshold, state.pending * 3)) {
-                    return {FlushAction::Flush, ReasonPending};
-                }
-                return {};
-            }
-            if (draws >= params.min_draws && since >= params.pass_interval_us) {
-                return {FlushAction::Flush, ReasonIdle};
+            // SYNC_SUBMIT_SPEC §14 #2 rule C (MP §5.5 "chunk count, pending GPU work", DXVK
+            // GpuFlushTracker): mid-pass only DXVK's table, from the measured pending count. The
+            // §2.5 idle branch's min_draws and 2 ms terms kept the GPU idle with recorded work
+            // waiting. No waiter's request (rule W is served at the back's entry boundary), no
+            // hint (rule B weighs hints at the pass boundary). Max draws and cost stay in Advance.
+            (void)chunks;
+            if (RecordedChunks() >= TableChunks(state)) {
+                return {FlushAction::Flush, state.pending == 0 ? ReasonIdle : ReasonPending};
             }
             return {};
         }

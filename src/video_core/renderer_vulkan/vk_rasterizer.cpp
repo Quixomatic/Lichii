@@ -4178,6 +4178,14 @@ void RasterizerVulkan::RequestHostWaitedFence() {
     VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::HostSyncpointRequests);
 }
 
+void RasterizerVulkan::NoteGuestVisibleFence() {
+    // SYNC §14 #2/#3: the open tick holds a guest-visible result; with the GPU idle the DXVK
+    // table submits it at one chunk, and the back's batch end at once (I′).
+    if (scheduler.LazyFencesHere()) {
+        scheduler.NoteGuestVisibleFence();
+    }
+}
+
 void RasterizerVulkan::TraceRenderState(bool is_indexed, const char* outcome,
                                         const Framebuffer* framebuffer) {
     if (!VideoCommon::RenderTrace::SampleFrame(render_trace_frame)) {
@@ -5106,6 +5114,7 @@ VideoCommon::V2::FlushState RasterizerVulkan::ReadFlushState() {
     // thread's publish (0.5-1 ms late: the GPU looked busy when it had drained). Read only.
     const u64 done = master.GpuValueNow();
     state.pending = VideoCommon::V2::PendingSubmissions(current, done);
+    state.guest_fence = scheduler.OpenTickHasGuestVisibleFence();
     if (VideoCommon::V2::P5bStats::Enabled()) [[unlikely]] {
         namespace P5b = VideoCommon::V2::P5bStats;
         P5b::Add(state.pending == 0   ? P5b::Counter::DecisionsPending0

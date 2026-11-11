@@ -141,8 +141,12 @@ public:
         if constexpr (can_async_check) {
             guard.lock();
         }
+        // SYNC §14 #2/#3: a fence carrying a result the guest reads (an operation that lands at
+        // it, or committed downloads) marks the open tick (DXVK's GPU-idle rule weighs it).
+        bool guest_visible = delay_fence || committed_flushes != 0;
         {
             std::scoped_lock lock{uncommitted_guard};
+            guest_visible |= !uncommitted_operations.empty();
             if (delay_fence) {
                 uncommitted_operations.emplace_back(std::move(func));
             }
@@ -157,6 +161,9 @@ public:
             func();
         }
         fences.push(std::move(new_fence));
+        if (guest_visible) {
+            rasterizer.NoteGuestVisibleFence();
+        }
         if (should_flush) {
             rasterizer.FlushCommandsForFence(downloads);
         }
