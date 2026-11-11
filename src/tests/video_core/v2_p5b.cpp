@@ -871,9 +871,8 @@ TEST_CASE("V2 P5b flush decisions at pass boundaries", "[video_core][v2_p5b]") {
         CHECK(heuristic.AtPassBoundary(FlushHint::Weak, FlushState{.pending = 0}, 1001).action ==
               FlushAction::Flush);
     }
-    SECTION("SYNC §14.7a: nothing pending, a boundary submits at the sweep's minimum, never "
-            "before") {
-        for (const u32 minimum : {10U, 32U, 64U, 128U}) { // EDEN_NX2_SYNC_IDLE_MIN_DRAWS
+    SECTION("SYNC §15.1: nothing pending, a boundary submits at DXVK's 2 chunks, never before") {
+        for (const u32 minimum : {params.idle_min_cost}) {
         FlushParams sweep = params;
         sweep.idle_min_cost = minimum;
         FlushHeuristic heuristic{sweep};

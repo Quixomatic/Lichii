@@ -865,15 +865,6 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
         scheduler.SetLazyFences(true);
         VideoCommon::V2::FlushParams params{};
         params.pass_boundaries = true;
-        // SYNC §14.7a experiment switch (never a feature; removed once the sweep sets the rule):
-        // rule B's nothing-pending minimum in draws (default 64, the table's 2 chunks).
-        if (const char* value = std::getenv("EDEN_NX2_SYNC_IDLE_MIN_DRAWS"); value != nullptr) {
-            params.idle_min_cost =
-                static_cast<u32>(std::max(1UL, std::strtoul(value, nullptr, 10)));
-            LOG_INFO(Render_Vulkan, "EDEN_NX2_SYNC_IDLE_MIN_DRAWS={}: rule B submits with "
-                                    "nothing pending at {} draws",
-                     value, params.idle_min_cost);
-        }
         flush_heuristic = VideoCommon::V2::FlushHeuristic{params};
         VideoCommon::GpuSplit::Get().SetIdleSleepHook(
             [](void* argument, bool prepare) {

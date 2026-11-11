@@ -64,9 +64,9 @@ struct FlushParams {
     u32 idle_chunks = 2;
     u32 idle_guest_chunks = 1;
     u32 one_pending_chunks = 3;
-    /// SYNC §14.7a: rule B's nothing-pending minimum, in recorded cost units (draws; a dispatch
-    /// counts 4). 64 = the table's 2 chunks. EDEN_NX2_SYNC_IDLE_MIN_DRAWS sets it for the
-    /// 10/32/64/128 sweep (an experiment switch, removed once the cost-based rule is set).
+    /// SYNC §15.1: rule B's nothing-pending minimum, in recorded cost units (draws; a dispatch
+    /// counts 4): DXVK's 2 chunks. The §14.7a sweep (10 vs 64) moved neither fps beyond noise nor
+    /// the GPU idle with recorded work, which is the CPU's production time.
     u32 idle_min_cost = 64;
     u64 request_gap_us = 500;         ///< a waiter's request mid-pass, no sooner than this
     u64 mid_pass_interval_us = 8000;  ///< safety net for passes that never end
