@@ -246,10 +246,10 @@ public:
         FlushCommands();
     }
 
-    /// SYNC §12 R3: a fence carrying results the guest reads (operations that land at it,
-    /// committed downloads) was queued in the open submission. Vulkan's adaptive submission
-    /// weighs it as a strong hint at a one-chunk threshold; others ignore it.
-    virtual void NoteFenceResults() {}
+    /// SYNC §12.4 R3: a fence just queued carries a host syncpoint increment a guest thread is
+    /// blocked on. Backends whose fences ride the open submission (Vulkan lazy fences) file a
+    /// submit request for its tick (rule W); others submit fences anyway.
+    virtual void RequestHostWaitedFence() {}
 
     /// Notify rasterizer that a frame is about to finish
     virtual void TickFrame() = 0;

@@ -106,11 +106,7 @@ public:
         // fence runs its operation at once, before the host GPU has run the work the report
         // follows, and Ocarina of Time then reads a wrong report (white flashes on leaves and walls
         // at low GPU accuracy).
-        const bool delay_fence = VideoCore::g_signaling_query_report_fence ||
-                                 (Settings::IsGPUFenceBehaviorDefault()
-                                      ? Settings::IsGPULevelHigh()
-                                      : Settings::IsGPUFenceBehaviorBalanced() ||
-                                            Settings::IsGPUFenceBehaviorAccurate());
+        const bool delay_fence = VideoCore::g_signaling_query_report_fence || FencesDelayed();
         if constexpr (!can_async_check) {
             TryReleasePendingFences<false>();
         }
@@ -145,10 +141,8 @@ public:
         if constexpr (can_async_check) {
             guard.lock();
         }
-        bool carries_results = delay_fence || committed_flushes != 0;
         {
             std::scoped_lock lock{uncommitted_guard};
-            carries_results |= !uncommitted_operations.empty();
             if (delay_fence) {
                 uncommitted_operations.emplace_back(std::move(func));
             }
@@ -165,9 +159,6 @@ public:
         fences.push(std::move(new_fence));
         if (should_flush) {
             rasterizer.FlushCommandsForFence(downloads);
-        }
-        if (carries_results) {
-            rasterizer.NoteFenceResults();
         }
         if constexpr (can_async_check) {
             guard.unlock();
@@ -190,6 +181,18 @@ public:
         syncpoint_manager.IncrementGuest(value);
         std::function<void()> func([this, value] { syncpoint_manager.IncrementHost(value); });
         SignalFence(std::move(func));
+        if (FencesDelayed() && syncpoint_manager.HasHostWaiters()) {
+            // SYNC §12.4 R3 (2): a guest thread blocks on a host syncpoint whose increment rides
+            // this fence (an undelayed one ran at once): rule W for the fence's tick.
+            rasterizer.RequestHostWaitedFence();
+        }
+    }
+
+    /// Whether fence operations wait for their fence (GPU accuracy / fence behaviour settings).
+    [[nodiscard]] static bool FencesDelayed() {
+        return Settings::IsGPUFenceBehaviorDefault() ? Settings::IsGPULevelHigh()
+                                                     : Settings::IsGPUFenceBehaviorBalanced() ||
+                                                           Settings::IsGPUFenceBehaviorAccurate();
     }
 
     /// Pipeline v2 P5a (EDEN_NX2_V2_COMMIT without the cache locks): the fencing thread no longer

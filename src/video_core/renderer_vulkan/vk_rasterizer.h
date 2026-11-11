@@ -160,7 +160,7 @@ public:
     void TiledCacheBarrier() override;
     void FlushCommands() override;
     void FlushCommandsForFence(bool downloads) override;
-    void NoteFenceResults() override;
+    void RequestHostWaitedFence() override;
     void TickFrame() override;
     bool AccelerateConditionalRendering() override;
     bool HasDrawTransformFeedback() override;
