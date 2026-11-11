@@ -145,8 +145,10 @@ public:
         if constexpr (can_async_check) {
             guard.lock();
         }
+        bool carries_results = delay_fence || committed_flushes != 0;
         {
             std::scoped_lock lock{uncommitted_guard};
+            carries_results |= !uncommitted_operations.empty();
             if (delay_fence) {
                 uncommitted_operations.emplace_back(std::move(func));
             }
@@ -163,6 +165,9 @@ public:
         fences.push(std::move(new_fence));
         if (should_flush) {
             rasterizer.FlushCommandsForFence(downloads);
+        }
+        if (carries_results) {
+            rasterizer.NoteFenceResults();
         }
         if constexpr (can_async_check) {
             guard.unlock();

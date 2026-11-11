@@ -246,6 +246,11 @@ public:
         FlushCommands();
     }
 
+    /// SYNC §12 R3: a fence carrying results the guest reads (operations that land at it,
+    /// committed downloads) was queued in the open submission. Vulkan's adaptive submission
+    /// weighs it as a strong hint at a one-chunk threshold; others ignore it.
+    virtual void NoteFenceResults() {}
+
     /// Notify rasterizer that a frame is about to finish
     virtual void TickFrame() = 0;
 

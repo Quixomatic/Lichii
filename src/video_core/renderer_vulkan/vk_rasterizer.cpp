@@ -4138,6 +4138,20 @@ void RasterizerVulkan::FlushCommandsForFence(bool downloads) {
     }
 }
 
+void RasterizerVulkan::NoteFenceResults() {
+    // SYNC §12 R3 (MP §5.5 strong hints, DXVK ImplicitStrongHint): df94 held fence-carried
+    // results (deferred QMD reductions, landing writes, downloads) up to 24.5 ms in the open tick
+    // (reductions at their fence: mean 2.1 ms, max 33 ms) while the guest paced its frames on
+    // them. Lazy fences only; the heuristic submits at the next boundary after one chunk.
+    if (!adapt_submit || !scheduler.LazyFencesHere() || gpu_memory == nullptr ||
+        !gpu_memory->UsesNativeTiling()) {
+        return;
+    }
+    SyncAdaptiveTick();
+    flush_heuristic.HintFenceResult();
+    VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::FenceResultHints);
+}
+
 void RasterizerVulkan::TraceRenderState(bool is_indexed, const char* outcome,
                                         const Framebuffer* framebuffer) {
     if (!VideoCommon::RenderTrace::SampleFrame(render_trace_frame)) {
@@ -5088,9 +5102,12 @@ void RasterizerVulkan::AdaptiveFlushWork(u32 cost) {
                 P5b::Counter::FlushOther,    P5b::Counter::FlushMax,    P5b::Counter::FlushCost,
                 P5b::Counter::FlushIdle,     P5b::Counter::FlushPending, P5b::Counter::FlushStrong,
                 P5b::Counter::FlushWeak,     P5b::Counter::FlushInterval, P5b::Counter::FlushFast,
-                P5b::Counter::FlushPass,     P5b::Counter::FlushLazy,
+                P5b::Counter::FlushPass,     P5b::Counter::FlushLazy,   P5b::Counter::FlushStrong,
             };
             P5b::Add(counters[reason < counters.size() ? reason : 0]);
+            if (reason == H::ReasonResult) {
+                P5b::Add(P5b::Counter::SubmitsFenceResult); // SYNC §12 R3 (within B or C)
+            }
         }
     };
     if (params.pass_boundaries && flush_heuristic.Draws() != 0 &&
@@ -5170,6 +5187,9 @@ void RasterizerVulkan::NoteNonDrawWork(u32 cost) {
         scheduler.Flush();
         adapt_tick = scheduler.GetMasterSemaphore().CurrentTick();
         P5b::Add(P5b::Counter::SubmitsChunk);
+        if (decision.reason == VideoCommon::V2::FlushHeuristic::ReasonResult) {
+            P5b::Add(P5b::Counter::SubmitsFenceResult);
+        }
     } else if (decision.action == VideoCommon::V2::FlushAction::Dispatch) {
         scheduler.DispatchWork();
     }

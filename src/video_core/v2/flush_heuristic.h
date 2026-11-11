@@ -59,6 +59,10 @@ struct FlushParams {
     u64 pass_interval_us = 2000;      ///< ... and this long since the last submission
     u64 request_gap_us = 500;         ///< a waiter's request mid-pass, no sooner than this
     u64 mid_pass_interval_us = 8000;  ///< safety net for passes that never end
+    /// SYNC §12 R3: a fence carrying results the guest reads is a strong hint at this many
+    /// chunks (instead of strong_chunks), at the next pass boundary or mid-pass once no
+    /// boundary came for that long.
+    u32 fence_result_chunks = 1;
 };
 
 /// What the heuristic knows about the GPU and the recording thread at a decision.
@@ -92,6 +96,7 @@ public:
         ReasonFast,
         ReasonPass,    ///< F4-03: a pass boundary after enough draws and time (Ryujinx)
         ReasonRequest, ///< F4-02: a waiter's request
+        ReasonResult,  ///< SYNC §12 R3: a fence carrying guest-visible results (strong hint)
         ReasonCount,
     };
 
@@ -133,6 +138,7 @@ public:
     /// submission; DXVK: the pending rule and the idle rule; any waiter's request.
     Decision AtPassBoundary(FlushHint level, const FlushState& state, u64 now_us) noexcept {
         hint = (std::max)(hint, level);
+        draws_at_boundary = draws;
         if (draws == 0) {
             return {};
         }
@@ -144,6 +150,8 @@ public:
         Decision decision{};
         if (state.requested) {
             decision = {FlushAction::Flush, ReasonRequest};
+        } else if (fence_result && chunks >= params.fence_result_chunks) {
+            decision = {FlushAction::Flush, ReasonResult};
         } else if (hint >= FlushHint::Strong && chunks >= params.strong_chunks) {
             decision = {FlushAction::Flush, ReasonStrong};
         } else if (fast_mode && !state.back_behind && since >= params.fast_interval_us) {
@@ -173,6 +181,19 @@ public:
         hint = (std::max)(hint, level);
     }
 
+    /// SYNC §12 R3 (MP §5.5 "strong hints after work the guest will read", DXVK
+    /// ImplicitStrongHint): a fence carrying results the guest reads (operations that land at it,
+    /// committed downloads) was queued in the open submission. Rule B submits it at the next pass
+    /// boundary once fence_result_chunks are recorded; rule C mid-pass once no boundary came for
+    /// that many chunks.
+    void HintFenceResult() noexcept {
+        hint = (std::max)(hint, FlushHint::Strong);
+        fence_result = true;
+    }
+    [[nodiscard]] bool FenceResultPending() const noexcept {
+        return fence_result;
+    }
+
     /// A strong hint decided right away (after work the guest reads back, not on a draw). DXVK's
     /// ImplicitStrongHint: enough chunks recorded, "aggressively to reduce readback latency",
     /// whether the GPU is busy or not; no idle shortcut (that flushed after 16 draws).
@@ -195,6 +216,8 @@ public:
         draws = 0;
         cost_units = 0;
         hint = FlushHint::None;
+        fence_result = false;
+        draws_at_boundary = 0;
         last_submit_us = now_us;
     }
 
@@ -235,6 +258,11 @@ private:
             // cut at most once per pass_interval_us). No waiter's request (rule W is served at
             // the back's entry boundary), no hint (rule B weighs hints at the pass boundary).
             // Max draws and cost stay in Advance.
+            // SYNC §12 R3: a pending fence result once no pass boundary came for its threshold.
+            if (fence_result &&
+                draws - draws_at_boundary >= params.fence_result_chunks * params.chunk_draws) {
+                return {FlushAction::Flush, ReasonResult};
+            }
             if (state.pending >= params.busy_pending) {
                 if (chunks >= (std::min)(params.max_chunk_threshold, state.pending * 3)) {
                     return {FlushAction::Flush, ReasonPending};
@@ -281,6 +309,8 @@ private:
     u32 draws = 0;
     u32 cost_units = 0;
     FlushHint hint = FlushHint::None;
+    bool fence_result = false; ///< HintFenceResult since the last submission
+    u32 draws_at_boundary = 0; ///< `draws` at the last pass boundary since the last submission
     u64 last_submit_us = 0;
     u64 frame_wait_us = 0;
     u64 average_wait_us = 0;

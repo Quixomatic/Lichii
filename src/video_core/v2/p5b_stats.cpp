@@ -191,11 +191,14 @@ void Report(const char* thread_name, u64 window_ns) {
         LOG_INFO(HW_GPU,
                  "V2 stats {} SYNC §12 | CPU-written list fetches (per s): no wait {:.0f}, "
                  "ranged writers {:.0f}, GPU pages (unbounded before the sync) {:.0f}, residual "
-                 "(unbounded skipped on CPU pages) {:.0f}",
+                 "(unbounded skipped on CPU pages) {:.0f} | R3 fences carrying results {:.0f}/s, "
+                 "their submits (in B/C) {:.2f}/frame",
                  thread_name, PerSecond(at(Counter::ListFetchNoWait), seconds),
                  PerSecond(at(Counter::ListFetchRanged), seconds),
                  PerSecond(at(Counter::ListFetchGpuPages), seconds),
-                 PerSecond(at(Counter::ListFetchResidual), seconds));
+                 PerSecond(at(Counter::ListFetchResidual), seconds),
+                 PerSecond(at(Counter::FenceResultHints), seconds),
+                 per_frame(at(Counter::SubmitsFenceResult)));
     }
     // F4-06: which untracked operations still flush every pending write.
     LOG_INFO(HW_GPU, "V2 stats {} P5b full barriers by site (per frame) | {}", thread_name,

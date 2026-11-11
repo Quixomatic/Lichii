@@ -140,6 +140,8 @@ enum class Counter : u32 {
     ListFetchRanged,      ///< waited for noted writers over the list (its pages never GPU-written)
     ListFetchGpuPages,    ///< pages may be GPU-written: unbounded writers before the sync count
     ListFetchResidual,    ///< ...never GPU-written pages: unbounded writers skipped (MP §11)
+    SubmitsFenceResult,   ///< SYNC §12 R3: B/C submits for a fence carrying guest-visible results
+    FenceResultHints,     ///< ... fences that set the hint
     Count,
 };
 

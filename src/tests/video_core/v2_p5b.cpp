@@ -930,6 +930,66 @@ TEST_CASE("V2 P5b flush decisions at pass boundaries", "[video_core][v2_p5b]") {
     }
 }
 
+// SYNC_SUBMIT_SPEC §12 R3: df94's fence-carried results (deferred QMD reductions, landing
+// writes) waited up to 24.5 ms in the open tick; a fence carrying them is a strong hint at one
+// chunk.
+TEST_CASE("SYNC §12 R3: a fence carrying results is submitted at the first boundary after a chunk",
+          "[video_core][v2_p5b]") {
+    FlushParams params;
+    params.pass_boundaries = true;
+    const FlushState two{.pending = 2, .back_behind = true};
+    SECTION("rule B: the first pass boundary once one chunk is recorded") {
+        FlushHeuristic heuristic{params};
+        heuristic.NoteSubmit(1000);
+        heuristic.HintFenceResult();
+        for (u32 i = 1; i < params.chunk_draws; ++i) {
+            REQUIRE(heuristic.Advance(1, two, 1000).action != FlushAction::Flush);
+        }
+        // Under one chunk: no submit at the boundary (busy GPU, too soon for Ryujinx's rule).
+        REQUIRE(heuristic.AtPassBoundary(FlushHint::Weak, two, 1001).action == FlushAction::None);
+        heuristic.Advance(1, two, 1001);
+        const auto boundary = heuristic.AtPassBoundary(FlushHint::Weak, two, 1002);
+        REQUIRE(boundary.action == FlushAction::Flush);
+        REQUIRE(boundary.reason == FlushHeuristic::ReasonResult);
+        // The submission took it: the next boundary weighs the old rules again.
+        REQUIRE_FALSE(heuristic.FenceResultPending());
+        for (u32 i = 0; i < params.chunk_draws; ++i) {
+            heuristic.Advance(1, two, 1003);
+        }
+        REQUIRE(heuristic.AtPassBoundary(FlushHint::Weak, two, 1004).action == FlushAction::None);
+    }
+    SECTION("without the fence: a strong hint still needs strong_chunks") {
+        FlushHeuristic heuristic{params};
+        heuristic.NoteSubmit(1000);
+        heuristic.Hint(FlushHint::Strong);
+        for (u32 i = 0; i < params.chunk_draws; ++i) {
+            heuristic.Advance(1, two, 1000);
+        }
+        REQUIRE(heuristic.AtPassBoundary(FlushHint::Weak, two, 1001).action == FlushAction::None);
+    }
+    SECTION("rule C: mid-pass once no boundary came for one chunk") {
+        FlushHeuristic heuristic{params};
+        heuristic.NoteSubmit(1000);
+        // Draws of a pass begun before the fence, then a boundary, then one long pass.
+        for (u32 i = 0; i < 10; ++i) {
+            heuristic.Advance(1, two, 1000);
+        }
+        heuristic.HintFenceResult();
+        REQUIRE(heuristic.AtPassBoundary(FlushHint::Weak, two, 1000).action == FlushAction::None);
+        FlushHeuristic::Decision decision{};
+        u32 recorded = 0;
+        while (decision.action != FlushAction::Flush && recorded < 4 * params.chunk_draws) {
+            decision = heuristic.Advance(1, two, 1001);
+            ++recorded;
+        }
+        REQUIRE(decision.action == FlushAction::Flush);
+        REQUIRE(decision.reason == FlushHeuristic::ReasonResult);
+        // At the first chunk boundary at least one chunk past the last pass boundary.
+        REQUIRE(recorded <= 2 * params.chunk_draws);
+        REQUIRE(recorded + 10 >= 10 + params.chunk_draws);
+    }
+}
+
 TEST_CASE("V2 P5b the idle hook submits nothing while the GPU is busy and nobody waits",
           "[video_core][v2_p5b]") {
     // F4-X2 (f1d05e9625: 54 idle-hook submits a frame; 0fe48cd86a: the hook waited for the GPU's
