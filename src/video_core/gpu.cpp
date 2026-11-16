@@ -8,11 +8,13 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <deque>
 #include <list>
 #include <memory>
 #include <utility>
 
 #include "common/assert.h"
+#include "common/scope_exit.h"
 #include "common/settings.h"
 #include "common/settings_enums.h"
 #include "core/core.h"
@@ -20,6 +22,8 @@
 #include "core/gpu_dirty_memory_manager.h"
 #include "core/frontend/emu_window.h"
 #include "core/frontend/graphics_context.h"
+#include "core/hle/kernel/k_event.h"
+#include "core/hle/service/nvdrv/core/heap_mapper.h"
 #include "core/hle/service/nvdrv/nvdata.h"
 #include "core/perf_stats.h"
 #include "video_core/cdma_pusher.h"
@@ -30,6 +34,7 @@
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/engines/kepler_memory.h"
 #include "video_core/engines/maxwell_3d.h"
+#include "video_core/nx2_fast_draw.h"
 #include "video_core/engines/maxwell_dma.h"
 #include "video_core/gpu.h"
 #include "video_core/pending_maps.h"
@@ -41,8 +46,45 @@
 #include "video_core/nx2.h"
 #include "video_core/renderer_base.h"
 #include "video_core/shader_notify.h"
+#include "video_core/gpu_split.h"
+#include "video_core/v2/v2_switches.h"
 
 namespace Tegra {
+
+namespace {
+
+/// What a sync request asks of the GPU's owner thread (TickWork, or the split's back for the
+/// CPU lane). Pipeline v2 P1b: typed requests instead of std::function closures.
+enum class SyncOp : u8 {
+    Idle,               ///< Nothing: WaitForIdle's ordering point
+    Flush,              ///< FlushRegion(address, size) (RequestFlush)
+    CpuReadFlush,       ///< InvalidateGPUCache, then FlushRegion (reactive flush on a CPU read)
+    CpuReadback,        ///< InvalidateGPUCache, then FlushRegionForRead into *out (READBACK)
+    PreserveInvalidate, ///< FlushRegion(BufferCache), then OnCacheInvalidation
+    Present,            ///< Composite the present slot `present.slot` (typed Present record)
+    Capture,            ///< *out (std::vector<u8>) = GetAppletCaptureBuffer()
+    Debug,              ///< debug(): debug hooks only (EDEN_NX2_FRAME_CAPTURE dumps)
+};
+
+struct SyncRequest {
+    SyncOp op{};
+    u64 sequence{}; ///< The request's sync fence
+    u64 address{};
+    u64 size{};
+    void* out{};
+    VideoCommon::V2::Ir::PresentBody present{};
+    bool recorded{}; ///< A Present record marks its position (TakeQueuedPresents)
+    std::function<void()> debug;
+};
+
+/// The layers and fences of a queued composite (PresentBody::slot).
+struct PresentSlot {
+    std::vector<Tegra::FramebufferConfig> layers;
+    std::vector<Service::Nvidia::NvFence> fences;
+    size_t counter{};
+};
+
+} // Anonymous namespace
 
 struct GPU::Impl {
     explicit Impl(Core::System& system_, bool is_async_, bool use_nvdec_)
@@ -109,13 +151,40 @@ struct GPU::Impl {
 
     /// Synchronizes CPU writes with Host GPU memory.
     void InvalidateGPUCache() {
-        std::vector<std::pair<DAddr, u64>> writes;
-        std::function<void(PAddr, size_t)> callback_writes(
-            [&writes](PAddr address, size_t size) { writes.emplace_back(address, size); });
+        // F2-18: no allocation per gather. The gather (one gatherer at a time per manager) may
+        // run on threads other than the caches' owner, so the list is per thread.
+        thread_local std::vector<std::pair<DAddr, u64>> writes;
+        thread_local std::function<void(PAddr, size_t)> callback_writes(
+            [](PAddr address, size_t size) { writes.emplace_back(address, size); });
+        thread_local bool gathering = false;
+        if (gathering) [[unlikely]] {
+            // Re-entered from applying a gather: a list of its own.
+            std::vector<std::pair<DAddr, u64>> nested;
+            std::function<void(PAddr, size_t)> callback(
+                [&nested](PAddr address, size_t size) { nested.emplace_back(address, size); });
+            system.GatherGPUDirtyMemory(callback);
+            if (!nested.empty()) {
+                renderer->ReadRasterizer()->OnCacheInvalidations(nested);
+            }
+            return;
+        }
+        gathering = true;
+        SCOPE_EXIT {
+            gathering = false;
+        };
+        writes.clear();
         system.GatherGPUDirtyMemory(callback_writes);
         if (!writes.empty()) {
             renderer->ReadRasterizer()->OnCacheInvalidations(writes);
         }
+    }
+
+    [[nodiscard]] u64 CollectedCpuWrites() const {
+        u64 total = 0;
+        for (const auto& manager : system.GetGPUDirtyMemoryManager()) {
+            total += manager.Collected();
+        }
+        return total;
     }
 
     void ForEachPendingCpuWrite(const std::function<void(DAddr, size_t)>& callback) {
@@ -130,13 +199,49 @@ struct GPU::Impl {
         Settings::UpdateGPUAccuracy();
     }
 
-    /// Request a host GPU memory flush from the CPU.
-    template <typename Func>
-    [[nodiscard]] u64 RequestSyncOperation(Func&& action) {
+    /// Queues a typed request for the next TickWork; returns its sync fence.
+    [[nodiscard]] u64 RequestSyncOperation(SyncRequest&& request) {
         std::unique_lock lck{sync_request_mutex};
         const u64 fence = ++last_sync_fence;
-        sync_requests.emplace_back(std::forward<Func>(action));
+        request.sequence = fence;
+        sync_requests.push_back(std::move(request));
         return fence;
+    }
+
+    /// Runs a sync request (the owner of the caches: TickWork or the CPU lane).
+    void RunSyncRequest(SyncRequest& request) {
+        auto* const rasterizer = renderer->ReadRasterizer();
+        switch (request.op) {
+        case SyncOp::Idle:
+            return;
+        case SyncOp::Flush:
+            rasterizer->FlushRegion(request.address, request.size);
+            return;
+        case SyncOp::CpuReadFlush:
+            // Apply collected guest writes before downloading GPU data over guest memory.
+            InvalidateGPUCache();
+            rasterizer->FlushRegion(request.address, request.size);
+            return;
+        case SyncOp::CpuReadback:
+            InvalidateGPUCache();
+            rasterizer->FlushRegionForRead(request.address, request.size,
+                                           *static_cast<std::function<void()>*>(request.out));
+            return;
+        case SyncOp::PreserveInvalidate:
+            rasterizer->FlushRegion(request.address, request.size,
+                                    VideoCommon::CacheType::BufferCache);
+            rasterizer->OnCacheInvalidation(request.address, request.size);
+            return;
+        case SyncOp::Present:
+            RunPresent(request.present);
+            return;
+        case SyncOp::Capture:
+            *static_cast<std::vector<u8>*>(request.out) = renderer->GetAppletCaptureBuffer();
+            return;
+        case SyncOp::Debug:
+            request.debug();
+            return;
+        }
     }
 
     /// Obtains current flush request fence id.
@@ -144,25 +249,113 @@ struct GPU::Impl {
         return current_sync_fence.load(std::memory_order_relaxed);
     }
 
+    /// Returns once the request of `fence` ran, or once the GPU threads stopped for good
+    /// (NotifyShutdown): then it never runs.
     void WaitForSyncOperation(const u64 fence) {
         std::unique_lock lck{sync_request_mutex};
-        sync_request_cv.wait(lck, [this, fence] { return CurrentSyncRequestFence() >= fence; });
+        sync_request_cv.wait(lck, [this, fence] {
+            return CurrentSyncRequestFence() >= fence || sync_requests_dropped;
+        });
+    }
+
+    // EDEN_NX2_V2_CPULANE (MASTER_PLAN.md section 6): a guest CPU flush (a read of GPU-written
+    // memory, an invalidation that keeps GPU writes) is served by the split's back after the
+    // entry it runs now, instead of after everything queued. The ordering point is that entry:
+    // GPU work the guest waited for (its fence signalled) has run by then, and work still queued
+    // is work the guest hasn't synchronised with, which hardware could also be partway through.
+    // Requests that need everything before them (WaitForIdle, composites, captures) keep the
+    // ordered TickWork path. The lane has its own fences, so the two never reorder each other.
+    [[nodiscard]] bool UseCpuLane() const {
+        return is_async && VideoCommon::V2::On(VideoCommon::V2::Switch::CpuLane) &&
+               VideoCommon::GpuSplit::Get().BackRunning();
+    }
+
+    void RunOnCpuLane(SyncRequest&& request) {
+        u64 fence;
+        {
+            std::scoped_lock lck{lane_mutex};
+            if (lane_dropped) [[unlikely]] {
+                return;
+            }
+            fence = ++lane_last;
+            request.sequence = fence;
+            lane_requests.push_back(std::move(request));
+            lane_pending.store(true, std::memory_order_release);
+        }
+        auto& split = VideoCommon::GpuSplit::Get();
+        split.RequestCpuLane();
+        // The back serves the lane after its entry (or at once if it waits for work). Only a
+        // back that isn't running needs the ordered path, where TickWork serves the lane
+        // (MASTER_PLAN §6 lane: no TickGPU per request).
+        bool ticked = false;
+        if (!split.BackRunning()) {
+            gpu_thread.TickGPU(is_async);
+            ticked = true;
+        }
+        std::unique_lock lck{lane_mutex};
+        while (!lane_cv.wait_for(lck, std::chrono::milliseconds{2},
+                                 [this, fence] { return lane_done >= fence || lane_dropped; })) {
+            if (!ticked && !split.BackRunning()) {
+                // The back stopped before serving it.
+                lck.unlock();
+                gpu_thread.TickGPU(is_async);
+                ticked = true;
+                lck.lock();
+            }
+        }
+    }
+
+    void TickCpuLane() {
+        // EDEN_NX2_V2_COMMIT: the lane hook also serves work handed to the caches' owner.
+        renderer->ReadRasterizer()->ServeCommitRequests();
+        if (!lane_pending.load(std::memory_order_acquire)) {
+            return;
+        }
+        std::unique_lock lck{lane_mutex};
+        while (!lane_requests.empty()) {
+            auto request = std::move(lane_requests.front());
+            lane_requests.pop_front();
+            lck.unlock();
+            VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::TickWork);
+            RunSyncRequest(request);
+            lck.lock();
+            ++lane_done;
+            lane_cv.notify_all();
+        }
+        lane_pending.store(false, std::memory_order_release);
     }
 
     void WaitForIdle() {
-        const u64 fence = RequestSyncOperation([] {});
+        const u64 fence = RequestSyncOperation(SyncRequest{.op = SyncOp::Idle});
         gpu_thread.TickGPU(is_async);
         WaitForSyncOperation(fence);
     }
 
+    /// Gets the caches' owner to serve handed-over work: the split's back through its CPU lane
+    /// hook (served after its current entry, or at once when it waits for work), else the GPU
+    /// thread through a Tick (TickWork serves it).
+    void WakeCacheOwner() {
+        auto& split = VideoCommon::GpuSplit::Get();
+        if (split.BackRunning()) {
+            split.RequestCpuLane();
+            return;
+        }
+        gpu_thread.TickGPU(is_async);
+    }
+
     /// Tick pending requests within the GPU.
     void TickWork() {
+        renderer->ReadRasterizer()->ServeCommitRequests();
+        if (lane_used) [[unlikely]] {
+            TickCpuLane();
+        }
         std::unique_lock lck{sync_request_mutex};
         while (!sync_requests.empty()) {
             auto request = std::move(sync_requests.front());
             sync_requests.pop_front();
             sync_request_mutex.unlock();
-            request();
+            VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::TickWork);
+            RunSyncRequest(request);
             current_sync_fence.fetch_add(1, std::memory_order_release);
             sync_request_mutex.lock();
             sync_request_cv.notify_all();
@@ -171,10 +364,15 @@ struct GPU::Impl {
 
     [[nodiscard]] u64 GetTicks() const {
         return ReadGpuTimestamp(system.CoreTiming(), g_nx2_ampere.load(std::memory_order_relaxed),
-                                Settings::values.gpu_clock.GetValue());
+                                Settings::values.gpu_clock.GetValue(),
+                                ampere_anchor.load(std::memory_order_relaxed));
     }
 
     void RendererFrameEndNotify() {
+        ampere_anchor.store(
+            AmpereAnchor::At(static_cast<u64>(system.CoreTiming().GetGlobalTimeNs().count()),
+                             Settings::values.gpu_clock.GetValue()),
+            std::memory_order_relaxed);
         system.GetPerfStats().EndGameFrame();
     }
 
@@ -188,6 +386,28 @@ struct GPU::Impl {
 
     void NotifyShutdown() {
         gpu_thread.NotifyShutdown();
+        {
+            // The GPU threads stopped: no sync operation runs anymore. Guest threads still run
+            // until the kernel suspends them, and one waiting for a read's flush (OnCPURead)
+            // would wait forever, in host code where the kernel cannot suspend it
+            // (KernelCore::SuspendEmulation then waits for it forever). Drop the requests, which
+            // may refer to their waiters' frames, and release the waiters.
+            std::scoped_lock requests_lock{sync_request_mutex};
+            sync_requests.clear();
+            sync_requests_dropped = true;
+        }
+        sync_request_cv.notify_all();
+        // Pipeline v2: the same for the CPU lane (EDEN_NX2_V2_CPULANE) and the caches' owner
+        // calls (EDEN_NX2_V2_COMMIT).
+        {
+            std::scoped_lock lane_lock{lane_mutex};
+            lane_requests.clear();
+            lane_dropped = true;
+        }
+        lane_cv.notify_all();
+        if (renderer) {
+            renderer->ReadRasterizer()->OnCacheOwnerStopped();
+        }
         std::unique_lock lk{sync_mutex};
         shutting_down.store(true, std::memory_order::relaxed);
         sync_cv.notify_all();
@@ -211,18 +431,75 @@ struct GPU::Impl {
         gpu_thread.SubmitList(channel, std::move(entries), is_async);
     }
 
-    void RunInOrder(std::function<void()>&& func) {
-        gpu_thread.Run(std::move(func), is_async);
+    void MapInOrder(VideoCommon::V2::Ir::MapBody map) {
+        if ((map.flags & VideoCommon::V2::Ir::MapBeforeLaterReads) != 0) {
+            map.pending_id = pending_maps.Add(map.gpu_address, map.size);
+        }
+        gpu_thread.QueueMap(map, is_async);
     }
 
-    void MapInOrder(GPUVAddr gpu_addr, u64 size, std::function<void()>&& func) {
-        const u64 id = pending_maps.Add(gpu_addr, size);
-        gpu_thread.Run(
-            [this, id, func = std::move(func)] {
-                func();
-                pending_maps.Remove(id);
-            },
-            is_async, true);
+    void ExecuteMap(const VideoCommon::V2::Ir::MapBody& map) {
+        using VideoCommon::V2::Ir::MapOp;
+        VideoCommon::GpuSplit::NoteMapExecuted();
+        auto* const gmmu = reinterpret_cast<Tegra::MemoryManager*>(map.object);
+        switch (map.op) {
+        case MapOp::GmmuMap:
+            gmmu->Map(map.gpu_address, map.device_address, map.size, Tegra::PTEKind::PITCH, false);
+            break;
+        case MapOp::GmmuUnmap:
+            gmmu->Unmap(map.gpu_address, map.size);
+            break;
+        case MapOp::SmmuRelease: {
+            auto* const smmu = reinterpret_cast<Tegra::MaxwellDeviceMemoryManager*>(map.object);
+            smmu->Unmap(map.device_address, map.size);
+            smmu->Free(map.device_address, map.extra);
+            break;
+        }
+        case MapOp::HeapRelease:
+            if (map.object != 0) {
+                reinterpret_cast<Service::Nvidia::NvCore::HeapMapper*>(map.object)
+                    ->Unmap(map.cpu_address, map.size);
+            }
+            break;
+        case MapOp::SparseRelease: {
+            auto* const smmu = reinterpret_cast<Tegra::MaxwellDeviceMemoryManager*>(map.object2);
+            gmmu->Unmap(map.gpu_address, map.size);
+            smmu->Unmap(map.device_address, map.size);
+            smmu->Free(map.device_address, map.extra);
+            break;
+        }
+        case MapOp::SparseTile: {
+            auto* const smmu = reinterpret_cast<Tegra::MaxwellDeviceMemoryManager*>(map.object);
+            smmu->Unmap(map.device_address, map.size);
+            if (map.cpu_address != 0) {
+                smmu->Map(map.device_address, map.cpu_address, map.size,
+                          Core::Asid{static_cast<size_t>(map.extra)}, true);
+            }
+            break;
+        }
+        case MapOp::Count:
+            LOG_ERROR(HW_GPU, "Unknown map op {}", static_cast<u32>(map.op));
+            break;
+        }
+        if (map.pending_id != 0) {
+            pending_maps.Remove(map.pending_id);
+        }
+    }
+
+    u64 MarkInOrder() {
+        return gpu_thread.Notify(is_async);
+    }
+
+    bool InOrderDone(u64 marker) const {
+        return gpu_thread.SignaledSequence() >= marker;
+    }
+
+    void SignalInOrder(Kernel::KEvent* event) {
+        gpu_thread.SignalEvent(event, is_async);
+    }
+
+    void SignalEventInOrder(void* event) {
+        static_cast<Kernel::KEvent*>(event)->Signal(system.Kernel());
     }
 
     bool IsMapPending(GPUVAddr gpu_addr, u64 size) const {
@@ -240,6 +517,10 @@ struct GPU::Impl {
             return raster_area;
         }
         raster_area.preemtive = true;
+        // SYNC §15.2: the guest CPU reads GPU results here: later downloads and query results on
+        // these pages are work the guest will read (strong hints, rule I′).
+        Tegra::Nx2MarkCpuReadPage(raster_area.start_address,
+                                  raster_area.end_address - raster_area.start_address);
         // A guest CPU read of GPU-written memory (reactive flushing): count them, they decide
         // whether buffer data must be copied back at every fence (EDEN_NX2_BUFFER_DOWNLOADS).
         if (static std::atomic<u64> reads{}; (reads.fetch_add(1, std::memory_order_relaxed) & 63) == 0) {
@@ -247,11 +528,41 @@ struct GPU::Impl {
                      raster_area.start_address, raster_area.end_address,
                      reads.load(std::memory_order_relaxed));
         }
-        const u64 fence = RequestSyncOperation([this, raster_area]() {
-            // Apply collected guest writes before downloading GPU data over guest memory.
-            InvalidateGPUCache();
-            renderer->ReadRasterizer()->FlushRegion(raster_area.start_address, raster_area.end_address - raster_area.start_address);
-        });
+        if (VideoCommon::V2::On(VideoCommon::V2::Switch::Readback) && is_async) [[unlikely]] {
+            // EDEN_NX2_V2_READBACK: the caches' owner records and submits the download; this
+            // thread waits for the GPU and writes guest memory itself (Ryujinx's readback on the
+            // reading thread), so the owner never blocks on the GPU for it.
+            std::function<void()> land;
+            const SyncRequest record{
+                .op = SyncOp::CpuReadback,
+                .address = raster_area.start_address,
+                .size = raster_area.end_address - raster_area.start_address,
+                .out = &land,
+            };
+            if (UseCpuLane()) {
+                lane_used = true;
+                RunOnCpuLane(SyncRequest{record});
+            } else {
+                const u64 fence = RequestSyncOperation(SyncRequest{record});
+                gpu_thread.TickGPU(is_async);
+                WaitForSyncOperation(fence);
+            }
+            if (land) {
+                land();
+            }
+            return raster_area;
+        }
+        const SyncRequest flush{
+            .op = SyncOp::CpuReadFlush,
+            .address = raster_area.start_address,
+            .size = raster_area.end_address - raster_area.start_address,
+        };
+        if (UseCpuLane()) [[unlikely]] {
+            lane_used = true;
+            RunOnCpuLane(SyncRequest{flush});
+            return raster_area;
+        }
+        const u64 fence = RequestSyncOperation(SyncRequest{flush});
         gpu_thread.TickGPU(is_async);
         WaitForSyncOperation(fence);
         return raster_area;
@@ -262,10 +573,14 @@ struct GPU::Impl {
         if (preserve_gpu_writes) {
             VideoCore::RasterizerInterface* rasterizer = renderer->ReadRasterizer();
             if (!rasterizer->TryCacheInvalidation(addr, size)) {
-                const u64 fence = RequestSyncOperation([rasterizer, addr, size] {
-                    rasterizer->FlushRegion(addr, size, VideoCommon::CacheType::BufferCache);
-                    rasterizer->OnCacheInvalidation(addr, size);
-                });
+                const SyncRequest flush{
+                    .op = SyncOp::PreserveInvalidate, .address = addr, .size = size};
+                if (UseCpuLane()) [[unlikely]] {
+                    lane_used = true;
+                    RunOnCpuLane(SyncRequest{flush});
+                    return;
+                }
+                const u64 fence = RequestSyncOperation(SyncRequest{flush});
                 gpu_thread.TickGPU(is_async);
                 WaitForSyncOperation(fence);
             }
@@ -297,30 +612,75 @@ struct GPU::Impl {
                 free_swap_counters.pop_front();
             }
         }
-        pending_composite_fence = RequestSyncOperation(
-            [this, current_request_counter, num_fences, composite_layers = std::move(layers),
-             composite_fences = std::move(fences)] {
-                if (num_fences == 0) {
-                    renderer->Composite(composite_layers);
+        // A typed Present request: its layers and fences wait in a present slot.
+        VideoCommon::V2::Ir::PresentBody present{
+            .frame = 0,
+            .slot = 0,
+            .num_layers = static_cast<u32>(layers.size()),
+            .num_fences = static_cast<u32>(num_fences),
+            .reserved = 0,
+        };
+        {
+            std::unique_lock<std::mutex> lk(request_swap_mutex);
+            present.frame = ++present_count;
+            if (free_present_slots.empty()) {
+                present.slot = static_cast<u32>(present_slots.size());
+                present_slots.emplace_back();
+            } else {
+                present.slot = free_present_slots.back();
+                free_present_slots.pop_back();
+            }
+            present_slots[present.slot] = {std::move(layers), std::move(fences),
+                                           current_request_counter};
+        }
+        pending_composite_fence =
+            RequestSyncOperation(SyncRequest{.op = SyncOp::Present, .present = present});
+        gpu_thread.TickGPU(is_async);
+    }
+
+    /// The queued composites not recorded yet, for Present records. The request stays queued:
+    /// the TickWork after the record composites it, exactly where and when it did without the
+    /// records (vi2's composite order and pacing are unchanged).
+    std::vector<VideoCommon::V2::Ir::PresentBody> TakeQueuedPresents() {
+        std::vector<VideoCommon::V2::Ir::PresentBody> presents;
+        std::unique_lock lck{sync_request_mutex};
+        for (SyncRequest& request : sync_requests) {
+            if (request.op == SyncOp::Present && !request.recorded) {
+                presents.push_back(request.present);
+                request.recorded = true;
+            }
+        }
+        return presents;
+    }
+
+    /// Runs a Present request (TickWork): composites now, or once its fences signal.
+    void RunPresent(const VideoCommon::V2::Ir::PresentBody& present) {
+        PresentSlot slot;
+        {
+            std::unique_lock<std::mutex> lk(request_swap_mutex);
+            slot = std::move(present_slots[present.slot]);
+            present_slots[present.slot] = {};
+            free_present_slots.push_back(present.slot);
+        }
+        if (slot.fences.empty()) {
+            renderer->Composite(slot.layers);
+            return;
+        }
+        auto& syncpoint_manager = system.Host1x().GetSyncpointManager();
+        const auto executer = [this, current_request_counter = slot.counter,
+                               composite_layers = slot.layers]() {
+            {
+                std::unique_lock<std::mutex> lk(request_swap_mutex);
+                if (--request_swap_counters[current_request_counter] != 0) {
                     return;
                 }
-                auto& syncpoint_manager = system.Host1x().GetSyncpointManager();
-                const auto executer = [this, current_request_counter, composite_layers]() {
-                    {
-                        std::unique_lock<std::mutex> lk(request_swap_mutex);
-                        if (--request_swap_counters[current_request_counter] != 0) {
-                            return;
-                        }
-                        free_swap_counters.push_back(current_request_counter);
-                    }
-                    renderer->Composite(composite_layers);
-                };
-                for (size_t i = 0; i < num_fences; i++) {
-                    syncpoint_manager.RegisterGuestAction(composite_fences[i].id,
-                                                          composite_fences[i].value, executer);
-                }
-            });
-        gpu_thread.TickGPU(is_async);
+                free_swap_counters.push_back(current_request_counter);
+            }
+            renderer->Composite(composite_layers);
+        };
+        for (const auto& fence : slot.fences) {
+            syncpoint_manager.RegisterGuestAction(fence.id, fence.value, executer);
+        }
     }
 
     void WaitForComposite() {
@@ -339,7 +699,7 @@ struct GPU::Impl {
         std::vector<u8> out;
 
         const auto wait_fence =
-            RequestSyncOperation([&] { out = renderer->GetAppletCaptureBuffer(); });
+            RequestSyncOperation(SyncRequest{.op = SyncOp::Capture, .out = &out});
         gpu_thread.TickGPU(is_async);
         WaitForSyncOperation(wait_fence);
 
@@ -370,13 +730,26 @@ struct GPU::Impl {
 
     std::condition_variable sync_cv;
 
-    std::list<std::function<void()>> sync_requests;
+    std::deque<SyncRequest> sync_requests;
     std::atomic<u64> current_sync_fence{};
+    std::atomic<AmpereAnchor> ampere_anchor{};
     u64 last_sync_fence{};
 
     VideoCommon::PendingMaps pending_maps;
     std::mutex sync_request_mutex;
     std::condition_variable sync_request_cv;
+    /// The GPU threads stopped and the requests were dropped (NotifyShutdown, under the mutex).
+    bool sync_requests_dropped{};
+
+    // EDEN_NX2_V2_CPULANE (RunOnCpuLane).
+    std::mutex lane_mutex;
+    std::condition_variable lane_cv;
+    std::deque<SyncRequest> lane_requests;
+    u64 lane_last{};
+    u64 lane_done{};
+    bool lane_dropped{}; ///< NotifyShutdown dropped the lane (under lane_mutex)
+    std::atomic<bool> lane_pending{};
+    std::atomic<bool> lane_used{}; ///< Once set, TickWork serves the lane too
 
     const bool is_async;
 
@@ -390,6 +763,9 @@ struct GPU::Impl {
     std::deque<size_t> free_swap_counters;
     std::deque<size_t> request_swap_counters;
     std::mutex request_swap_mutex;
+    std::vector<PresentSlot> present_slots;  ///< Under request_swap_mutex
+    std::vector<u32> free_present_slots;
+    u64 present_count{};
     u64 pending_composite_fence{};
 };
 
@@ -449,13 +825,13 @@ void GPU::OnCommandListEnd() {
 }
 
 u64 GPU::RequestFlush(DAddr addr, std::size_t size) {
-    return impl->RequestSyncOperation([this, addr, size]() {
-        impl->renderer->ReadRasterizer()->FlushRegion(addr, size);
-    });
+    return impl->RequestSyncOperation(
+        SyncRequest{.op = SyncOp::Flush, .address = addr, .size = size});
 }
 
 u64 GPU::RunOnGpuThread(std::function<void()>&& action) {
-    return impl->RequestSyncOperation(std::move(action));
+    return impl->RequestSyncOperation(
+        SyncRequest{.op = SyncOp::Debug, .debug = std::move(action)});
 }
 
 u64 GPU::CurrentSyncRequestFence() const {
@@ -468,6 +844,18 @@ void GPU::WaitForSyncOperation(u64 fence) {
 
 void GPU::TickWork() {
     impl->TickWork();
+}
+
+void GPU::TickCpuLane() {
+    impl->TickCpuLane();
+}
+
+void GPU::WakeCacheOwner() {
+    impl->WakeCacheOwner();
+}
+
+u64 GPU::CollectedCpuWrites() const {
+    return impl->CollectedCpuWrites();
 }
 
 /// Gets a mutable reference to the Host1x interface
@@ -529,6 +917,10 @@ void GPU::WaitForComposite() {
     impl->WaitForComposite();
 }
 
+std::vector<VideoCommon::V2::Ir::PresentBody> GPU::TakeQueuedPresents() {
+    return impl->TakeQueuedPresents();
+}
+
 std::vector<u8> GPU::GetAppletCaptureBuffer() {
     return impl->GetAppletCaptureBuffer();
 }
@@ -585,12 +977,28 @@ void GPU::FlushRegion(DAddr addr, u64 size) {
     impl->FlushRegion(addr, size);
 }
 
-void GPU::RunInOrder(std::function<void()>&& func) {
-    impl->RunInOrder(std::move(func));
+void GPU::MapInOrder(const VideoCommon::V2::Ir::MapBody& map) {
+    impl->MapInOrder(map);
 }
 
-void GPU::MapInOrder(GPUVAddr gpu_addr, u64 size, std::function<void()>&& func) {
-    impl->MapInOrder(gpu_addr, size, std::move(func));
+void GPU::ExecuteMap(const VideoCommon::V2::Ir::MapBody& map) {
+    impl->ExecuteMap(map);
+}
+
+u64 GPU::MarkInOrder() {
+    return impl->MarkInOrder();
+}
+
+bool GPU::InOrderDone(u64 marker) const {
+    return impl->InOrderDone(marker);
+}
+
+void GPU::SignalInOrder(Kernel::KEvent* event) {
+    impl->SignalInOrder(event);
+}
+
+void GPU::SignalEventInOrder(void* event) {
+    impl->SignalEventInOrder(event);
 }
 
 bool GPU::IsMapPending(GPUVAddr gpu_addr, u64 size) const {

@@ -6,11 +6,14 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstring>
 #include <cstdlib>
 #include <span>
 #include <vector>
 
+#include "video_core/renderer_vulkan/vk_background_readback.h"
+#include "video_core/v2/p5b_stats.h"
 #include "video_core/buffer_cache/buffer_cache_base.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/nx2_profile.h"
@@ -18,6 +21,10 @@
 #include "video_core/renderer_vulkan/vertex_repack.h"
 
 #include "video_core/renderer_vulkan/maxwell_to_vk.h"
+#include "video_core/renderer_vulkan/vk_bindless_heap.h"
+#include "video_core/v2/cbuf_ring.h"
+#include "video_core/v2/p3_stats.h"
+#include "video_core/v2/v2_switches.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
@@ -88,7 +95,7 @@ vk::Buffer CreateBuffer(const Device& device, const MemoryAllocator& memory_allo
     if (device.IsBufferDeviceAddressSupported()) {
         flags |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
     }
-    const VkBufferCreateInfo buffer_ci = {
+    VkBufferCreateInfo buffer_ci = {
         .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
         .pNext = nullptr,
         .flags = 0,
@@ -98,6 +105,7 @@ vk::Buffer CreateBuffer(const Device& device, const MemoryAllocator& memory_allo
         .queueFamilyIndexCount = 0,
         .pQueueFamilyIndices = nullptr,
     };
+    device.ApplyTransferSharing(buffer_ci); // EDEN_NX2_V2_XFERQ
     if (sparse_alignment > 1) {
         return memory_allocator.CreateBuffer(buffer_ci, MemoryUsage::DeviceLocal, sparse_alignment);
     }
@@ -168,8 +176,189 @@ VkBufferView Buffer::View(u32 offset, u32 size, VideoCore::Surface::PixelFormat 
             .offset = offset,
             .range = size,
         }),
+        .heap_slot = {},
     });
+    if (BindlessHeap* const heap = BindlessHeap::Active(); heap != nullptr && heap->TexelBuffers())
+        [[unlikely]] {
+        // The view may get heap slots: it frees them when it dies.
+        views.back().heap_slot = HeapSlotOwner{*views.back().handle};
+    }
     return *views.back().handle;
+}
+
+void Buffer::HeapSlotOwner::Forget() noexcept {
+    if (view == VK_NULL_HANDLE) {
+        return;
+    }
+    if (BindlessHeap* const heap = BindlessHeap::Active()) {
+        heap->ForgetBufferView(view);
+    }
+    view = VK_NULL_HANDLE;
+}
+
+void BufferCacheRuntime::BindHeapTexelBuffer(Buffer& buffer, u32 offset, u32 size,
+                                             VideoCore::Surface::PixelFormat format, u32 index) {
+    namespace SPIRV = Shader::Backend::SPIRV;
+    BindlessHeap* const heap = BindlessHeap::Active();
+    const VkBufferView view = buffer.View(offset, size, format);
+    const bool storage = ((heap_texel_storage >> index) & 1) != 0;
+    const bool integer = ((heap_texel_integer >> index) & 1) != 0;
+    const u32 binding = storage ? SPIRV::HeapStorageTexelBinding(integer)
+                                : SPIRV::HEAP_UNIFORM_TEXEL_BINDING;
+    const u32 slot = heap->TexelSlot(binding, view);
+    heap_texel_words->push_back(slot);
+    if (heap_texel_verify) {
+        // EDEN_NX2_V2_BINDLESS=verify: what the old path would bind against what the heap holds.
+        auto& data = VideoCommon::V2::P3Stats::Get();
+        ++data.heap_verify;
+        if (heap->TexelAt(binding, slot) != view) {
+            ++data.heap_mismatches;
+        }
+    }
+}
+
+std::span<const u8> BufferCacheRuntime::MappedBytes(VkBuffer buffer, u64 offset,
+                                                    u64 size) const noexcept {
+    if (buffer != VK_NULL_HANDLE && cbuf_ring_buffer && buffer == *cbuf_ring_buffer) {
+        const std::span<const u8> mapped = cbuf_ring_buffer.Mapped();
+        if (offset + size <= mapped.size()) {
+            return std::span<const u8>(mapped.data() + offset, size);
+        }
+        return {};
+    }
+    return StreamBytes(buffer, offset, size);
+}
+
+StagingBufferRef BufferCacheRuntime::PaddedCbufCopy(const u8* source, u32 size, u32 used) {
+    const StagingBufferRef ref = staging_pool.Request(used, MemoryUsage::Upload);
+    const u32 copied = source != nullptr ? (std::min)(size, used) : 0;
+    if (copied != 0) {
+        std::memcpy(ref.mapped_span.data(), source, copied);
+    }
+    std::memset(ref.mapped_span.data() + copied, 0, used - copied);
+    if (VideoCommon::V2::P3Stats::Enabled()) {
+        ++VideoCommon::V2::P3Stats::Get().bda_padded;
+    }
+    return ref;
+}
+
+void BufferCacheRuntime::VerifyCbufAddress(const u8* bound, const u8* addressed, u32 size,
+                                           u32 used) {
+    // EDEN_NX2_V2_CBUFBDA=verify: within the bound range the shader reads the bound bytes, past
+    // it zeros (a bounded uniform buffer's reads).
+    auto& data = VideoCommon::V2::P3Stats::Get();
+    ++data.bda_verify;
+    const u32 head = (std::min)(size, used);
+    bool same = bound == nullptr || std::memcmp(bound, addressed, head) == 0;
+    for (u32 i = head; same && i < used; ++i) {
+        same = addressed[i] == 0;
+    }
+    if (same) {
+        return;
+    }
+    ++data.bda_mismatches;
+    static std::atomic<u32> logged{};
+    if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+        LOG_WARNING(Render_Vulkan,
+                    "V2 cbuf address verify: {} bytes bound ({} read) differ at the address", size,
+                    used);
+    }
+}
+
+std::span<u8> BufferCacheRuntime::BindMappedCbufAddress(u32 size, u32 used) {
+    // The caller fills `size` bytes; a shorter bind than the shader reads gets a zero tail.
+    const u32 allocated = (std::max)(size, used);
+    const StagingBufferRef ref = staging_pool.Request(allocated, MemoryUsage::Upload);
+    last_stream_uniform = StreamUniformRef{
+        .buffer = ref.buffer,
+        .device_address = ref.device_address,
+        .offset = static_cast<u32>(ref.offset),
+    };
+    if (allocated != size) {
+        std::memset(ref.mapped_span.data() + size, 0, allocated - size);
+    }
+    *(cbuf_addresses++) = ref.device_address + ref.offset;
+    if (VideoCommon::V2::P3Stats::Enabled()) {
+        auto& data = VideoCommon::V2::P3Stats::Get();
+        ++data.bda_addresses;
+        data.bda_padded += allocated != size ? 1 : 0;
+    }
+    if (cbuf_verify) {
+        AddStreamUniform(last_stream_uniform, size);
+    }
+    return ref.mapped_span.first(size);
+}
+
+void BufferCacheRuntime::CbufAddressFromStream(const StreamUniformRef& ref, u32 size, u32 used) {
+    if (size >= used) {
+        // The range itself (ring or stream allocation, live for the tick).
+        *(cbuf_addresses++) = ref.device_address + ref.offset;
+        if (VideoCommon::V2::P3Stats::Enabled()) {
+            ++VideoCommon::V2::P3Stats::Get().bda_addresses;
+        }
+        if (cbuf_verify) {
+            // The address is the descriptor's range: the same bytes.
+            ++VideoCommon::V2::P3Stats::Get().bda_verify;
+        }
+        return;
+    }
+    // A ring or stream range is host visible: a copy with the zero tail.
+    const std::span<const u8> bytes = MappedBytes(ref.buffer, ref.offset, size);
+    const StagingBufferRef copy =
+        PaddedCbufCopy(bytes.empty() ? nullptr : bytes.data(), size, used);
+    *(cbuf_addresses++) = copy.device_address + copy.offset;
+    if (VideoCommon::V2::P3Stats::Enabled()) {
+        ++VideoCommon::V2::P3Stats::Get().bda_addresses;
+    }
+    if (cbuf_verify && !bytes.empty()) {
+        VerifyCbufAddress(bytes.data(), copy.mapped_span.data(), size, used);
+    }
+}
+
+void BufferCacheRuntime::CbufAddressFromBuffer(const Buffer& buffer, u32 offset, u32 size,
+                                               u32 used) {
+    const bool stats = VideoCommon::V2::P3Stats::Enabled();
+    const auto zeros = [&] {
+        const StagingBufferRef copy = PaddedCbufCopy(nullptr, 0, used);
+        return copy.device_address + copy.offset;
+    };
+    VkDeviceAddress address = 0;
+    if (buffer.Handle() == VK_NULL_HANDLE || buffer.DeviceAddress() == 0) {
+        // The null buffer: what an unbound uniform buffer reads.
+        address = zeros();
+    } else if (size >= used || offset + u64{used} <= buffer.SizeBytes()) {
+        // Device-local: read in place. A short bind reads the buffer's next bytes (its guest
+        // memory) instead of zeros; the buffer holds them, so the read stays inside it.
+        address = buffer.DeviceAddress() + offset;
+        if (stats && size < used) {
+            ++VideoCommon::V2::P3Stats::Get().bda_short_device;
+        }
+    } else {
+        // Past the end of the buffer: a device-local range can't be copied here; zeros instead
+        // of reading outside the buffer.
+        address = zeros();
+        static std::atomic<u32> logged{};
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+            LOG_WARNING(Render_Vulkan,
+                        "V2 cbuf address: a {}-byte uniform bind at the end of a buffer is read "
+                        "as {} bytes; zeros are read instead",
+                        size, used);
+        }
+    }
+    *(cbuf_addresses++) = address;
+    if (stats) {
+        ++VideoCommon::V2::P3Stats::Get().bda_addresses;
+    }
+    if (cbuf_verify) {
+        // Device-local bytes can't be read here: the address must be the descriptor's range.
+        auto& data = VideoCommon::V2::P3Stats::Get();
+        ++data.bda_verify;
+        const bool in_place = buffer.Handle() != VK_NULL_HANDLE && buffer.DeviceAddress() != 0 &&
+                              (size >= used || offset + u64{used} <= buffer.SizeBytes());
+        if (in_place && address != buffer.DeviceAddress() + offset) {
+            ++data.bda_mismatches;
+        }
+    }
 }
 
 class QuadIndexBuffer {
@@ -238,8 +427,7 @@ public:
         }
 
         if (!host_visible) {
-            scheduler.RequestOutsideRenderPassOperationContext();
-            scheduler.Record([src_buffer = staging.buffer, src_offset = staging.offset,
+            scheduler.RecordBufferOperation([src_buffer = staging.buffer, src_offset = staging.offset,
                               dst_buffer = *buffer, size_bytes](vk::CommandBuffer cmdbuf) {
                 const VkBufferCopy copy{
                     .srcOffset = src_offset,
@@ -409,6 +597,42 @@ BufferCacheRuntime::BufferCacheRuntime(const Device& device_, MemoryAllocator& m
                                                                      scheduler_, staging_pool_);
     quad_strip_index_buffer = std::make_shared<QuadStripIndexBuffer>(device_, memory_allocator_,
                                                                      scheduler_, staging_pool_);
+    if (VideoCommon::V2::On(VideoCommon::V2::Switch::CbufRing)) [[unlikely]] {
+        VkBufferCreateInfo ring_ci{
+            .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .size = VideoCommon::V2::CbufRing::Shared::Capacity,
+            .usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+            .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+            .queueFamilyIndexCount = 0,
+            .pQueueFamilyIndices = nullptr,
+        };
+        if (device.IsBufferDeviceAddressSupported()) {
+            ring_ci.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+        }
+        cbuf_ring_buffer = memory_allocator.CreateBuffer(ring_ci, MemoryUsage::Stream);
+        if (device.IsBufferDeviceAddressSupported()) {
+            cbuf_ring_address = device.GetLogical().GetBufferDeviceAddress(*cbuf_ring_buffer);
+        }
+        const std::span<u8> mapped = cbuf_ring_buffer.Mapped();
+        if (!mapped.empty()) {
+            VideoCommon::V2::CbufRing::Get().Init(mapped.data(), GetUniformBufferAlignment());
+            // R2-F2-03: the verify log names each page's last writer.
+            VideoCommon::V2::CbufWatch::Get().track_writers.store(
+                VideoCommon::V2::Verify(VideoCommon::V2::Switch::CbufRing),
+                std::memory_order_relaxed);
+        }
+        LOG_INFO(Render_Vulkan, "V2 F2-02 constant buffer version ring: {} MiB, {}",
+                 VideoCommon::V2::CbufRing::Shared::Capacity >> 20,
+                 mapped.empty() ? "not host visible, off" : "mapped");
+    }
+}
+
+BufferCacheRuntime::~BufferCacheRuntime() {
+    if (cbuf_ring_buffer) {
+        VideoCommon::V2::CbufRing::Get().Shutdown();
+    }
 }
 
 u32 BufferCacheRuntime::SetVertexRepackLayout(const Tegra::Engines::Maxwell3D::Regs& regs,
@@ -495,6 +719,7 @@ void BufferCacheRuntime::WaitSubmittedTick(u64 tick) {
     if (!scheduler.IsSubmitted(tick) && VideoCommon::GpuSplit::Get().Active() &&
         !VideoCommon::GpuSplit::OnBackThread()) {
         VideoCommon::Nx2Profile::Scope scope{VideoCommon::Nx2Profile::Zone::ListSubmitWait};
+        scheduler.RequestLazyFlush(tick); // F4-X2: list copies ride the open submission
         if (!scheduler.WaitSubmitted(tick)) {
             scheduler.Wait(tick);
             return;
@@ -504,18 +729,85 @@ void BufferCacheRuntime::WaitSubmittedTick(u64 tick) {
     master.Wait(tick);
 }
 
-void BufferCacheRuntime::Finish() {
-    scheduler.Finish();
+void BufferCacheRuntime::Finish(std::source_location location) {
+    scheduler.Finish({}, {}, location);
 }
 
-void BufferCacheRuntime::FinishForHostRead() {
-    scheduler.RequestOutsideRenderPassOperationContext();
-    scheduler.Record(HostReadBarrier);
-    scheduler.Finish();
+void BufferCacheRuntime::FinishForHostRead(std::source_location location) {
+    // F4-06: the host reads buffers only; pending attachment writes stay pending for graphics.
+    scheduler.RecordBufferOperation(HostReadBarrier);
+    // SYNC Step 8: a synchronous download (class C residual, MP §11): counted by its caller.
+    scheduler.Finish({}, {}, location);
+}
+
+void BufferCacheRuntime::NoteMappedGpuWrite() {
+    scheduler.WantHostReadBarrier();
+}
+
+bool BufferCacheRuntime::TransferReadbackDirect(u64 producer) {
+    if (scheduler.GetBackgroundReadback()->DirectRoute(producer)) {
+        return true;
+    }
+    // STATS: riding the open submission in order (R2-F4-11), no flush of its own.
+    VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::ReadbacksRiding);
+    return false;
+}
+
+bool BufferCacheRuntime::WaitForProducerHostRead(u64 producer) {
+    if (!scheduler.IsSubmitted(producer) || !scheduler.HostVisibleThrough(producer)) {
+        return false;
+    }
+    scheduler.GetMasterSemaphore().Wait(producer);
+    return true;
+}
+
+u64 BufferCacheRuntime::SubmitForHostRead() {
+    scheduler.RecordBufferOperation(HostReadBarrier);
+    const u64 tick = scheduler.CurrentTick();
+    if (scheduler.LazyFencesHere()) [[unlikely]] {
+        // F4-04: no submit of its own; the reader asks for it only if still open (WaitForHostRead).
+        scheduler.WantSubmit();
+        return tick;
+    }
+    scheduler.Flush();
+    return tick;
+}
+
+void BufferCacheRuntime::WaitForHostRead(u64 tick) {
+    scheduler.EnsureSubmitted(tick);
+    scheduler.GetMasterSemaphore().Wait(tick);
+}
+
+bool BufferCacheRuntime::TransferReadbacks() const noexcept {
+    const BackgroundReadback* const readback = scheduler.GetBackgroundReadback();
+    return readback != nullptr && readback->Active();
+}
+
+void BufferCacheRuntime::TransferReadbackCopy(VkBuffer staging, Buffer& src,
+                                              const VideoCommon::BufferCopy& copy, bool mapped) {
+    scheduler.GetBackgroundReadback()->AddBufferCopy(src.Handle(), staging,
+                                                     MakeBufferCopy(copy));
+    if (mapped) {
+        VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::MappedReadbacks);
+    }
+}
+
+std::pair<u64, u64> BufferCacheRuntime::SubmitTransferReadback(u64 producer_tick,
+                                                                u64& ride_tick) {
+    ride_tick = 0;
+    const auto job = scheduler.GetBackgroundReadback()->Submit(producer_tick, &ride_tick);
+    return {reinterpret_cast<u64>(job.semaphore), job.value};
+}
+
+void BufferCacheRuntime::WaitTransferReadback(u64 semaphore, u64 value, u64 ride_tick) {
+    scheduler.GetBackgroundReadback()->Wait(
+        {reinterpret_cast<VkSemaphore>(semaphore), value, std::chrono::steady_clock::now()},
+        ride_tick);
 }
 
 bool BufferCacheRuntime::CanReorderUpload(const Buffer& buffer,
                                           std::span<const VideoCommon::BufferCopy> copies) {
+    reorder_to_transfer = false;
     if (Settings::values.disable_buffer_reorder) {
         return false;
     }
@@ -523,12 +815,26 @@ bool BufferCacheRuntime::CanReorderUpload(const Buffer& buffer,
         std::ranges::all_of(copies, [&](const VideoCommon::BufferCopy& copy) {
             return !buffer.IsRegionUsed(copy.dst_offset, copy.size);
         });
+    // EDEN_NX2_V2_XFERQ: regions no in-flight work uses (the condition above) can be copied on
+    // the transfer queue: no graphics tick to wait for, and the open submission waits for the
+    // transfer batch. TryHoistTransfer refuses after a class B join in this submission.
+    // Perf fix C: small uploads stay in the upload command buffer (inline on graphics, already out
+    // of passes): a transfer batch costs a copy-engine launch and two cross-queue signals, more
+    // than ~18 KiB of copies. Large ones go to the transfer queue with no graphics wait.
+    static constexpr u64 TransferMinBytes = 64 * 1024;
+    if (can_use_upload_cmdbuf && scheduler.HasTransferQueue()) [[unlikely]] {
+        u64 bytes = 0;
+        for (const VideoCommon::BufferCopy& copy : copies) {
+            bytes += copy.size;
+        }
+        reorder_to_transfer = bytes >= TransferMinBytes && scheduler.TryHoistBufferUpload();
+    }
     return can_use_upload_cmdbuf;
 }
 
 void BufferCacheRuntime::CopyBuffer(VkBuffer dst_buffer, VkBuffer src_buffer,
                                     std::span<const VideoCommon::BufferCopy> copies, bool barrier,
-                                    bool can_reorder_upload) {
+                                    bool can_reorder_upload, bool hazard_free) {
     if (dst_buffer == VK_NULL_HANDLE || src_buffer == VK_NULL_HANDLE) {
         return;
     }
@@ -548,16 +854,41 @@ void BufferCacheRuntime::CopyBuffer(VkBuffer dst_buffer, VkBuffer src_buffer,
     // Measuring a popular game, this number never exceeds the specified size once data is warmed up
     boost::container::small_vector<VkBufferCopy, 8> vk_copies(copies.size());
     std::ranges::transform(copies, vk_copies.begin(), MakeBufferCopy);
+    if (can_reorder_upload && std::exchange(reorder_to_transfer, false)) [[unlikely]] {
+        if (VideoCommon::V2::P5bStats::Enabled()) {
+            namespace P5b = VideoCommon::V2::P5bStats;
+            P5b::Add(P5b::Counter::TransferCopies, vk_copies.size());
+            for (const VkBufferCopy& copy : vk_copies) {
+                P5b::Add(P5b::Counter::TransferBytes, copy.size);
+            }
+        }
+        scheduler.RecordTransfer([src_buffer, dst_buffer, vk_copies](vk::CommandBuffer cmdbuf) {
+            cmdbuf.CopyBuffer(src_buffer, dst_buffer, vk_copies);
+        });
+        return;
+    }
     if (src_buffer == staging_pool.StreamBuf() && can_reorder_upload) {
-        scheduler.RecordWithUploadBuffer([src_buffer, dst_buffer, vk_copies](
+        // F4-06: only the upload command buffer (it runs before the submission's main stream):
+        // no pending main-stream write can be ordered before it, so no auto flush (8.75 full
+        // barriers/f at 8d31).
+        scheduler.RecordUpload([src_buffer, dst_buffer, vk_copies](
                                              vk::CommandBuffer, vk::CommandBuffer upload_cmdbuf) {
             upload_cmdbuf.CopyBuffer(src_buffer, dst_buffer, vk_copies);
         });
         return;
     }
+    if (hazard_free) {
+        // SYNC Step 9: a buffer-to-buffer copy the caller found hazard-free (neither range used
+        // by work in flight) runs in the upload command buffer, as uploads do: no pass ends.
+        VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::HoistedCopies);
+        scheduler.RecordUpload([src_buffer, dst_buffer, vk_copies](
+                                   vk::CommandBuffer, vk::CommandBuffer upload_cmdbuf) {
+            upload_cmdbuf.CopyBuffer(src_buffer, dst_buffer, vk_copies);
+        });
+        return;
+    }
 
-    scheduler.RequestOutsideRenderPassOperationContext();
-    scheduler.Record([src_buffer, dst_buffer, vk_copies, barrier](vk::CommandBuffer cmdbuf) {
+    scheduler.RecordBufferOperation([src_buffer, dst_buffer, vk_copies, barrier](vk::CommandBuffer cmdbuf) {
         if (barrier) {
             cmdbuf.PipelineBarrier(vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER,
                                    VK_PIPELINE_STAGE_TRANSFER_BIT, 0, READ_BARRIER);
@@ -577,8 +908,7 @@ void BufferCacheRuntime::PreCopyBarrier() {
         .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
         .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
     };
-    scheduler.RequestOutsideRenderPassOperationContext();
-    scheduler.Record([](vk::CommandBuffer cmdbuf) {
+    scheduler.RecordBufferOperation([](vk::CommandBuffer cmdbuf) {
         cmdbuf.PipelineBarrier(vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER, VK_PIPELINE_STAGE_TRANSFER_BIT,
                                0, READ_BARRIER);
     });
@@ -591,8 +921,7 @@ void BufferCacheRuntime::PostCopyBarrier() {
         .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
         .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
     };
-    scheduler.RequestOutsideRenderPassOperationContext();
-    scheduler.Record([](vk::CommandBuffer cmdbuf) {
+    scheduler.RecordBufferOperation([](vk::CommandBuffer cmdbuf) {
         cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, vk::PIPELINE_STAGE_GRAPHICS_COMPUTE,
                                0, WRITE_BARRIER);
     });
@@ -615,8 +944,7 @@ void BufferCacheRuntime::ClearBuffer(VkBuffer dest_buffer, u32 offset, size_t si
         .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
     };
 
-    scheduler.RequestOutsideRenderPassOperationContext();
-    scheduler.Record([dest_buffer, offset, size, value](vk::CommandBuffer cmdbuf) {
+    scheduler.RecordBufferOperation([dest_buffer, offset, size, value](vk::CommandBuffer cmdbuf) {
         cmdbuf.PipelineBarrier(vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER, VK_PIPELINE_STAGE_TRANSFER_BIT,
                                0, READ_BARRIER);
         cmdbuf.FillBuffer(dest_buffer, offset, size, value);
@@ -886,8 +1214,7 @@ vk::Buffer BufferCacheRuntime::CreateNullBuffer() {
         ret.SetObjectNameEXT("Null buffer");
     }
 
-    scheduler.RequestOutsideRenderPassOperationContext();
-    scheduler.Record([buffer = *ret](vk::CommandBuffer cmdbuf) {
+    scheduler.RecordBufferOperation([buffer = *ret](vk::CommandBuffer cmdbuf) {
         cmdbuf.FillBuffer(buffer, 0, VK_WHOLE_SIZE, 0);
     });
 

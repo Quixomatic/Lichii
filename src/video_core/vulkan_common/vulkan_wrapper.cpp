@@ -120,6 +120,8 @@ void Load(VkDevice device, DeviceDispatch& dld) noexcept {
     X(vkCmdEndConditionalRenderingEXT);
     X(vkCmdEndQuery);
     X(vkCmdEndRenderPass);
+    X(vkCmdBeginRendering);
+    X(vkCmdEndRendering);
     X(vkCmdEndTransformFeedbackEXT);
     X(vkCmdEndDebugUtilsLabelEXT);
     X(vkCmdFillBuffer);
@@ -237,6 +239,8 @@ void Load(VkDevice device, DeviceDispatch& dld) noexcept {
     X(vkQueueSubmit);
     X(vkQueueSubmit2);
     X(vkResetFences);
+    X(vkResetCommandPool);
+    X(vkWaitForPresentKHR);
     X(vkResetQueryPool);
     X(vkSetDebugUtilsObjectNameEXT);
     X(vkSetDebugUtilsObjectTagEXT);
@@ -275,6 +279,11 @@ void Load(VkDevice device, DeviceDispatch& dld) noexcept {
     }
     if (!dld.vkQueueSubmit2) {
         Proc(dld.vkQueueSubmit2, dld, "vkQueueSubmit2KHR", device);
+    }
+
+    if (!dld.vkCmdBeginRendering) {
+        Proc(dld.vkCmdBeginRendering, dld, "vkCmdBeginRenderingKHR", device);
+        Proc(dld.vkCmdEndRendering, dld, "vkCmdEndRenderingKHR", device);
     }
 
     if (!dld.vkCreateRenderPass2) {

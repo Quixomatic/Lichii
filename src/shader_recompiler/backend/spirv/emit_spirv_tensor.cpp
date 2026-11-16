@@ -52,8 +52,8 @@ CooperativeHmmaTypes DefineCooperativeHmmaTypes(Sirit::Module& module, Id u32_ty
     const Id float16{module.TypeFloat(16)};
     const auto constant{[&](u32 value) { return module.Constant(u32_type, value); }};
     const Id scope{constant(static_cast<u32>(spv::Scope::Subgroup))};
-    const auto matrix{[&](u32 columns, spv::CooperativeMatrixUse use) {
-        return module.TypeStruct(float16, scope, constant(16), constant(columns),
+    const auto matrix{[&](u32 cols, spv::CooperativeMatrixUse use) {
+        return module.TypeStruct(float16, scope, constant(16), constant(cols),
                                  constant(static_cast<u32>(use)));
     }};
     return CooperativeHmmaTypes{
@@ -233,7 +233,7 @@ void DefineSoftwareMatrixFunctions(EmitContext& ctx, const IR::Program& program)
         if (!needed[variant]) continue;
         ctx.AddCapability(spv::Capability::GroupNonUniform);
         ctx.AddCapability(spv::Capability::GroupNonUniformShuffle);
-        if (!ctx.profile.SupportsSubgroupStage(program.stage) ||
+        if (!ctx.SupportsSubgroups() ||
             ctx.profile.has_broken_spirv_subgroup_shuffle)
             throw NotImplementedException("Software HMMA requires subgroup shuffle support");
         const Id u32ty = ctx.U32[1], f32ty = ctx.F32[1];

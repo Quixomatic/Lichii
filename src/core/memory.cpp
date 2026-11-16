@@ -38,6 +38,9 @@
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/host1x/host1x.h"
 #include "video_core/rasterizer_download_area.h"
+#include "video_core/v2/cbuf_watch.h"
+#include "video_core/v2/v2_switches.h"
+#include "video_core/v2/versions.h"
 
 namespace Core::Memory {
 
@@ -494,7 +497,9 @@ struct Memory::Impl {
         }
     }
 
-    void RasterizerMarkRegionCached(u64 vaddr, u64 size, bool cached) {
+    /// `write_only` (F2-03's write watch alone holds the pages): reads stay free whatever the
+    /// reactive flushing setting; only writes trap.
+    void RasterizerMarkRegionCached(u64 vaddr, u64 size, bool cached, bool write_only = false) {
         if (vaddr == 0 || !AddressSpaceContains(*current_page_table, vaddr, size)) {
             return;
         }
@@ -510,7 +515,7 @@ struct Memory::Impl {
             const bool reactive_flushing =
                 Settings::values.use_reactive_flushing.GetValue() &&
                 !(nx2_no_reactive && Settings::CurrentProgramIsSwitch2());
-            if (!reactive_flushing || !cached) {
+            if (!reactive_flushing || !cached || write_only) {
                 perm |= Common::MemoryPermission::Read;
             }
             if (!cached) {
@@ -944,6 +949,16 @@ struct Memory::Impl {
             }
         };
         gpu_device_memory->ApplyOpOnPointer(p, scratch_buffers[core], [&](DAddr address) {
+            // EDEN_NX2_V2_DRAWCACHE: every trapped write moves its page's version.
+            VideoCommon::V2::Versions::HookCpuWrite(address, size);
+            if (VideoCommon::V2::On(VideoCommon::V2::Switch::CbufRing)) [[unlikely]] {
+                // F2-03: the store disarms its watched pages before it lands; the disarming
+                // thread gives the watch's count back.
+                VideoCommon::V2::CbufWatch::Get().OnCpuWrite(address, size, [this](DAddr page) {
+                    const std::pair<DAddr, size_t> range{page, YUZU_PAGESIZE};
+                    gpu_device_memory->UpdateWatchCount(std::span{&range, 1}, -1);
+                });
+            }
             auto& current_area = rasterizer_write_areas[core];
             PAddr subaddress = address >> YUZU_PAGEBITS;
             // Performance note:
@@ -1192,6 +1207,10 @@ Result Memory::StoreDataCache(Common::ProcessAddress dest_addr, const std::size_
 
 Result Memory::FlushDataCache(Common::ProcessAddress dest_addr, const std::size_t size) {
     return impl->FlushDataCache(dest_addr, size);
+}
+
+void Memory::RasterizerMarkRegionWatched(Common::ProcessAddress vaddr, u64 size) {
+    impl->RasterizerMarkRegionCached(GetInteger(vaddr), size, true, true);
 }
 
 void Memory::RasterizerMarkRegionCached(Common::ProcessAddress vaddr, u64 size, bool cached) {

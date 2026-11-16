@@ -28,6 +28,7 @@
 #include "core/device_memory_manager.h"
 #include "core/memory.h"
 #include "video_core/nx2_perf.h"
+#include "video_core/v2/cbuf_watch.h"
 
 namespace Core {
 
@@ -280,6 +281,7 @@ void DeviceMemoryManager<Traits>::Map(DAddr address, VAddr virtual_address, size
     Core::Memory::Memory* process_memory = registered_processes[asid.id];
     size_t start_page_d = address >> Memory::YUZU_PAGEBITS;
     size_t num_pages = Common::AlignUp(size, Memory::YUZU_PAGESIZE) >> Memory::YUZU_PAGEBITS;
+    ReleaseWatchedPages(address, size);
     std::scoped_lock lk(mapping_guard);
 
     tracked_entries.CommitRegion(start_page_d, start_page_d + num_pages);
@@ -320,6 +322,7 @@ template <typename Traits>
 void DeviceMemoryManager<Traits>::Unmap(DAddr address, size_t size) {
     size_t start_page_d = address >> Memory::YUZU_PAGEBITS;
     size_t num_pages = Common::AlignUp(size, Memory::YUZU_PAGESIZE) >> Memory::YUZU_PAGEBITS;
+    ReleaseWatchedPages(address, size);
     device_inter->InvalidateRegion(address, size);
     std::scoped_lock lk(mapping_guard);
 
@@ -646,12 +649,16 @@ void DeviceMemoryManager<Traits>::UnregisterProcess(Asid asid) {
 }
 
 template <typename Traits>
-void DeviceMemoryManager<Traits>::UpdatePagesCachedCountNoLock(DAddr addr, size_t size, s32 delta) {
+void DeviceMemoryManager<Traits>::UpdatePagesCachedCountNoLock(DAddr addr, size_t size, s32 delta,
+                                                               bool watch_op) {
     u64 uncache_begin = 0;
     u64 cache_begin = 0;
     u64 uncache_bytes = 0;
     u64 cache_bytes = 0;
+    u64 watch_begin = 0;
+    u64 watch_bytes = 0;
     const auto MarkRegionCaching = &DeviceMemoryManager<Traits>::DeviceMethods::MarkRegionCaching;
+    const auto MarkRegionWatched = &DeviceMemoryManager<Traits>::DeviceMethods::MarkRegionWatched;
 
     std::atomic_thread_fence(std::memory_order_acquire);
     const size_t page_end = Common::DivCeil(addr + size, Memory::YUZU_PAGESIZE);
@@ -673,6 +680,13 @@ void DeviceMemoryManager<Traits>::UpdatePagesCachedCountNoLock(DAddr addr, size_
                                   cache_bytes, true);
             }
             cache_bytes = 0;
+        }
+        if (watch_bytes > 0) {
+            if (memory_device_inter != nullptr) {
+                MarkRegionWatched(memory_device_inter, watch_begin << Memory::YUZU_PAGEBITS,
+                                  watch_bytes);
+            }
+            watch_bytes = 0;
         }
     };
     size_t old_vpage = (base_vaddress >> Memory::YUZU_PAGEBITS) - 1;
@@ -701,6 +715,61 @@ void DeviceMemoryManager<Traits>::UpdatePagesCachedCountNoLock(DAddr addr, size_
 
         // Adds or subtracts 1, as count is a unsigned 8-bit value
         count.fetch_add(static_cast<CounterType>(delta), std::memory_order_release);
+
+        if (watch_active.load(std::memory_order_relaxed)) [[unlikely]] {
+            // F2-03: three states. Uncached; watched (the write watch is the only holder: only
+            // writes trap); cached (the reactive flushing setting decides reads).
+            const CounterType now = count.load(std::memory_order::relaxed);
+            const CounterType before =
+                static_cast<CounterType>(now - static_cast<CounterType>(delta));
+            bool held_now = WatchHeld(page);
+            bool held_before = held_now;
+            if (watch_op) {
+                held_now = delta > 0;
+                held_before = !held_now;
+                SetWatchHeld(page, held_now);
+            }
+            using VideoCommon::V2::CbufWatch::ProtectionOf;
+            const auto from = ProtectionOf(before, held_before);
+            const auto to = ProtectionOf(now, held_now);
+            const int kind = from == to ? -1 : static_cast<int>(to);
+            if (kind != 0 && uncache_bytes > 0) {
+                if (memory_device_inter != nullptr) {
+                    MarkRegionCaching(memory_device_inter, uncache_begin << Memory::YUZU_PAGEBITS,
+                                      uncache_bytes, false);
+                }
+                uncache_bytes = 0;
+            }
+            if (kind != 1 && cache_bytes > 0) {
+                if (memory_device_inter != nullptr) {
+                    MarkRegionCaching(memory_device_inter, cache_begin << Memory::YUZU_PAGEBITS,
+                                      cache_bytes, true);
+                }
+                cache_bytes = 0;
+            }
+            if (kind != 2 && watch_bytes > 0) {
+                if (memory_device_inter != nullptr) {
+                    MarkRegionWatched(memory_device_inter, watch_begin << Memory::YUZU_PAGEBITS,
+                                      watch_bytes);
+                }
+                watch_bytes = 0;
+            }
+            u64* const run_begin = kind == 0 ? &uncache_begin
+                                   : kind == 1 ? &cache_begin
+                                   : kind == 2 ? &watch_begin
+                                               : nullptr;
+            u64* const run_bytes = kind == 0 ? &uncache_bytes
+                                   : kind == 1 ? &cache_bytes
+                                   : kind == 2 ? &watch_bytes
+                                               : nullptr;
+            if (run_bytes != nullptr) {
+                if (*run_bytes == 0) {
+                    *run_begin = vpage;
+                }
+                *run_bytes += Memory::YUZU_PAGESIZE;
+            }
+            continue;
+        }
 
         // Assume delta is either -1 or 1
         if (count.load(std::memory_order::relaxed) == 0) {
@@ -735,6 +804,62 @@ template <typename Traits>
 void DeviceMemoryManager<Traits>::UpdatePagesCachedCount(DAddr addr, size_t size, s32 delta) {
     Common::ScopedRangeLock lk(counter_guard, addr, size);
     UpdatePagesCachedCountNoLock(addr, size, delta);
+}
+
+template <typename Traits>
+void DeviceMemoryManager<Traits>::ReleaseWatchedPages(DAddr addr, size_t size) {
+    // F2-03: a count of the constant buffer write watch goes back while the old CPU backing
+    // still exists; left on the device page it would not protect the next mapping.
+    if (VideoCommon::V2::On(VideoCommon::V2::Switch::CbufRing)) [[unlikely]] {
+        VideoCommon::V2::CbufWatch::Get().ReleaseRange(addr, size, [this](u64 page) {
+            const std::pair<DAddr, size_t> range{page, Memory::YUZU_PAGESIZE};
+            UpdateWatchCount(std::span{&range, 1}, -1);
+        });
+    }
+}
+
+template <typename Traits>
+void DeviceMemoryManager<Traits>::EnableWatch() {
+    std::call_once(watch_once, [this] {
+        watch_bits = std::make_unique<std::atomic<u64>[]>(num_watch_words);
+        watch_active.store(true, std::memory_order_release);
+    });
+}
+
+template <typename Traits>
+void DeviceMemoryManager<Traits>::UpdateWatchCount(
+    std::span<const std::pair<DAddr, size_t>> ranges, s32 delta) {
+    if (ranges.empty()) {
+        return;
+    }
+    EnableWatch();
+    // The watch's ranges are sorted and separated (CbufWatch::Arming).
+    const DAddr lock_begin = ranges.front().first;
+    const DAddr lock_end = ranges.back().first + ranges.back().second;
+    Common::ScopedRangeLock lk(counter_guard, lock_begin,
+                               static_cast<size_t>(lock_end - lock_begin));
+    for (const auto& [range_addr, range_size] : ranges) {
+        UpdatePagesCachedCountNoLock(range_addr, range_size, delta, true);
+    }
+}
+
+template <typename Traits>
+bool DeviceMemoryManager<Traits>::HoldPageIfCached(DAddr addr) {
+    EnableWatch();
+    Common::ScopedRangeLock lk(counter_guard, addr, Memory::YUZU_PAGESIZE);
+    const size_t page = addr >> Memory::YUZU_PAGEBITS;
+    if ((ExtractCPUBacking(page).second >> Memory::YUZU_PAGEBITS) == 0) {
+        return false; // no CPU backing: the count would not protect anything
+    }
+    CounterAtomicType& count = cached_pages->at(page >> subentries_shift).Count(page);
+    const CounterType value = count.load(std::memory_order_relaxed);
+    if (value == 0 || value == std::numeric_limits<CounterType>::max()) {
+        return false;
+    }
+    // Others hold it (cached): no protection change. Given back through UpdateWatchCount.
+    count.fetch_add(1, std::memory_order_release);
+    SetWatchHeld(page, true);
+    return true;
 }
 
 template <typename Traits>

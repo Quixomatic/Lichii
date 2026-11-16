@@ -9,6 +9,8 @@
 
 #ifdef __linux__
 #include <sys/prctl.h>
+#elif defined(_WIN32)
+#include "common/windows/timer_resolution.h"
 #endif
 
 #include "common/assert.h"
@@ -26,13 +28,14 @@
 #include "video_core/nx2_profile.h"
 #include "video_core/host1x/host1x.h"
 #include "video_core/renderer_base.h"
+#include "video_core/v2/commit.h"
+#include "video_core/v2/front_wake.h"
+#include "video_core/v2/p5b_stats.h"
+#include "video_core/v2/v2_stats.h"
 
 namespace VideoCommon::GPUThread {
 
-namespace {
-
-// Tells a CPU thread waiting in PushCommand that its command ran.
-void SignalCommand(SynchState& state, u64 fence, bool block) {
+void SignalCommandFence(SynchState& state, u64 fence, bool block) {
     state.signaled_fence.store(fence);
     if (block) {
         // We have to lock the write_lock to ensure that the condition_variable wait not get a
@@ -41,8 +44,6 @@ void SignalCommand(SynchState& state, u64 fence, bool block) {
         state.cv.notify_all();
     }
 }
-
-} // Anonymous namespace
 
 ThreadManager::ThreadManager(Core::System& system_)
     : system{system_}
@@ -55,6 +56,8 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
     thread = std::jthread([&](std::stop_token stop_token) {
         const Common::DkbCpuTrace::Registration cpu_trace{Common::DkbCpuTrace::Role::GpuCommand};
         Common::SetCurrentThreadName("GPU");
+        // Pipeline v2 P5a: this thread owns the caches while the split doesn't run.
+        VideoCommon::V2::Commit::t_gpu_thread = true;
 #ifdef __linux__
         // The pending-channel polls below sleep 50 us; the default timer slack adds up to 50 more.
         prctl(PR_SET_TIMERSLACK, 1UL, 0, 0, 0);
@@ -65,34 +68,102 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
             Common::PinCurrentThread(Common::PinnedRole::GpuFront);
         }
         system.RegisterHostThread();
+        V2::FrontWake::RegisterFrontThread();
 
         auto current_context = context.Acquire();
-        CommandDataContainer next;
+        CpuRecord next;
         // When a pending channel last moved or a command arrived (see the polling below).
         auto last_progress = std::chrono::steady_clock::now();
+        // SYNC: the event epoch of the last suspended-channel pass, and whether the next must run.
+        u64 last_event_epoch = ~u64{0};
+        bool resume_due = true;
+        bool cpu_waiter_due = false;
+        auto last_pass = std::chrono::steady_clock::now();
         namespace Profile = VideoCommon::Nx2Profile;
         auto& split = VideoCommon::GpuSplit::Get();
         while (!stop_token.stop_requested()) {
             Profile::Report();
+            V2::Stats::Report("GPU thread");
             split.MaybeStart(system);
+            // SYNC §14.7 (3): what the guest cores block on while a channel is suspended.
+            if (V2::P5bStats::Enabled()) [[unlikely]] {
+                V2::P5bStats::front_pending.store(scheduler.HasPendingChannels(),
+                                                  std::memory_order_relaxed);
+            }
             if (scheduler.HasPendingChannels()) {
                 // Suspended channels wait on semaphores the CPU releases: poll them meanwhile.
-                {
-                    Profile::Scope scope{Profile::Zone::ResumePending};
-                    scheduler.ResumePending(system.GPU());
+                bool resumed = false;
+                // SYNC Step 5: rings after this point end the sleep below (or skip it).
+                const u64 ring_epoch = V2::FrontWake::Epoch();
+                // SYNC (9c4a: 68-90k passes/s): with the view, a pass runs only when something
+                // that can change an answer happened since the last one (a ring, a release
+                // parsed), or the last pass resumed a channel or polled a guest CPU waiter.
+                const bool view_pass = split.AcquireMode() != V2::Mode::Off;
+                const u64 event_epoch = ring_epoch + (view_pass ? split.Sem().Notes() : 0);
+                // A guest CPU waiter alone (nothing rings for a CPU store) is read once per
+                // quarter millisecond, as the front's tick sleep reads it (spec §2.2 "the poll is
+                // a memory read on wake; the tick-bounded sleep is the epoch"), not every loop.
+                const auto now = std::chrono::steady_clock::now();
+                const bool cpu_epoch =
+                    cpu_waiter_due && now - last_pass >= std::chrono::microseconds{250};
+                if (!view_pass || resume_due || cpu_epoch || event_epoch != last_event_epoch) {
+                    static_cast<void>(V2::FrontWake::TakeTickWaiter());
+                    {
+                        Profile::Scope scope{Profile::Zone::ResumePending};
+                        resumed = scheduler.ResumePending(system.GPU());
+                    }
+                    V2::FrontWake::NoteSleepEnd(false); // SYNC §14 #4: only this pass counts it
+                    last_event_epoch = event_epoch;
+                    last_pass = now;
+                    resume_due = resumed;
+                    cpu_waiter_due = V2::FrontWake::TickWaiter();
+                }
+                if (resumed) {
+                    last_progress = std::chrono::steady_clock::now();
                 }
                 if (!state.queue.TryPop(next)) {
+                    if (!scheduler.HasPendingChannels()) {
+                        continue;
+                    }
                     // The CPU usually releases the semaphore soon after: poll for half a
                     // millisecond, then in short sleeps. Ocarina of Time waits here ~330 times a
                     // second and its present waits for the work behind them: with 1 ms sleeps the
                     // present waited ~17 ms a frame in Kokiri village, with 50 us ~1 ms. A channel
                     // still waiting after 2 s (menus, loading) goes back to 1 ms sleeps.
                     Profile::Scope scope{Profile::Zone::PendingSleep};
+                    const bool view = split.AcquireMode() != V2::Mode::Off;
+                    if (view) [[unlikely]] {
+                        // Polls no longer drain: hand the back what the front holds before
+                        // sleeping (0758309bcc), or it waits out the sleep without work.
+                        split.Publish();
+                    }
                     const auto waited = std::chrono::steady_clock::now() - last_progress;
                     if (waited < std::chrono::microseconds{500}) {
                         std::this_thread::yield();
+                    } else if (view && waited < std::chrono::seconds{2}) [[unlikely]] {
+                        // W-01b: a release latching a waiter, the back's progress, a readback
+                        // or a new command ends the tick at once (v2/front_wake.h). SYNC Step 5
+                        // (spec §2.2): one tick only while a guest CPU waiter polls memory;
+                        // otherwise every wake source rings, so sleep until one does.
+                        if (cpu_waiter_due || V2::FrontWake::TakeTickWaiter()) {
+                            const u64 rings_before = V2::FrontWake::Epoch();
+                            V2::FrontWake::Sleep();
+                            // SYNC §14 #4: no ring during the sleep: the tick ended it.
+                            V2::FrontWake::NoteSleepEnd(V2::FrontWake::Epoch() == rings_before);
+                            V2::Stats::NoteFrontSleep(static_cast<u8>(V2::FrontWake::SleepEnd::Tick));
+                        } else {
+                            const auto end = V2::FrontWake::SleepUntilRing(ring_epoch);
+                            V2::FrontWake::NoteSleepEnd(end != V2::FrontWake::SleepEnd::Ring);
+                            V2::Stats::NoteFrontSleep(static_cast<u8>(end));
+                        }
                     } else if (waited < std::chrono::seconds{2}) {
+#ifdef _WIN32
+                        // sleep_for(50us) rounds up to Sleep(1) (>= 1 ms) on Windows;
+                        // SleepForOneTick uses NtDelayExecution(-1) for one high-res timer tick.
+                        Common::Windows::SleepForOneTick();
+#else
                         std::this_thread::sleep_for(std::chrono::microseconds{50});
+#endif
                     } else {
                         std::this_thread::sleep_for(std::chrono::milliseconds{1});
                     }
@@ -105,81 +176,160 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
             if (stop_token.stop_requested()) {
                 break;
             }
-            last_progress = std::chrono::steady_clock::now();
             if (split.Active()) {
                 // Only command lists are parsed here; everything else runs on the back thread
                 // in order, and so does the signal that the command ran.
-                auto* const rasterizer_ptr = renderer.ReadRasterizer();
-                if (auto* submit_list = std::get_if<SubmitListCommand>(&next.data)) {
+                if (next.op == CpuOp::Submit) {
                     Profile::Scope scope{Profile::Zone::Push};
-                    scheduler.Push(system.GPU(), submit_list->channel, std::move(submit_list->entries));
-                } else if (std::holds_alternative<GPUTickCommand>(next.data)) {
-                    split.Defer([gpu = &system.GPU()] { gpu->TickWork(); });
-                } else if (auto* run = std::get_if<RunCommand>(&next.data)) {
-                    if (run->before_later_reads) {
-                        // GPU memory maps unmap caches (UnmapMemory downloads): the back's state.
-                        split.DeferFunction(std::move(run->func));
-                        split.Drain(VideoCommon::DrainSite::Map);
-                    } else {
-                        split.DeferFunction(std::move(run->func));
-                    }
-                } else if (const auto* flush = std::get_if<FlushRegionCommand>(&next.data)) {
-                    split.Defer([rasterizer_ptr, addr = flush->addr, size = flush->size] {
-                        rasterizer_ptr->FlushRegion(addr, size);
-                    });
-                } else if (const auto* invalidate = std::get_if<InvalidateRegionCommand>(&next.data)) {
-                    split.Defer([rasterizer_ptr, addr = invalidate->addr, size = invalidate->size] {
-                        rasterizer_ptr->OnCacheInvalidation(addr, size);
-                    });
+                    scheduler.Push(system.GPU(), next.channel, std::move(next.list));
                 } else {
-                    ASSERT(false);
+                    SendToBack(next, renderer.ReadRasterizer());
                 }
-                split.Defer([state_ptr = &state, fence = next.fence, block = next.block] {
-                    SignalCommand(*state_ptr, fence, block);
-                });
+                const V2::Ir::SyncPointBody signal{.id = 0,
+                                                   .value = 0,
+                                                   .op = V2::Ir::SyncPointOp::CommandSignal,
+                                                   .object = split.Ref(&state),
+                                                   .a = next.sequence,
+                                                   .b = next.block ? 1U : 0U};
+                split.Emit(V2::Ir::Kind::SyncPoint, signal,
+                           [state_ptr = &state, fence = next.sequence, block = next.block] {
+                    SignalCommandFence(*state_ptr, fence, block);
+                }, VideoCommon::GpuSplit::FastDrawNeutral);
+
                 split.Publish();
+                last_progress = std::chrono::steady_clock::now();
                 continue;
             }
-            if (auto* submit_list = std::get_if<SubmitListCommand>(&next.data)) {
+            switch (next.op) {
+            case CpuOp::Submit: {
                 Profile::Scope scope{Profile::Zone::Push};
-                scheduler.Push(system.GPU(), submit_list->channel, std::move(submit_list->entries));
-            } else if (std::holds_alternative<GPUTickCommand>(next.data)) {
+                scheduler.Push(system.GPU(), next.channel, std::move(next.list));
+                break;
+            }
+            case CpuOp::Tick: {
                 Profile::Scope scope{Profile::Zone::Tick};
                 system.GPU().TickWork();
-            } else if (auto* run = std::get_if<RunCommand>(&next.data)) {
-                Profile::Scope scope{Profile::Zone::Run};
-                run->func();
-            } else if (const auto* flush = std::get_if<FlushRegionCommand>(&next.data)) {
-                Profile::Scope scope{Profile::Zone::FlushInvalidate};
-                renderer.ReadRasterizer()->FlushRegion(flush->addr, flush->size);
-            } else if (const auto* invalidate = std::get_if<InvalidateRegionCommand>(&next.data)) {
-                Profile::Scope scope{Profile::Zone::FlushInvalidate};
-                renderer.ReadRasterizer()->OnCacheInvalidation(invalidate->addr, invalidate->size);
-            } else {
-                ASSERT(false);
+                break;
             }
-            SignalCommand(state, next.fence, next.block);
+            case CpuOp::Map: {
+                Profile::Scope scope{Profile::Zone::Run};
+                system.GPU().ExecuteMap(next.map);
+                break;
+            }
+            case CpuOp::Notify:
+                break;
+            case CpuOp::SignalEvent: {
+                Profile::Scope scope{Profile::Zone::Run};
+                system.GPU().SignalEventInOrder(reinterpret_cast<void*>(next.object));
+                break;
+            }
+            case CpuOp::Flush: {
+                Profile::Scope scope{Profile::Zone::FlushInvalidate};
+                renderer.ReadRasterizer()->FlushRegion(next.address, next.size);
+                break;
+            }
+            }
+            SignalCommandFence(state, next.sequence, next.block);
+            last_progress = std::chrono::steady_clock::now();
         }
     });
 }
 
+void ThreadManager::SendToBack(CpuRecord& record, VideoCore::RasterizerInterface* rasterizer_ptr) {
+    auto& split = VideoCommon::GpuSplit::Get();
+    switch (record.op) {
+    case CpuOp::Submit:
+        break;
+    case CpuOp::Tick: {
+        if (split.TypedIr()) {
+            // Composites marked at their position in the stream (MASTER_PLAN §5.2 Present
+            // records), right before the TickWork that composites them as it always did.
+            for (const V2::Ir::PresentBody& present : system.GPU().TakeQueuedPresents()) {
+                split.Note(V2::Ir::Kind::Present, present);
+            }
+        }
+        // TickWork ends fast draw reuse itself when it runs a request.
+        const V2::Ir::BarrierBody body{.op = V2::Ir::BarrierOp::TickWork,
+                                       .object = split.Ref(&system.GPU()),
+                                       .a = 0,
+                                       .b = 0};
+        split.Emit(V2::Ir::Kind::Barrier, body, [gpu = &system.GPU()] { gpu->TickWork(); },
+                   VideoCommon::GpuSplit::FastDrawNeutral);
+        break;
+    }
+    case CpuOp::Map: {
+        // GPU memory maps unmap caches (UnmapMemory downloads): the back's state.
+        V2::Ir::MapBody body = record.map;
+        body.object = split.Ref(reinterpret_cast<const void*>(record.map.object));
+        body.object2 = split.Ref(reinterpret_cast<const void*>(record.map.object2));
+        split.FlushBeforeMap(record.map);
+        split.Emit(V2::Ir::Kind::Map, body,
+                   [gpu = &system.GPU(), map = record.map] { gpu->ExecuteMap(map); });
+        split.NoteMapSent();
+        if ((record.map.flags & V2::Ir::MapBeforeLaterReads) != 0) {
+            // The front reads later command lists through the GPU page table it changes.
+            split.Drain(VideoCommon::DrainSite::Map);
+        }
+        break;
+    }
+    case CpuOp::Notify:
+        break; // Only the command signal
+    case CpuOp::SignalEvent: {
+        const V2::Ir::SyncPointBody body{
+            .id = 0,
+            .value = 0,
+            .op = V2::Ir::SyncPointOp::SignalEvent,
+            .object = split.Ref(reinterpret_cast<const void*>(record.object)),
+            .a = 0,
+            .b = 0};
+        split.Emit(V2::Ir::Kind::SyncPoint, body,
+                   [gpu = &system.GPU(), event = record.object] {
+            gpu->SignalEventInOrder(reinterpret_cast<void*>(event));
+        });
+        break;
+    }
+    case CpuOp::Flush: {
+        const V2::Ir::ReadbackBody body{.op = V2::Ir::ReadbackOp::Flush,
+                                        .object = split.Ref(rasterizer_ptr),
+                                        .address = record.address,
+                                        .bytes = record.size};
+        split.Emit(V2::Ir::Kind::Readback, body,
+                   [rasterizer_ptr, addr = record.address, size = record.size] {
+            rasterizer_ptr->FlushRegion(addr, size);
+        });
+        break;
+    }
+    }
+}
+
 void ThreadManager::SubmitList(s32 channel, Tegra::CommandList&& entries, bool is_async) {
-    PushCommand(SubmitListCommand(channel, std::move(entries)), false, is_async);
+    CpuRecord record{.op = CpuOp::Submit, .channel = channel};
+    record.list = std::move(entries);
+    PushCommand(std::move(record), false, is_async);
 }
 
 void ThreadManager::FlushRegion(DAddr addr, u64 size, bool is_async) {
     if (!is_async) {
         // Always flush with synchronous GPU mode
-        PushCommand(FlushRegionCommand(addr, size), false, is_async);
+        PushCommand(CpuRecord{.op = CpuOp::Flush, .address = addr, .size = size}, false, is_async);
     }
 }
 
 void ThreadManager::TickGPU(bool is_async) {
-    PushCommand(GPUTickCommand(), false, is_async);
+    PushCommand(CpuRecord{.op = CpuOp::Tick}, false, is_async);
 }
 
-void ThreadManager::Run(std::function<void()>&& func, bool is_async, bool before_later_reads) {
-    PushCommand(RunCommand{std::move(func), before_later_reads}, false, is_async);
+void ThreadManager::QueueMap(const V2::Ir::MapBody& map, bool is_async) {
+    PushCommand(CpuRecord{.op = CpuOp::Map, .map = map}, false, is_async);
+}
+
+u64 ThreadManager::Notify(bool is_async) {
+    return PushCommand(CpuRecord{.op = CpuOp::Notify}, false, is_async);
+}
+
+void ThreadManager::SignalEvent(void* event, bool is_async) {
+    PushCommand(CpuRecord{.op = CpuOp::SignalEvent, .object = reinterpret_cast<u64>(event)}, false,
+                is_async);
 }
 
 void ThreadManager::InvalidateRegion(DAddr addr, u64 size) {
@@ -189,7 +339,8 @@ void ThreadManager::InvalidateRegion(DAddr addr, u64 size) {
 void ThreadManager::FlushAndInvalidateRegion(DAddr addr, u64 size, bool is_async) {
     if (Settings::IsGPULevelHigh()) {
         if (!is_async) {
-            PushCommand(FlushRegionCommand(addr, size), false, is_async);
+            PushCommand(CpuRecord{.op = CpuOp::Flush, .address = addr, .size = size}, false,
+                        is_async);
         } else {
             auto& gpu = system.GPU();
             const u64 fence = gpu.RequestFlush(addr, size);
@@ -200,18 +351,29 @@ void ThreadManager::FlushAndInvalidateRegion(DAddr addr, u64 size, bool is_async
     rasterizer->OnCacheInvalidation(addr, size);
 }
 
-u64 ThreadManager::PushCommand(CommandData&& command_data, bool block, bool is_async) {
+u64 ThreadManager::PushCommand(CpuRecord&& record, bool block, bool is_async) {
     if (!is_async) {
         // In synchronous GPU mode, block the caller until the command has executed
         block = true;
     }
 
+    const std::stop_token stop = thread.get_stop_token();
     std::unique_lock lk(state.write_lock);
     const u64 fence{++state.last_fence};
-    state.queue.EmplaceWait(std::move(command_data), fence, block);
+    // Once the GPU thread stops (NotifyShutdown) nothing pops the queue: drop the record rather
+    // than fill the queue and block. Guest cores still run until the kernel suspends them.
+    if (stop.stop_requested()) [[unlikely]] {
+        return fence;
+    }
+    record.sequence = fence;
+    record.block = block;
+    if (!state.queue.EmplaceWaitUnlessStopped(stop, std::move(record))) [[unlikely]] {
+        return fence;
+    }
+    V2::FrontWake::Ring(); // W-01b: a front sleeping on suspended channels takes it at once
 
     if (block) {
-        state.cv.wait(lk, thread.get_stop_token(), [this, fence] {
+        state.cv.wait(lk, stop, [this, fence] {
             return fence <= state.signaled_fence.load(std::memory_order_relaxed);
         });
     }

@@ -9,6 +9,7 @@
 #include <array>
 #include <chrono>
 #include <cstddef>
+#include <memory>
 #include <optional>
 #include <vector>
 #include "common/bit_field.h"
@@ -40,6 +41,10 @@ struct ChannelState;
 
 namespace VideoCore {
 class RasterizerInterface;
+}
+
+namespace VideoCommon::V2 {
+struct WordReadback;
 }
 
 namespace Tegra::Engines {
@@ -78,7 +83,34 @@ public:
         u32 value;
         u32 operation;
         std::chrono::steady_clock::time_point since;
+        std::chrono::steady_clock::time_point last_fences; ///< When it last released fences
+        /// EDEN_NX2_V2_ACQUIRE: when an unmet poll last asked the back for a submit
+        std::chrono::steady_clock::time_point last_request;
         bool reported;
+        /// EDEN_NX2_V2_ACQUIRE: the comparison (V2::SemaphoreOp), and whether it is an Ampere
+        /// SEM_EXECUTE acquire suspended like a trigger acquire (its operation is not one of
+        /// GpuSemaphoreOperation's).
+        u8 view_op{};
+        bool sem_execute{};
+        /// A GPU-written word's readback (V2::WordReadback) was sent and not landed yet.
+        bool readback_sent{};
+        /// SYNC_SUBMIT_SPEC §2.2 (V2::PlanSuspendedPoll): the fence tick it asked to be
+        /// submitted last (one request per tick change).
+        u64 requested_tick{};
+        /// Unmet checks of this suspension (the 2 s clock is read every 64).
+        u32 polls{};
+        /// SYNC_SUBMIT_SPEC §8.2: a poll passed it; it stays passed until ResumeAcquire clears it
+        /// (DmaPusher::Step's second check must not contradict ResumePending's).
+        bool passed{};
+        /// SYNC Step 0: what its last poll waited for (V2::Stats::WakeClass), for the STATS line.
+        u8 wake{};
+        /// SYNC_SUBMIT_SPEC §2.2: the wake classes that can change its answer (V2::SemWake; 0:
+        /// check every pass) and their epochs at the last check.
+        u8 wake_bits{};
+        u64 seen_notes{};
+        u64 seen_consumed{};
+        u64 seen_landings{};
+        u64 seen_maps{};
 
         [[nodiscard]] bool Matches(u32 current) const;
     };
@@ -97,6 +129,16 @@ public:
     void CallEngineMethod(DmaPusher& dma_pusher, const MethodCall& method_call);
     void CallEngineMultiMethod(DmaPusher& dma_pusher, u32 method, u32 subchannel, const u32* base_start, u32 amount, u32 methods_pending);
 private:
+    /// CanResumeAcquire's check (CanResumeAcquire also counts it for EDEN_NX2_V2_STATS).
+    [[nodiscard]] bool PollAcquire(DmaPusher& dma_pusher);
+    /// EDEN_NX2_V2_ACQUIRE: PollAcquire decided by the front's semaphore view.
+    [[nodiscard]] bool PollAcquireView(DmaPusher& dma_pusher);
+    /// EDEN_NX2_V2_ACQUIRE=1: suspends the channel on an acquire the view doesn't pass, without
+    /// draining (MASTER_PLAN §6). `gpu_written`: its word is read back (V2::WordReadback).
+    void SuspendOnView(DmaPusher& dma_pusher, PendingAcquire acquire, bool gpu_written);
+    /// Sends the readback of the pending acquire's GPU-written word (no wait).
+    void SendWordReadback(DmaPusher& dma_pusher);
+
     static constexpr std::size_t NUM_REGS = 0x800;
     struct Regs {
         static constexpr size_t NUM_REGS = 0x40;
@@ -149,6 +191,8 @@ private:
     [[nodiscard]] bool ExecuteMethodOnEngine(DmaPusher& dma_pusher, u32 method);
 
     std::optional<PendingAcquire> pending_acquire;
+    /// EDEN_NX2_V2_ACQUIRE: the slot a GPU-written semaphore word is read back through.
+    std::shared_ptr<VideoCommon::V2::WordReadback> word_readback;
 
     /// Mapping of command subchannels to their bound engine ids
     std::array<EngineID, 8> bound_engines{};

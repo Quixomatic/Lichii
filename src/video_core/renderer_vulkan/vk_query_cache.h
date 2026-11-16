@@ -41,6 +41,8 @@ public:
     void SyncValues(std::span<SyncValuesType> values, VkBuffer base_src_buffer = VkBuffer{});
 
     void Barriers(bool is_prebarrier);
+    /// SYNC Step 9: Scheduler::DeferToPassEnd (query result copies at the pass end).
+    bool DeferToPassEnd(void (*job)(void*), void* argument);
 
     void EndHostConditionalRendering();
 

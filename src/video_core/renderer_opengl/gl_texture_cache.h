@@ -147,7 +147,7 @@ public:
         return state_tracker;
     }
 
-    void BarrierFeedbackLoop() const noexcept {
+    void BarrierFeedbackLoop(Image&) const noexcept {
         // OpenGL does not require a barrier for attachment feedback loops.
     }
 

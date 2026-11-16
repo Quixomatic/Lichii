@@ -34,14 +34,25 @@ struct TICEntry;
 }
 } // namespace Tegra
 
+namespace VideoCommon::OotNetwork {
+struct BypassState;
+}
+
 namespace VideoCore {
 
 enum class LoadCallbackStage {
     Prepare,
     Build,
     Complete,
+    /// The shader precache running before the game starts (programs built / total).
+    /// Last, so the values of the others stay as frontends that know only those expect.
+    Warm,
 };
 using DiskResourceLoadCallback = std::function<void(LoadCallbackStage, std::size_t, std::size_t)>;
+
+/// Set while the query cache signals the fence that writes a fence-flagged report, so the fence
+/// manager makes that fence even when it is empty (FenceManager::SignalFence).
+inline thread_local bool g_signaling_query_report_fence = false;
 
 class RasterizerInterface {
 public:
@@ -103,6 +114,15 @@ public:
     virtual void FlushRegion(DAddr addr, u64 size,
                              VideoCommon::CacheType which = VideoCommon::CacheType::All) = 0;
 
+    /// Pipeline v2 (EDEN_NX2_V2_READBACK): FlushRegion for a guest CPU read, where the caches'
+    /// owner may only record and submit the download. When it does, it returns true and sets
+    /// `land`, which the reading thread calls: it waits for the download and writes guest memory.
+    virtual bool FlushRegionForRead(DAddr addr, u64 size, std::function<void()>& land) {
+        (void)land;
+        FlushRegion(addr, size);
+        return false;
+    }
+
     /// Switch 2, from the GPU thread's front: where a GPU-written command list's words are.
     enum class GpuWrittenList {
         Unknown, ///< Neither: the caller drains, flushes the page and notes it synced
@@ -111,11 +131,22 @@ public:
         /// Draws write the page: ask again with `past_sync` once the split's back ran the work
         /// before the last host-level wait (GpuSplit::WaitForSync)
         NeedsSync,
+        /// Only with `pending_tick`: the copy is not done yet, `*pending_tick` is the host GPU
+        /// tick that completes it. Ask again once IsGpuTickDone(*pending_tick).
+        Pending,
     };
+    /// With `pending_tick`, a copy the GPU is still making returns Pending instead of waiting.
     virtual GpuWrittenList ReadGpuWrittenCommandList([[maybe_unused]] DAddr addr,
                                                      [[maybe_unused]] std::span<u8> out,
-                                                     [[maybe_unused]] bool past_sync) {
+                                                     [[maybe_unused]] bool past_sync,
+                                                     [[maybe_unused]] u64* pending_tick = nullptr) {
         return GpuWrittenList::Unknown;
+    }
+
+    /// Whether the host GPU passed `tick`, without waiting. Asks for deferred work to be
+    /// submitted when the tick is not submitted yet, so it completes.
+    virtual bool IsGpuTickDone([[maybe_unused]] u64 tick) {
+        return true;
     }
 
     /// Switch 2: the front flushed this command list page with the split drained.
@@ -147,11 +178,21 @@ public:
     virtual void PrepareRegionWrite([[maybe_unused]] DAddr addr, [[maybe_unused]] u64 size,
                                     [[maybe_unused]] VideoCommon::CacheType which) {}
 
+    /// Pipeline v2 P5a (EDEN_NX2_V2_COMMIT): the caches' owner runs what other threads handed it
+    /// (its idle points: TickWork, the split's CPU lane hook, fence waits). Other threads: no-op.
+    virtual void ServeCommitRequests() {}
+
+    /// Shutdown, once the GPU threads stopped for good: handed-over work is dropped and its
+    /// waiters released, as nothing serves it anymore.
+    virtual void OnCacheOwnerStopped() {}
+
     virtual void InnerInvalidation(std::span<const std::pair<DAddr, std::size_t>> sequences) {
-        if (!Settings::values.skip_cpu_inner_invalidation.GetValue()) {
-            for (const auto& [cpu_addr, size] : sequences) {
-                InvalidateRegion(cpu_addr, size);
-            }
+        // The skip keeps the texture cache: software engine writes reach images only here.
+        const auto which = Settings::values.skip_cpu_inner_invalidation.GetValue()
+                               ? VideoCommon::CacheType::TextureCache
+                               : VideoCommon::CacheType::All;
+        for (const auto& [cpu_addr, size] : sequences) {
+            InvalidateRegion(cpu_addr, size, which);
         }
     }
 
@@ -198,6 +239,24 @@ public:
 
     /// Notify the rasterizer to send all written commands to the host GPU.
     virtual void FlushCommands() = 0;
+
+    /// A fence with work to flush was queued; `downloads`: data the guest reads back (class C).
+    /// Backends that let fences ride submissions (Vulkan, F4-02) only hint; others flush.
+    /// `committed`: the caches with a committed download a CPU consumer reads (1 texture,
+    /// 2 buffer; SYNC §15.2): only those raise the strong hint.
+    virtual void FlushCommandsForFence([[maybe_unused]] bool downloads,
+                                       [[maybe_unused]] u8 committed) {
+        FlushCommands();
+    }
+
+    /// SYNC §12.4 R3: a fence just queued carries a host syncpoint increment a guest thread is
+    /// blocked on. Backends whose fences ride the open submission (Vulkan lazy fences) file a
+    /// submit request for its tick (rule W); others submit fences anyway.
+    virtual void RequestHostWaitedFence() {}
+
+    /// SYNC §14 #2/#3: a fence just queued carries a result the guest reads (an operation that
+    /// lands at it, committed downloads). Vulkan's adaptive submission notes it on the open tick.
+    virtual void NoteGuestVisibleFence() {}
 
     /// Notify rasterizer that a frame is about to finish
     virtual void TickFrame() = 0;
@@ -246,6 +305,12 @@ public:
     [[nodiscard]] virtual std::optional<VideoCore::GameDlssProbe> ProbeGameDlssOutput(
         const Tegra::Engines::Fermi2D::Surface& src, const Tegra::Engines::Fermi2D::Surface& dst) {
         return std::nullopt;
+    }
+
+    /// State of the Ocarina of Time anti-aliasing network bypass (oot_network.h), or null when
+    /// this backend cannot bypass it or NVIDIA DLSS replaces the same output pass.
+    [[nodiscard]] virtual VideoCommon::OotNetwork::BypassState* OotNetworkBypass() {
+        return nullptr;
     }
 
     [[nodiscard]] virtual Tegra::Engines::AccelerateDMAInterface& AccessAccelerateDMA() = 0;

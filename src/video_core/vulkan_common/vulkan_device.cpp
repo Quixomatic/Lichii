@@ -29,9 +29,11 @@
 #include "common/settings_enums.h"
 #include "video_core/vulkan_common/nsight_aftermath_tracker.h"
 #include "video_core/vulkan_common/vma.h"
+#include "video_core/v2/v2_switches.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 #include "video_core/gpu_logging/gpu_logging.h"
+#include "video_core/v2/v2_switches.h"
 #ifdef EGLANTINE_STREAMLINE
 #include "video_core/vulkan_common/streamline.h"
 #endif
@@ -727,19 +729,31 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
     // Descriptors feature list
     {
         auto& descriptor_indexing = features.descriptor_indexing;
+        // EDEN_NX2_V2_HEAP_TEXEL (with BINDLESS) keeps what texel buffers in the heap need.
+        const bool texel_heap = VideoCommon::V2::On(VideoCommon::V2::Switch::Bindless) &&
+                                VideoCommon::V2::On(VideoCommon::V2::Switch::HeapTexel);
         descriptor_indexing.shaderInputAttachmentArrayDynamicIndexing = false;
-        descriptor_indexing.shaderUniformTexelBufferArrayDynamicIndexing = false;
-        descriptor_indexing.shaderStorageTexelBufferArrayDynamicIndexing = false;
+        descriptor_indexing.shaderUniformTexelBufferArrayDynamicIndexing =
+            texel_heap && descriptor_indexing.shaderUniformTexelBufferArrayDynamicIndexing;
+        descriptor_indexing.shaderStorageTexelBufferArrayDynamicIndexing =
+            texel_heap && descriptor_indexing.shaderStorageTexelBufferArrayDynamicIndexing;
         descriptor_indexing.shaderUniformBufferArrayNonUniformIndexing = false;
         descriptor_indexing.shaderStorageBufferArrayNonUniformIndexing = false;
         descriptor_indexing.shaderInputAttachmentArrayNonUniformIndexing = false;
         descriptor_indexing.descriptorBindingUniformBufferUpdateAfterBind = false;
-        descriptor_indexing.descriptorBindingSampledImageUpdateAfterBind = false;
-        descriptor_indexing.descriptorBindingStorageImageUpdateAfterBind = false;
+        // EDEN_NX2_V2_BINDLESS keeps what its heap needs (vk_bindless_heap.h); off, as before.
+        const bool bindless_heap = VideoCommon::V2::On(VideoCommon::V2::Switch::Bindless);
+        descriptor_indexing.descriptorBindingSampledImageUpdateAfterBind =
+            bindless_heap && descriptor_indexing.descriptorBindingSampledImageUpdateAfterBind;
+        descriptor_indexing.descriptorBindingStorageImageUpdateAfterBind =
+            bindless_heap && descriptor_indexing.descriptorBindingStorageImageUpdateAfterBind;
         descriptor_indexing.descriptorBindingStorageBufferUpdateAfterBind = false;
-        descriptor_indexing.descriptorBindingUniformTexelBufferUpdateAfterBind = false;
-        descriptor_indexing.descriptorBindingStorageTexelBufferUpdateAfterBind = false;
-        descriptor_indexing.descriptorBindingUpdateUnusedWhilePending = false;
+        descriptor_indexing.descriptorBindingUniformTexelBufferUpdateAfterBind =
+            texel_heap && descriptor_indexing.descriptorBindingUniformTexelBufferUpdateAfterBind;
+        descriptor_indexing.descriptorBindingStorageTexelBufferUpdateAfterBind =
+            texel_heap && descriptor_indexing.descriptorBindingStorageTexelBufferUpdateAfterBind;
+        descriptor_indexing.descriptorBindingUpdateUnusedWhilePending =
+            bindless_heap && descriptor_indexing.descriptorBindingUpdateUnusedWhilePending;
         descriptor_indexing.descriptorBindingVariableDescriptorCount = false;
         descriptor_indexing.runtimeDescriptorArray = false;
     }
@@ -750,18 +764,27 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
         RemoveExtensionFeature(extensions.descriptor_buffer, features.descriptor_buffer,
                                VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME);
     }
+    // EDEN_NX2_V2_CBUFBDA reads constant buffers through device addresses: keep them for it.
+    // Buffer device address is core since Vulkan 1.2 (`extensions.buffer_device_address` is
+    // set only for the extension on older instances): the device's feature decides.
+    const bool cbuf_bda = VideoCommon::V2::On(VideoCommon::V2::Switch::CbufBda) &&
+                          features.buffer_device_address.bufferDeviceAddress;
 #ifdef EGLANTINE_STREAMLINE
     // NVIDIA's DLSS needs buffer device addresses: keep the feature enabled for
     // it, but leave Eglantine's own buffers as they are without descriptor buffers.
     const bool dlss_wants_device_address =
         streamline_extensions && features.buffer_device_address.bufferDeviceAddress;
     if (!extensions.descriptor_buffer && dlss_wants_device_address) {
-        extensions.buffer_device_address = false;
+        extensions.buffer_device_address = cbuf_bda;
     } else
 #endif
-    if (!extensions.descriptor_buffer) {
+    if (!extensions.descriptor_buffer && !cbuf_bda) {
         RemoveExtensionFeature(extensions.buffer_device_address, features.buffer_device_address,
                                VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME);
+    }
+    if (cbuf_bda) {
+        // What IsBufferDeviceAddressSupported reads: buffer usage bits, addresses, the VMA flag.
+        extensions.buffer_device_address = true;
     }
 
     // The float16 workarounds above keep shaders from doing float16 arithmetic. Cooperative
@@ -784,6 +807,17 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
 
     graphics_queue = logical.GetQueue(graphics_family);
     present_queue = logical.GetQueue(present_family);
+    if (has_transfer_queue) {
+        if (HasTimelineSemaphore() && HasSynchronization2()) {
+            transfer_queue = logical.GetQueue(transfer_family);
+            transfer_sharing_families = {graphics_family, transfer_family};
+            LOG_INFO(Render_Vulkan, "EDEN_NX2_V2_XFERQ: transfer queue family {}", transfer_family);
+        } else {
+            has_transfer_queue = false;
+            LOG_INFO(Render_Vulkan, "EDEN_NX2_V2_XFERQ: needs timeline semaphores and "
+                                    "synchronization2; uploads stay on the upload command buffer");
+        }
+    }
 
 #ifdef EGLANTINE_STREAMLINE
     if (streamline_extensions) {
@@ -798,12 +832,35 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
     functions.vkGetInstanceProcAddr = dld.vkGetInstanceProcAddr;
     functions.vkGetDeviceProcAddr = dld.vkGetDeviceProcAddr;
 
-    VmaAllocatorCreateFlags flags = VMA_ALLOCATOR_CREATE_EXTERNALLY_SYNCHRONIZED_BIT;
+    // X-03 (the c876 crash: VMA metadata corrupted in VmaBlockMetadata_TLSF::Alloc): with
+    // EDEN_NX2_V2_SUBMITTHREAD the finish thread destroys retired images (F4-09, MASTER_PLAN
+    // §5.5: S6 owns lifetimes) while the back allocates, and the transfer-queue readbacks and the
+    // lock-free commit run allocator calls on other threads too. Then the allocator takes VMA's
+    // own mutex; v1 keeps the externally synchronized allocator.
+    namespace V2 = VideoCommon::V2;
+    vma_shared = V2::On(V2::Switch::SubmitThread) || V2::On(V2::Switch::XReadback) ||
+                 V2::On(V2::Switch::XferQ) || V2::On(V2::Switch::Commit);
+    VmaAllocatorCreateFlags flags =
+        vma_shared ? VmaAllocatorCreateFlags{0} : VMA_ALLOCATOR_CREATE_EXTERNALLY_SYNCHRONIZED_BIT;
+    if (vma_shared) {
+        LOG_INFO(Render_Vulkan, "VMA allocator internally synchronized (v2 threads allocate or "
+                                "free memory off the GPU thread)");
+    }
     if (extensions.memory_budget) {
         flags |= VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT;
     }
     if (extensions.buffer_device_address) {
         flags |= VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT;
+    }
+    if (VideoCommon::V2::On(VideoCommon::V2::Switch::CbufBda)) {
+        LOG_INFO(Render_Vulkan,
+                 "EDEN_NX2_V2_CBUFBDA: buffer device address usable {} (device feature {}, "
+                 "extension loaded {}, VMA flag {}, instance 1.2+ {})",
+                 extensions.buffer_device_address,
+                 features.buffer_device_address.bufferDeviceAddress != VK_FALSE,
+                 loaded_extensions.contains(VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME),
+                 (flags & VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT) != 0,
+                 instance_version >= VK_API_VERSION_1_2);
     }
     // EDEN_NX2_VRAM_LIMIT_MIB: VMA fails allocations past the limit, like a smaller card.
     std::array<VkDeviceSize, VK_MAX_MEMORY_HEAPS> heap_size_limits;
@@ -1442,6 +1499,11 @@ bool Device::GetSuitability(bool requires_swapchain) {
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_PROPERTIES_KHR;
         SetNext(next, properties.cooperative_matrix);
     }
+    if (supported_extensions.contains(VK_KHR_SHADER_INTEGER_DOT_PRODUCT_EXTENSION_NAME)) {
+        properties.integer_dot_product.sType =
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_PROPERTIES;
+        SetNext(next, properties.integer_dot_product);
+    }
 
     // Perform the property fetch.
     physical.GetProperties2(properties2);
@@ -1706,6 +1768,12 @@ void Device::RemoveUnsuitableExtensions() {
     features.mesh_shader.primitiveFragmentShadingRateMeshShader = VK_FALSE;
     features.mesh_shader.meshShaderQueries = VK_FALSE;
     extensions.mesh_shader = features.mesh_shader.taskShader && features.mesh_shader.meshShader;
+    // EDEN_NX2_FORCE_MESH_FALLBACK=1: leave VK_EXT_mesh_shader disabled, so task/mesh draws take
+    // the compute fallback a device without it uses.
+    if (extensions.mesh_shader && std::getenv("EDEN_NX2_FORCE_MESH_FALLBACK") != nullptr) {
+        LOG_WARNING(Render_Vulkan, "EDEN_NX2_FORCE_MESH_FALLBACK: VK_EXT_mesh_shader disabled");
+        extensions.mesh_shader = false;
+    }
     RemoveExtensionFeatureIfUnsuitable(extensions.mesh_shader, features.mesh_shader,
                                        VK_EXT_MESH_SHADER_EXTENSION_NAME);
 
@@ -1729,7 +1797,12 @@ void Device::RemoveUnsuitableExtensions() {
     // The guest's own M=16 N=8 K=16 shape is preferred; without it, a 16x16x16 shape runs HMMA
     // through shared memory with the compute subgroups forced to 32 lanes.
     {
-        const auto shapes = physical.GetCooperativeMatrixPropertiesKHR();
+        // The instance may expose this entry point even when the selected physical device
+        // does not support VK_KHR_cooperative_matrix. Query only eligible devices.
+        std::vector<VkCooperativeMatrixPropertiesKHR> shapes;
+        if (extensions.cooperative_matrix) {
+            shapes = physical.GetCooperativeMatrixPropertiesKHR();
+        }
         const auto has_shape = [&](u32 columns) {
             return std::ranges::any_of(shapes, [=](const VkCooperativeMatrixPropertiesKHR& shape) {
                 return shape.MSize == 16 && shape.NSize == columns && shape.KSize == 16 &&
@@ -1741,7 +1814,20 @@ void Device::RemoveUnsuitableExtensions() {
                        shape.scope == VK_SCOPE_SUBGROUP_KHR;
             });
         };
-        const bool usable = extensions.cooperative_matrix &&
+        // AMD's driver also advertises the extension on GPUs without matrix cores (GCN, RDNA1,
+        // RDNA2) and crashes in amdvlk64.dll building these pipelines on RDNA2. RDNA3 brought
+        // matrix cores together with accelerated mixed-signedness dot4, which the driver reports.
+        const VkDriverId driver_id = properties.driver.driverID;
+        const bool emulated_amd_matrices =
+            (driver_id == VK_DRIVER_ID_AMD_PROPRIETARY ||
+             driver_id == VK_DRIVER_ID_AMD_OPEN_SOURCE) &&
+            !properties.integer_dot_product.integerDotProduct4x8BitPackedMixedSignednessAccelerated;
+        if (extensions.cooperative_matrix && emulated_amd_matrices) {
+            LOG_INFO(Render_Vulkan,
+                     "VK_KHR_cooperative_matrix is emulated on this AMD GPU: guest tensor "
+                     "operations stay in shader emulation");
+        }
+        const bool usable = extensions.cooperative_matrix && !emulated_amd_matrices &&
                             features.cooperative_matrix.cooperativeMatrix &&
                             (properties.cooperative_matrix.cooperativeMatrixSupportedStages &
                              VK_SHADER_STAGE_COMPUTE_BIT) != 0 &&
@@ -1814,6 +1900,23 @@ void Device::RemoveUnsuitableExtensions() {
     extensions.synchronization2 = features.synchronization2.synchronization2;
     RemoveExtensionFeatureIfUnsuitable(extensions.synchronization2, features.synchronization2,
                                        VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME);
+
+    // VK_KHR_dynamic_rendering (EDEN_NX2_V2_DYNRENDER only)
+    extensions.dynamic_rendering = features.dynamic_rendering.dynamicRendering &&
+                                   VideoCommon::V2::On(VideoCommon::V2::Switch::DynRender) &&
+                                   !IsTiler();
+    RemoveExtensionFeatureIfUnsuitable(extensions.dynamic_rendering, features.dynamic_rendering,
+                                       VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME);
+
+    // VK_KHR_present_id / VK_KHR_present_wait (EDEN_NX2_V2_PRESENTPACE only)
+    const bool present_pace = VideoCommon::V2::On(VideoCommon::V2::Switch::PresentPace);
+    extensions.present_id = present_pace && features.present_id.presentId;
+    RemoveExtensionFeatureIfUnsuitable(extensions.present_id, features.present_id,
+                                       VK_KHR_PRESENT_ID_EXTENSION_NAME);
+    extensions.present_wait =
+        present_pace && extensions.present_id && features.present_wait.presentWait;
+    RemoveExtensionFeatureIfUnsuitable(extensions.present_wait, features.present_wait,
+                                       VK_KHR_PRESENT_WAIT_EXTENSION_NAME);
 }
 
 void Device::SetupFamilies(VkSurfaceKHR surface) {
@@ -1850,6 +1953,25 @@ void Device::SetupFamilies(VkSurfaceKHR surface) {
     }
     if (present) {
         present_family = *present;
+    }
+    // EDEN_NX2_V2_XFERQ: a family the copy engine owns alone (no graphics, no compute).
+    has_transfer_queue = false;
+    if (VideoCommon::V2::On(VideoCommon::V2::Switch::XferQ)) {
+        for (u32 index = 0; index < static_cast<u32>(queue_family_properties.size()); ++index) {
+            const VkQueueFlags flags = queue_family_properties[index].queueFlags;
+            if (queue_family_properties[index].queueCount != 0 &&
+                (flags & VK_QUEUE_TRANSFER_BIT) != 0 &&
+                (flags & (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT)) == 0) {
+                transfer_family = index;
+                has_transfer_queue = true;
+                break;
+            }
+        }
+        if (!has_transfer_queue) {
+            LOG_INFO(Render_Vulkan,
+                     "EDEN_NX2_V2_XFERQ: no dedicated transfer queue; uploads stay on the upload "
+                     "command buffer");
+        }
     }
 }
 
@@ -2023,6 +2145,9 @@ std::vector<VkDeviceQueueCreateInfo> Device::GetDeviceQueueCreateInfos() const {
     static constexpr float QUEUE_PRIORITY = 1.0f;
 
     ::Common::unordered_set<u32> unique_queue_families{graphics_family, present_family};
+    if (has_transfer_queue) {
+        unique_queue_families.insert(transfer_family);
+    }
     std::vector<VkDeviceQueueCreateInfo> queue_cis;
     queue_cis.reserve(unique_queue_families.size());
 

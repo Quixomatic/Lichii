@@ -70,6 +70,10 @@ enum : u8 {
     BlendEquations,
     ColorMask,
     ViewportSwizzles,
+    /// With dynamic vertex input, the command buffer update (UpdateVertexInput) consumes
+    /// VertexInput on every draw, including fast-path draws that never refresh the pipeline key:
+    /// it sets this so the key's attribute types follow the change at the next refresh.
+    VertexInputKey,
 
     Last,
 };
@@ -87,6 +91,16 @@ public:
         (*flags) |= invalidation_flags;
         current_topology = INVALID_TOPOLOGY;
         stencil_reset = true;
+    }
+
+    void InvalidateInputState() {
+        (*flags)[Dirty::VertexInput] = true;
+        (*flags)[Dirty::PrimitiveRestartEnable] = true;
+        for (std::size_t index = VideoCommon::Dirty::VertexBuffer0;
+             index <= VideoCommon::Dirty::VertexBuffer31; ++index) {
+            (*flags)[index] = true;
+        }
+        current_topology = INVALID_TOPOLOGY;
     }
 
     void InvalidateViewports() {

@@ -35,4 +35,7 @@ std::chrono::nanoseconds SetCurrentTimerResolutionToMaximum();
 /// Sleep for one tick of the current timer resolution.
 void SleepForOneTick();
 
+/// SleepForOneTick, alertable: an APC queued to the thread (QueueUserAPC) ends it early.
+void SleepForOneTickAlertable();
+
 } // namespace Common::Windows

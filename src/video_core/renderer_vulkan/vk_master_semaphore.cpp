@@ -4,6 +4,7 @@
 // SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <chrono>
 #include <thread>
 
 #include <ranges>
@@ -76,6 +77,22 @@ void MasterSemaphore::Refresh() {
                                              std::memory_order_relaxed));
 }
 
+void MasterSemaphore::SetFinishPublisher(bool on) {
+    {
+        std::scoped_lock lock{publish_mutex};
+        finish_publisher.store(on, std::memory_order_release);
+    }
+    publish_cv.notify_all();
+}
+
+void MasterSemaphore::PublishFromFinish() {
+    Refresh();
+    if (publish_waiters.load(std::memory_order_seq_cst) != 0) {
+        { std::scoped_lock lock{publish_mutex}; }
+        publish_cv.notify_all();
+    }
+}
+
 void MasterSemaphore::Wait(u64 tick) {
     if (!semaphore) {
         // Fast check: already reached the requested tick?
@@ -103,6 +120,28 @@ void MasterSemaphore::Wait(u64 tick) {
         return;
     }
 
+    if (finish_publisher.load(std::memory_order_acquire)) [[unlikely]] {
+        // F4-10: the finish thread is the timeline's one waiter; sleep on what it publishes. The
+        // timed wakeups re-read the counter, so a missed notify or a stopped finish thread only
+        // costs a few milliseconds.
+        publish_waiters.fetch_add(1, std::memory_order_seq_cst);
+        {
+            std::unique_lock lock{publish_mutex};
+            while (!IsFree(tick) && finish_publisher.load(std::memory_order_acquire)) {
+                if (!publish_cv.wait_for(lock, std::chrono::milliseconds{4},
+                                         [&] { return IsFree(tick); })) {
+                    lock.unlock();
+                    Refresh();
+                    lock.lock();
+                }
+            }
+        }
+        publish_waiters.fetch_sub(1, std::memory_order_seq_cst);
+        if (IsFree(tick)) {
+            return;
+        }
+    }
+
     // If none of the above is hit, fallback to a regular wait
     try {
         while (!semaphore.Wait(tick)) {
@@ -118,10 +157,11 @@ void MasterSemaphore::Wait(u64 tick) {
 
 VkResult MasterSemaphore::SubmitQueue(vk::CommandBuffer& cmdbuf, vk::CommandBuffer& upload_cmdbuf,
                                       VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
-                                      u64 host_tick) {
+                                      u64 host_tick,
+                                      std::span<const VkSemaphoreSubmitInfo> extra_waits) {
     if (semaphore) {
         return SubmitQueueTimeline(cmdbuf, upload_cmdbuf, signal_semaphore, wait_semaphore,
-                                   host_tick);
+                                   host_tick, extra_waits);
     } else {
         return SubmitQueueFence(cmdbuf, upload_cmdbuf, signal_semaphore, wait_semaphore, host_tick);
     }
@@ -133,8 +173,53 @@ static constexpr VkPipelineStageFlags wait_stage_mask = VK_PIPELINE_STAGE_VERTEX
 VkResult MasterSemaphore::SubmitQueueTimeline(vk::CommandBuffer& cmdbuf,
                                               vk::CommandBuffer& upload_cmdbuf,
                                               VkSemaphore signal_semaphore,
-                                              VkSemaphore wait_semaphore, u64 host_tick) {
+                                              VkSemaphore wait_semaphore, u64 host_tick,
+                                              std::span<const VkSemaphoreSubmitInfo> extra_waits) {
     const VkSemaphore timeline_semaphore = *semaphore;
+
+    if (!extra_waits.empty()) {
+        // P5b: the transfer batch and readback jobs this submission waits for, plus the binary
+        // wait semaphore. Only reached with synchronization2 (the transfer queue requires it).
+        std::array<VkSemaphoreSubmitInfo, 12> waits{};
+        u32 num_waits = 0;
+        if (wait_semaphore) {
+            waits[num_waits++] = VkSemaphoreSubmitInfo{
+                .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
+                .pNext = nullptr,
+                .semaphore = wait_semaphore,
+                .value = 0,
+                .stageMask = static_cast<VkPipelineStageFlags2>(wait_stage_mask),
+                .deviceIndex = 0,
+            };
+        }
+        for (const VkSemaphoreSubmitInfo& wait : extra_waits) {
+            if (num_waits < waits.size()) {
+                waits[num_waits++] = wait;
+            }
+        }
+        const std::array<VkCommandBufferSubmitInfo, 2> cmdbuffer_infos{{
+            {VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, nullptr, *upload_cmdbuf, 0},
+            {VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, nullptr, *cmdbuf, 0},
+        }};
+        std::array<VkSemaphoreSubmitInfo, 2> signal_infos{{
+            {VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, nullptr, timeline_semaphore, host_tick,
+             VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, 0},
+            {VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, nullptr, signal_semaphore, 0,
+             VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, 0},
+        }};
+        const VkSubmitInfo2 submit_info2{
+            .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
+            .pNext = nullptr,
+            .flags = 0,
+            .waitSemaphoreInfoCount = num_waits,
+            .pWaitSemaphoreInfos = waits.data(),
+            .commandBufferInfoCount = static_cast<u32>(cmdbuffer_infos.size()),
+            .pCommandBufferInfos = cmdbuffer_infos.data(),
+            .signalSemaphoreInfoCount = signal_semaphore ? 2U : 1U,
+            .pSignalSemaphoreInfos = signal_infos.data(),
+        };
+        return device.GetGraphicsQueue().Submit2(submit_info2);
+    }
 
     if (device.HasSynchronization2()) {
         const std::array<VkCommandBufferSubmitInfo, 2> cmdbuffer_infos{{

@@ -239,8 +239,64 @@ private:
     spv::ImageOperandsMask mask{};
 };
 
+/// EDEN_NX2_V2_BINDLESS: whether a heap element read with `index` varies per invocation (array
+/// elements selected by a non-uniform index); the heap accesses are then marked NonUniform.
+bool HeapNonUniform(EmitContext& ctx, u32 count, const IR::Value& index, NonUniformKind kind) {
+    if (count <= 1 || index.IsImmediate() || !IsNonUniformSupported(ctx.profile, kind)) {
+        return false;
+    }
+    if (kind == NonUniformKind::SampledImage) {
+        ctx.uses_nonuniform_sampled_image = true;
+    } else {
+        ctx.uses_nonuniform_storage_image = true;
+    }
+    return true;
+}
+
+/// A pointer to the heap image of a word (low 16 bits) in `array`.
+Id HeapImagePointer(EmitContext& ctx, Id pointer_type, Id array, Id word, bool non_uniform) {
+    const Id element{ctx.OpBitwiseAnd(ctx.U32[1], word, ctx.Const(0xffffu))};
+    const Id pointer{ctx.OpAccessChain(pointer_type, array, element)};
+    if (non_uniform) {
+        DecorateNonUniform(ctx, pointer);
+    }
+    return pointer;
+}
+
+/// The heap image of a heap texture element.
+Id HeapImage(EmitContext& ctx, const TextureDefinition& def, Id word, bool non_uniform) {
+    const Id image{ctx.OpLoad(def.image_type,
+                              HeapImagePointer(ctx, def.pointer_type, def.id, word, non_uniform))};
+    if (non_uniform) {
+        DecorateNonUniform(ctx, image);
+    }
+    return image;
+}
+
+/// The sampled image of a heap texture element: its image and the heap sampler of the word's
+/// high bits.
+Id HeapSampledImage(EmitContext& ctx, const TextureDefinition& def, const IR::Value& index) {
+    const bool non_uniform{HeapNonUniform(ctx, def.count, index, NonUniformKind::SampledImage)};
+    const Id word{ctx.HeapWord(def.heap_word, index, def.count > 1)};
+    const Id image{HeapImage(ctx, def, word, non_uniform)};
+    const Id sampler_element{ctx.OpShiftRightLogical(ctx.U32[1], word, ctx.Const(16u))};
+    const Id sampler_pointer{
+        ctx.OpAccessChain(ctx.heap_sampler_pointer, ctx.heap_samplers, sampler_element)};
+    const Id sampler{ctx.OpLoad(ctx.heap_sampler_type, sampler_pointer)};
+    const Id sampled{ctx.OpSampledImage(def.sampled_type, image, sampler)};
+    if (non_uniform) {
+        DecorateNonUniform(ctx, sampler_pointer);
+        DecorateNonUniform(ctx, sampler);
+        DecorateNonUniform(ctx, sampled);
+    }
+    return sampled;
+}
+
 Id Texture(EmitContext& ctx, IR::TextureInstInfo info, [[maybe_unused]] const IR::Value& index) {
     const TextureDefinition& def{ctx.textures.at(info.descriptor_index)};
+    if (def.heap) [[unlikely]] {
+        return HeapSampledImage(ctx, def, index);
+    }
     if (def.count > 1) {
         auto const idx = index.IsImmediate() ? ctx.Const(index.U32()) : ctx.Def(index);
         const bool non_uniform{MarkNonUniform(ctx, idx, index, NonUniformKind::SampledImage)};
@@ -259,6 +315,14 @@ Id Texture(EmitContext& ctx, IR::TextureInstInfo info, [[maybe_unused]] const IR
 Id TextureImage(EmitContext& ctx, IR::TextureInstInfo info, const IR::Value& index) {
     if (info.type == TextureType::Buffer) {
         const TextureBufferDefinition& def{ctx.texture_buffers.at(info.descriptor_index)};
+        if (def.heap) [[unlikely]] {
+            // EDEN_NX2_V2_HEAP_TEXEL: the heap texel buffer of the element's word.
+            const Id word{ctx.HeapWord(def.heap_word, index, def.count > 1)};
+            const Id pointer_type{
+                ctx.TypePointer(spv::StorageClass::UniformConstant, ctx.image_buffer_type)};
+            return ctx.OpLoad(ctx.image_buffer_type,
+                              HeapImagePointer(ctx, pointer_type, def.id, word, false));
+        }
         if (def.count > 1) {
             const Id idx{index.IsImmediate() ? ctx.Const(index.U32()) : ctx.Def(index)};
             const bool non_uniform{
@@ -274,6 +338,12 @@ Id TextureImage(EmitContext& ctx, IR::TextureInstInfo info, const IR::Value& ind
         return ctx.OpLoad(ctx.image_buffer_type, def.id);
     } else {
         const TextureDefinition& def{ctx.textures.at(info.descriptor_index)};
+        if (def.heap) [[unlikely]] {
+            const bool non_uniform{
+                HeapNonUniform(ctx, def.count, index, NonUniformKind::SampledImage)};
+            return HeapImage(ctx, def, ctx.HeapWord(def.heap_word, index, def.count > 1),
+                             non_uniform);
+        }
         if (def.count > 1) {
             auto const idx = index.IsImmediate() ? ctx.Const(index.U32()) : ctx.Def(index);
             const bool non_uniform{MarkNonUniform(ctx, idx, index, NonUniformKind::SampledImage)};
@@ -294,6 +364,23 @@ Id TextureImage(EmitContext& ctx, IR::TextureInstInfo info, const IR::Value& ind
 std::pair<Id, bool> Image(EmitContext& ctx, const IR::Value& index, IR::TextureInstInfo info) {
     if (info.type == TextureType::Buffer) {
         const ImageBufferDefinition def{ctx.image_buffers.at(info.descriptor_index)};
+        if (def.heap) [[unlikely]] {
+            // EDEN_NX2_V2_HEAP_TEXEL: the heap storage texel buffer of the element's word.
+            const bool non_uniform{
+                def.count > 1 && !index.IsImmediate() &&
+                IsNonUniformSupported(ctx.profile, NonUniformKind::StorageTexelBuffer)};
+            if (non_uniform) {
+                ctx.uses_nonuniform_storage_texel_buffer = true;
+            }
+            const Id word{ctx.HeapWord(def.heap_word, index, def.count > 1)};
+            const Id image{ctx.OpLoad(def.image_type, HeapImagePointer(ctx, def.pointer_type,
+                                                                        def.id, word,
+                                                                        non_uniform))};
+            if (non_uniform) {
+                DecorateNonUniform(ctx, image);
+            }
+            return {image, def.is_integer};
+        }
         if (def.count > 1) {
             const Id idx{index.IsImmediate() ? ctx.Const(index.U32()) : ctx.Def(index)};
             const bool non_uniform{
@@ -309,6 +396,18 @@ std::pair<Id, bool> Image(EmitContext& ctx, const IR::Value& index, IR::TextureI
         return {ctx.OpLoad(def.image_type, def.id), def.is_integer};
     } else {
         const ImageDefinition def{ctx.images.at(info.descriptor_index)};
+        if (def.heap) [[unlikely]] {
+            const bool non_uniform{
+                HeapNonUniform(ctx, def.count, index, NonUniformKind::StorageImage)};
+            const Id word{ctx.HeapWord(def.heap_word, index, def.count > 1)};
+            const Id image{ctx.OpLoad(def.image_type, HeapImagePointer(ctx, def.pointer_type,
+                                                                        def.id, word,
+                                                                        non_uniform))};
+            if (non_uniform) {
+                DecorateNonUniform(ctx, image);
+            }
+            return {image, def.is_integer};
+        }
         if (def.count > 1) {
             const Id idx{index.IsImmediate() ? ctx.Const(index.U32()) : ctx.Def(index)};
             const bool non_uniform{MarkNonUniform(ctx, idx, index, NonUniformKind::StorageImage)};

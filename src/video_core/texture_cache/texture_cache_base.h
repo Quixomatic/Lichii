@@ -8,7 +8,9 @@
 
 #include <atomic>
 #include <deque>
+#include <functional>
 #include <limits>
+#include <memory>
 #include <map>
 #include <mutex>
 #include <optional>
@@ -45,9 +47,15 @@
 #include "video_core/texture_cache/image_info.h"
 #include "video_core/texture_cache/image_view_base.h"
 #include "video_core/texture_cache/render_targets.h"
+#include "video_core/texture_cache/sampled_views.h"
+#include "video_core/texture_cache/stale_pages.h"
 #include "video_core/texture_cache/types.h"
 #include "video_core/textures/texture.h"
 #include "video_core/textures/unswizzle_worker.h"
+#include "video_core/v2/commit.h"
+#include "video_core/v2/residency.h"
+#include "video_core/v2/resolve/draw_record.h"
+#include "video_core/v2/versions.h"
 
 namespace Tegra {
 namespace Control {
@@ -66,6 +74,40 @@ struct ImageViewInOut {
     u32 index{};
     bool blacklist{};
     ImageViewId id{};
+};
+
+/// A texture handle word a draw read, and where.
+struct TextureHandleRead {
+    GPUVAddr address{};
+    u32 raw{};
+};
+
+/// What a draw's sampled textures were resolved from, kept by the pipeline that drew them. The
+/// next draw with the same pipeline resolves its textures from it (ResolveMemoizedTextures) while
+/// every byte they came from is the same: the handle words, the texture and sampler descriptors
+/// and the tables, mappings and views behind them.
+struct SampledTextureMemo {
+    struct Entry {
+        GPUVAddr handle_address{};
+        const u8* handle_host{}; ///< The handle word in host memory
+        const u8* tic_host{};
+        const u8* tsc_host{};
+        TICEntry tic{};
+        TSCEntry tsc{};
+        u32 raw{};        ///< The handle word
+        u32 view_index{}; ///< The texture header index the handle gives
+        ImageViewId view{};
+        SamplerId sampler{};
+    };
+    std::vector<Entry> entries;
+    const void* memory{};      ///< The address space the pointers belong to
+    const void* image_table{}; ///< The channel's table the views were read from
+    u64 host_serial{};         ///< MemoryManager::HostPointerSerial
+    u64 image_changes{};       ///< DescriptorTable::changes of both tables
+    u64 sampler_changes{};
+    bool via_header_index{}; ///< The sampler binding the handles were split with
+    bool valid{};
+    u32 misses{}; ///< Draws in a row that did not find the memo good
 };
 
 struct AsyncDecodeContext {
@@ -94,6 +136,11 @@ public:
     // TODO: still relies on bad iterators :(
     std::unordered_map<TICEntry, ImageViewId> image_views;
     std::unordered_map<TSCEntry, SamplerId> samplers;
+
+    /// Pipeline v2 P5a (EDEN_NX2_V2_COMMIT): lock-free published copies of image_views and
+    /// samplers, written by the commit owner, read by pure lookups (P6: from shard threads).
+    V2::PublishedMap<TICEntry> v2_views{V2::Commit::Epochs()};
+    V2::PublishedMap<TSCEntry> v2_samplers{V2::Commit::Epochs()};
 
     TextureCacheGPUMap* gpu_page_table = nullptr;
     TextureCacheGPUMap* sparse_page_table = nullptr;
@@ -144,15 +191,15 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     u64 slack_margin{};           ///< Extra room for allocator block space the driver counts as used
     u64 astc_opaque_images{};
     u64 astc_alpha_images{};
-    std::vector<u8> astc_scan_buffer;
+    Common::ScratchBuffer<u8> astc_scan_buffer;
     u64 images_deleted{};
     std::map<u64, std::pair<u32, GPUVAddr>> created_shapes;
     bool debug_stats{}; ///< Collect what only the debug statistics lines use
 
     static constexpr s64 DEFAULT_EXPECTED_MEMORY = 1_GiB + 125_MiB;
     static constexpr s64 DEFAULT_CRITICAL_MEMORY = 1_GiB + 625_MiB;
-    /// The most device memory the collector lets the cache fill before it collects in earnest,
-    /// on every GPU (ApplyThresholdOverrides).
+    /// The most device memory the collector lets the cache fill before it collects in earnest on
+    /// cards up to 8 GiB; larger ones 5/8 of the driver's budget (ApplyThresholdOverrides).
     static constexpr u64 MaxCriticalMemory = 5_GiB;
     static constexpr size_t GC_EMERGENCY_COUNTS = 2;
 
@@ -237,16 +284,86 @@ public:
     /// Get the imageview from the graphics descriptor table in the specified index
     [[nodiscard]] ImageView& GetImageView(u32 index) noexcept;
 
+    // Publish the CPU-readable collision image. Caller holds the cache mutex.
+    bool PublishComputeCollisionImage(u32 index);
+
     /// Mark an image as modified from the GPU
     void MarkModification(ImageId id) noexcept;
 
     /// Fill image_view_ids with the graphics/compute images in indices
-    void FillImageViews(std::span<ImageViewInOut> views, bool compute, bool blacklist = true);
+    /// With COMMIT=1, `samplers` (the ids GetSamplerId returned since BeginSamplerLookups) get
+    /// their proxies patched: the sampler requests commit first, in order, as the old lookups ran.
+    void FillImageViews(std::span<ImageViewInOut> views, bool compute, bool blacklist = true,
+                        std::span<SamplerId> samplers = {});
+
+    /// P5a: the GetSamplerId calls until the next FillImageViews defer their table updates and
+    /// creations (a created sampler's id is a proxy until then).
+    void BeginSamplerLookups() noexcept {
+        v2_sampler_scope = commit != nullptr && !commit->verify;
+        if (v2_sampler_scope) {
+            v2_sampler_list.Reset(0);
+        }
+    }
+
+    /// Fills views and samplers of a draw from the pipeline's memo when nothing they were
+    /// resolved from has changed since (true), prepares the images as FillImageViews does.
+    /// handle_addresses are where the draw reads its texture handles from, in binding order.
+    [[nodiscard]] bool ResolveMemoizedTextures(SampledTextureMemo& memo,
+                                               std::span<const GPUVAddr> handle_addresses,
+                                               std::span<ImageViewInOut> views,
+                                               std::span<SamplerId> samplers);
+
+    /// Keeps what FillImageViews and GetSamplerId resolved the draw's textures from.
+    void MemoizeTextures(SampledTextureMemo& memo, std::span<const TextureHandleRead> reads,
+                         std::span<const ImageViewInOut> views, std::span<const SamplerId> samplers);
 
     /// Handle feedback loops during draws.
     void CheckFeedbackLoop(std::span<const ImageViewInOut> views);
 
     [[nodiscard]] bool SamplesRenderTarget(std::span<const ImageViewInOut> views);
+
+    /// Whether sampling the views now needs PrepareImageView: an image with an upload pending or
+    /// a newer alias to copy in (fast draw delta draws keep their views and prepare none).
+    [[nodiscard]] bool SampledViewsChange(std::span<const ImageViewInOut> views) const noexcept {
+        return VideoCommon::SampledViewsChange(views, slot_image_views, slot_images);
+    }
+
+    /// EDEN_NX2_V2_DRAWCACHE: prepares a recipe's views as FillImageViews prepares the views it
+    /// finds (uploads, alias copies, the LRU), as a texture memo hit does. False when preparing
+    /// deleted images: the draw resolves in full.
+    [[nodiscard]] bool PrepareRecipeViews(std::span<const ImageViewInOut> views);
+
+    /// Pipeline v2 F2-09 (MASTER_PLAN §5.3 textures, §8): image residency by epoch. The prepare
+    /// epoch moves whenever a PrepareImageView of an image prepared before could do more than the
+    /// LRU touch (a CPU-modified mark, a newer alias, registration, deletion, a rescale). A recipe
+    /// or continued chain that prepared its views under a stamp equal to the current one skips
+    /// every PrepareImageView.
+    using ResidencyStamp = V2::ResidencyStamp;
+    [[nodiscard]] ResidencyStamp CurrentResidency() const noexcept;
+    /// PrepareRecipeViews unless `stamp` still holds; refreshes `stamp` after a prepare.
+    [[nodiscard]] bool PrepareResidentViews(std::span<const ImageViewInOut> views,
+                                            ResidencyStamp& stamp);
+    void BumpPrepareEpoch() noexcept {
+        ++prepare_epoch;
+    }
+
+    /// EDEN_NX2_V2_DRAWCACHE: the image (sampler = false) or sampler descriptor `index` of a
+    /// handle, as the last resolve read it: its GPU address, its host pointer and its bytes. False
+    /// when it crosses a page or memory no longer holds those bytes; true with a null host
+    /// pointer when the index is past the table's limit (the resolve read nothing).
+    [[nodiscard]] bool CaptureDescriptor(bool compute, bool sampler, u32 index, GPUVAddr& address,
+                                         const u8*& host, std::span<u8, 32> bytes) const;
+
+    /// EDEN_NX2_V2_DRAWCACHE: the guest range of the image a view samples (none for null and
+    /// buffer views).
+    [[nodiscard]] std::optional<std::pair<DAddr, u64>> ViewImageRange(ImageViewId id) const;
+
+    /// EDEN_NX2_TEXTURE_MEMO_VERIFY: PrepareImage adds the images it is asked to prepare to `log`
+    /// (nullptr stops it) and, with `dry`, does nothing else.
+    void LogPrepares(std::vector<ImageId>* log, bool dry) noexcept {
+        prepare_log = log;
+        prepare_log_dry = dry;
+    }
 
     /// Get the sampler from the graphics/compute descriptor table in the specified index
     Sampler* GetSampler(u32 index, bool compute);
@@ -285,6 +402,12 @@ public:
     /// Download contents of host images to guest memory in a region
     void DownloadMemory(DAddr cpu_addr, size_t size);
 
+    /// SYNC §12 R4 (MP §6: guest CPU reads of GPU-written memory are served on the reading
+    /// thread): DownloadMemory with the copies recorded into the open submission and `land` set
+    /// for the reader, which waits for their tick and swizzles into guest memory itself. False
+    /// (nothing done) when the backend or the size needs the synchronous path.
+    bool DownloadMemoryAsync(DAddr cpu_addr, size_t size, std::function<void()>& land);
+
     std::optional<VideoCore::RasterizerDownloadArea> GetFlushArea(DAddr cpu_addr, u64 size);
 
     /// Remove images in a region
@@ -317,6 +440,10 @@ public:
 
     /// Return true when there are uncommitted images to be downloaded
     [[nodiscard]] bool HasUncommittedFlushes() const noexcept;
+
+    /// SYNC §15.2: whether an uncommitted download lands on a page a CPU consumer reads
+    /// (Nx2IsCpuReadPage; unknown translations count).
+    [[nodiscard]] bool UncommittedFlushesCpuRead();
 
     /// Whether CommitAsyncFlushes would commit anything (downloads or their buffers).
     [[nodiscard]] bool HasAsyncFlushWork() const noexcept;
@@ -355,7 +482,165 @@ public:
 
     Common::SpinRecursiveMutex mutex;
 
+    // Pipeline v2 P5a (EDEN_NX2_V2_COMMIT): pure lookups and the commit stage's appliers.
+    /// Sets the renderer's commit state (null: the old in-lookup mutations).
+    void SetCommit(V2::Commit::Context* context) noexcept {
+        commit = context;
+    }
+
+    /// What VisitImageView(index) would do, without doing it: the view (or none) and whether
+    /// it needs a request (a table update, a creation, or a prepare). Pure.
+    struct CommitViewLookup {
+        ImageViewId id{};
+        V2::Commit::Kind kind = V2::Commit::Kind::ImagePrepare;
+        bool request = false;
+    };
+    [[nodiscard]] CommitViewLookup LookupImageView(u32 index, bool compute) const;
+
+    /// The effects PrepareImageView(id, ...) would have. Pure.
+    [[nodiscard]] u32 PredictPrepare(ImageViewId id, bool is_modification, bool invalidate) const;
+
+    /// What GetSamplerId(index) would do: the sampler and whether it needs a request. Pure.
+    struct CommitSamplerLookup {
+        SamplerId id{};
+        V2::Commit::Kind kind = V2::Commit::Kind::SamplerBind;
+        bool request = false;
+    };
+    [[nodiscard]] CommitSamplerLookup LookupSampler(u32 index, bool compute) const;
+
+    /// P5a item 4: the next UpdateRenderTargets comes from a recipe replay (stats only).
+    void NoteRecipeRenderTargets() noexcept {
+        recipe_render_targets = true;
+    }
+
+    /// Whether EDEN_NX2_V2_COMMIT is on for this cache.
+    [[nodiscard]] bool CommitActive() const noexcept {
+        return commit != nullptr;
+    }
+
+    /// P5a item 4: true when the render target registers are clean and the bound targets are the
+    /// recipe's (whose generations the recipe's validation checked): the next UpdateRenderTargets
+    /// resolves nothing and binds the same views, so the replay needs no check after it. Pure.
+    [[nodiscard]] bool RenderTargetsUnchanged(std::span<const u32, NUM_RT> color_ids,
+                                              u32 depth_id) const noexcept;
+
+    // Pipeline v2 P6 Step 0 (EDEN_NX2_V2_DRAWREC, notes/STEP0_SPEC.md §2 items 1, 3, 4, 7): pure
+    // twins of the fused entry points and the appliers ApplyDraw runs.
+    /// Whether the graphics descriptor tables are the ones `key` selects (no Synchronize due).
+    [[nodiscard]] bool DescriptorTablesMatch(const V2::Resolve::DescriptorTablesKey& key) const
+        noexcept;
+    /// SynchronizeDescriptors(false) for the tables `key` selects.
+    void SyncDescriptorTables(const V2::Resolve::DescriptorTablesKey& key);
+    /// RenderTargetInputsHold for the registers in `key`.
+    [[nodiscard]] bool RenderTargetInputsHold(const V2::Resolve::RtKey& key) const;
+    /// The render target views a full update for `key` binds, as far as the bound views show
+    /// them (pure; no prepares, no effects).
+    struct RtPrediction {
+        std::array<u32, NUM_RT + 1> ids{}; ///< color targets, then depth (ImageViewId indices)
+        bool known = false;
+        bool inputs_hold = false;
+    };
+    [[nodiscard]] RtPrediction PredictRenderTargets(const V2::Resolve::RtKey& key) const;
+    /// Applies one request of a draw record's texture list: sampler kinds as GetSamplerId
+    /// outside a sampler scope (CommitSamplerLookups), views as the commit's own applier.
+    u32 ApplyDrawRequest(const V2::Commit::Request& request, bool& has_blacklisted);
+    /// Whether an image was deleted since the last call (and clears it).
+    [[nodiscard]] bool TakeDeletedImages() noexcept {
+        return std::exchange(has_deleted_images, false);
+    }
+    [[nodiscard]] u32 ViewGeneration(ImageViewId id) const noexcept {
+        return V2::Versions::Gens().Get(V2::Versions::Kind::ImageView, id.index);
+    }
+    [[nodiscard]] u32 SamplerGeneration(SamplerId id) const noexcept {
+        return V2::Versions::Gens().Get(V2::Versions::Kind::Sampler, id.index);
+    }
+    /// The record stamps: the graphics tables' change counts and the bindings serial.
+    [[nodiscard]] u64 GraphicsImageTableChanges() const noexcept {
+        return channel_state->graphics_image_table.changes;
+    }
+    [[nodiscard]] u64 GraphicsSamplerTableChanges() const noexcept {
+        return channel_state->graphics_sampler_table.changes;
+    }
+    [[nodiscard]] u64 TextureBindingsSerial() const noexcept {
+        return texture_bindings_serial;
+    }
+    /// DRAWREC=verify: views and samplers created so far (deletions during a draw can keep the
+    /// live counts from growing).
+    [[nodiscard]] size_t ImageViewSlots() const noexcept {
+        return views_created;
+    }
+    [[nodiscard]] size_t SamplerSlots() const noexcept {
+        return samplers_created;
+    }
+    /// DRAWREC=verify (step 10): a hash of what a cache mutation moves (slot vectors, serials,
+    /// table changes, deferred requests); a pure resolve leaves it unchanged.
+    [[nodiscard]] u64 DrawRecPurity() const noexcept {
+        u64 hash = 0xcbf29ce484222325ULL;
+        const auto mix = [&](u64 value) { hash = (hash ^ value) * 0x100000001b3ULL; };
+        mix(slot_images.size());
+        mix(slot_image_views.size());
+        mix(slot_samplers.size());
+        mix(texture_bindings_serial);
+        mix(render_targets_serial);
+        mix(prepare_epoch);
+        mix(modification_tick);
+        mix(channel_state->graphics_image_table.changes);
+        mix(channel_state->graphics_sampler_table.changes);
+        mix(v2_sampler_list.Requests().size());
+        mix(has_deleted_images ? 1 : 0);
+        return hash;
+    }
+
 private:
+    /// FillImageViews with COMMIT=1: pure lookups into requests, then one commit.
+    void FillImageViewsCommit(std::span<ImageViewInOut> views, bool compute, bool blacklist);
+    /// COMMIT=verify: the lookups' requests for these views (into commit->list), unapplied.
+    void PredictImageViews(std::span<const ImageViewInOut> views, bool compute, bool blacklist);
+    /// UpdateRenderTargets with COMMIT=1, and its requests (pure).
+    void UpdateRenderTargetsCommit(bool is_clear);
+    void PushRenderTargetRequests(bool is_clear);
+    /// The effects of a full render target update (dirty registers), from the views it will find.
+    /// `known` turns false when a target may not be the bound view.
+    u32 PredictRenderTargetUpdate(bool is_clear, bool& known);
+    /// The old UpdateRenderTargets body.
+    void UpdateRenderTargetsImpl(bool is_clear);
+    /// Prepares views through requests and one commit (memo hits, recipe replays). False when
+    /// preparing deleted images.
+    bool PrepareViewsCommit(std::span<const ImageViewInOut> views);
+    /// Pushes a direct prepare request for a view (pure; skips views that prepare nothing).
+    void PushPrepareRequest(ImageViewId id);
+    /// The effects of preparing `id` (sampled), with images an earlier request of the open
+    /// segment prepares counted as having nothing left to upload or copy in.
+    u32 PredictSegmentPrepare(ImageViewId id, bool is_modification, bool invalidate);
+    /// COMMIT=verify: checks GetSamplerId's lookup against what the old path did.
+    void VerifySamplerLookup(u32 index, const CommitSamplerLookup& lookup, SamplerId result,
+                             bool created);
+    /// Applies one texture request; returns the slot it resolved.
+    u32 ApplyTextureRequest(const V2::Commit::Request& request, bool& has_blacklisted);
+    /// Compares commit->list (the predictions) with the verify log, counts and logs.
+    void FinishVerify(const char* what);
+    /// Starts recording the old path's steps (verify).
+    void BeginVerify();
+    /// The commit stats' timing of one commit.
+    void NoteCommitTime(u64 start_ns);
+
+    V2::Commit::Context* commit = nullptr;
+    /// P5b (XFERQ, GPUDECODE, DYNRENDER): images keep their last-use tick (v2_track_id) so
+    /// uploads to images the open submission hasn't used may be hoisted ahead of it.
+    bool v2_track_uses = V2::On(V2::Switch::XferQ) || V2::On(V2::Switch::GpuDecode) ||
+                         V2::On(V2::Switch::DynRender);
+    V2::Commit::RequestList v2_sampler_list; ///< deferred sampler table updates and creations
+    bool v2_sampler_scope = false;
+    /// Applies the deferred sampler requests and patches their proxies in `samplers`.
+    void CommitSamplerLookups(std::span<SamplerId> samplers);
+    std::vector<u32> v2_view_ids;                            ///< FillImageViewsCommit's ids
+    boost::container::small_vector<ImageId, 16> v2_prepared; ///< images the segment prepares
+    /// The image the last MarkModification marked, while it holds the newest modification tick
+    /// alone (P5a item 4: re-marking it changes nothing).
+    const ImageBase* v2_sole_newest = nullptr;
+    bool recipe_render_targets = false;
+    u32 v2_rt_checks = 0; ///< verify samples of the render target skip rule
+
     /// Iterate over all page indices in a range
     template <typename Func>
     static void ForEachCPUPage(DAddr addr, size_t size, Func&& func) {
@@ -548,10 +833,15 @@ private:
     std::array<ImageId, 8> rt_image_id{};
     ImageId rt_depth_image_id{};
     u64 texture_bindings_serial = 0;
+    u64 views_created = 0;    ///< ImageViewSlots
+    u64 samplers_created = 0; ///< SamplerSlots
     u64 last_feedback_loop_serial = 0;
     u64 last_feedback_texture_serial = 0;
     bool last_feedback_loop_result = false;
     bool feedback_depth_dirty = true;
+    /// F4-06 (EDEN_NX2_V2_DYNRENDER): the feedback barrier is re-armed only by draws that can
+    /// write depth or stencil (not by a stencil test with nothing to write).
+    bool v2_feedback_writes = V2::On(V2::Switch::DynRender);
     FramebufferId last_framebuffer_id{};
     u64 last_framebuffer_serial = 0;
 
@@ -564,10 +854,27 @@ private:
     /// Applies EDEN_NX2_TC_EXPECTED_MIB / EDEN_NX2_TC_CRITICAL_MIB and logs the thresholds.
     void ApplyThresholdOverrides(bool log = true);
 
+    /// A GPU-written image dropped without being written back leaves its
+    /// guest memory stale (the GPU's data is gone). Its whole pages are marked here and kept
+    /// tracked, so CPU writes, unmaps and write-backs clear them. An image made entirely on marked
+    /// pages starts without an upload: the upload would only copy stale bytes the GPU overwrites.
+    /// Switch 2 titles only: the buffer cache feeds Nx2MayBeGpuWritten for them alone.
+    void MarkStale(const ImageBase& image);
+    void ClearStale(DAddr addr, size_t size);
+    void ClearStaleImage(const ImageBase& image);
+    /// Clears every device range [gpu_addr, gpu_addr + size) maps to.
+    void ClearStaleGpu(GPUVAddr gpu_addr, size_t size);
+    StalePages stale_pages;
+    u64 tc_stale_skips{};        ///< Uploads skipped (last 600 frames)
+    u64 tc_stale_skip_bytes{};
+    u64 tc_stale_gpu_written{};  ///< Stale but buffer-written pages: uploaded after all
+
     /// The CPU address an image at gpu_addr is keyed by: its backing, or a fixed stand-in.
     [[nodiscard]] std::optional<DAddr> ImageCpuAddress(GPUVAddr gpu_addr, size_t size) const;
 
     bool has_deleted_images = false;
+    std::vector<ImageId>* prepare_log{}; ///< LogPrepares
+    bool prepare_log_dry{};
     /// True while a clear binds its render targets (UpdateRenderTargets(true)), so JoinImages can
     /// skip the upload of a new target the clear overwrites whole.
     bool clearing_render_targets = false;
@@ -629,6 +936,9 @@ private:
         Image image;
     };
     std::deque<GpuSentencedImage> gpu_sentenced_images;
+    /// F4-09: {tick, bytes} of deleted images the finish thread destroys (Runtime::RetireImage);
+    /// only their memory is counted here.
+    std::deque<std::pair<u64, u64>> gpu_retired_images;
     u64 gpu_sentenced_bytes{};
 
     /// Bytes of images per device memory block, for the collector (refreshed every 60 frames).
@@ -641,10 +951,46 @@ private:
 
     Common::ScratchBuffer<u8> swizzle_data_buffer;
     Common::ScratchBuffer<u8> unswizzle_data_buffer;
+
+    /// SYNC §12 R4: image downloads a reader lands (DownloadMemoryAsync); their staging memory
+    /// is freed by the owner once landed.
+    struct ReadbackState;
+    std::vector<std::shared_ptr<ReadbackState>> readbacks_in_flight;
+    void FreeLandedReadbacks();
     Tegra::Texture::UnswizzleWorker unswizzle_worker;
 
     u64 modification_tick = 0;
     u64 frame_tick = 0;
+    u64 prepare_epoch = 1; ///< F2-09, see ResidencyStamp
+    /// F2-05/F2-06: moves when the set of images or their scale changes (registration,
+    /// deletion, rescale): what a render target lookup over unchanged registers finds.
+    u64 image_set_epoch = 1;
+    /// F2-06: the render target registers of the last full update, its epoch and frame.
+    struct RenderTargetInputs {
+        std::array<Tegra::Engines::Maxwell3D::Regs::RenderTargetConfig, NUM_RT> rt{};
+        Tegra::Engines::Maxwell3D::Regs::Zeta zeta{};
+        Tegra::Engines::Maxwell3D::Regs::SurfaceClip surface_clip{};
+        Tegra::Engines::Maxwell3D::Regs::RtControl rt_control{};
+        Tegra::Engines::Maxwell3D::Regs::ZetaSize zeta_size{};
+        u32 zeta_enable{};
+        Tegra::Texture::MsaaMode anti_alias_samples_mode{};
+        u64 image_set_epoch{};
+        u64 map_serial{};
+        const void* memory{};
+        const void* engine{};
+        u64 frame{};
+        bool valid{};
+    } rt_inputs;
+    void SaveRenderTargetInputs();
+    [[nodiscard]] bool RenderTargetInputsHold() const;
+    /// F2-05: the state a clean-register render target check that skipped every target saw.
+    struct RtCleanStamp {
+        u64 serial{};
+        u64 modification{};
+        u64 epoch{};
+        u64 frame{};
+        bool operator==(const RtCleanStamp&) const = default;
+    } rt_clean_stamp;
 
     Common::ThreadWorker texture_decode_worker{1, "TextureDecoder", {},
                                                Common::ThreadPlacement::Efficiency};

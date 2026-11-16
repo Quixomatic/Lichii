@@ -117,9 +117,91 @@ add_library(video_core STATIC
     nx2_cmdpage_diag.h
     nx2_debug_control.cpp
     nx2_debug_control.h
+    nx2_fast_draw.cpp
+    nx2_fast_draw.h
     nx2_profile.h
     nx2_perf.h
     nx2_download_trace.h
+    v2/front_wake.cpp
+    v2/front_wake.h
+    v2/front_writes.cpp
+    v2/front_writes.h
+    v2/hazard.cpp
+    v2/hazard.h
+    v2/ir.h
+    v2/cbuf_version.cpp
+    v2/commit.cpp
+    v2/commit.h
+    v2/epoch_publish.h
+    v2/cbuf_address_table.h
+    v2/cbuf_ring.h
+    v2/cbuf_watch.cpp
+    v2/cbuf_watch.h
+    v2/cbuf_version.h
+    v2/continued_draw.h
+    v2/cpu_readback.h
+    v2/desc_cache.h
+    v2/draw_cache.cpp
+    v2/draw_cache.h
+    v2/draw_model.cpp
+    v2/draw_model.h
+    v2/ir_arena.h
+    v2/ir_check.cpp
+    v2/ir_check.h
+    v2/ir_exec.cpp
+    v2/ir_exec.h
+    v2/landing.h
+    v2/landing_fence.h
+    v2/sem_view.h
+    v2/after_pass.h
+    v2/macro_hle.cpp
+    v2/macro_hle.h
+    v2/macro_memo.cpp
+    v2/macro_memo.h
+    v2/p3_stats.cpp
+    v2/p3_stats.h
+    v2/p5b_stats.cpp
+    v2/p5b_stats.h
+    v2/barrier_tracker.h
+    v2/flush_heuristic.h
+    v2/frame_causes.h
+    v2/frame_pacer.h
+    v2/gpu_unswizzle.h
+    v2/qmd_front.h
+    v2/submit_requests.h
+    v2/tick_ring.h
+    v2/timeline_join.h
+    v2/pipeline_lookup.h
+    v2/regsem.cpp
+    v2/residency.h
+    v2/resolve/cbuf_table.h
+    v2/resolve/cow_regs.h
+    v2/resolve/draw_record.cpp
+    v2/resolve/draw_record.h
+    v2/resolve/dynamic_state.h
+    v2/resolve/multifront.cpp
+    v2/resolve/multifront.h
+    v2/resolve/parallel_resolve.cpp
+    v2/resolve/parallel_resolve.h
+    v2/resolve/segment.h
+    v2/resolve/split_resolve.cpp
+    v2/resolve/split_resolve.h
+    v2/resolve/state_view.h
+    v2/shader_writes.cpp
+    v2/shader_writes.h
+    v2/regsem.h
+    v2/regsem_3d.h
+    v2/ir_trace.cpp
+    v2/ir_trace.h
+    v2/s1_deltas.h
+    v2/v2_stats.cpp
+    v2/v2_stats.h
+    v2/v2_switches.cpp
+    v2/v2_switches.h
+    v2/va_map.h
+    v2/versions.cpp
+    v2/versions.h
+    v2/word_readback.h
     pending_maps.h
     present.h
     pte_kind.h
@@ -182,6 +264,8 @@ add_library(video_core STATIC
     renderer_vulkan/vk_blit_screen.cpp
     renderer_vulkan/vk_blit_screen.h
     renderer_vulkan/vk_buffer_cache_base.cpp
+    renderer_vulkan/vk_bindless_heap.cpp
+    renderer_vulkan/vk_bindless_heap.h
     renderer_vulkan/vk_buffer_cache.cpp
     renderer_vulkan/vk_buffer_cache.h
     renderer_vulkan/vk_command_pool.cpp
@@ -192,6 +276,8 @@ add_library(video_core STATIC
     renderer_vulkan/vk_fsr3_upscaler.h
     renderer_vulkan/vk_dlss_network_probe.cpp
     renderer_vulkan/vk_dlss_network_probe.h
+    renderer_vulkan/vk_ocarina_camera_motion.cpp
+    renderer_vulkan/vk_ocarina_camera_motion.h
     renderer_vulkan/vk_compute_pipeline.cpp
     renderer_vulkan/vk_compute_pipeline.h
     renderer_vulkan/vk_cooperative_hmma_test.cpp
@@ -200,6 +286,9 @@ add_library(video_core STATIC
     renderer_vulkan/vk_descriptor_buffer.h
     renderer_vulkan/vk_descriptor_pool.cpp
     renderer_vulkan/vk_descriptor_pool.h
+    renderer_vulkan/vk_draw_cache.cpp
+    renderer_vulkan/vk_draw_cache.h
+    renderer_vulkan/vk_draw_resolve.cpp
     renderer_vulkan/vk_fence_manager.cpp
     renderer_vulkan/vk_fence_manager.h
     renderer_vulkan/vk_frame_dump.cpp
@@ -212,6 +301,8 @@ add_library(video_core STATIC
     renderer_vulkan/vk_master_semaphore.h
     renderer_vulkan/vk_pipeline_cache.cpp
     renderer_vulkan/vk_pipeline_cache.h
+    renderer_vulkan/vk_pipeline_cache_records.cpp
+    renderer_vulkan/vk_pipeline_cache_records.h
     renderer_vulkan/vk_present_manager.cpp
     renderer_vulkan/vk_present_manager.h
     renderer_vulkan/vk_query_cache.cpp
@@ -224,6 +315,10 @@ add_library(video_core STATIC
     renderer_vulkan/vk_resource_pool.cpp
     renderer_vulkan/vk_resource_pool.h
     renderer_vulkan/vk_scheduler.cpp
+    renderer_vulkan/vk_background_readback.cpp
+    renderer_vulkan/vk_background_readback.h
+    renderer_vulkan/vk_submit_engine.cpp
+    renderer_vulkan/vk_submit_engine.h
     renderer_vulkan/vk_scheduler.h
     renderer_vulkan/fragment_barrier_state.h
     renderer_vulkan/vk_shader_util.cpp
@@ -251,6 +346,7 @@ add_library(video_core STATIC
     vulkan_common/vulkan_library.cpp
     vulkan_common/vulkan_library.h
     vulkan_common/vulkan_overlay_filter.h
+    vulkan_common/unbacked_fallback.h
     vulkan_common/vulkan_memory_allocator.cpp
     vulkan_common/vulkan_memory_allocator.h
     vulkan_common/vulkan_surface.cpp
@@ -270,6 +366,12 @@ add_library(video_core STATIC
     shader_handle_program.h
     shader_notify.cpp
     shader_notify.h
+    shader_warm/shader_archives.cpp
+    shader_warm/shader_archives.h
+    shader_warm/shader_warm_builder.cpp
+    shader_warm/shader_warm_builder.h
+    shader_warm/warm_records.cpp
+    shader_warm/warm_records.h
     smaa_area_tex.h
     smaa_search_tex.h
     surface.cpp
@@ -285,6 +387,7 @@ add_library(video_core STATIC
     texture_cache/format_lookup_table.h
     texture_cache/image_base.cpp
     texture_cache/image_base.h
+    texture_cache/host_mip_limits.h
     texture_cache/image_info.cpp
     texture_cache/image_info.h
     texture_cache/image_view_base.cpp
@@ -293,6 +396,7 @@ add_library(video_core STATIC
     texture_cache/image_view_info.h
     texture_cache/render_targets.h
     texture_cache/samples_helper.h
+    texture_cache/stale_pages.h
     texture_cache/texture_cache.cpp
     texture_cache/texture_cache.h
     texture_cache/texture_cache_base.h
@@ -458,6 +562,9 @@ target_link_libraries(video_core PUBLIC common core)
 if(WIN32)
     target_link_libraries(video_core PRIVATE advapi32)
 endif()
+
+# Shader precache builder: game archives use zstd (also with dictionaries) and zlib.
+target_link_libraries(video_core PRIVATE zstd::zstd ZLIB::ZLIB)
 target_link_libraries(video_core PUBLIC shader_recompiler stb bc_decoder gpu_logging)
 if (ENABLE_OPENGL)
     target_link_libraries(video_core PUBLIC glad)

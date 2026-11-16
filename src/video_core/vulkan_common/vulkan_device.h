@@ -51,7 +51,8 @@ VK_DEFINE_HANDLE(VmaPool)
             shader_demote_to_helper_invocation)                                                    \
     FEATURE(EXT, SubgroupSizeControl, SUBGROUP_SIZE_CONTROL, subgroup_size_control)                \
     FEATURE(KHR, Maintenance4, MAINTENANCE_4, maintenance4)                                        \
-    FEATURE(KHR, Synchronization2, SYNCHRONIZATION_2, synchronization2)
+    FEATURE(KHR, Synchronization2, SYNCHRONIZATION_2, synchronization2)                           \
+    FEATURE(KHR, DynamicRendering, DYNAMIC_RENDERING, dynamic_rendering)
 
 #define FOR_EACH_VK_FEATURE_1_4(FEATURE)
 
@@ -79,6 +80,8 @@ VK_DEFINE_HANDLE(VmaPool)
     FEATURE(KHR, CooperativeMatrix, COOPERATIVE_MATRIX, cooperative_matrix)                        \
     FEATURE(KHR, Maintenance5, MAINTENANCE_5, maintenance5)                                        \
     FEATURE(KHR, Maintenance6, MAINTENANCE_6, maintenance6)                                        \
+    FEATURE(KHR, PresentId, PRESENT_ID, present_id)                                                \
+    FEATURE(KHR, PresentWait, PRESENT_WAIT, present_wait)                                          \
     FEATURE(KHR, PipelineExecutableProperties, PIPELINE_EXECUTABLE_PROPERTIES,                     \
             pipeline_executable_properties)                                                        \
     FEATURE(KHR, ShaderQuadControl, SHADER_QUAD_CONTROL, shader_quad_control)                      \
@@ -274,6 +277,12 @@ public:
         return allocator;
     }
 
+    /// X-03: whether the VMA allocator is created without EXTERNALLY_SYNCHRONIZED (v2 threads use
+    /// it concurrently); false means every call must come from one thread at a time.
+    [[nodiscard]] bool IsAllocatorShared() const noexcept {
+        return vma_shared;
+    }
+
     /// Allocations kept out of the default blocks, which then hold images only: churned buffers
     /// and long-lived sparse pages left holes the texture cache's collector couldn't drain.
     enum class SeparatePool : u32 {
@@ -324,6 +333,27 @@ public:
         return present_family;
     }
 
+    /// EDEN_NX2_V2_XFERQ: a dedicated transfer queue (a family with transfer and neither graphics
+    /// nor compute), with timeline semaphores and synchronization2 to join it.
+    bool HasTransferQueue() const {
+        return has_transfer_queue;
+    }
+    vk::Queue GetTransferQueue() const {
+        return transfer_queue;
+    }
+    u32 GetTransferFamily() const {
+        return transfer_family;
+    }
+    /// Buffers the transfer queue may copy are shared by both families (no ownership transfers);
+    /// images stay exclusive and move with queue family ownership transfers.
+    void ApplyTransferSharing(VkBufferCreateInfo& ci) const {
+        if (has_transfer_queue) {
+            ci.sharingMode = VK_SHARING_MODE_CONCURRENT;
+            ci.queueFamilyIndexCount = static_cast<u32>(transfer_sharing_families.size());
+            ci.pQueueFamilyIndices = transfer_sharing_families.data();
+        }
+    }
+
     /// Returns the current Vulkan API version provided in Vulkan-formatted version numbers.
     u32 ApiVersion() const {
         return properties.properties.apiVersion;
@@ -332,6 +362,11 @@ public:
     /// Returns the current driver version provided in Vulkan-formatted version numbers.
     u32 GetDriverVersion() const {
         return properties.properties.driverVersion;
+    }
+
+    /// Returns the PCI device ID of the physical device.
+    u32 GetDeviceID() const {
+        return properties.properties.deviceID;
     }
 
     /// Returns the device name.
@@ -1007,11 +1042,41 @@ FN_MAX_LIMIT_LIST
         return features.descriptor_indexing.descriptorBindingPartiallyBound;
     }
 
+    /// Pipeline v2 (EDEN_NX2_V2_BINDLESS): sampled image bindings can be written after they are
+    /// bound and while pending work uses other elements (enabled only with the switch).
+    bool IsSampledImageUpdateAfterBindSupported() const {
+        return features.descriptor_indexing.descriptorBindingSampledImageUpdateAfterBind &&
+               features.descriptor_indexing.descriptorBindingUpdateUnusedWhilePending;
+    }
+    bool IsStorageImageUpdateAfterBindSupported() const {
+        return features.descriptor_indexing.descriptorBindingStorageImageUpdateAfterBind;
+    }
+    /// Pipeline v2 P5a (EDEN_NX2_V2_HEAP_TEXEL): texel buffer arrays written after bind and
+    /// indexed dynamically (enabled only with the switch).
+    bool IsTexelBufferHeapSupported() const {
+        const auto& indexing = features.descriptor_indexing;
+        return indexing.descriptorBindingUniformTexelBufferUpdateAfterBind &&
+               indexing.descriptorBindingStorageTexelBufferUpdateAfterBind &&
+               indexing.shaderUniformTexelBufferArrayDynamicIndexing &&
+               indexing.shaderStorageTexelBufferArrayDynamicIndexing;
+    }
+
     bool HasTimelineSemaphore() const;
 
     /// Returns true if the device supports VK_KHR_synchronization2.
     bool HasSynchronization2() const {
         return extensions.synchronization2;
+    }
+
+    /// EDEN_NX2_V2_DYNRENDER: game draws use dynamic rendering (supported, switch on, not a tiler:
+    /// tilers keep render passes for their MSAA resolve attachments).
+    bool IsDynamicRenderingEnabled() const {
+        return extensions.dynamic_rendering;
+    }
+
+    /// EDEN_NX2_V2_PRESENTPACE: VK_KHR_present_id + VK_KHR_present_wait.
+    bool HasPresentWait() const {
+        return extensions.present_id && extensions.present_wait;
     }
 
     /// Returns the minimum supported version of SPIR-V.
@@ -1270,6 +1335,7 @@ private:
 private:
     VkInstance instance;         ///< Vulkan instance.
     VmaAllocator allocator{};    ///< VMA allocator.
+    bool vma_shared{};           ///< X-03: IsAllocatorShared
     mutable std::mutex separate_pools_mutex;
     mutable std::array<std::array<VmaPool, VK_MAX_MEMORY_TYPES>, 2> separate_pools{};
     vk::DeviceDispatch dld;      ///< Device function pointers.
@@ -1277,6 +1343,10 @@ private:
     vk::Device logical;          ///< Logical device.
     vk::Queue graphics_queue;    ///< Main graphics queue.
     vk::Queue present_queue;     ///< Main present queue.
+    vk::Queue transfer_queue;    ///< EDEN_NX2_V2_XFERQ dedicated transfer queue.
+    u32 transfer_family{};
+    bool has_transfer_queue{};
+    std::array<u32, 2> transfer_sharing_families{};
     vk::PipelineCache static_pipeline_cache;
     bool owns_static_pipeline_cache{};
     u32 instance_version{};      ///< Vulkan instance version.
@@ -1329,6 +1399,7 @@ private:
         VkPhysicalDeviceDepthStencilResolveProperties depth_stencil_resolve{};
         VkPhysicalDeviceCustomBorderColorPropertiesEXT custom_border_color{};
         VkPhysicalDeviceCooperativeMatrixPropertiesKHR cooperative_matrix{};
+        VkPhysicalDeviceShaderIntegerDotProductProperties integer_dot_product{};
 
         VkPhysicalDeviceProperties properties{};
     };

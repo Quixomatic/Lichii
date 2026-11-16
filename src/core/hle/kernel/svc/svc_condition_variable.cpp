@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "core/core.h"
+#include "core/hle/kernel/guest_wait_debug.h"
 #include "core/hle/kernel/k_hardware_timer.h"
 #include "core/hle/kernel/k_memory_layout.h"
 #include "core/hle/kernel/k_process.h"
@@ -41,6 +42,9 @@ Result WaitProcessWideKeyAtomic(Core::System& system, u64 address, u64 cv_key, u
     }
 
     // Wait on the condition variable.
+    // SYNC §14.8 H-14.8: named in the GPU front's 2 s waiter dump while it waits.
+    const GuestWaitDebug::Scope wait_debug{GetCurrentThreadPointer(system.Kernel()),
+                                           GuestWaitDebug::Kind::ConditionVariable, cv_key};
     R_RETURN(
         GetCurrentProcess(system.Kernel())
             .WaitConditionVariable(address, Common::AlignDown(cv_key, sizeof(u32)), tag, timeout));

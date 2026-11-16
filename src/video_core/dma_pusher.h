@@ -9,6 +9,7 @@
 #include <array>
 #include <atomic>
 #include <condition_variable>
+#include <cstdlib>
 #include <optional>
 #include <span>
 #include <vector>
@@ -21,6 +22,7 @@
 #include "common/scratch_buffer.h"
 #include "video_core/engines/engine_interface.h"
 #include "video_core/engines/puller.h"
+#include "video_core/v2/front_writes.h"
 
 namespace Core {
 class System;
@@ -171,13 +173,12 @@ public:
 
     void DispatchCalls();
 
-    /// Switch 2: true while the channel is suspended on a semaphore acquire.
+    /// Switch 2: true while the channel is suspended, on a semaphore acquire or on the GPU's copy
+    /// of a command list it reads next.
     [[nodiscard]] bool HasPendingAcquire() const {
-        return puller.HasPendingAcquire();
+        return puller.HasPendingAcquire() || pending_list_tick.has_value();
     }
-    [[nodiscard]] bool CanResumeAcquire() {
-        return puller.CanResumeAcquire(*this);
-    }
+    [[nodiscard]] bool CanResumeAcquire();
 
     void BindSubchannel(Engines::EngineInterface* engine, u32 subchannel_id, Engines::EngineTypes engine_type) {
         subchannels[subchannel_id] = engine;
@@ -186,9 +187,29 @@ public:
 
     void BindRasterizer(VideoCore::RasterizerInterface* rasterizer);
 
+    /// A GP entry's sync bit: the rasterizer signals a fence whose completion lets the next
+    /// entry run (the back runs it: a SyncFence Barrier record or a deferred call).
+    void SignalSyncFence();
+
 private:
     friend struct DmaPusherTestAccess;
 
+    /// Before a command list on pages no GPU work wrote is read: waits for the work that can
+    /// write it (GpuSplit::WaitForWriters; EDEN_NX2_V2_HAZARD narrows it). Returns whether it
+    /// waited.
+    /// `cpu_written`: CPU-written lists, which only work before the last host-level sync orders (else
+    /// GPU-written ones, whose writers the copy path needs recorded).
+    bool WaitForListWriters(GPUVAddr address, size_t size, bool cpu_written = true);
+    /// SYNC §15.9: a fetch that took WaitForListWriters' early-out. STATS: counts it when an
+    /// Upload note over the list is still queued. `verify`: a sample of CPU-written fetches is
+    /// read again after the back ran everything sent and compared.
+    void CheckListEarlyOut(GPUVAddr address, size_t size, bool cpu_written, bool verify);
+    /// EDEN_NX2_V2_ACQUIRE/HAZARD: records the guest memory writes of an engine method just sent
+    /// to the split's back (GpuSplit::TracksWrites). `writer`: IsMemoryWriter.
+    /// EDEN_NX2_V2_IR_DRAWS: Copy records for copy engine launches and 2D blits being sent.
+    void NoteCopyRecord(Engines::EngineTypes type, u32 method, const u32* arguments, u32 amount);
+    void NoteTrackedWrite(Engines::EngineInterface& engine, Engines::EngineTypes type, u32 method,
+                          u32 argument, bool writer);
     static bool IsMemoryWriter(const Engines::EngineInterface& engine, Engines::EngineTypes type,
                                u32 method);
 
@@ -232,8 +253,9 @@ public:
     /// Reads a command list on pages the GPU wrote into command_headers, from the copies the
     /// buffer cache made after the work that wrote them or from guest memory for pages flushed
     /// since. False when not all are current (or the list isn't GPU-written): the caller drains,
-    /// flushes and reads guest memory.
-    bool ReadGpuWrittenCommands(GPUVAddr address, u32 count);
+    /// flushes and reads guest memory. With `pending`, a copy the GPU has not finished sets
+    /// `*pending` and pending_list_tick instead of waiting (the result is false then).
+    bool ReadGpuWrittenCommands(GPUVAddr address, u32 count, bool* pending = nullptr);
     /// Brings command list words the GPU wrote (still only in host buffers) to guest memory.
     bool FlushGpuWrittenCommands(GPUVAddr address, size_t size);
 
@@ -275,6 +297,17 @@ public:
     void ResolveSplitMethod(GPUVAddr entry_address);
     static constexpr size_t MaxParkedMethods = 16;
 
+    // Read per channel, not at static initialization, which runs before the frontend loads
+    // nx2_switches.txt.
+    // EDEN_NX2_SEM_WATCH=<gpu address>: log every method whose argument is the low word of an
+    // address in the 16 bytes there (finds the engine and method that release a semaphore).
+    const u32 semaphore_watch = [] {
+        const char* value = std::getenv("EDEN_NX2_SEM_WATCH");
+        return value ? static_cast<u32>(std::strtoull(value, nullptr, 16)) : 0U;
+    }();
+    // EDEN_NX2_PB_CHECK also keeps the last parsed entries, for DumpCurrentEntry.
+    const bool record_parsed_entries = std::getenv("EDEN_NX2_PB_CHECK") != nullptr;
+
     // Debug aid: hashes of the words of the last entries as they were parsed.
     struct ParsedEntry {
         GPUVAddr address;
@@ -287,6 +320,13 @@ public:
     GPUVAddr split_method_end{}; ///< End of the last entry that ended inside a method
 
     std::array<Engines::EngineInterface*, max_subchannels> subchannels{};
+    /// The copy engine's registers its launches read, as sent (NoteTrackedWrite).
+    VideoCommon::V2::CopyRecordTracker copy_records; ///< EDEN_NX2_V2_IR_DRAWS
+    VideoCommon::V2::DmaWriteTracker dma_writes;
+    /// The 2D engine's destination surface, as sent (NoteTrackedWrite).
+    VideoCommon::V2::BlitWriteTracker blit_writes;
+    /// The inline-to-memory engine's upload registers, as sent (NoteTrackedWrite).
+    VideoCommon::V2::UploadWriteTracker i2m_writes;
     std::array<Engines::EngineTypes, max_subchannels> subchannel_type;
 
     Engines::Puller puller;
@@ -294,11 +334,17 @@ public:
     std::condition_variable sync_cv;
 
     VideoCore::RasterizerInterface* rasterizer = nullptr;
+    /// Host GPU tick of the command list copy this channel waits for (ReadGpuWrittenCommands).
+    std::optional<u64> pending_list_tick;
+    /// The entry parsed next was suspended on pending_list_tick, which is done now.
+    bool resumed_list_read{};
 
-    const bool ib_enable : 1 = true; ///< IB mode enabled
-    bool dma_increment_once : 1 = false;
-    bool signal_sync : 1 = false;
-    bool synced : 1 = false;
+    // Not bitfields: the fence thread sets synced, and a bitfield write would rewrite the byte it
+    // shares with dma_increment_once and signal_sync (#479).
+    const bool ib_enable = true; ///< IB mode enabled
+    bool dma_increment_once = false;
+    bool signal_sync = false;
+    std::atomic<bool> synced{false};
 };
 
 } // namespace Tegra

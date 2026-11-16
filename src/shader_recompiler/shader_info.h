@@ -15,6 +15,7 @@
 
 #include "common/common_types.h"
 #include "shader_recompiler/frontend/ir/type.h"
+#include "shader_recompiler/storage_write_extent.h"
 #include "shader_recompiler/varying_state.h"
 
 #include <boost/container/small_vector.hpp>
@@ -178,6 +179,8 @@ struct StorageBufferDescriptor {
     /// When set, the buffer pointer is read from memory at this offset from the constant buffer
     /// pointer, which is bound as its own descriptor.
     u32 indirect_offset{~0U};
+    /// How far the program's stores reach past the pointer (unbounded unless proven)
+    StorageWriteExtent write_extent{};
 
     auto operator<=>(const StorageBufferDescriptor&) const = default;
 };
@@ -387,6 +390,33 @@ struct Info {
     TextureBufferDescriptors texture_buffer_descriptors;
     ImageBufferDescriptors image_buffer_descriptors;
     TextureDescriptors texture_descriptors;
+    /// Pipeline v2 (EDEN_NX2_V2_BINDLESS, backend/spirv/bindless_heap.h): texture and storage
+    /// image descriptors (by index) read from the host descriptor heap, and the stage's first word
+    /// in the draw's heap word table. Set by the host before emission; zero masks emit the program
+    /// exactly as before.
+    u64 heap_texture_mask{};
+    u64 heap_image_mask{};
+    /// P5a (EDEN_NX2_V2_HEAP_TEXEL): texture buffer and image buffer descriptors (by index) read
+    /// from the heap's texel buffer arrays.
+    u64 heap_texel_mask{};
+    u64 heap_image_buffer_mask{};
+    u32 heap_word_base{};
+    /// The pipeline's heap words (all stages) fit the push constants (HEAP_PUSH_WORDS): the
+    /// shader reads them there instead of from the word table.
+    bool heap_words_pushed{};
+    /// Why descriptors of this stage were left out of the heap (host bits, for the stats).
+    u32 heap_block_reasons{};
+    /// Pipeline v2 F2-02 (d) (EDEN_NX2_V2_CBUFBDA, backend/spirv/cbuf_bda.h): constant buffers (by
+    /// cbuf index) read through a buffer device address instead of a uniform buffer binding; the
+    /// stage's first address index; the push constant offset of the addresses (or of the address
+    /// table's pointer); whether the addresses are pushed or in the table; whether those
+    /// constant buffers keep their bindings (verify binds them the old way too). Set by the host
+    /// before emission; a zero mask emits the program exactly as before.
+    u32 cbuf_bda_mask{};
+    u32 cbuf_bda_base{};
+    u32 cbuf_bda_offset{};
+    bool cbuf_bda_pushed{};
+    bool cbuf_bda_keep_bindings{};
     /// Texture handles the shader reads from storage buffers, as programs over constant buffer
     /// and storage buffer words (see EvaluateHandleProgram), evaluated for each draw.
     std::vector<std::vector<u32>> handle_programs;

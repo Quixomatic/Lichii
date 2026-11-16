@@ -1,0 +1,79 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+// P5b (EDEN_NX2_V2_GPUDECODE): generic block-linear -> linear untile of one (level, layer)
+// segment, byte exact with Tegra::Texture::UnswizzleTexture (C++ twin: v2/gpu_unswizzle.h).
+// Each invocation writes one 32-bit word of the linear output; any block size works, so the
+// image is then filled by the CPU path's own buffer-to-image copies.
+
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PushConstants {
+    uint src_offset;
+    uint dst_offset;
+    uint num_bytes;
+    uint pitch;
+    uint height;
+    uint block_height;
+    uint block_depth;
+    uint block_size;
+    uint slice_size;
+    uint x_shift;
+    uint native_tiling;
+};
+
+layout(binding = 0, std430) readonly buffer InputBuffer { uint src_words[]; };
+layout(binding = 1, std430) writeonly buffer OutputBuffer { uint dst_words[]; };
+
+const uint GOB_SIZE_SHIFT = 9;
+const uint SWIZZLE_X_BITS = 0x12F; // 0b100101111
+const uint SWIZZLE_Y_BITS = 0x0D0; // 0b011010000
+
+uint Pdep(uint value, uint mask) {
+    uint result = 0;
+    for (uint bit = 1; mask != 0; bit += bit) {
+        if ((value & bit) != 0) {
+            result |= mask & (~mask + 1);
+        }
+        mask &= mask - 1;
+    }
+    return result;
+}
+
+uint SourceByte(uint b) {
+    const uint slice_bytes = pitch * height;
+    const uint slice = b / slice_bytes;
+    const uint rest = b - slice * slice_bytes;
+    const uint line = rest / pitch;
+    const uint x = rest - line * pitch;
+    const uint offset_z = (slice >> block_depth) * slice_size +
+                          ((slice & ((1u << block_depth) - 1u)) << (GOB_SIZE_SHIFT + block_height));
+    const uint block_y = line >> 3;
+    const uint offset_y = (block_y >> block_height) * block_size +
+                          ((block_y & ((1u << block_height) - 1u)) << GOB_SIZE_SHIFT);
+    const uint offset_x = (x >> 6) << x_shift;
+    uint offset = offset_z + offset_y + offset_x +
+                  (Pdep(x & 63u, SWIZZLE_X_BITS) | Pdep(line & 7u, SWIZZLE_Y_BITS));
+    if (native_tiling != 0) {
+        const uint difference = ((offset >> 5) ^ (offset >> 6)) & 1u;
+        offset ^= (difference << 5) | (difference << 6);
+    }
+    return offset;
+}
+
+void main() {
+    const uint word = gl_GlobalInvocationID.x;
+    const uint first = word * 4u;
+    if (first >= num_bytes) {
+        return;
+    }
+    uint value = 0;
+    for (uint k = 0; k < 4u; ++k) {
+        const uint source = src_offset + SourceByte(first + k);
+        const uint byte_value = (src_words[source >> 2] >> ((source & 3u) * 8u)) & 0xFFu;
+        value |= byte_value << (k * 8u);
+    }
+    dst_words[(dst_offset >> 2) + word] = value;
+}

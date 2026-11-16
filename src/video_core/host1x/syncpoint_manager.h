@@ -46,7 +46,14 @@ public:
     template <typename Func>
     ActionHandle RegisterHostAction(u32 syncpoint_id, u32 expected_value, Func&& action) {
         return RegisterAction(syncpoints_host[syncpoint_id], host_action_storage[syncpoint_id],
-                              expected_value, std::move(action));
+                              expected_value, std::move(action), &host_waits);
+    }
+
+    /// Pipeline v2 R2-F4-02: whether anyone waits on a host syncpoint value (a registered host
+    /// action or a WaitHost caller). Only fence completions advance host values, so such a wait
+    /// makes the fences it may depend on urgent; guest values (IsReadyGuest) do not.
+    [[nodiscard]] bool HasHostWaiters() const {
+        return host_waits.load(std::memory_order_relaxed) != 0;
     }
 
     void DeregisterGuestAction(u32 syncpoint_id, const ActionHandle& handle);
@@ -71,13 +78,15 @@ public:
 
 private:
     void Increment(std::atomic<u32>& syncpoint, std::condition_variable& wait_cv,
-                   std::list<RegisteredAction>& action_storage);
+                   std::list<RegisteredAction>& action_storage,
+                   std::atomic<u32>* waits = nullptr);
 
     ActionHandle RegisterAction(std::atomic<u32>& syncpoint,
                                 std::list<RegisteredAction>& action_storage, u32 expected_value,
-                                std::function<void()>&& action);
+                                std::function<void()>&& action, std::atomic<u32>* waits = nullptr);
 
-    void DeregisterAction(std::list<RegisteredAction>& action_storage, const ActionHandle& handle);
+    void DeregisterAction(std::list<RegisteredAction>& action_storage, const ActionHandle& handle,
+                          std::atomic<u32>* waits = nullptr);
 
     void Wait(std::atomic<u32>& syncpoint, std::condition_variable& wait_cv, u32 expected_value);
 
@@ -91,6 +100,7 @@ private:
     u64 last_action_id{};
     std::condition_variable wait_guest_cv;
     std::condition_variable wait_host_cv;
+    std::atomic<u32> host_waits{}; ///< HasHostWaiters: pending host actions + WaitHost callers
 };
 
 } // namespace Host1x

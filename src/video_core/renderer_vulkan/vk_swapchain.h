@@ -42,7 +42,17 @@ public:
     bool AcquireNextImage(bool may_flush = true);
 
     /// Presents the rendered image to the swapchain.
-    void Present(VkSemaphore render_semaphore);
+    /// Returns the present id it used (EDEN_NX2_V2_PRESENTPACE with present wait), else 0.
+    u64 Present(VkSemaphore render_semaphore);
+
+    /// EDEN_NX2_V2_PRESENTPACE: waits until present `id` of the current swapchain was shown;
+    /// false on timeout or when the swapchain changed since.
+    bool WaitForPresent(u64 id, u64 timeout_ns);
+
+    /// Bumped at every swapchain creation (ids restart).
+    [[nodiscard]] u64 Generation() const noexcept {
+        return generation;
+    }
 
     /// Returns true when the swapchain needs to be recreated.
     bool NeedsRecreation() const {
@@ -142,6 +152,8 @@ private:
 
     u32 image_index{};
     u32 frame_index{};
+    u64 next_present_id{};
+    u64 generation{};
 
     VkFormat image_view_format{};
     VkExtent2D extent{};

@@ -1,9 +1,11 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <algorithm>
 #include <array>
 #include <limits>
 #include <thread>
+#include <vector>
 #include <catch2/catch_test_macros.hpp>
 #include "common/atomic_ops.h"
 #include "common/scope_exit.h"
@@ -68,6 +70,63 @@ TEST_CASE("sysmix input publishes fresh mono capture across ring wrap", "[sysmix
     REQUIRE(purged == 3);
     REQUIRE(context.Memory().Read32Acquire(Context::Base + 0x44, read));
     REQUIRE(read == write);
+}
+
+TEST_CASE("sysmix input captures silence when the host microphone cannot open", "[sysmix][input]") {
+    Context context;
+    context.sink.ready = false;
+    std::array<s16, 2400> stale{};
+    stale.fill(0x1234);
+    REQUIRE(context.Memory().WriteBlock(Context::Base + 0x1040, stale.data(), sizeof(stale)));
+    SysmixOutput stream{
+        context.system, *context.process, context.sink, 2, Context::Base, Context::Size, 2, true};
+    REQUIRE(stream.Open(2, 1, 48000, 4096, 0, 0).IsSuccess());
+    REQUIRE(context.sink.last == nullptr);
+    REQUIRE(context.sink.closed == 1);
+    REQUIRE(stream.SetEngaged(true).IsSuccess());
+    REQUIRE(stream.GetState() == 2);
+    const auto advance = [&] {
+        context.system.CoreTiming().cpu_ticks += Common::WallClock::CPUTickFreq / 200;
+        context.system.CoreTiming().Advance();
+        stream.Pump();
+    };
+    for (int block = 0; block < 10; ++block) {
+        advance();
+    }
+    u32 write{};
+    REQUIRE(context.Memory().Read32Acquire(Context::Base + 0x1004, write));
+    REQUIRE(write >= 9 * 240);
+    REQUIRE(write <= 10 * 240);
+    std::vector<s16> captured(write);
+    REQUIRE(context.Memory().ReadBlock(Context::Base + 0x1040, captured.data(),
+                                       captured.size() * sizeof(s16)));
+    REQUIRE(std::ranges::all_of(captured, [](s16 sample) { return sample == 0; }));
+    REQUIRE(stream.GetCounters().nonzero_frames == 0);
+    REQUIRE(stream.SetEngaged(false).IsSuccess());
+    const u32 stopped = write;
+    advance();
+    REQUIRE(context.Memory().Read32Acquire(Context::Base + 0x1004, write));
+    REQUIRE(write == stopped);
+}
+
+TEST_CASE("sysmix input captures silence when the host microphone cannot start",
+          "[sysmix][input]") {
+    Context context;
+    context.sink.fail_start = true;
+    SysmixOutput stream{
+        context.system, *context.process, context.sink, 2, Context::Base, Context::Size, 2, true};
+    REQUIRE(stream.Open(2, 1, 48000, 1024, 0, 0).IsSuccess());
+    REQUIRE(context.sink.last != nullptr);
+    REQUIRE(stream.SetEngaged(true).IsSuccess());
+    REQUIRE(context.sink.last == nullptr);
+    for (int block = 0; block < 2; ++block) {
+        context.system.CoreTiming().cpu_ticks += Common::WallClock::CPUTickFreq / 200;
+        context.system.CoreTiming().Advance();
+        stream.Pump();
+    }
+    u32 write{};
+    REQUIRE(context.Memory().Read32Acquire(Context::Base + 0x1004, write));
+    REQUIRE(write >= 240);
 }
 
 TEST_CASE("sysmix input applies gain to float capture and protects producer ownership",

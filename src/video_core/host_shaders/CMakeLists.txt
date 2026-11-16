@@ -26,6 +26,7 @@ set(SHADER_FILES
     ${CMAKE_CURRENT_SOURCE_DIR}/blit_depth_stencil_msaa.frag
     ${CMAKE_CURRENT_SOURCE_DIR}/block_linear_unswizzle_3d.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/block_linear_unswizzle_3d_bcn.comp
+    ${CMAKE_CURRENT_SOURCE_DIR}/block_linear_unswizzle_linear.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/convert_abgr8_to_d24s8.frag
     ${CMAKE_CURRENT_SOURCE_DIR}/convert_abgr8_to_x8d24.frag
     ${CMAKE_CURRENT_SOURCE_DIR}/convert_x8d24_to_abgr8.frag
@@ -101,6 +102,13 @@ set(SHADER_FILES
     ${CMAKE_CURRENT_SOURCE_DIR}/fsr3_optical_flow.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/fsr3_frame_interpolation.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/dlss_network_probe.comp
+    ${CMAKE_CURRENT_SOURCE_DIR}/ocarina_camera_motion.comp
+    ${CMAKE_CURRENT_SOURCE_DIR}/ocarina_actor_motion.vert
+    ${CMAKE_CURRENT_SOURCE_DIR}/ocarina_actor_motion.frag
+    ${CMAKE_CURRENT_SOURCE_DIR}/ocarina_dlss_color.comp
+    ${CMAKE_CURRENT_SOURCE_DIR}/ocarina_dlss_output.comp
+    ${CMAKE_CURRENT_SOURCE_DIR}/ocarina_dlss_4k_composite.comp
+    ${CMAKE_CURRENT_SOURCE_DIR}/ocarina_dlss_4k_reference.comp
 )
 
 if (HAIKUOS)

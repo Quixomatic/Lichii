@@ -31,8 +31,16 @@
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_state_tracker.h"
+#include "video_core/renderer_vulkan/vk_background_readback.h"
+#include "video_core/renderer_vulkan/vk_submit_engine.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
+#include "video_core/v2/flush_heuristic.h"
+#include "video_core/v2/front_wake.h"
+#include "video_core/v2/landing_fence.h"
+#include "video_core/v2/p5b_stats.h"
+#include "video_core/v2/v2_switches.h"
 #include "video_core/vulkan_common/vulkan_device.h"
+#include "video_core/v2/versions.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
 namespace Vulkan {
@@ -147,6 +155,40 @@ Scheduler::Scheduler(const Device& device_, StateTracker& state_tracker_)
         }
     }
 
+    // P5b: the transfer queue (EDEN_NX2_V2_XFERQ) and the submit/finish threads
+    // (EDEN_NX2_V2_SUBMITTHREAD) share one submission path; with both off nothing changes.
+    if (device.HasTransferQueue()) {
+        transfer_queue = std::make_unique<TransferQueue>(device);
+    }
+    const bool submit_thread = VideoCommon::V2::On(VideoCommon::V2::Switch::SubmitThread) &&
+                               device.HasTimelineSemaphore() && device.HasSynchronization2();
+    if (VideoCommon::V2::On(VideoCommon::V2::Switch::SubmitThread) && !submit_thread) {
+        LOG_INFO(Render_Vulkan, "EDEN_NX2_V2_SUBMITTHREAD needs timeline semaphores and "
+                                "synchronization2; the worker keeps submitting");
+    }
+    dynamic_rendering = device.IsDynamicRenderingEnabled();
+    track_barriers = VideoCommon::V2::On(VideoCommon::V2::Switch::DynRender);
+    if (track_barriers) {
+        LOG_INFO(Render_Vulkan, "EDEN_NX2_V2_DYNRENDER: {} rendering, range barrier tracker",
+                 dynamic_rendering ? "dynamic" : "render pass (fallback)");
+    }
+    if (submit_thread || transfer_queue) {
+        submit_engine = std::make_unique<SubmitEngine>(device, *master_semaphore, submit_mutex,
+                                                       submit_thread, transfer_queue.get());
+        finish_publishes_tick = submit_thread;
+        if (submit_thread) {
+            submit_engine->SetProgressHook(
+                [](void* self) { static_cast<Scheduler*>(self)->OnGpuProgress(); }, this);
+        }
+    }
+
+    if (transfer_queue && VideoCommon::V2::On(VideoCommon::V2::Switch::XReadback)) {
+        background_readback = std::make_unique<BackgroundReadback>(device, *this);
+    } else if (VideoCommon::V2::On(VideoCommon::V2::Switch::XReadback)) {
+        LOG_INFO(Render_Vulkan, "EDEN_NX2_V2_XREADBACK needs the transfer queue "
+                                "(EDEN_NX2_V2_XFERQ and a dedicated transfer family)");
+    }
+
     AcquireNewChunk();
     AllocateWorkerCommandBuffer();
     worker_thread = std::jthread([this](std::stop_token token) { WorkerThread(token); });
@@ -165,18 +207,152 @@ Scheduler::~Scheduler() {
 
 u64 Scheduler::Flush(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
                      std::source_location location) {
+    // SYNC §14.7a (a): the back's cost of one submission (this call; the pass re-begin after it
+    // is timed in RequestRenderpass / RequestRendering).
+    const bool cost_stats = VideoCommon::V2::P5bStats::Enabled();
+    const u64 flush_start = cost_stats ? VideoCommon::Nx2Profile::Now() : 0;
+    RunPreSubmitHook();
+    RunAfterPass(); // SYNC Step 9: the pass's deferred copies go in this submission
+    // EDEN_NX2_V2_DRAWCACHE: a submit is an ordering point (collect epoch). F4-08 (§8): with
+    // lazy fences, only a submission carrying something the guest observes is one (a fence, a
+    // waiter's request, deferred or wanted work); a heuristic submit orders nothing.
+    if (!lazy_fences || flush_pending || submit_wanted || SubmitRequested() ||
+        lazy_outstanding_tick == CurrentTick()) {
+        VideoCommon::V2::Versions::HookEpoch(VideoCommon::V2::Versions::EpochReason::Submit);
+    }
     if (state.renderpass) {
         CountRenderPassEnd(location.file_name(), location.line());
+    }
+    if (VideoCommon::V2::P5bStats::Enabled()) [[unlikely]] {
+        VideoCommon::V2::P5bStats::NoteSubmitSite(location.file_name(), location.line());
     }
     if (VideoCommon::GpuSplit::check_owner) [[unlikely]] {
         VideoCommon::GpuSplit::CheckOwner("Scheduler::Flush");
     }
+    if (lazy_fences) [[unlikely]] {
+        NoteBlockedWait();
+        NoteOpenTickSubmitted();
+    }
     // When flushing, we only send data to the worker thread; no waiting is necessary.
     const u64 signal_value = SubmitExecution(signal_semaphore, wait_semaphore);
+    if (lazy_fences) [[unlikely]] {
+        VideoCommon::V2::LandingFence::diag_open_tick.store(CurrentTick(),
+                                                            std::memory_order_relaxed);
+        NoteOpenTickEmpty();
+    }
     AllocateNewContext();
     last_flush = std::chrono::steady_clock::now();
     flush_pending = false;
+    submit_wanted = false;
+    if (cost_stats) [[unlikely]] {
+        VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::SubmitCostBackNs,
+                                       VideoCommon::Nx2Profile::Now() - flush_start);
+        VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::SubmitCostFlushes);
+        post_submit_pass = true;
+    }
     return signal_value;
+}
+
+void Scheduler::NotePostSubmitPass(u64 start_ns) {
+    // SYNC §14.7a (a): the first pass begin after a submission (its re-begin cost).
+    VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::SubmitCostPassNs,
+                                   VideoCommon::Nx2Profile::Now() - start_ns);
+    post_submit_pass = false;
+}
+
+void Scheduler::NoteBlockedWait() {
+    if (blocked_since_us.load(std::memory_order_relaxed) == 0) {
+        return;
+    }
+    const u64 since = blocked_since_us.exchange(0, std::memory_order_relaxed);
+    if (since != 0 && submit_requests.Urgent(CurrentTick())) {
+        blocked_wait_us.fetch_add(NowUs() - since, std::memory_order_relaxed);
+    }
+}
+
+bool Scheduler::LazyFencesHere() const {
+    return lazy_fences && VideoCommon::GpuSplit::OnBackThread();
+}
+
+void Scheduler::ServeIdleHook() {
+    if (!lazy_fences) {
+        FlushDeferred();
+        return;
+    }
+    // F4-02: the back is going idle (nothing else will submit) or a waiter asked. Replaces
+    // DeferFlush's own submit for lazy fences and command list ends.
+    if (submit_requests.IdleSubmits(flush_pending, lazy_fences, submit_wanted,
+                                    lazy_outstanding_tick, CurrentTick())) {
+        VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::FlushLazy);
+        VideoCommon::V2::P5bStats::Add(
+            flush_pending ? VideoCommon::V2::P5bStats::Counter::SubmitsDeferred
+            : submit_requests.Urgent(CurrentTick())
+                ? VideoCommon::V2::P5bStats::Counter::SubmitsWaiter
+                : VideoCommon::V2::P5bStats::Counter::SubmitsIdle);
+        Flush();
+    }
+}
+
+void Scheduler::ServeSplitIdleHook() {
+    if (!lazy_fences) {
+        FlushDeferred();
+        return;
+    }
+    namespace P5b = VideoCommon::V2::P5bStats;
+    using IdleAction = VideoCommon::V2::SubmitRequests::IdleAction;
+    // F4-X2 (MASTER_PLAN §5.5, DXVK): DeferFlush's work and an urgent request (a thread blocks on
+    // the open tick: a landing wait, a front list read, a readback, a fence wait past its
+    // escalation) submit now, whether the GPU is busy or not. Everything else (lazy fences and
+    // their bounded-time requests, list ends, list copies, recorded work) is left: a pass
+    // boundary or chunk takes it while the back records, and invariant S at the back's sleep
+    // point (SYNC_SUBMIT_SPEC §11.2, RasterizerVulkan::ServeIdleSleep) when it stops. A wake
+    // alone (RequestIdleHook) is not a reason.
+    const u64 open = CurrentTick();
+    switch (submit_requests.AtIdleHook(flush_pending, lazy_fences, submit_wanted,
+                                       lazy_outstanding_tick, open)) {
+    case IdleAction::None:
+        return;
+    case IdleAction::Leave:
+        P5b::Add(P5b::Counter::IdleLeft);
+        return;
+    case IdleAction::Deferred:
+        P5b::Add(P5b::Counter::IdleDeferredWork);
+        P5b::Add(P5b::Counter::SubmitsDeferred);
+        break;
+    case IdleAction::Urgent:
+        // SYNC_SUBMIT_SPEC §2.5 rule W: a thread blocks on the open tick; served at this entry
+        // boundary (requests filed since the previous one share this submit), with no "two in
+        // flight → postpone" exception (d1435e18fd's coalescing branch removed).
+        P5b::Add(P5b::Counter::IdleUrgent);
+        P5b::Add(P5b::Counter::SubmitsWaiter);
+        break;
+    }
+    P5b::Add(P5b::Counter::FlushLazy);
+    Flush();
+}
+
+void Scheduler::OnGpuProgress() {
+    // Finish thread, a completion published. A front channel suspended on a command list copy
+    // (DmaPusher's pending list tick) may go on: end the front's pending sleep (W-01b).
+    VideoCommon::V2::FrontWake::Ring();
+    // SYNC_SUBMIT_SPEC §2.5 "GPU progress wake" (DXVK's "about to go idle" point, ALL_FINDINGS_R2
+    // P5b row 1): fewer than two submissions still in flight while the back sleeps: its idle hook
+    // re-evaluates rule I (it submits open work only if DXVK's rule holds; nothing open, nothing
+    // happens). Not a wait for full idle.
+    auto& split = VideoCommon::GpuSplit::Get();
+    if (!lazy_fences) {
+        return;
+    }
+    // SYNC_SUBMIT_SPEC §11.2 step 3 (invariant S), the finish side of the Dekker handshake: the
+    // completion is published (PublishFromFinish), then back_waiting is read; the back stores
+    // back_waiting, then re-reads the in-flight count. The fence keeps the published tick ahead
+    // of the load, so one side always sees the other (3fd8: a completion between the back's
+    // check and its sleep woke nobody). Any completion wakes a back asleep on a non-empty open
+    // tick; the back itself decides whether fewer than two are in flight.
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    if (split.BackIdle() && open_tick_nonempty.load(std::memory_order_seq_cst)) {
+        split.RequestIdleHook();
+    }
 }
 
 bool Scheduler::DeferFlush() {
@@ -185,6 +361,14 @@ bool Scheduler::DeferFlush() {
     // kept the Vulkan worker busy submitting. Batched within 500 us: ~10-15% more fps there.
     // Command list copies after dispatches were ~9,000 more a second, of which the front waited
     // for about 5%.
+    if (lazy_fences && VideoCommon::GpuSplit::OnBackThread()) [[unlikely]] {
+        // SYNC_SUBMIT_SPEC §11.6 item 7: with lazy fences deferred work is never an idle submit
+        // (no flush_pending): it is a strong hint for rule B (TakeDeferredHint) and open work
+        // for C and S. Both callers take their lazy branch first, so this is the fallback.
+        deferred_hint = true;
+        WantSubmit();
+        return true;
+    }
     static const s64 interval_us = [] {
         const char* value = std::getenv("EDEN_NX2_FENCE_FLUSH_US");
         if (value != nullptr) {
@@ -202,7 +386,37 @@ bool Scheduler::DeferFlush() {
 
 void Scheduler::FlushDeferred() {
     if (flush_pending) {
+        VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::FlushDeferred);
+        VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::SubmitsDeferred);
         Flush();
+        return;
+    }
+    // SYNC_SUBMIT_SPEC §2.5: with lazy fences an open request is rule W, served at the back's
+    // next entry boundary (the idle hook between entries) or by a pass boundary, never mid-entry
+    // here (63eeb187d1 / d5e4: ~18 submits/f cut passes from this call after delayed fences).
+    if (!lazy_fences && submit_requests.Open(CurrentTick())) [[unlikely]] {
+        VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::FlushLazy);
+        VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::SubmitsWaiter);
+        Flush();
+    }
+}
+
+void Scheduler::EnsureSubmitted(u64 tick) {
+    if (IsSubmitted(tick)) {
+        return;
+    }
+    auto& split = VideoCommon::GpuSplit::Get();
+    if (!split.Active() || VideoCommon::GpuSplit::OnBackThread()) {
+        if (lazy_fences) [[unlikely]] {
+            // The recording thread itself blocks on the tick (a readback, a host read): rule W.
+            VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::SubmitsWaiter);
+        }
+        Flush();
+        return;
+    }
+    RequestLazyFlush(tick);
+    if (!WaitSubmitted(tick) && !IsSubmitted(tick)) {
+        Flush(); // The back stopped: nothing else uses the scheduler
     }
 }
 
@@ -211,6 +425,11 @@ bool Scheduler::WaitSubmitted(u64 tick) {
         return true;
     }
     auto& split = VideoCommon::GpuSplit::Get();
+    // F4-X2 (R2-F4-01): this thread blocks on the tick: an urgent request, which the back's next
+    // idle hook submits whether the GPU is busy or not (not after the GPU's queue drained).
+    if (lazy_fences) [[unlikely]] {
+        RequestLazyFlush(tick, true);
+    }
     split.RequestIdleHook();
     // No time limit: the back can spend seconds on one entry (a large shader's translation),
     // and a fence reported as submitted before it is would release its downloads too early.
@@ -241,18 +460,47 @@ void Scheduler::Finish(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
     if (state.renderpass) {
         CountRenderPassEnd(location.file_name(), location.line());
     }
+    if (VideoCommon::V2::P5bStats::Enabled()) [[unlikely]] {
+        VideoCommon::V2::P5bStats::NoteSubmitSite(location.file_name(), location.line());
+    }
     if (VideoCommon::GpuSplit::check_owner) [[unlikely]] {
         VideoCommon::GpuSplit::CheckOwner("Scheduler::Finish");
     }
+    RunPreSubmitHook();
+    RunAfterPass();
     // When finishing, we need to wait for the submission to have executed on the device.
     const u64 presubmit_tick = CurrentTick();
+    const bool p5b_stats = VideoCommon::V2::P5bStats::Enabled();
     const bool profile = VideoCommon::Nx2Profile::Enabled();
-    const u64 start = profile ? VideoCommon::Nx2Profile::Now() : 0;
+    const bool frame_causes = VideoCommon::V2::FrameCauses::Enabled();
+    const u64 start =
+        profile || p5b_stats || frame_causes ? VideoCommon::Nx2Profile::Now() : 0;
+    if (lazy_fences) [[unlikely]] {
+        NoteBlockedWait();
+        NoteOpenTickSubmitted();
+        // SYNC §11.6 item 7: the caller blocks on this submission (finishes by site name it): W.
+        VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::SubmitsWaiter);
+    }
     SubmitExecution(signal_semaphore, wait_semaphore);
+    if (lazy_fences) [[unlikely]] {
+        VideoCommon::V2::LandingFence::diag_open_tick.store(CurrentTick(),
+                                                            std::memory_order_relaxed);
+        NoteOpenTickEmpty();
+    }
     Wait(presubmit_tick);
     AllocateNewContext();
     last_flush = std::chrono::steady_clock::now();
     flush_pending = false;
+    submit_wanted = false;
+    if (p5b_stats) [[unlikely]] {
+        // SYNC Step 0: which Finish calls block their thread on the GPU, and for how long.
+        VideoCommon::V2::P5bStats::NoteFinishSite(location.file_name(), location.line(),
+                                                  VideoCommon::Nx2Profile::Now() - start);
+    }
+    if (frame_causes) [[unlikely]] {
+        VideoCommon::V2::FrameCauses::Note(VideoCommon::V2::FrameCauses::Cause::Finish,
+                                           VideoCommon::Nx2Profile::Now() - start);
+    }
     if (profile) {
         g_profile_finishes.fetch_add(1, std::memory_order_relaxed);
         g_profile_finish_ns.fetch_add(VideoCommon::Nx2Profile::Now() - start,
@@ -271,6 +519,93 @@ void Scheduler::WaitWorker() {
 
     // Now wait for execution to finish.
     std::scoped_lock el{execution_mutex};
+    WaitSubmitThread();
+}
+
+void Scheduler::WaitSubmitThread() {
+    if (submit_engine) [[unlikely]] {
+        submit_engine->WaitSubmitted();
+    }
+}
+
+void Scheduler::RetireAfter(u64 tick, std::function<void()>&& func) {
+    if (submit_engine) {
+        submit_engine->RetireAfter(tick, std::move(func));
+        return;
+    }
+    master_semaphore->Wait(tick);
+    func();
+}
+
+bool Scheduler::TryHoistTransfer(u64 track) {
+    if (!transfer_queue) {
+        return false;
+    }
+    const u64 open_tick = master_semaphore->CurrentTick();
+    if (!timeline_join.CanHoist(track, open_tick)) {
+        VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::TransferFallbacks);
+        return false;
+    }
+    timeline_join.Hoist(track, open_tick);
+    return true;
+}
+
+bool Scheduler::TryHoistBufferUpload() {
+    if (!transfer_queue) {
+        return false;
+    }
+    if (!timeline_join.CanHoistUnordered()) {
+        VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::TransferFallbacks);
+        return false;
+    }
+    timeline_join.HoistUnordered();
+    return true;
+}
+
+void Scheduler::NoteAcquireJoin() {
+    if (transfer_queue) {
+        timeline_join.NoteAcquire(master_semaphore->CurrentTick());
+        VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::AcquireJoins);
+    }
+}
+
+bool Scheduler::AddTransferJob(VkCommandBuffer cmdbuf, VkSemaphore semaphore, u64 value) {
+    if (!submit_engine || !transfer_queue) {
+        return false;
+    }
+    return timeline_join.AddPostJob(reinterpret_cast<u64>(cmdbuf),
+                                    reinterpret_cast<u64>(semaphore), value);
+}
+
+bool Scheduler::AddGraphicsWait(VkSemaphore semaphore, u64 value) {
+    if (!submit_engine) {
+        return false;
+    }
+    return timeline_join.AddGraphicsWait(reinterpret_cast<u64>(semaphore), value);
+}
+
+vk::CommandBuffer Scheduler::WorkerTransferCmdbuf() {
+    const vk::CommandBuffer cmdbuf{current_context->Transfer(), device.GetDispatchLoader()};
+    if (!current_context->xfer_begun) {
+        current_context->xfer_begun = true;
+        cmdbuf.Begin({
+            .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+            .pNext = nullptr,
+            .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+            .pInheritanceInfo = nullptr,
+        });
+        // Perf fix C: batches of unused-region uploads wait for no graphics tick; earlier batches
+        // on this queue are ordered by this barrier instead (its first scope covers them).
+        static constexpr VkMemoryBarrier TRANSFER_ORDER{
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .pNext = nullptr,
+            .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+        };
+        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+                               TRANSFER_ORDER);
+    }
+    return cmdbuf;
 }
 
 void Scheduler::MarkFrameEnd(u64 frame) {
@@ -306,9 +641,39 @@ void Scheduler::BeginRenderPassImpl(const Framebuffer* framebuffer, VkRenderPass
     }
     const VkFramebuffer framebuffer_handle = framebuffer->Handle();
     const VkExtent2D render_area = framebuffer->RenderArea();
+    if (track_barriers) [[unlikely]] {
+        // Only the pending writes this pass's attachments overlap need a barrier first; the
+        // read hazards its first draw noted go with it.
+        for (u32 i = 0; i < framebuffer->NumImages(); ++i) {
+            const auto [begin, end] = framebuffer->GuestRanges()[i];
+            const auto hazard = barrier_tracker.Take(reinterpret_cast<u64>(framebuffer->Images()[i]),
+                                                     begin, end);
+            read_hazard.stages |= hazard.stages;
+            read_hazard.access |= hazard.access;
+            read_hazard.count += hazard.count;
+        }
+        if (read_hazard.Any()) {
+            const auto hazard = std::exchange(read_hazard, {});
+            RecordHazardBarrier(hazard.stages, hazard.access, VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT,
+                                VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
+                                    VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                                    VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+                                    VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT);
+        }
+        renderpass_guest_ranges = framebuffer->GuestRanges();
+    }
+    VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::Passes);
+    ++render_pass_serial;
     state.renderpass = renderpass;
     state.framebuffer = framebuffer_handle;
     state.render_area = render_area;
+    state.dynamic = next_pass_dynamic;
+    if (track_barriers) [[unlikely]] {
+        active_color_views = framebuffer->ColorViews();
+        active_depth_view = framebuffer->DepthView();
+        active_layers = framebuffer->Layers();
+    }
+    auto_flush = false;
 
     if (GPU::Logging::IsActive() && Settings::values.gpu_log_vulkan_calls.GetValue()) {
         const std::string render_pass_info =
@@ -323,7 +688,7 @@ void Scheduler::BeginRenderPassImpl(const Framebuffer* framebuffer, VkRenderPass
     }
     const bool after_compute = std::exchange(compute_writes_pending, false);
     Record([renderpass, framebuffer_handle, render_area, values, clear_value_count,
-            after_compute](vk::CommandBuffer cmdbuf) {
+            after_compute, dynamic = next_pass_dynamic](vk::CommandBuffer cmdbuf) {
         const VkRenderPassBeginInfo renderpass_bi{
             .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
             .pNext = nullptr,
@@ -349,7 +714,9 @@ void Scheduler::BeginRenderPassImpl(const Framebuffer* framebuffer, VkRenderPass
             cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                                    VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT, 0, COMPUTE_TO_GRAPHICS);
         }
-        cmdbuf.BeginRenderPass(renderpass_bi, VK_SUBPASS_CONTENTS_INLINE);
+        if (!dynamic) {
+            cmdbuf.BeginRenderPass(renderpass_bi, VK_SUBPASS_CONTENTS_INLINE);
+        }
     });
     num_renderpass_images = framebuffer->NumImages();
     renderpass_images = framebuffer->Images();
@@ -415,6 +782,40 @@ bool Scheduler::DeferDepthStencilClear(const Framebuffer* framebuffer, const VkC
     return true;
 }
 
+bool Scheduler::CanClearInPass(const Framebuffer* framebuffer, std::optional<u32> color_slot,
+                               bool depth_stencil, const VkClearRect& rect) const {
+    if (!track_barriers || state.renderpass == VK_NULL_HANDLE) {
+        return false;
+    }
+    if (color_slot) {
+        if (*color_slot >= active_color_views.size() ||
+            (state.dynamic && *color_slot >= dynamic_color_count)) {
+            return false; // A dynamic pass may attach fewer colours than its framebuffer
+        }
+        const VkImageView view = framebuffer->ColorViews()[*color_slot];
+        if (view == VK_NULL_HANDLE || view != active_color_views[*color_slot]) {
+            return false;
+        }
+    }
+    if (depth_stencil && (framebuffer->DepthView() == VK_NULL_HANDLE ||
+                          framebuffer->DepthView() != active_depth_view)) {
+        return false;
+    }
+    const u64 right = u64{static_cast<u32>(rect.rect.offset.x)} + rect.rect.extent.width;
+    const u64 bottom = u64{static_cast<u32>(rect.rect.offset.y)} + rect.rect.extent.height;
+    return rect.rect.offset.x >= 0 && rect.rect.offset.y >= 0 &&
+           right <= state.render_area.width && bottom <= state.render_area.height &&
+           u64{rect.baseArrayLayer} + rect.layerCount <= active_layers;
+}
+
+void Scheduler::EndRenderPassForClear(std::source_location location) {
+    if (!state.renderpass) {
+        return;
+    }
+    CountRenderPassEnd(location.file_name(), location.line());
+    EndRenderPass();
+}
+
 void Scheduler::FlushDeferredClear() {
     if (deferred_clear.framebuffer == nullptr) {
         return;
@@ -431,7 +832,14 @@ void Scheduler::RequestRenderpass(const Framebuffer* framebuffer, std::source_lo
     const VkRenderPass renderpass = framebuffer->RenderPass();
     const VkFramebuffer framebuffer_handle = framebuffer->Handle();
     const VkExtent2D render_area = framebuffer->RenderArea();
-    if (renderpass == state.renderpass && framebuffer_handle == state.framebuffer &&
+    // A draw continues the active pass whenever the same framebuffer and area are bound. The
+    // render-pass *variant* (a deferred clear's loadOp=CLEAR form) is only meaningful at begin -
+    // loadOps are applied once, and the base/variant passes are render-pass-compatible (only
+    // loadOp/storeOp differ). Comparing the exact handle here made every draw after a deferred
+    // clear restart the pass and re-LOAD what was just CLEARed (~118 MB of attachment traffic per
+    // world-target turn). The framebuffer handle already fixes the attachment structure and key,
+    // so it is the correct identity to compare.
+    if (state.renderpass && !state.dynamic && framebuffer_handle == state.framebuffer &&
         render_area.width == state.render_area.width &&
         render_area.height == state.render_area.height) {
         return;
@@ -439,9 +847,291 @@ void Scheduler::RequestRenderpass(const Framebuffer* framebuffer, std::source_lo
     if (state.renderpass) {
         CountRenderPassEnd(location.file_name(), location.line());
     }
+    const u64 pass_start = post_submit_pass ? VideoCommon::Nx2Profile::Now() : 0;
     // Ends any active pass and realizes a deferred clear
     EndRenderPass();
     BeginRenderPassImpl(framebuffer, renderpass, nullptr, 0);
+    if (pass_start != 0) [[unlikely]] {
+        NotePostSubmitPass(pass_start);
+    }
+}
+
+void Scheduler::RequestRendering(const Framebuffer* framebuffer, u32 color_count,
+                                 std::source_location location) {
+    if (!dynamic_rendering || !framebuffer->DynamicRenderingCapable()) {
+        if (state.renderpass && state.dynamic) {
+            EndRenderPass();
+        }
+        RequestRenderpass(framebuffer, location);
+        return;
+    }
+    if (read_hazard.Any() && state.renderpass) [[unlikely]] {
+        // A draw of the active pass reads a pending write: end the pass for its barrier.
+        VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::HazardBreaks);
+        EndRenderPass();
+    }
+    if (deferred_clear.framebuffer == framebuffer && color_count != 0 &&
+        (deferred_clear.color_clear_mask >> (std::min)(color_count, 8U)) != 0) [[unlikely]] {
+        // Chunk B3: the draw's pipeline attaches fewer colours than a cleared slot: those load
+        // ops would be cut off, so the clear runs as its own pass first.
+        EndRenderPass();
+    }
+    if (deferred_clear.framebuffer == framebuffer) {
+        // The deferred clear becomes the pass's clear load ops.
+        const DeferredClear dc = std::exchange(deferred_clear, DeferredClear{});
+        const u64 pass_start = post_submit_pass ? VideoCommon::Nx2Profile::Now() : 0;
+        EndRenderPass();
+        BeginRenderingImpl(framebuffer, color_count, dc.color_clear_mask, dc.color_values,
+                           dc.depth_stencil,
+                           dc.depth_stencil_value);
+        if (pass_start != 0) [[unlikely]] {
+            NotePostSubmitPass(pass_start);
+        }
+        return;
+    }
+    const VkExtent2D render_area = framebuffer->RenderArea();
+    if (state.renderpass && state.dynamic && framebuffer->Handle() == state.framebuffer &&
+        (color_count == 0 || color_count == dynamic_color_count) &&
+        render_area.width == state.render_area.width &&
+        render_area.height == state.render_area.height) {
+        ++pass_draws;
+        return;
+    }
+    if (state.renderpass) {
+        CountRenderPassEnd(location.file_name(), location.line());
+        if (state.dynamic && framebuffer->Handle() == state.framebuffer &&
+            render_area.width == state.render_area.width &&
+            render_area.height == state.render_area.height) [[unlikely]] {
+            // Chunk B3: the same attachments, restarted only for the pipeline's colour count.
+            VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::PassColorRestarts);
+        }
+    }
+    const u64 pass_start = post_submit_pass ? VideoCommon::Nx2Profile::Now() : 0;
+    EndRenderPass();
+    BeginRenderingImpl(framebuffer, color_count, 0, {}, false, {});
+    if (pass_start != 0) [[unlikely]] {
+        NotePostSubmitPass(pass_start);
+    }
+}
+
+void Scheduler::BeginRenderingImpl(const Framebuffer* framebuffer, u32 color_count,
+                                   u32 color_clear_mask,
+                                   const std::array<VkClearValue, 8>& color_values,
+                                   bool depth_clear, const VkClearValue& depth_value) {
+    // The same bookkeeping as a render pass (tracker, serials, queries), then BeginRendering.
+    next_pass_dynamic = true;
+    BeginRenderPassImpl(framebuffer, framebuffer->RenderPass(), nullptr, 0);
+    next_pass_dynamic = false;
+    VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::DynamicPasses);
+    ++pass_draws;
+    if (color_clear_mask == 0 && !depth_clear) {
+        // U-13: a pass without clear load ops (nearly all of them) records only the views; the
+        // worker builds the attachment infos (no ~700-byte struct built and copied here).
+        struct Views {
+            std::array<VkImageView, 8> colors{};
+            VkImageView depth{};
+            VkExtent2D render_area{};
+            u32 layers{};
+            u32 num_colors{};
+            bool has_depth{};
+            bool has_stencil{};
+        } compact;
+        const auto& color_views = framebuffer->ColorViews();
+        const RenderPassKey& base_key = framebuffer->RenderPassKeyBase();
+        for (u32 slot = 0; slot < 8; ++slot) {
+            if (base_key.color_formats[slot] != VideoCore::Surface::PixelFormat::Invalid) {
+                compact.colors[slot] = color_views[slot];
+                compact.num_colors = slot + 1;
+            }
+        }
+        if (color_count != 0) {
+            compact.num_colors = (std::min)(color_count, 8U);
+        }
+        dynamic_color_count = compact.num_colors;
+        if (base_key.depth_format != VideoCore::Surface::PixelFormat::Invalid) {
+            compact.depth = framebuffer->DepthView();
+            compact.has_depth = framebuffer->HasAspectDepthBit();
+            compact.has_stencil = framebuffer->HasAspectStencilBit();
+        }
+        compact.render_area = framebuffer->RenderArea();
+        compact.layers = framebuffer->Layers();
+        Record([compact](vk::CommandBuffer cmdbuf) {
+            const auto info = [](VkImageView view) {
+                return VkRenderingAttachmentInfo{
+                    .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+                    .pNext = nullptr,
+                    .imageView = view,
+                    .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+                    .resolveMode = VK_RESOLVE_MODE_NONE,
+                    .resolveImageView = VK_NULL_HANDLE,
+                    .resolveImageLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+                    .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD,
+                    .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+                    .clearValue = {},
+                };
+            };
+            std::array<VkRenderingAttachmentInfo, 8> colors;
+            for (u32 slot = 0; slot < compact.num_colors; ++slot) {
+                colors[slot] = info(compact.colors[slot]);
+            }
+            const VkRenderingAttachmentInfo depth = info(compact.depth);
+            const VkRenderingInfo rendering_info{
+                .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
+                .pNext = nullptr,
+                .flags = 0,
+                .renderArea = {.offset = {0, 0}, .extent = compact.render_area},
+                .layerCount = compact.layers,
+                .viewMask = 0,
+                .colorAttachmentCount = compact.num_colors,
+                .pColorAttachments = colors.data(),
+                .pDepthAttachment = compact.has_depth ? &depth : nullptr,
+                .pStencilAttachment = compact.has_stencil ? &depth : nullptr,
+            };
+            cmdbuf.BeginRendering(rendering_info);
+        });
+        return;
+    }
+    struct Attachments {
+        std::array<VkRenderingAttachmentInfo, 8> colors{};
+        u32 num_colors = 0;
+        VkRenderingAttachmentInfo depth{};
+        bool has_depth = false;
+        bool has_stencil = false;
+    } attachments;
+    const auto& views = framebuffer->ColorViews();
+    const RenderPassKey& key = framebuffer->RenderPassKeyBase();
+    for (u32 slot = 0; slot < 8; ++slot) {
+        if (key.color_formats[slot] == VideoCore::Surface::PixelFormat::Invalid) {
+            attachments.colors[slot] = VkRenderingAttachmentInfo{
+                .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+                .pNext = nullptr,
+                .imageView = VK_NULL_HANDLE,
+            };
+            continue;
+        }
+        const bool clear = (color_clear_mask & (1u << slot)) != 0;
+        attachments.colors[slot] = VkRenderingAttachmentInfo{
+            .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+            .pNext = nullptr,
+            .imageView = views[slot],
+            .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+            .resolveMode = VK_RESOLVE_MODE_NONE,
+            .resolveImageView = VK_NULL_HANDLE,
+            .resolveImageLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+            .loadOp = clear ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD,
+            .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+            .clearValue = color_values[slot],
+        };
+        attachments.num_colors = slot + 1;
+    }
+    // The bound pipeline's count (its blend attachments) decides, unused slots are null views.
+    if (color_count != 0) {
+        attachments.num_colors = (std::min)(color_count, 8U);
+    }
+    dynamic_color_count = attachments.num_colors;
+    if (key.depth_format != VideoCore::Surface::PixelFormat::Invalid) {
+        attachments.depth = VkRenderingAttachmentInfo{
+            .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+            .pNext = nullptr,
+            .imageView = framebuffer->DepthView(),
+            .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+            .resolveMode = VK_RESOLVE_MODE_NONE,
+            .resolveImageView = VK_NULL_HANDLE,
+            .resolveImageLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+            .loadOp = depth_clear ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD,
+            .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+            .clearValue = depth_value,
+        };
+        attachments.has_depth = framebuffer->HasAspectDepthBit();
+        attachments.has_stencil = framebuffer->HasAspectStencilBit();
+    }
+    const VkExtent2D render_area = framebuffer->RenderArea();
+    const u32 layers = framebuffer->Layers();
+    Record([attachments, render_area, layers](vk::CommandBuffer cmdbuf) {
+        const VkRenderingInfo rendering_info{
+            .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .renderArea = {.offset = {0, 0}, .extent = render_area},
+            .layerCount = layers,
+            .viewMask = 0,
+            .colorAttachmentCount = attachments.num_colors,
+            .pColorAttachments = attachments.colors.data(),
+            .pDepthAttachment = attachments.has_depth ? &attachments.depth : nullptr,
+            .pStencilAttachment = attachments.has_stencil ? &attachments.depth : nullptr,
+        };
+        cmdbuf.BeginRendering(rendering_info);
+    });
+}
+
+void Scheduler::NoteImageReadTracked(VkImage image, u64 begin, u64 end) {
+    const auto hazard = barrier_tracker.Take(reinterpret_cast<u64>(image), begin, end);
+    if (hazard.Any()) {
+        read_hazard.stages |= hazard.stages;
+        read_hazard.access |= hazard.access;
+        read_hazard.count += hazard.count;
+        UpdateAutoFlush();
+    }
+}
+
+void Scheduler::FlushReadHazards() {
+    if (!read_hazard.Any()) {
+        return;
+    }
+    if (state.renderpass) {
+        VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::HazardBreaks);
+        EndRenderPass();
+    }
+    const auto hazard = std::exchange(read_hazard, {});
+    RecordHazardBarrier(hazard.stages, hazard.access,
+                        VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                        VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
+                            VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
+                            VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                            VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+                            VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT);
+}
+
+void Scheduler::FlushAllPendingWrites(std::source_location location) {
+    const auto hazard = barrier_tracker.TakeAll();
+    auto_flush = false;
+    const auto reads = std::exchange(read_hazard, {});
+    const u32 stages = hazard.stages | reads.stages;
+    if (stages == 0) {
+        return; // Nothing pending: no barrier (Fix pass 1: this was still counted as one)
+    }
+    VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::FullBarriers);
+    if (VideoCommon::V2::P5bStats::Enabled()) [[unlikely]] {
+        VideoCommon::V2::P5bStats::NoteFullBarrierSite(location.file_name(), location.line());
+    }
+    RecordHazardBarrierUncounted(stages, hazard.access | reads.access,
+                                 VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                 VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+}
+
+void Scheduler::RecordHazardBarrier(u32 src_stages, u32 src_access, u32 dst_stages,
+                                    u32 dst_access) {
+    // Recorded straight into the chunk: Record's auto flush must not run again for it.
+    if (src_stages == 0) {
+        return;
+    }
+    VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::TargetedBarriers);
+    RecordHazardBarrierUncounted(src_stages, src_access, dst_stages, dst_access);
+}
+
+void Scheduler::RecordHazardBarrierUncounted(u32 src_stages, u32 src_access, u32 dst_stages,
+                                             u32 dst_access) {
+    const bool saved = std::exchange(auto_flush, false);
+    Record([src_stages, src_access, dst_stages, dst_access](vk::CommandBuffer cmdbuf) {
+        const VkMemoryBarrier barrier{
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .pNext = nullptr,
+            .srcAccessMask = src_access,
+            .dstAccessMask = dst_access,
+        };
+        cmdbuf.PipelineBarrier(src_stages, dst_stages, 0, barrier);
+    });
+    auto_flush = saved && !barrier_tracker.Empty();
 }
 
 void Scheduler::RequestOutsideRenderPassOperationContext(std::source_location location) {
@@ -449,6 +1139,111 @@ void Scheduler::RequestOutsideRenderPassOperationContext(std::source_location lo
         CountRenderPassEnd(location.file_name(), location.line());
     }
     EndRenderPass();
+    if (track_barriers && (!barrier_tracker.Empty() || read_hazard.Any())) [[unlikely]] {
+        // An operation the tracker doesn't follow: every pending write before it, as the old
+        // pass-end barrier gave it (one barrier for every pass that ended since).
+        FlushAllPendingWrites(location);
+    }
+}
+
+bool Scheduler::RequestOutsideRenderPassForImages(std::initializer_list<TrackedImage> images,
+                                                  std::source_location location) {
+    if (!track_barriers) {
+        RequestOutsideRenderPassOperationContext(location);
+        return false;
+    }
+    if (state.renderpass) {
+        CountRenderPassEnd(location.file_name(), location.line());
+    }
+    EndRenderPass();
+    // Reads noted for draws that never came keep their hazards (the next pass begin takes them).
+    VideoCommon::V2::RangeBarrierTracker::Hazard hazard{};
+    for (const TrackedImage& image : images) {
+        if (image.image == VK_NULL_HANDLE) {
+            continue;
+        }
+        const auto taken =
+            barrier_tracker.Take(reinterpret_cast<u64>(image.image), image.begin, image.end);
+        hazard.stages |= taken.stages;
+        hazard.access |= taken.access;
+        hazard.count += taken.count;
+    }
+    const bool saved = std::exchange(targeted_scope, true);
+    UpdateAutoFlush();
+    RecordHazardBarrier(hazard.stages, hazard.access,
+                        VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT |
+                            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                        VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+    return saved;
+}
+
+bool Scheduler::BeginBufferOperation(std::source_location location) {
+    if (state.renderpass) {
+        CountRenderPassEnd(location.file_name(), location.line());
+    }
+    EndRenderPass();
+    const bool saved = std::exchange(targeted_scope, true);
+    UpdateAutoFlush();
+    return saved;
+}
+
+void Scheduler::RequestOutsideRenderPassForDispatch(std::source_location location) {
+    if (!track_barriers) {
+        RequestOutsideRenderPassOperationContext(location);
+        return;
+    }
+    if (state.renderpass) {
+        CountRenderPassEnd(location.file_name(), location.line());
+    }
+    EndRenderPass();
+    // The dispatch's own read barrier (graphics, compute and transfer writes -> compute reads)
+    // covers its reads of pending attachment writes; they stay pending for graphics readers.
+    read_hazard = {};
+}
+
+void Scheduler::WaitForIdleTracked(u32 stages, std::source_location location) {
+    // F4-X3: the old WFI ended the pass, flushed every pending write with a full barrier and
+    // recorded its own barrier after it (~90 full barriers and ~70 pass ends a frame at Castle
+    // Town). Now one barrier, and the pass goes on while its draws wrote only attachments.
+    using VideoCommon::V2::WfiAction;
+    namespace P5b = VideoCommon::V2::P5bStats;
+    switch (VideoCommon::V2::DecideWaitForIdle(state.renderpass != VK_NULL_HANDLE,
+                                                render_pass_has_stores,
+                                                pass_transform_feedback)) {
+    case WfiAction::AtPassEnd:
+        // Draws before it wrote only attachments, which the pass's later draws see in
+        // rasterization order unless they sample them; work recorded before the pass is ordered
+        // for its draws by that work's own barriers (compute: the pass begin's). A later draw that
+        // samples a render target or stores ends the pass (the fragment barrier rule); the pass
+        // end records the barrier.
+        wfi_at_pass_end |= stages;
+        fragment_barrier.Defer(true);
+        P5b::Add(P5b::Counter::WfiDeferred);
+        return;
+    case WfiAction::EndPass:
+        CountRenderPassEnd(location.file_name(), location.line());
+        P5b::Add(P5b::Counter::WfiPassEnds);
+        wfi_at_pass_end |= stages;
+        EndRenderPass();
+        return;
+    case WfiAction::Barrier:
+        break;
+    }
+    // Realizes a deferred clear as the old pass end did (a deferred WFI is recorded with it).
+    EndRenderPass();
+    RecordWaitForIdleBarrier(stages);
+}
+
+void Scheduler::RecordWaitForIdleBarrier(u32 stages) {
+    // The global barrier (MASTER_PLAN §5.5: the WFI is the only one): every pending write the
+    // tracker holds folds into it, so later readers find nothing pending, as after the old
+    // full flush, without a second barrier.
+    const auto pending = barrier_tracker.TakeAll();
+    const auto reads = std::exchange(read_hazard, {});
+    VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::WfiBarriers);
+    RecordHazardBarrierUncounted(stages | pending.stages | reads.stages,
+                                 VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                 VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
 }
 
 bool Scheduler::UpdateGraphicsPipeline(GraphicsPipeline* pipeline) {
@@ -540,7 +1335,14 @@ void Scheduler::WorkerThread(std::stop_token stop_token) {
             // Perform the work, tracking whether the chunk was a submission
             // before executing.
             const bool has_submit = work->HasSubmit();
+            // SYNC §14.7a (a): the worker's time per closed command buffer (all its chunks).
+            const bool cost_stats = VideoCommon::V2::P5bStats::Enabled();
+            const u64 work_start = cost_stats ? VideoCommon::Nx2Profile::Now() : 0;
             work->ExecuteAll(current_cmdbuf, current_upload_cmdbuf);
+            if (cost_stats) [[unlikely]] {
+                VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::SubmitCostWorkerNs,
+                                               VideoCommon::Nx2Profile::Now() - work_start);
+            }
 
             // If the chunk was a submission, reallocate the command buffer.
             if (has_submit) {
@@ -558,6 +1360,28 @@ void Scheduler::WorkerThread(std::stop_token stop_token) {
 }
 
 void Scheduler::AllocateWorkerCommandBuffer() {
+    if (submit_engine) {
+        current_context = submit_engine->Acquire();
+        current_cmdbuf = vk::CommandBuffer(current_context->Main(), device.GetDispatchLoader());
+        current_upload_cmdbuf =
+            vk::CommandBuffer(current_context->Upload(), device.GetDispatchLoader());
+        current_cmdbuf.Begin({
+            .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+            .pNext = nullptr,
+            .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+            .pInheritanceInfo = nullptr,
+        });
+        current_upload_cmdbuf.Begin({
+            .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+            .pNext = nullptr,
+            .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+            .pInheritanceInfo = nullptr,
+        });
+        if (trace_query_pool && !trace_gpu_failed) {
+            TraceGpuSubmission();
+        }
+        return;
+    }
     current_cmdbuf = vk::CommandBuffer(command_pool->Commit(), device.GetDispatchLoader());
     current_cmdbuf.Begin({
         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
@@ -730,13 +1554,47 @@ void Scheduler::TraceGpuSubmission() {
                   results[0].timestamp, results[trace_gpu_count * 2 - 1].timestamp,
                   trace_timestamp_bits)) * trace_timestamp_period / 1e6
             : -1.0;
+        // SYNC §14 #5 / §14.5 (diagnostic): idle gaps between consecutive measured submissions
+        // (only when none of the frame's was dropped), on the host clock (CalibrateGpuToHost),
+        // intersected with each next submission's recorded-but-unsubmitted interval.
+        VideoCommon::V2::IdleGapHistogram gaps;
+        s64 calibration_ns = 0;
+        if (trace_gpu_skipped == 0 && trace_gpu_count > 1) {
+            std::array<s64, TraceMaxSubmissions> begin_ns{};
+            std::array<s64, TraceMaxSubmissions> end_ns{};
+            std::array<s64, TraceMaxSubmissions> queued_ns{};
+            const auto relative_ns = [&](u64 timestamp) {
+                return static_cast<s64>(static_cast<double>(Common::DkbFrameTrace::TimestampDelta(
+                                            results[0].timestamp, timestamp,
+                                            trace_timestamp_bits)) *
+                                        trace_timestamp_period);
+            };
+            for (u32 i = 0; i < trace_gpu_count; ++i) {
+                begin_ns[i] = relative_ns(results[i * 2].timestamp);
+                end_ns[i] = relative_ns(results[i * 2 + 1].timestamp);
+                queued_ns[i] = static_cast<s64>(trace_submissions[i].submitted_ns);
+            }
+            calibration_ns = VideoCommon::V2::CalibrateGpuToHost(begin_ns.data(), queued_ns.data(),
+                                                                 trace_gpu_count);
+            for (u32 i = 1; i < trace_gpu_count; ++i) {
+                const SubmissionTrace& next = trace_submissions[i];
+                gaps.Add(end_ns[i - 1] + calibration_ns, begin_ns[i] + calibration_ns,
+                         static_cast<s64>(next.recorded_ns), static_cast<s64>(next.submitted_ns));
+            }
+        }
         LOG_INFO(Render_Vulkan,
                  "DKB gpu_frame renderer_frame={} last_submission_tick={} "
                  "gpu_frame_span_ms={:.3f} gpu_submission_sum_ms={:.3f} "
                  "measured_submissions={} dropped_submissions={} "
-                 "valid_bits={} period_ns={}",
+                 "valid_bits={} period_ns={} gpu_idle_with_unsubmitted_work_ms={:.3f} "
+                 "handoff_latency_ms={:.3f} "
+                 "idle_gaps_with_work(<0.25/0.25-1/1-3/>3ms)={}/{}/{}/{} "
+                 "idle_gaps_without_work={}/{}/{}/{}",
                  trace_sample_frame, trace_gpu_tick, span_ms, total_ms, trace_gpu_count,
-                 trace_gpu_skipped, trace_timestamp_bits, trace_timestamp_period);
+                 trace_gpu_skipped, trace_timestamp_bits, trace_timestamp_period,
+                 gaps.idle_with_work_ms, gaps.handoff_ms, gaps.with_work[0], gaps.with_work[1],
+                 gaps.with_work[2], gaps.with_work[3], gaps.without_work[0],
+                 gaps.without_work[1], gaps.without_work[2], gaps.without_work[3]);
         for (const auto& [duration_ms, index] : slowest) {
             if (duration_ms < 10.0) {
                 continue;
@@ -779,11 +1637,42 @@ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_se
         g_profile_submits.fetch_add(1, std::memory_order_relaxed);
         ReportSubmitCounts();
     }
+    if (pre_submit) [[unlikely]] {
+        pre_submit();
+    }
     EndPendingOperations();
     InvalidateState();
+    if (host_read_wanted) [[unlikely]] {
+        // R2-F4-07 (MASTER_PLAN §6 class C): a mapped buffer was written in this submission;
+        // its end makes the writes host-visible, so a reader waits for this tick only
+        // (HostVisibleThrough) instead of a Finish of whatever is open then.
+        host_read_wanted = false;
+        host_visible_tick = master_semaphore->CurrentTick();
+        const bool saved = std::exchange(auto_flush, false);
+        Record([](vk::CommandBuffer cmdbuf) {
+            static constexpr VkMemoryBarrier HOST_READ_BARRIER{
+                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                .pNext = nullptr,
+                .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+                .dstAccessMask = VK_ACCESS_HOST_READ_BIT,
+            };
+            cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+                                   0, HOST_READ_BARRIER);
+        });
+        auto_flush = saved;
+    }
 
     const u64 signal_value = master_semaphore->NextTick();
-    RecordWithUploadBuffer([signal_semaphore, wait_semaphore, signal_value,
+    if (VideoCommon::V2::P5bStats::Enabled()) {
+        VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::Submits);
+    }
+    if (submit_engine) [[unlikely]] {
+        SubmitExecutionEngine(signal_semaphore, wait_semaphore, signal_value);
+        return signal_value;
+    }
+    auto_flush = false; // The submit closure touches no image: pending writes stay pending
+    const u64 recorded_ns = std::exchange(open_work_since_ns, 0); // SYNC §14 #5
+    RecordWithUploadBuffer([signal_semaphore, wait_semaphore, signal_value, recorded_ns,
                             this](vk::CommandBuffer cmdbuf, vk::CommandBuffer upload_cmdbuf) {
         static constexpr VkMemoryBarrier WRITE_BARRIER{
             .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
@@ -798,6 +1687,8 @@ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_se
                                  trace_gpu_count * 2 + 1);
             trace_gpu_tick = signal_value;
             trace_work.tick = signal_value;
+            trace_work.recorded_ns = recorded_ns;
+            trace_work.submitted_ns = TraceNowNs();
             trace_submissions[trace_gpu_count] = trace_work;
             ++trace_gpu_count;
             trace_gpu_recording = false;
@@ -846,7 +1737,92 @@ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_se
     });
     chunk->MarkSubmit();
     DispatchWork();
+    UpdateAutoFlush();
     return signal_value;
+}
+
+void Scheduler::SubmitExecutionEngine(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
+                                      u64 signal_value) {
+    // P5b: as the closure above, but the submission (with the transfer batch and the joins the
+    // recording thread decided) goes to the submit engine: the submit thread, or inline.
+    const VideoCommon::V2::TimelineJoin::Batch batch = timeline_join.Close(signal_value);
+    auto_flush = false; // The submit closure touches no image: pending writes stay pending
+    const u64 recorded_ns = std::exchange(open_work_since_ns, 0); // SYNC §14 #5
+    RecordWithUploadBuffer([signal_semaphore, wait_semaphore, signal_value, batch, recorded_ns,
+                            this](vk::CommandBuffer cmdbuf, vk::CommandBuffer upload_cmdbuf) {
+        static constexpr VkMemoryBarrier WRITE_BARRIER{
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .pNext = nullptr,
+            .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+        };
+        upload_cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                      VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, WRITE_BARRIER);
+        upload_cmdbuf.End();
+        if (trace_gpu_recording) {
+            cmdbuf.WriteTimestamp(VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, *trace_query_pool,
+                                  trace_gpu_count * 2 + 1);
+            trace_gpu_tick = signal_value;
+            trace_work.tick = signal_value;
+            trace_work.recorded_ns = recorded_ns;
+            trace_work.submitted_ns = TraceNowNs();
+            trace_submissions[trace_gpu_count] = trace_work;
+            ++trace_gpu_count;
+            trace_gpu_recording = false;
+        } else if (trace_gpu_sampling) {
+            ++trace_gpu_skipped;
+        }
+        if (trace_query_pool) {
+            trace_work = {};
+        }
+        cmdbuf.End();
+        const bool transfer = batch.transfer && current_context->xfer_begun;
+        if (current_context->xfer_begun) {
+            WorkerTransferCmdbuf().End();
+        }
+        if (on_submit) {
+            on_submit();
+        }
+        SubmitWork work{};
+        work.context = current_context;
+        work.signal_semaphore = signal_semaphore;
+        work.wait_semaphore = wait_semaphore;
+        work.tick = signal_value;
+        work.transfer = transfer;
+        work.transfer_wait = batch.transfer_wait;
+        work.graphics_waits_transfer = transfer && batch.graphics_waits_transfer;
+        work.transfer_images = batch.transfer_images;
+        work.num_extra_waits = batch.num_extra_waits;
+        for (u32 i = 0; i < batch.num_extra_waits; ++i) {
+            work.extra_waits[i] = {reinterpret_cast<VkSemaphore>(batch.extra_waits[i].semaphore),
+                                   batch.extra_waits[i].value};
+        }
+        work.num_post_jobs = (std::min<u32>)(batch.num_post_jobs,
+                                             static_cast<u32>(work.post_jobs.size()));
+        for (u32 i = 0; i < work.num_post_jobs; ++i) {
+            work.post_jobs[i] = {
+                reinterpret_cast<VkCommandBuffer>(batch.post_jobs[i].cmdbuf),
+                reinterpret_cast<VkSemaphore>(batch.post_jobs[i].semaphore),
+                batch.post_jobs[i].value,
+            };
+        }
+        submit_engine->Submit(std::move(work));
+        if (trace_frame_end != 0) {
+            if (trace_gpu_sampling) {
+                trace_gpu_pending = true;
+                trace_gpu_sampling = false;
+            }
+            if (trace_query_pool && !trace_gpu_failed && !trace_gpu_pending &&
+                trace_gpu_rate.Ready(std::chrono::steady_clock::now())) {
+                trace_sample_frame = trace_frame_end + 1;
+                trace_gpu_sampling = true;
+            }
+            trace_frame_end = 0;
+        }
+    });
+    chunk->MarkSubmit();
+    DispatchWork();
+    UpdateAutoFlush();
 }
 
 void Scheduler::AllocateNewContext() {
@@ -877,6 +1853,7 @@ void Scheduler::EndRenderPass()
         ++recording_epoch;
         fragment_barrier.Reset();
         render_pass_has_stores = false;
+        ++render_pass_serial;
 
         query_cache->CounterClose(VideoCommon::QueryType::StreamingByteCount);
 
@@ -888,6 +1865,66 @@ void Scheduler::EndRenderPass()
 
         query_cache->CounterEnable(VideoCommon::QueryType::ZPassPixelCount64, false);
         query_cache->NotifySegment(false);
+        VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::PassDraws,
+                                       std::exchange(pass_draws, 0));
+
+        if (track_barriers) [[unlikely]] {
+            // No barrier now: the attachments' writes stay pending, keyed by image and guest
+            // range, until something overlapping reads or writes them (or an untracked
+            // operation flushes them all).
+            for (u32 i = 0; i < num_renderpass_images; ++i) {
+                const bool is_color =
+                    (renderpass_image_ranges[i].aspectMask & VK_IMAGE_ASPECT_COLOR_BIT) != 0;
+                const u32 stages = is_color ? VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT
+                                            : VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
+                                                  VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+                const u32 access = is_color ? VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT
+                                            : VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+                barrier_tracker.NoteWrite(reinterpret_cast<u64>(renderpass_images[i]),
+                                          renderpass_guest_ranges[i].first,
+                                          renderpass_guest_ranges[i].second,
+                                          stages | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                                          access | VK_ACCESS_SHADER_WRITE_BIT);
+            }
+            const bool dynamic = state.dynamic;
+            // F4-07: the XFB barrier only after a pass that ran transform feedback.
+            const bool has_transform_feedback = device.IsExtTransformFeedbackSupported() &&
+                                                std::exchange(pass_transform_feedback, false);
+            Record([dynamic, has_transform_feedback](vk::CommandBuffer cmdbuf) {
+                if (dynamic) {
+                    cmdbuf.EndRendering();
+                } else {
+                    cmdbuf.EndRenderPass();
+                }
+                if (has_transform_feedback) {
+                    static constexpr VkMemoryBarrier XFB_OUTPUT_BARRIER{
+                        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                        .pNext = nullptr,
+                        .srcAccessMask = VK_ACCESS_TRANSFORM_FEEDBACK_WRITE_BIT_EXT,
+                        .dstAccessMask =
+                            VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT,
+                    };
+                    cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFORM_FEEDBACK_BIT_EXT,
+                                           VK_PIPELINE_STAGE_VERTEX_INPUT_BIT |
+                                               VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                           0, XFB_OUTPUT_BARRIER);
+                }
+            });
+            VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::SkippedBarriers);
+            state.renderpass = VkRenderPass{};
+            state.dynamic = false;
+            num_renderpass_images = 0;
+            UpdateAutoFlush();
+            if (wfi_at_pass_end != 0) [[unlikely]] {
+                // F4-X3: a wait-for-idle recorded inside the pass.
+                RecordWaitForIdleBarrier(std::exchange(wfi_at_pass_end, 0));
+            }
+            // SYNC Step 9: query result copies deferred to this pass end (after the queries
+            // ended, before anything later and before the submit).
+            RunAfterPass();
+            return;
+        }
+        VideoCommon::V2::P5bStats::Add(VideoCommon::V2::P5bStats::Counter::PassEndBarriers);
 
         Record([num_images = num_renderpass_images,
                        images = renderpass_images,

@@ -7,6 +7,7 @@
 #pragma once
 
 #include <array>
+#include <bitset>
 #include <atomic>
 #include <cstddef>
 #include <memory>
@@ -24,6 +25,7 @@
 #include "video_core/macro.h"
 #include "video_core/native_qmd.h"
 #include "video_core/textures/texture.h"
+#include "video_core/v2/regsem.h"
 
 namespace Core {
 class System;
@@ -31,6 +33,9 @@ class System;
 
 namespace VideoCommon {
 class GpuSplit;
+namespace V2::RegSem {
+struct MirrorCompute;
+}
 }
 
 namespace Tegra {
@@ -253,6 +258,10 @@ public:
 
     bool IsNativeMode() const { return native_mode; }
     bool ProcessGameDlss(u64 program_id, u64 native_key);
+    /// Ocarina of Time with anti-aliasing at No sharpening (oot_network.h): true when this
+    /// dispatch of the game's network is skipped, or its output pass replaced by a copy of the
+    /// tonemapped image.
+    bool BypassOotNetwork(u64 program_id, u64 native_key);
     void TraceDlssContract(u64 native_key, bool warn_unvalidated = true);
 
     /// GPU thread split with macros on its front half (gpu_split.h, EDEN_NX2_SPLIT=2), called by
@@ -265,20 +274,68 @@ public:
                               const u32* base_start, u32 amount, u32 methods_pending,
                               const GPUVAddr* segment);
 
+    /// EDEN_NX2_V2_REGSEM: the executing engine's compute register groups (v2_groups).
+    [[nodiscard]] const VideoCommon::V2::ComputeGroupTracker& V2Groups() const {
+        return v2_groups;
+    }
+
+    /// Native methods CallMethod only stores (tests: the table must give the same set).
+    [[nodiscard]] const std::bitset<0xe00>& NativePlainMethods() const {
+        return native_plain_methods;
+    }
+
 private:
     struct FrontState;
     FrontState& Front(VideoCommon::GpuSplit& split);
     void ReleaseFront();
     void FrontApply(FrontState& state, u32 method, u32 argument);
+    void FrontApplyV1(FrontState& state, u32 method, u32 argument);
+    void FrontApplyRegSem(FrontState& state, u32 method, u32 argument); ///< EDEN_NX2_V2_REGSEM
     MacroEngine& FrontMacroEngine(FrontState& state);
     std::span<u32> FrontMacroPositions(FrontState& state);
     void FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split, FrontState& state);
+    /// EDEN_NX2_V2_ACQUIRE/HAZARD: records the guest memory writes of a method just sent.
+    void FrontNoteWrites(VideoCommon::GpuSplit& split, FrontState& state, u32 method,
+                         u32 argument);
+    /// An inline QMD (0x107) was sent: the QMD it stores and, if it launches, what it writes.
+    /// EDEN_NX2_V2_IR_DRAWS: a Dispatch record before writes that can launch compute work.
+    void FrontDispatchRecord(VideoCommon::GpuSplit& split, FrontState& state, u32 method,
+                             const u32* arguments, u32 amount);
+    void FrontNoteInlineQmd(VideoCommon::GpuSplit& split, FrontState& state);
+    /// EDEN_NX2_V2_QMDSCHED: runs the front's QMD scheduler model on the signals of a write.
+    void FrontModelQmd(VideoCommon::GpuSplit& split, FrontState& state, u32 method,
+                       const u32* arguments, u32 amount);
+    /// The storage buffer ranges a QMD's program writes (false: unknown, unbounded).
+    bool FrontQmdWriteRanges(VideoCommon::GpuSplit& split, const u32* qmd,
+                             std::vector<std::pair<GPUVAddr, u64>>& out);
+    /// S1 single owner (F1-05): a write FrontApply took becomes classified entries (`old_value`:
+    /// the register before it).
+    void FrontS1Write(VideoCommon::GpuSplit& split, FrontState& state, u32 method, u32 old_value,
+                      bool is_last);
+    /// S1: a register write the front makes itself (the inline QMD's launch address).
+    void FrontS1Store(VideoCommon::GpuSplit& split, FrontState& state, u32 method, u32 value);
+    /// S1: the front's compute groups and hashes before a write that may launch QMDs.
+    void FrontS1Groups(VideoCommon::GpuSplit& split, FrontState& state);
+    /// The inline QMD (0x107) upload; false when its destination is not mapped.
+    bool NativeInlineQmdUpload();
     std::unique_ptr<FrontState> front;
     bool front_macros{}; ///< The front owns the macro code and bindings (the back skips them)
+    /// S1 for this engine (set on the front before its first classified run is published): the
+    /// back takes register groups from the front and hashes nothing itself.
+    bool s1_compute{};
+    bool s1_inline_failed{}; ///< Back, S1: the last inline QMD upload found no mapped memory
+
+public:
+    /// Back, S1 single owner: a classified StateRun of this engine (V2::S1 entries).
+    void ExecuteS1Run(Core::System& system, const u64* it, const u64* end);
+
+private:
 
     bool DispatchNativeCompute(const NativeQmdScheduler::Descriptor& descriptor);
     void ProcessNativeReportSemaphore(u32 argument);
     void DescribeNativeResources(const NativeQmdScheduler::Descriptor& qmd);
+    /// Texture descriptor that the handle at `offset` in constant buffer 0 selects.
+    std::optional<Texture::TICEntry> ConstBuffer0Image(u32 offset) const;
     void RememberDlssMotionVectors();
     bool TryFireEmblemUpscale(bool allow_history = true);
     void CaptureFireEmblemJitter();
@@ -286,6 +343,8 @@ private:
     void CheckDlssNetwork();
     [[nodiscard]] VideoCore::GameDlssReason GameDlssBlocker() const;
     void UpdateGameDlssStatus(bool complete, VideoCore::GameDlssReason blocker);
+    std::pair<std::vector<u32>, std::vector<u32>> NativeImageHandles(GPUVAddr program);
+    void RememberNativeUpscaleInput();
 
     /// This frame's DLSS evaluation (Fortune's Weave): whether its passes all ran, and whether
     /// the game's own network output is shown instead of the replacement upscale.
@@ -315,6 +374,17 @@ private:
         VideoCore::GameDlssStatus status{};
     } dlss_chain;
 
+    /// Ocarina of Time's movie network: a pass that reads one colour image and stores none
+    /// retains its input here; the pass that stores an image upscaling it is replaced by a plain
+    /// copy (the network's matrix passes cost tens of milliseconds per frame). Cleared after the
+    /// copy.
+    std::optional<Texture::TICEntry> native_upscale_input;
+    /// Native dispatches left to skip while a retained network is being replaced (bounded, so a
+    /// non-network pass cannot silence the engine forever).
+    u32 network_skip_remaining{};
+    /// Set when the replacement copy fails, so the full network runs from then on.
+    bool native_upscale_disabled{};
+
     /// Motion vectors and depth of Fire Emblem: Fortune's Weave's DLSS evaluation, from its first
     /// pass (run earlier in the frame than the network pass the stand-in replaces), with the input
     /// colour image and camera jitter they go with.
@@ -332,6 +402,14 @@ private:
     NativeMacroContext* native_context{};
     bool native_compute_uploaded{};
     MacroEngine* native_macro{};
+    /// EDEN_NX2_V2_REGSEM: groups and fingerprints of the executing engine's compute registers
+    /// (native_registers, or regs for the Kepler class); draw_dirty is what the current
+    /// dispatch sees changed (NoteDispatchCompute).
+    VideoCommon::V2::ComputeGroupTracker v2_groups;
+    bool v2_compute_table{};  ///< EDEN_NX2_V2_REGSEM=1 (TableComputeMacroWrite)
+    bool v2_compute_verify{}; ///< EDEN_NX2_V2_REGSEM=verify (VerifyComputeWrite)
+    u64 v2_compute_writes{};
+    std::unique_ptr<VideoCommon::V2::RegSem::MirrorCompute> v2_compute_mirror;
     std::array<u32, 0x1000> native_registers{};
     /// Native methods that only store their value (no macro, QMD, upload, semaphore or code
     /// side effect): CallMethod writes those directly.
@@ -342,7 +420,16 @@ private:
     std::optional<u32> native_executing_macro;
     u32 native_bind_pointer{};
 
+    /// CallMethod after the native class's methods: the Kepler class's registers and uploads.
+    void CallMethodKepler(Core::System& system, u32 method, u32 method_argument,
+                          bool is_last_call);
+    /// EDEN_NX2_V2_REGSEM=1: compute macro upload/bind registers through RegSem::ApplyCompute.
+    void TableComputeMacroWrite(u32 method, u32 argument);
+    /// EDEN_NX2_V2_REGSEM=verify: the native method, compared with the table on a copy.
+    void VerifyComputeWrite(Core::System& system, u32 method, u32 argument, bool is_last_call);
     void ProcessLaunch();
+    /// EDEN_NX2_V2_REGSEM: a dispatch is about to run (compute group dirty bits, hash checks).
+    void NoteV2Dispatch(bool native);
 
     void ConsumeSinkImpl(Core::System& system) override;
 

@@ -53,6 +53,9 @@ public:
         bool (*emit)(State*, Word method, Word value);
         Word (*read)(State*, Word address);
         const std::vector<Word>* fifo;
+        // Programs compiled with data RAM hooks only: DREAD and DWRITE (index checked).
+        Word (*dram_read)(State*, Word index);
+        void (*dram_write)(State*, Word index, Word value);
     };
 
     enum Error : Word {
@@ -91,17 +94,45 @@ public:
     }
 
     /// Compiles `code` (3 words per instruction) when it differs from what was compiled.
-    void Prepare(std::span<const Word> code, std::uint64_t generation) {
-        if (program && generation == compiled_generation) {
+    /// `dram_hooks`: the program the Execute with data RAM callbacks runs (its own copy).
+    void Prepare(std::span<const Word> code, std::uint64_t generation, bool dram_hooks = false) {
+        std::unique_ptr<Program>& target = dram_hooks ? hooked_program : program;
+        std::uint64_t& target_generation = dram_hooks ? hooked_generation : compiled_generation;
+        if (target && generation == target_generation) {
             return;
         }
-        program = std::make_unique<Program>(code);
-        compiled_generation = generation;
+        target = std::make_unique<Program>(code, dram_hooks);
+        target_generation = generation;
     }
 
     template <typename Read, typename Emit>
     Result Execute(Word start, std::vector<Word>& parameters, std::span<Word> data_ram, Read read,
                    Emit emit) {
+        Thunks<Read, Emit> thunks{read, emit};
+        return Run(*program, &thunks, &Thunks<Read, Emit>::CallEmit,
+                   &Thunks<Read, Emit>::CallRead, nullptr, nullptr, start, parameters, data_ram);
+    }
+
+    /// Fix F3d (the macro memo's recordings): as Execute, with every DREAD through
+    /// `dram_read(index)` and every DWRITE through `dram_write(index, value)`, which access
+    /// the data RAM themselves. Prepare(code, generation, true) first.
+    template <typename Read, typename Emit, typename DramRead, typename DramWrite>
+    Result Execute(Word start, std::vector<Word>& parameters, std::span<Word> data_ram, Read read,
+                   Emit emit, DramRead dram_read, DramWrite dram_write) {
+        using Hooks = DramThunks<Read, Emit, DramRead, DramWrite>;
+        Hooks thunks{{read, emit}, dram_read, dram_write};
+        return Run(*hooked_program, static_cast<Thunks<Read, Emit>*>(&thunks),
+                   &Thunks<Read, Emit>::CallEmit, &Thunks<Read, Emit>::CallRead, &Hooks::CallDramRead,
+                   &Hooks::CallDramWrite, start, parameters, data_ram);
+    }
+
+private:
+    struct Program;
+
+    Result Run(Program& target, void* user, bool (*emit)(State*, Word, Word),
+               Word (*read)(State*, Word), Word (*dram_read)(State*, Word),
+               void (*dram_write)(State*, Word, Word), Word start, std::vector<Word>& parameters,
+               std::span<Word> data_ram) {
         State state;
         state.regs.fill(0);
         state.carry = state.method = state.increment = 0;
@@ -115,18 +146,18 @@ public:
         state.params_size = static_cast<Word>(parameters.size());
         state.dram = data_ram.data();
         state.fifo = &parameters;
-        Thunks<Read, Emit> thunks{read, emit};
-        state.user = &thunks;
-        state.emit = &Thunks<Read, Emit>::CallEmit;
-        state.read = &Thunks<Read, Emit>::CallRead;
-        const Word error = program->entry(&state);
+        state.user = user;
+        state.emit = emit;
+        state.read = read;
+        state.dram_read = dram_read;
+        state.dram_write = dram_write;
+        const Word error = target.entry(&state);
         if (error == None) {
             return {true, state.fail_pc, state.consumed, {}};
         }
         return {false, state.fail_pc, state.consumed, ErrorText(error)};
     }
 
-private:
     template <typename Read, typename Emit>
     struct Thunks {
         Read& read;
@@ -142,10 +173,24 @@ private:
             return static_cast<Thunks*>(state->user)->read(address);
         }
     };
+    template <typename Read, typename Emit, typename DramRead, typename DramWrite>
+    struct DramThunks : Thunks<Read, Emit> {
+        DramRead& dram_read;
+        DramWrite& dram_write;
+        static DramThunks* Of(State* state) {
+            return static_cast<DramThunks*>(static_cast<Thunks<Read, Emit>*>(state->user));
+        }
+        static Word CallDramRead(State* state, Word index) {
+            return Of(state)->dram_read(index);
+        }
+        static void CallDramWrite(State* state, Word index, Word value) {
+            Of(state)->dram_write(index, value);
+        }
+    };
 
     struct Program : Xbyak::CodeGenerator {
-        explicit Program(std::span<const Word> code)
-            : Xbyak::CodeGenerator(1 << 20, Xbyak::AutoGrow) {
+        explicit Program(std::span<const Word> code, bool dram_hooks_ = false)
+            : Xbyak::CodeGenerator(1 << 20, Xbyak::AutoGrow), dram_hooks{dram_hooks_} {
             Generate(code);
             ready();
             entry = getCode<Word (*)(State*)>();
@@ -155,6 +200,7 @@ private:
 
     private:
         using Decoded = TuringMacroInterpreter::Decoded;
+        const bool dram_hooks;
 #ifdef _WIN32
         const Xbyak::Reg64 arg0 = rcx, arg1 = rdx, arg2 = r8;
 #else
@@ -632,12 +678,27 @@ private:
             case 30:
                 cmp(ecx, 0xc00);
                 jae(fail_dread, T_NEAR);
+                if (dram_hooks) {
+                    mov(arg1.cvt32(), ecx);
+                    mov(arg0, st);
+                    call(ptr[st + offsetof(State, dram_read)]);
+                    return;
+                }
                 mov(rax, qword[st + offsetof(State, dram)]);
                 mov(eax, dword[rax + rcx * 4]);
                 return;
             case 31:
                 cmp(ecx, 0xc00);
                 jae(fail_dwrite, T_NEAR);
+                if (dram_hooks) {
+                    // arg2 first: on Windows arg1 is edx (the value).
+                    mov(arg2.cvt32(), edx);
+                    mov(arg1.cvt32(), ecx);
+                    mov(arg0, st);
+                    call(ptr[st + offsetof(State, dram_write)]);
+                    xor_(eax, eax);
+                    return;
+                }
                 mov(rax, qword[st + offsetof(State, dram)]);
                 mov(dword[rax + rcx * 4], edx);
                 xor_(eax, eax);
@@ -657,6 +718,8 @@ private:
 
     std::unique_ptr<Program> program;
     std::uint64_t compiled_generation{~std::uint64_t{0}};
+    std::unique_ptr<Program> hooked_program; ///< With data RAM hooks (memo recordings)
+    std::uint64_t hooked_generation{~std::uint64_t{0}};
 };
 
 } // namespace Tegra

@@ -7,6 +7,7 @@
 #pragma once
 
 #include <array>
+#include <memory>
 #include <optional>
 #include <string_view>
 
@@ -18,11 +19,18 @@
 #include "video_core/control/channel_state_cache.h"
 #include "video_core/engines/maxwell_dma.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
+#include "video_core/oot_network.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/renderer_vulkan/blit_image.h"
+#include "video_core/renderer_vulkan/vk_bindless_heap.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
 #include "video_core/renderer_vulkan/vk_descriptor_buffer.h"
 #include "video_core/renderer_vulkan/vk_descriptor_pool.h"
+#include "video_core/renderer_vulkan/vk_draw_cache.h"
+#include "video_core/v2/flush_heuristic.h"
+#include "video_core/v2/commit.h"
+#include "video_core/v2/resolve/draw_record.h"
+#include "video_core/v2/v2_switches.h"
 #include "video_core/renderer_vulkan/vk_fence_manager.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_query_cache.h"
@@ -71,7 +79,19 @@ public:
     bool BufferToImage(const Tegra::DMA::ImageCopy& copy_info, const Tegra::DMA::BufferOperand& src,
                        const Tegra::DMA::ImageOperand& dst) override;
 
+    /// SYNC_SUBMIT_SPEC §11.6 item 4 (rule C counts all work): called after each copy or clear,
+    /// with no cache lock held.
+    void SetWorkHook(void (*hook)(void*), void* argument) {
+        work_hook = hook;
+        work_argument = argument;
+    }
+
 private:
+    void NoteWork() {
+        if (work_hook != nullptr) [[unlikely]] {
+            work_hook(work_argument);
+        }
+    }
     template <bool IS_IMAGE_UPLOAD>
     bool DmaBufferImageCopy(const Tegra::DMA::ImageCopy& copy_info,
                             const Tegra::DMA::BufferOperand& src,
@@ -80,6 +100,8 @@ private:
     BufferCache& buffer_cache;
     TextureCache& texture_cache;
     Scheduler& scheduler;
+    void (*work_hook)(void*){};
+    void* work_argument{};
 };
 
 class RasterizerVulkan final : public VideoCore::RasterizerInterface,
@@ -104,14 +126,16 @@ public:
     void FlushAll() override;
     void FlushRegion(DAddr addr, u64 size,
                      VideoCommon::CacheType which = VideoCommon::CacheType::All) override;
-    GpuWrittenList ReadGpuWrittenCommandList(DAddr addr, std::span<u8> out,
-                                             bool past_sync) override;
+    GpuWrittenList ReadGpuWrittenCommandList(DAddr addr, std::span<u8> out, bool past_sync,
+                                             u64* pending_tick = nullptr) override;
+    bool IsGpuTickDone(u64 tick) override;
     void NoteGpuWrittenCommandListSynced(DAddr page) override;
     void FlushGpuWrittenCommandListPages(std::span<const DAddr> pages) override;
     bool MustFlushRegion(DAddr addr, u64 size,
                          VideoCommon::CacheType which = VideoCommon::CacheType::All) override;
     VideoCore::RasterizerDownloadArea GetFlushArea(DAddr addr, u64 size) override;
     bool HasPendingQueries(DAddr addr, u64 size) override;
+    bool FlushRegionForRead(DAddr addr, u64 size, std::function<void()>& land) override;
     void InvalidateRegion(DAddr addr, u64 size,
                           VideoCommon::CacheType which = VideoCommon::CacheType::All) override;
     void PrepareRegionWrite(DAddr addr, u64 size, VideoCommon::CacheType which) override;
@@ -135,6 +159,9 @@ public:
     void FragmentBarrier() override;
     void TiledCacheBarrier() override;
     void FlushCommands() override;
+    void FlushCommandsForFence(bool downloads, u8 committed) override;
+    void RequestHostWaitedFence() override;
+    void NoteGuestVisibleFence() override;
     void TickFrame() override;
     bool AccelerateConditionalRendering() override;
     bool HasDrawTransformFeedback() override;
@@ -155,6 +182,7 @@ public:
                                    const Tegra::Texture::TICEntry* depth,
                                    std::array<f32, 2> jitter,
                                    std::array<f32, 2> motion_scale, bool use_history = true) override;
+    VideoCommon::OotNetwork::BypassState* OotNetworkBypass() override;
     Tegra::Engines::AccelerateDMAInterface& AccessAccelerateDMA() override;
     void AccelerateInlineToMemory(GPUVAddr address, size_t copy_size,
                                   std::span<const u8> memory) override;
@@ -170,7 +198,109 @@ public:
                                                             VAddr framebuffer_addr,
                                                             u32 pixel_stride);
 
+    void ServeCommitRequests() override;
+    void OnCacheOwnerStopped() override;
+
 private:
+    // Pipeline v2 P5a (EDEN_NX2_V2_COMMIT): the commit stage. Null when off.
+    std::unique_ptr<VideoCommon::V2::Commit::Context> commit;
+    /// COMMIT=1 without COMMIT_LOCKED: the draw path takes no cache lock; other threads hand
+    /// their cache work to the owner (IMPLEMENTATION_LOG.md, P5a protocol).
+    bool commit_lock_free{};
+    /// EDEN_NX2_V2_DRAWREC (P6 Step 0, notes/STEP0_SPEC.md) as the constructor allowed it: off
+    /// unless COMMIT=1 lock-free, DRAWCACHE on and no dynamic storage buffer limit.
+    VideoCommon::V2::Mode drawrec{VideoCommon::V2::Mode::Off};
+    VideoCommon::V2::Resolve::DynamicFeatures drawrec_features{};
+    u64 drawrec_features_program{~0ULL}; ///< the program id the features were built for
+    /// The draw's record and its request lists (reset per draw with a new commit segment).
+    VideoCommon::V2::Resolve::ResolvedDraw drawrec_record;
+    VideoCommon::V2::Commit::RequestList drawrec_textures;
+    VideoCommon::V2::Commit::RequestList drawrec_buffers;
+    u64 drawrec_ordinal{};
+    GraphicsPipeline::DrawRecObserver drawrec_observer_state;
+    DrawApplyOut drawrec_apply;
+    /// DRAWREC=1 (step 14): resolve, apply and encode the draw from its record in place of
+    /// pipeline.Configure; a CommitOnly draw runs Configure. `recorded`: the record path drew
+    /// it (its dynamic state is the record's). False: the draw can't be recorded. `capture`: a
+    /// recipe capture is armed (a CommitOnly draw captures in the old configure, step 15).
+    [[nodiscard]] bool PrepareDrawRecord(GraphicsPipeline& pipeline, bool is_indexed,
+                                         bool is_indirect, bool& recorded, bool capture);
+    /// Steps 16-17: a record from `base` (a recipe template, the pipeline's last record) into
+    /// `out` (Stale: tables synchronized and resolved again once).
+    VideoCommon::V2::Resolve::ResolveStatus ResolveRecordFromBase(
+        GraphicsPipeline& pipeline, bool is_indexed,
+        const VideoCommon::V2::Resolve::ResolvedDraw& base,
+        VideoCommon::V2::Resolve::ResolvedDraw& out,
+        VideoCommon::V2::Commit::RequestList& buffers, bool base_inputs_hold = false);
+    /// DRAWREC=1 (step 16): a recipe hit from its template in place of ConfigureRecipe.
+    [[nodiscard]] GraphicsPipeline::RecipeResult PrepareTemplateRecord(
+        GraphicsPipeline& pipeline, bool is_indexed, VideoCommon::V2::DrawCache::Recipe& recipe,
+        GraphicsPipeline::BufferReplay& buffers, bool& recorded);
+    /// DRAWREC=verify (step 16): the template path's record against the full resolve.
+    void VerifyTemplateRecord(GraphicsPipeline& pipeline, bool is_indexed,
+                              const VideoCommon::V2::DrawCache::Recipe& recipe);
+    VideoCommon::V2::Resolve::ResolvedDraw drawrec_scratch;
+    VideoCommon::V2::Commit::RequestList drawrec_scratch_buffers;
+    VideoCommon::V2::Commit::RequestList drawrec_scratch_textures;
+    /// Step 19 (G15): the per-draw debug and title hooks (OoT tracking, pending CPU writes,
+    /// render trace, frame dump pass, Dkb indirect readback), run after the draw's encode on
+    /// every path; the mesh survey and emulation stay with the mesh (commit-only) draws, the
+    /// native capture after the draw it reads.
+    void DrawHooks(GraphicsPipeline& pipeline, bool is_indexed, bool is_indirect, bool lean);
+    /// The last draw went through the record path (its pipeline's last record is its base).
+    bool drawrec_last_drawn{};
+    /// DRAWREC=1 (step 17): a continued draw from the pipeline's last record in place of
+    /// ConfigureDelta. False with `recorded` unset: not taken (ConfigureDelta runs).
+    [[nodiscard]] bool PrepareDeltaRecord(GraphicsPipeline& pipeline, bool is_indexed,
+                                          bool& recorded);
+    /// DRAWREC=verify (step 10): what a cache mutation moves, around a pure resolve.
+    struct DrawRecPurity {
+        u64 flags{};
+        u64 textures{};
+        u64 buffers{};
+        u64 heap_releases{};
+        u64 heap_generation{};
+        u64 commit_list{};
+        u64 record_mark{};
+        bool operator==(const DrawRecPurity&) const = default;
+    };
+    [[nodiscard]] DrawRecPurity TakeDrawRecPurity() const;
+    /// F2-01: the record a full resolve reuses sub-records from (never null).
+    [[nodiscard]] const VideoCommon::V2::Resolve::ResolvedDraw* DrawRecBase(
+        const GraphicsPipeline& pipeline);
+    /// Resolves the draw into drawrec_record (Stale: tables synchronized and resolved again
+    /// once; a second Stale is CommitOnly(Retry)); with `check`, around the purity snapshot.
+    VideoCommon::V2::Resolve::ResolveStatus ResolveDrawRecord(GraphicsPipeline& pipeline,
+                                                              bool is_indexed, bool is_indirect,
+                                                              bool check);
+    /// GPU::CollectedCpuWrites as the owner last applied them.
+    u64 commit_collected{};
+    u64 commit_batch{~0ULL}; ///< F2-17: the back batch whose start applied the CPU writes
+    /// Whether the calling thread owns the caches: the split's back while it runs, else the GPU
+    /// thread.
+    [[nodiscard]] bool IsCacheOwner() const;
+    /// The owner's commit point (each draw, dispatch and clear): applies collected guest CPU
+    /// writes and handed-over work before any lookup.
+    void CommitPoint();
+    void ServeExternal();
+    void ApplyExternal(const VideoCommon::V2::Commit::ExternalOp& op);
+    /// Runs `func` on the caches: at once on the owner (or before any owner exists), else as a
+    /// synchronous owner call.
+    template <typename Func>
+    void WithCaches(Func&& func);
+    /// The same for work nobody waits on: posted to the owner when the caller isn't it.
+    template <typename Func>
+    void PostOrRun(const VideoCommon::V2::Commit::ExternalOp& op, Func&& func);
+    /// Pushes `op` to the owner's queue, waking it while full. False once the owner stopped.
+    [[nodiscard]] bool PushToOwner(const VideoCommon::V2::Commit::ExternalOp& op);
+    /// Applies deferred buffer binds a failed configure left (with the lock unless lock free).
+    void CommitBindsAfterDraw();
+    /// AccelerateDisplay's body, with the caches held.
+    std::optional<FramebufferTextureInfo> AccelerateDisplayImpl(
+        const Tegra::FramebufferConfig& config, DAddr framebuffer_addr, u32 pixel_stride);
+    /// The cache parts of InvalidateRegion and OnCacheInvalidation (no locks).
+    void InvalidateRegionCaches(DAddr addr, u64 size, VideoCommon::CacheType which);
+
     static constexpr const u64 NEEDS_D24[] = {
         0x01006A800016E000ULL, // SSBU
         0x0100E95004038000ULL, // XC2
@@ -188,9 +318,57 @@ private:
     void CaptureIndirectTrace();
     void CollectIndirectTrace();
     void TraceDrawFailure(std::string_view reason);
+    /// Remembers render target 0 of a draw with one of Ocarina of Time's tonemap shaders.
+    void TrackOotTonemappedImage(const GraphicsPipeline& pipeline);
     bool TryNx2IndirectReset(bool is_indexed, u32 instance_count);
+    /// The env-gated per-draw debug hooks of Draw; true when the draw must be skipped
+    /// (EDEN_NX2_SKIP_VS).
+    bool DrawDebugHooks(bool is_indexed, u32 instance_count);
+    /// EDEN_NX2_V2_LEANDRAW: whether DrawDebugHooks can do anything (one cached gate).
+    [[nodiscard]] bool DrawHooksActive() const;
+    /// EDEN_NX2_NO_MESH / EDEN_NX2_NO_MESH_FILE: whether task/mesh draws are skipped.
+    bool NoMeshDebug();
+    /// EDEN_NX2_V2_LEANDRAW: whether the program is Ocarina's (-1: not known yet).
+    s8 oot_title{-1};
+    /// EDEN_NX2_V2_BINDLESS: the texture heap (vk_bindless_heap.h), null when off or unsupported.
+    std::unique_ptr<BindlessHeap> bindless_heap;
+    /// Pipeline v2: the program addresses whose write summaries were last recorded.
+    std::array<VAddr, 6> shader_write_addresses{};
+    const GraphicsPipeline* shader_write_pipeline{};
 
-    void FlushWork();
+    void FlushWork(u32 cost = 1);
+
+    /// EDEN_NX2_V2_ADAPTSUBMIT: FlushWork's adaptive form.
+    void AdaptiveFlushWork(u32 cost);
+    /// SYNC_SUBMIT_SPEC §7.3 fix 3 (MP §5.5 "chunk count"): a list end or a fence counts toward
+    /// rule C's chunks and cost like a draw, so a stream without draws is bounded too.
+    void NoteNonDrawWork(u32 cost);
+
+    /// A hint for the adaptive submission heuristic (no-op unless EDEN_NX2_V2_ADAPTSUBMIT).
+    /// `source` (SYNC §14.7 counters, strong hints): StrongSource bits.
+    void FlushHint(VideoCommon::V2::FlushHint hint, u8 source = 0);
+    /// SYNC §14.7: what asked for the strong hints since the last submission.
+    enum StrongSource : u8 {
+        StrongQuery = 1,
+        StrongTexture = 2,
+        StrongBuffer = 4,
+    };
+    u8 strong_sources{};
+    /// Resets the heuristic's counters when any submission happened since it last looked.
+    void SyncAdaptiveTick();
+    static u64 AdaptNowUs();
+    /// The GPU's progress and the recorder's state for the heuristic's decisions.
+    VideoCommon::V2::FlushState ReadFlushState();
+    /// F4-X2: the split's idle hook (Scheduler::ServeSplitIdleHook with DXVK's sync rule).
+    void ServeSplitIdleHook();
+    /// SYNC_SUBMIT_SPEC §11.2 invariant S, the split's idle-sleep hook (GpuSplit::SetIdleSleepHook):
+    /// `prepare` fences the unfenced and submits a due open tick; otherwise only says if one is due.
+    bool ServeIdleSleep(bool prepare);
+    /// SYNC_SUBMIT_SPEC §14 #3 rule I′, the split's batch-end hook (GpuSplit::SetBatchEndHook).
+    void ServeBatchEnd();
+    /// §11.2 step 1: puts operations with no fence, uncommitted query flushes and (with
+    /// `owed_writebacks`) the caches' uncommitted downloads on an observable fence. True if it made one.
+    bool FenceUnfenced(bool owed_writebacks);
 
     void TraceRenderState(bool is_indexed, const char* outcome, const Framebuffer* framebuffer);
 
@@ -224,7 +402,7 @@ private:
     void UpdateLineStipple(Tegra::Engines::Maxwell3D::Regs& regs);
     void UpdateLineRasterizationMode(Tegra::Engines::Maxwell3D::Regs& regs);
     void UpdateDepthBiasEnable(Tegra::Engines::Maxwell3D::Regs& regs);
-    void UpdateLogicOpEnable(Tegra::Engines::Maxwell3D::Regs& regs);
+    void UpdateLogicOpEnable(bool enable);
     void UpdateDepthClampEnable(Tegra::Engines::Maxwell3D::Regs& regs);
     void UpdateAlphaToCoverageEnable(Tegra::Engines::Maxwell3D::Regs& regs);
     void UpdateAlphaToOneEnable(Tegra::Engines::Maxwell3D::Regs& regs);
@@ -237,9 +415,27 @@ private:
 
     void UpdateVertexInput(Tegra::Engines::Maxwell3D::Regs& regs);
 
+    /// P6 Step 0 (EDEN_NX2_V2_DRAWREC): UpdateDynamicStates' control flow (state tracker
+    /// touches, the F2-08 mask test, the flags it sets) recording a draw record's values.
+    void EncodeDynamic(const VideoCommon::V2::Resolve::DynamicState& state,
+                       const GraphicsPipeline* pipeline);
+    /// The device features ComputeDynamic reads (refreshed when the title or a setting moves).
+    [[nodiscard]] const VideoCommon::V2::Resolve::DynamicFeatures& DrawRecFeatures();
+    /// The host has no D24 depth and the title rescales its D24 depth bias (NEEDS_D24).
+    [[nodiscard]] bool D24BiasRescale() const;
+    [[nodiscard]] u32 MaxVertexInputAttributes() const;
+    [[nodiscard]] u32 MaxVertexInputBindings() const;
+
     void FrameDumpPass(const Framebuffer* framebuffer);
     /// EDEN_NX2_PENDING_WRITE_TRACE: logs bound buffer ranges with collected, unapplied CPU writes.
     void TracePendingCpuWrites(bool compute, std::span<const u64> shader_hashes);
+#ifdef EGLANTINE_STREAMLINE
+    bool OcarinaDlssEnabled() const;
+    void TrackOcarinaCamera();
+    void TrackOcarinaActor(u64 shader_hash, bool is_indexed, bool is_indirect);
+    bool TryOcarinaDlss(const ComputePipeline& pipeline, bool replace);
+    void ReadOcarinaActor(struct OcarinaActorMesh& mesh);
+#endif
     /// Records the uniform and storage buffers of the current draw or dispatch for the frame dump.
     bool FrameDumpBuffers(bool compute, std::span<const u64> shader_hashes);
 
@@ -275,6 +471,39 @@ private:
     boost::container::static_vector<VkSampler, MAX_TEXTURES> sampler_handles;
 
     u32 draw_counter = 0;
+    /// EDEN_NX2_V2_ADAPTSUBMIT
+    bool adapt_submit = false;
+    u64 adapt_tick = 0; ///< The open tick the heuristic last saw (a change is a submission)
+    VideoCommon::V2::FlushHeuristic flush_heuristic;
+#ifdef EGLANTINE_STREAMLINE
+    std::optional<u64> oot_camera_sample_frame;
+    struct OcarinaMotionTrace {
+        const Tegra::MemoryManager* camera_channel{};
+        const Tegra::MemoryManager* depth_channel{};
+        u64 depth_frame{};
+        GPUVAddr depth_address{};
+        u32 depth_tic{};
+        VkExtent2D extent{};
+        std::array<f32, 16> current{};
+        std::array<f32, 16> previous{};
+    } oot_motion;
+    std::unique_ptr<class OcarinaLiveDlss> oot_live_dlss;
+    bool oot_live_failed{};
+    const char* oot_fallback_reason{};
+    u32 oot_fallback_repeats{};
+    std::optional<u64> oot_dlss_frame;
+    std::optional<u64> oot_4k_scene_frame;
+    VkImage oot_4k_guest_present{};
+    struct OcarinaActorPose {
+        u64 frame{};
+        const Tegra::MemoryManager* channel{};
+        GPUVAddr vertex{};
+        GPUVAddr indices{};
+        s32 base_vertex{};
+        std::array<f32, 4> origin{};
+        std::array<f32, 280 * 12> bones{};
+    } oot_actor, oot_previous_actor;
+#endif
     u64 render_trace_frame = 0;
     u32 render_trace_draws = 0;
     u32 render_trace_clears = 0;
@@ -282,6 +511,154 @@ private:
     bool mesh_draw{}; ///< the draw being prepared uses a task/mesh pipeline
     /// Fragment output components the dynamic color write mask was last recorded with
     u32 last_color_output_mask{};
+    VideoCommon::OotNetwork::BypassState oot_network_bypass;
+    u32 mesh_emulation_groups{};             ///< mesh workgroups of the emulated draw
+    u32 mesh_emulation_vertices_per_group{}; ///< 0 unless the draw is an emulated mesh draw
+    /// Mesh emulation diagnostics with a task program: one draw's distribution arguments.
+    struct {
+        std::span<const u8> args;
+        u64 tick{};
+        u32 tasks{};
+        u32 capacity{};
+        bool pending{};
+    } mesh_task_probe;
+    /// With a task program: the vkCmdDrawIndirect arguments the distribution pass writes.
+    struct {
+        VkBuffer buffer{};
+        VkDeviceSize offset{};
+    } mesh_emulation_indirect;
+    /// Mesh emulation diagnostics: one draw's output, read back once the GPU has written it.
+    struct MeshEmulationProbe {
+        std::span<const u8> data;
+        u64 tick{};
+        u64 frame{};
+        u32 groups{};
+        u32 block_words{};
+        u32 vertex_lines{};
+        u32 max_vertices{};
+        u32 max_primitives{};
+        std::array<u32, 4> position_lines{};
+        bool pending{};
+    } mesh_probe;
+    void ReadMeshEmulationProbe();
+    /// Mesh emulation with a task program: the output arena every task draw of a submission
+    /// allocates its mesh workgroups from, and its host-visible counter of allocated words.
+    struct MeshArena {
+        vk::Buffer buffer;
+        vk::Buffer counter;
+        u64 size{};
+        u64 tick{};
+        bool counted{}; ///< the counter of its last submission was read
+    };
+    std::vector<MeshArena> mesh_arenas;
+    size_t mesh_arena_current{~size_t{}};
+    u64 mesh_arena_size{64ULL << 20};
+    /// The current submission's arena, after its counter is reset.
+    const MeshArena& AcquireMeshArena();
+
+    /// Fast draw (nx2_fast_draw.h): what the last recorded draw left bound.
+    struct ReusableDraw {
+        GraphicsPipeline* pipeline{};
+        const Tegra::Engines::Maxwell3D* maxwell3d{};
+        u64 serial{};
+        u64 map_serial{};
+        u64 tick{};
+        u64 render_pass{};
+        u64 event_serial{}; ///< EDEN_NX2_V2_CONTDRAW: Nx2FastDraw::EventSerial()
+        Maxwell::PrimitiveTopology topology{};
+        bool is_indexed{};
+    };
+    enum class FullDraw : u8 {
+        NoCandidate,
+        Kind,
+        StateChanged,
+        Submitted,
+        RenderPass,
+        DeltaPipeline,
+        HandleBind,
+        HandleData,
+        SampledImages,
+        Count,
+    };
+    /// Why a recorded draw can't be followed by a delta draw.
+    enum class Ineligible : u8 {
+        Indirect,
+        Mesh,
+        NotBuilt,
+        WritesImages,
+        TransformFeedback,
+        InlineIndex,
+        Quads,
+        Repacked,
+        NoRenderPass,
+        PipelineNotBound,
+        OffBackThread,
+        Count,
+    };
+    enum class DrawPath : u8 { Full, Delta, Count };
+    struct FastDrawStats {
+        u64 delta{};
+        std::array<u64, static_cast<size_t>(FullDraw::Count)> full{};
+        std::array<u64, static_cast<size_t>(Ineligible::Count)> ineligible{};
+        /// PrepareDraw time and draws per path.
+        std::array<u64, static_cast<size_t>(DrawPath::Count)> prepare_ns{};
+        std::array<u64, static_cast<size_t>(DrawPath::Count)> prepare_draws{};
+        /// EDEN_NX2_FAST_DRAW_VERIFY
+        u64 verified{};
+        u64 pipeline_mismatches{};
+        u64 view_mismatches{};
+        u64 binding_mismatches{};
+        /// DeltaPipeline draws by GraphicsPipeline::DeltaDrawBlocker.
+        std::array<u64, static_cast<size_t>(GraphicsPipeline::DeltaBlocker::Count)> delta_blockers{};
+        /// StateChanged draws by the reason of the last break, and by its 3D method.
+        std::array<u64, static_cast<size_t>(VideoCommon::Nx2FastDraw::Reason::Count)> breaks{};
+        std::array<u32, Maxwell::NUM_REGS> break_methods{};
+        u64 window_start{};
+    };
+    /// The pipeline the draw can take the delta path with, or null for a full resolve. Clears
+    /// the remembered draw either way: only a recorded draw remembers one again.
+    GraphicsPipeline* TakeReusableDraw(bool is_indexed, bool is_indirect);
+    /// Whether the draw TakeReusableDraw took still holds once the caches are locked (serial and
+    /// map_serial as read then), and the images it samples need no preparing.
+    bool DeltaStillHolds(u64 serial, u64 map_serial);
+    void NoteResolvedDraw(GraphicsPipeline* pipeline, bool is_indexed, bool is_indirect, u64 serial,
+                          u64 map_serial, u64 event_serial);
+    void ReportFastDraws();
+    /// Pipeline v2 (EDEN_NX2_V2_CONTDRAW): the groups changed since the candidate draw allow a
+    /// continued draw of `draw`; may look the pipeline up (kept in cont_lookup).
+    bool ContinuedDrawHolds(const ReusableDraw& draw);
+    /// Pipeline v2 P3: the register groups changed since the last resolved draw that the bound
+    /// pipeline can see (relevance masking by shader use).
+    [[nodiscard]] u32 RelevantGroups(u32 groups, const GraphicsPipeline& pipeline,
+                                     const VideoCommon::Nx2FastDraw::Delta& delta,
+                                     bool is_indexed) const;
+    /// The pipeline ContinuedDrawHolds looked up for this draw (PrepareDraw takes it instead of
+    /// a second lookup), valid while cont_lookup_valid.
+    GraphicsPipeline* cont_lookup{};
+    bool cont_lookup_valid{};
+    bool logic_op_enable_recorded{}; ///< The last SetLogicOpEnableEXT value (UpdateLogicOpEnable)
+    /// Serial() when TakeReusableDraw took a continued draw (register changes allowed).
+    u64 cont_take_serial{};
+    /// The delta TakeReusableDraw took, kept for the relevance stats.
+    VideoCommon::Nx2FastDraw::Delta cont_delta{};
+    ReusableDraw reusable_draw;
+    ReusableDraw taken_draw; ///< The draw TakeReusableDraw last returned the pipeline of
+    /// Device memory of the constant buffers TakeReusableDraw checks for texture handle writes.
+    std::array<std::array<VideoCommon::Nx2FastDraw::DeviceSpans, Maxwell::MaxConstBuffers>,
+               Maxwell::MaxShaderStage>
+        handle_spans;
+    FastDrawStats fast_draw_stats;
+    /// EDEN_NX2_V2_DRAWCACHE (P4): the draw/dispatch recipe cache, made on first use.
+    std::unique_ptr<DrawCacheGlue> draw_cache;
+    [[nodiscard]] DrawCacheGlue& DrawCache() {
+        if (!draw_cache) [[unlikely]] {
+            draw_cache = std::make_unique<DrawCacheGlue>(device_memory);
+        }
+        return *draw_cache;
+    }
+    /// Nx2FastDraw::Enabled and VerifyEnabled as the drawing thread last read them.
+    bool fast_draw_on{};
+    bool fast_draw_verify{};
 
     struct IndirectTrace {
         vk::Buffer readback;

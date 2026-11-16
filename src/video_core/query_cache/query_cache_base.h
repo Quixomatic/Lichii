@@ -75,9 +75,9 @@ public:
     /// Writes out the finalized reports in the region. True when some still wait for host results.
     bool SemiFlushRegion(VAddr addr, std::size_t size) {
         bool result = false;
+        // Visits every query in the range: each final value not written yet is written here.
         IterateCache<false>(addr, size, [this, &result](QueryLocation location) {
             result |= SemiFlushQueryDirty(location);
-            return result;
         });
         return result;
     }
@@ -109,7 +109,12 @@ public:
     void CounterReport(GPUVAddr addr, QueryType counter_type, QueryPropertiesFlags flags,
                        u32 payload, u32 subreport);
 
-    void NotifyWFI();
+    /// `at_pass_end` (SYNC Step 9, the guest's wait for idle): with the range tracker the copies
+    /// may run at the open pass's end. A fence's commit (CommitAsyncFlushes) syncs at once.
+    void NotifyWFI(bool at_pass_end = false);
+    /// NotifyWFI's work: the pending query results copied out (SYNC Step 9: may run at the end of
+    /// the open pass).
+    void SyncQueryWrites();
 
     bool AccelerateHostConditionalRendering();
 
@@ -132,8 +137,10 @@ public:
 protected:
     template <bool remove_from_cache, typename Func>
     void IterateCache(VAddr addr, std::size_t size, Func&& func) {
+        // invoke_result_t: with invoke_result (the trait, never bool) callbacks returning bool
+        // never ended the walk early.
         static constexpr bool RETURNS_BOOL =
-            std::is_same_v<std::invoke_result<Func, QueryLocation>, bool>;
+            std::is_same_v<std::invoke_result_t<Func, QueryLocation>, bool>;
         const u64 addr_begin = addr;
         const u64 addr_end = addr_begin + size;
 

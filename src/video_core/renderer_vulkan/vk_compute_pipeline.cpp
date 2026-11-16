@@ -222,9 +222,58 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
 
     DescriptorLayoutBuilder builder{device};
     builder.Add(info, VK_SHADER_STAGE_COMPUTE_BIT);
+    // EDEN_NX2_V2_BINDLESS: the pipeline cache marked heap descriptors before emission.
+    BindlessHeap* const heap = BindlessHeap::Active();
+    heap_pipeline = heap != nullptr && (info.heap_texture_mask != 0 || info.heap_image_mask != 0 ||
+                                        info.heap_texel_mask != 0 ||
+                                        info.heap_image_buffer_mask != 0);
+    if (heap_pipeline) {
+        heap_texels = MakeHeapTexelMasks(info);
+    }
+    // EDEN_NX2_V2_DRAWCACHE: what a dispatch recipe records and replays.
+    {
+        bool computed = false;
+        const auto note = [&](const auto& descriptors) {
+            for (const auto& desc : descriptors) {
+                computed |= desc.handle_program != ~0U;
+                handle_constant_buffers |= 1U << desc.cbuf_index;
+            }
+        };
+        note(info.texture_buffer_descriptors);
+        note(info.image_buffer_descriptors);
+        note(info.texture_descriptors);
+        note(info.image_descriptors);
+        for (const auto& desc : info.texture_descriptors) {
+            if (desc.has_secondary) {
+                handle_constant_buffers |= 1U << desc.secondary_cbuf_index;
+            }
+        }
+        for (const auto& desc : info.texture_buffer_descriptors) {
+            if (desc.has_secondary) {
+                handle_constant_buffers |= 1U << desc.secondary_cbuf_index;
+            }
+        }
+        const bool byte_addressed = std::ranges::any_of(
+            info.image_descriptors, [](const auto& desc) { return desc.is_byte_addressed; });
+        recipe_eligible = !computed && !byte_addressed;
+    }
+    heap_reasons = info.heap_block_reasons;
+    if (heap_pipeline) {
+        heap_push.heap = heap;
+        heap_push.verify = VideoCommon::V2::Verify(VideoCommon::V2::Switch::Bindless);
+        heap_words_pushed = info.heap_words_pushed;
+        if (!heap_words_pushed) {
+            const bool added = builder.AddHeapWords();
+            ASSERT(added);
+            ++num_descriptor_entries;
+        }
+    }
 
     uses_push_descriptor = builder.CanUsePushDescriptor();
-    uses_descriptor_buffer = builder.CanUseDescriptorBuffer() && descriptor_buffer_ring.IsValid();
+    // While the heap exists no pipeline uses descriptor buffers (one descriptor model per
+    // command buffer, see GraphicsPipeline).
+    uses_descriptor_buffer = heap == nullptr && builder.CanUseDescriptorBuffer() &&
+                             descriptor_buffer_ring.IsValid();
     descriptor_set_layout =
         builder.CreateDescriptorSetLayout(uses_push_descriptor, uses_descriptor_buffer);
     if (uses_descriptor_buffer) {
@@ -239,7 +288,8 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
             descriptor_set_layout = builder.CreateDescriptorSetLayout(false);
         }
     }
-    pipeline_layout = builder.CreatePipelineLayout(*descriptor_set_layout);
+    pipeline_layout =
+        builder.CreatePipelineLayout(*descriptor_set_layout, heap_pipeline ? heap : nullptr);
     if (!uses_descriptor_buffer) {
         descriptor_update_template =
             builder.CreateTemplate(*descriptor_set_layout, *pipeline_layout, uses_push_descriptor);
@@ -359,11 +409,38 @@ void ComputePipeline::RunBuild() {
     build_task = nullptr;
 }
 
+bool ComputePipeline::CanReplaceOcarinaUpscale() const {
+    const bool known_shader =
+        shader_hash == 0xe40f5efb5480e692ULL || shader_hash == Ocarina1440pShader;
+    return known_shader && !info.stores_global_memory &&
+           info.image_buffer_descriptors.empty() && info.image_descriptors.size() == 1 &&
+           info.image_descriptors.front().count == 1 && info.image_descriptors.front().is_written &&
+           !info.image_descriptors.front().is_read && !info.image_descriptors.front().is_byte_addressed &&
+           std::ranges::none_of(info.storage_buffers_descriptors, &Shader::StorageBufferDescriptor::is_written);
+}
+
 bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
                                 Tegra::MemoryManager& gpu_memory, Scheduler& scheduler,
                                 BufferCache& buffer_cache, TextureCache& texture_cache,
                                 TextureCacheRuntime& texture_runtime,
-                                std::optional<ByteAddressedShadow>& shadow) {
+                                std::optional<ByteAddressedShadow>& shadow,
+                                BindCommand* deferred_bind) {
+    // EDEN_NX2_V2_DRAWCACHE: one branch; the plain path has no recipe code.
+    if (recipe_capture != nullptr || recipe_replay != nullptr) [[unlikely]] {
+        return ConfigureImpl<true>(kepler_compute, gpu_memory, scheduler, buffer_cache,
+                                   texture_cache, texture_runtime, shadow, deferred_bind);
+    }
+    return ConfigureImpl<false>(kepler_compute, gpu_memory, scheduler, buffer_cache, texture_cache,
+                                texture_runtime, shadow, deferred_bind);
+}
+
+template <bool Recipes>
+bool ComputePipeline::ConfigureImpl(Tegra::Engines::KeplerCompute& kepler_compute,
+                                    Tegra::MemoryManager& gpu_memory, Scheduler& scheduler,
+                                    BufferCache& buffer_cache, TextureCache& texture_cache,
+                                    TextureCacheRuntime& texture_runtime,
+                                    std::optional<ByteAddressedShadow>& shadow,
+                                    BindCommand* deferred_bind) {
     shadow.reset();
     guest_descriptor_queue.Acquire(scheduler, num_descriptor_entries, uses_descriptor_buffer);
 
@@ -373,7 +450,9 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
     for (const auto& desc : info.storage_buffers_descriptors) {
         ASSERT(desc.count == 1);
         buffer_cache.BindComputeStorageBuffer(ssbo_index, desc.cbuf_index, desc.cbuf_offset,
-                                              desc.is_written, desc.indirect_offset);
+                                              desc.is_written, desc.indirect_offset,
+
+                                              desc.write_extent);
         ++ssbo_index;
     }
 
@@ -387,6 +466,9 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
     const bool via_header_index{qmd.linked_tsc != 0};
     const auto read_handle{[&](const auto& desc, u32 index) {
         if (desc.handle_program != ~0U) {
+            if (Recipes && recipe_capture != nullptr) {
+                recipe_capture->ineligible = true;
+            }
             // Read by the shader from a storage buffer: computed for this dispatch.
             return TexturePair(VideoCommon::EvaluateTextureHandle(
                                    info, desc.handle_program, gpu_memory,
@@ -411,12 +493,22 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
                 const u32 secondary_offset{desc.secondary_cbuf_offset};
                 const GPUVAddr separate_addr{cbufs[desc.secondary_cbuf_index].Address() +
                                              secondary_offset};
-                const u32 lhs_raw{gpu_memory.Read<u32>(addr) << desc.shift_left};
-                const u32 rhs_raw{gpu_memory.Read<u32>(separate_addr) << desc.secondary_shift_left};
+                const u32 lhs_word{gpu_memory.Read<u32>(addr)};
+                const u32 rhs_word{gpu_memory.Read<u32>(separate_addr)};
+                if (Recipes && recipe_capture != nullptr) {
+                    recipe_capture->AddWord(addr, lhs_word);
+                    recipe_capture->AddWord(separate_addr, rhs_word);
+                }
+                const u32 lhs_raw{lhs_word << desc.shift_left};
+                const u32 rhs_raw{rhs_word << desc.secondary_shift_left};
                 return TexturePair(lhs_raw | rhs_raw, via_header_index);
             }
         }
-        return TexturePair(gpu_memory.Read<u32>(addr), via_header_index);
+        const u32 word{gpu_memory.Read<u32>(addr)};
+        if (Recipes && recipe_capture != nullptr) {
+            recipe_capture->AddWord(addr, word);
+        }
+        return TexturePair(word, via_header_index);
     }};
     const auto add_image{[&](const auto& desc, bool blacklist) {
         for (u32 index = 0; index < desc.count; ++index) {
@@ -428,25 +520,68 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
             });
         }
     }};
-    for (const auto& desc : info.texture_buffer_descriptors) {
-        add_image(desc, false);
-    }
-    for (const auto& desc : info.image_buffer_descriptors) {
-        add_image(desc, false);
-    }
-    for (const auto& desc : info.texture_descriptors) {
-        for (u32 index = 0; index < desc.count; ++index) {
-            const auto handle{read_handle(desc, index)};
-            views.push_back({handle.first});
+    if (Recipes && recipe_replay != nullptr) {
+        // EDEN_NX2_V2_DRAWCACHE: the recipe proved the handles, descriptors and views current.
+        for (const auto& view : recipe_replay->views) {
+            views.push_back({
+                .index = view.index,
+                .blacklist = view.blacklist,
+                .id = VideoCommon::ImageViewId{view.id},
+            });
+        }
+        for (const auto& sampler : recipe_replay->samplers) {
+            samplers.push_back(VideoCommon::SamplerId{sampler.id});
+        }
+        if (views.size() != Shader::NumDescriptors(info.texture_buffer_descriptors) +
+                                Shader::NumDescriptors(info.image_buffer_descriptors) +
+                                Shader::NumDescriptors(info.texture_descriptors) +
+                                Shader::NumDescriptors(info.image_descriptors) ||
+            samplers.size() != Shader::NumDescriptors(info.texture_descriptors) ||
+            !texture_cache.PrepareRecipeViews(std::span(views.data(), views.size()))) {
+            recipe_replay_failed = true;
+            return false;
+        }
+    } else {
+        for (const auto& desc : info.texture_buffer_descriptors) {
+            add_image(desc, false);
+        }
+        for (const auto& desc : info.image_buffer_descriptors) {
+            add_image(desc, false);
+        }
+        texture_cache.BeginSamplerLookups();
+        for (const auto& desc : info.texture_descriptors) {
+            for (u32 index = 0; index < desc.count; ++index) {
+                const auto handle{VideoCommon::HandleIsStoragePointer(info, desc, index)
+                                      ? VideoCommon::NULL_TEXTURE_HANDLE
+                                      : read_handle(desc, index)};
+                views.push_back({handle.first});
 
-            VideoCommon::SamplerId sampler = texture_cache.GetSamplerId(handle.second, true);
-            samplers.push_back(sampler);
+                VideoCommon::SamplerId sampler = texture_cache.GetSamplerId(handle.second, true);
+                samplers.push_back(sampler);
+                if (Recipes && recipe_capture != nullptr) {
+                    recipe_capture->tsc_indices.push_back(handle.second);
+                }
+            }
+        }
+        for (const auto& desc : info.image_descriptors) {
+            add_image(desc, desc.is_written);
+        }
+        texture_cache.FillImageViews(std::span(views.data(), views.size()), true, true,
+                                     std::span(samplers.data(), samplers.size()));
+        if (Recipes && recipe_capture != nullptr) {
+            for (const VideoCommon::ImageViewInOut& view : views) {
+                recipe_capture->views.push_back({
+                    .index = view.index,
+                    .id = view.id.index,
+                    .generation = 0,
+                    .blacklist = view.blacklist,
+                });
+            }
+            for (const VideoCommon::SamplerId sampler : samplers) {
+                recipe_capture->samplers.push_back(sampler.index);
+            }
         }
     }
-    for (const auto& desc : info.image_descriptors) {
-        add_image(desc, desc.is_written);
-    }
-    texture_cache.FillImageViews(std::span(views.data(), views.size()), true);
     if (auto& trace{GetUpscalerTrace()}; trace.enabled && kepler_compute.IsNativeMode()) {
         const u64 frame{trace.frame.load(std::memory_order_relaxed)};
         if (!trace.armed && frame >= trace.first_frame && info.uses_subgroup_shuffles) {
@@ -461,7 +596,7 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
         }
     }
 
-    if (RecordingSampledTextures()) {
+    if (RecordingSampledTextures() || deferred_bind) {
         sampled_images.clear();
         const size_t first = Shader::NumDescriptors(info.texture_buffer_descriptors) +
                              Shader::NumDescriptors(info.image_buffer_descriptors);
@@ -568,8 +703,21 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
     std::ranges::for_each(info.texture_buffer_descriptors, add_buffer);
     std::ranges::for_each(info.image_buffer_descriptors, add_buffer);
 
+    // The heap words start with the texel buffers' (EDEN_NX2_V2_HEAP_TEXEL), bound next.
+    heap_push.words.clear();
+    HeapPushData heap_data{}; ///< pushed at HEAP_PUSH_OFFSET
     buffer_cache.UpdateComputeBuffers();
-    buffer_cache.BindHostComputeBuffers();
+    if (heap_texels.heap != 0) [[unlikely]] {
+        buffer_cache.runtime.BeginHeapTexels(heap_push.words, heap_texels.heap,
+                                             heap_texels.storage, heap_texels.integer,
+                                             heap_push.verify);
+        buffer_cache.BindHostComputeBuffers();
+        buffer_cache.runtime.EndHeapTexels();
+    } else {
+        buffer_cache.BindHostComputeBuffers();
+    }
+    // EDEN_NX2_V2_COMMIT: the deferred buffer mutations land before the dispatch is encoded.
+    buffer_cache.CommitBinds();
     if (buffer_cache.any_buffer_uploaded) {
         buffer_cache.runtime.PostCopyBarrier();
         buffer_cache.any_buffer_uploaded = false;
@@ -578,26 +726,65 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
     RescalingPushConstant rescaling;
     const VideoCommon::SamplerId* samplers_it{samplers.data()};
     const VideoCommon::ImageViewInOut* views_it{views.data()};
+    HeapPushConstant* const heap{heap_pipeline ? &heap_push : nullptr};
     if (!shadow) {
         PushImageDescriptors(texture_cache, guest_descriptor_queue, info, rescaling, samplers_it,
-                             views_it);
+                             views_it, heap);
     } else {
         auto sampled_info{info};
         sampled_info.image_descriptors.clear();
         PushImageDescriptors(texture_cache, guest_descriptor_queue, sampled_info, rescaling,
-                             samplers_it, views_it);
-        for (const auto& desc : info.image_descriptors) {
+                             samplers_it, views_it, heap);
+        for (size_t desc_index = 0; desc_index < info.image_descriptors.size(); ++desc_index) {
+            const auto& desc{info.image_descriptors[desc_index]};
+            // The shadow copy is byte-addressed, which never reads the heap.
+            const bool in_heap{heap != nullptr &&
+                               Shader::Backend::SPIRV::UsesHeapImage(info, desc_index)};
             bool is_rescaled{};
             for (u32 i = 0; i < desc.count; ++i) {
                 const size_t view_index{static_cast<size_t>(views_it - views.data())};
                 auto& view{texture_cache.GetImageView((views_it++)->id)};
                 const VkImageView storage{view_index == *shadow_index ? shadow->view :
                     view.StorageView(desc.type, desc.format, desc.is_byte_addressed)};
-                guest_descriptor_queue.AddImage(storage);
+                if (in_heap) {
+                    heap_push.words.push_back(heap_push.heap->ImageSlot(
+                        Shader::Backend::SPIRV::HeapStorageBinding(desc.type, desc.is_integer),
+                        storage));
+                } else {
+                    guest_descriptor_queue.AddImage(storage);
+                }
                 is_rescaled |= texture_cache.IsRescaling(view);
             }
             rescaling.PushImage(is_rescaled);
         }
+    }
+    if (heap_pipeline) {
+        // The heap slots this configure reserved get their descriptors (P5a).
+        heap_push.heap->Commit();
+        // EDEN_NX2_V2_BINDLESS: the dispatch's heap words as push constants, or (more than
+        // they hold) in the word table with the dispatch's first word pushed.
+        std::vector<u32>& words = heap_push.words;
+        if (words.empty()) {
+            words.push_back(0);
+        }
+        if (heap_words_pushed) {
+            const size_t count = (std::min)(words.size(), heap_data.words.size());
+            std::copy_n(words.begin(), count, heap_data.words.begin());
+            heap_data.count = static_cast<u32>(count);
+        } else {
+            heap_data.words[0] =
+                heap_table.Append(words, scheduler.CurrentTick(), [&buffer_cache](size_t bytes) {
+                    return buffer_cache.runtime.UploadStagingBuffer(bytes);
+                });
+            heap_data.count = 1;
+            guest_descriptor_queue.AddBuffer(heap_table.buffer, heap_table.offset,
+                                             heap_table.size);
+        }
+    }
+    if (VideoCommon::V2::P3Stats::Enabled() && !views.empty() &&
+        BindlessHeap::Active() != nullptr) {
+        CountHeapCoverage(heap_pipeline, heap_reasons,
+                          static_cast<u32>(heap_push.words.size()), true);
     }
 
     if (guest_descriptor_queue.UpdateCount() != num_descriptor_entries) {
@@ -637,7 +824,8 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
     }
 
     const bool bind_descriptor_buffer{
-        uses_descriptor_buffer && scheduler.UpdateDescriptorBufferChunk(descriptor_buffer_chunk)};
+        uses_descriptor_buffer &&
+        (deferred_bind || scheduler.UpdateDescriptorBufferChunk(descriptor_buffer_chunk))};
 
     if (shadow) {
         image_index = Shader::NumDescriptors(info.texture_buffer_descriptors) +
@@ -654,9 +842,16 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
     }
 
     const bool is_rescaling = !info.texture_descriptors.empty() || !info.image_descriptors.empty();
-    scheduler.Record([this, descriptor_data, is_rescaling, descriptor_buffer_offset,
-                      descriptor_buffer_chunk, bind_descriptor_buffer,
+    auto bind = [this, descriptor_data, is_rescaling, descriptor_buffer_offset,
+                      descriptor_buffer_chunk, bind_descriptor_buffer, heap_data,
                       rescaling_data = rescaling.Data()](vk::CommandBuffer cmdbuf) {
+        if (heap_pipeline && pipeline) {
+            // EDEN_NX2_V2_BINDLESS: the heap set, with every dispatch (its pipeline is bound
+            // again below too).
+            const VkDescriptorSet heap_set{heap_push.heap->Set()};
+            cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, *pipeline_layout,
+                                      Shader::Backend::SPIRV::HEAP_SET, heap_set, nullptr);
+        }
         if (bind_descriptor_buffer) {
             const VkDescriptorBufferBindingInfoEXT binding_info{
                 descriptor_buffer_ring.BindingInfo(descriptor_buffer_chunk)};
@@ -666,6 +861,13 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
             return;
         }
         cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, *pipeline);
+        if (heap_data.count != 0) {
+            // EDEN_NX2_V2_BINDLESS: the heap words (or the word table base).
+            cmdbuf.PushConstants(*pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
+                                 Shader::Backend::SPIRV::HEAP_PUSH_OFFSET,
+                                 static_cast<u32>(heap_data.count * sizeof(u32)),
+                                 heap_data.words.data());
+        }
         if (!descriptor_set_layout) {
             return;
         }
@@ -688,7 +890,12 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
             cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, *pipeline_layout, 0,
                                       descriptor_set, nullptr);
         }
-    });
+    };
+    if (deferred_bind) {
+        *deferred_bind = std::move(bind);
+    } else {
+        scheduler.Record(std::move(bind));
+    }
     return true;
 }
 

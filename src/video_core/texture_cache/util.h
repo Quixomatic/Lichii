@@ -15,6 +15,7 @@
 #include "common/common_types.h"
 #include "common/scratch_buffer.h"
 
+#include "video_core/v2/gpu_unswizzle.h"
 #include "video_core/surface.h"
 #include "video_core/texture_cache/image_base.h"
 #include "video_core/texture_cache/types.h"
@@ -103,6 +104,17 @@ struct UnswizzlePlan {
 void ExecuteUnswizzlePlan(Tegra::MemoryManager& gpu_memory, const UnswizzlePlan& plan,
                          std::span<u8> output);
 
+/// EDEN_NX2_V2_GPUDECODE: UnswizzleImage's loop as compute segments (one per level and layer)
+/// and the same copies; nothing when a segment's output isn't 4-byte aligned or the image isn't
+/// block linear.
+struct GpuUnswizzlePlan {
+    std::vector<V2::GpuUnswizzle::Segment> segments;
+    boost::container::small_vector<BufferImageCopy, 16> copies;
+    u64 output_size = 0;
+};
+[[nodiscard]] std::optional<GpuUnswizzlePlan> PlanGpuUnswizzle(const ImageInfo& info,
+                                                                bool native_tiling);
+
 [[nodiscard]] boost::container::small_vector<BufferImageCopy, 16> UnswizzleImage(
     Tegra::MemoryManager& gpu_memory, GPUVAddr gpu_addr, const ImageInfo& info,
     std::span<const u8> input, std::span<u8> output,
@@ -139,6 +151,12 @@ void ConvertImage(std::span<const u8> input, const ImageInfo& info, std::span<u8
 [[nodiscard]] Extent3D MipSize(Extent3D size, u32 level);
 
 [[nodiscard]] Extent3D MipBlockSize(const ImageInfo& info, u32 level);
+
+/// Whether `copies` from `src` write every texel of `dst` unscaled: same 2D format, every level
+/// and layer from the origin. False when either image is rescaled or lacks part of its host
+/// memory (sparse, unbacked, trimmed levels).
+[[nodiscard]] bool CopiesWriteWholeImage(const ImageBase& dst, const ImageBase& src,
+                                         std::span<const ImageCopy> copies);
 
 [[nodiscard]] boost::container::small_vector<SwizzleParameters, 16> FullUploadSwizzles(
     const ImageInfo& info);

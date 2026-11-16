@@ -10,6 +10,7 @@
 #include "common/scope_exit.h"
 #include "core/core.h"
 #include "core/core_timing.h"
+#include "core/hle/kernel/guest_wait_debug.h"
 #include "core/hle/kernel/k_hardware_timer.h"
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/kernel/k_scheduler.h"
@@ -185,6 +186,10 @@ void SleepThread(Core::System& system, s64 ns) {
 
         // Sleep.
         // NOTE: Nintendo does not check the result of this sleep.
+        // SYNC §14.8 H-14.8: named in the GPU front's 2 s waiter dump while it sleeps.
+        const GuestWaitDebug::Scope wait_debug{GetCurrentThreadPointer(kernel),
+                                               GuestWaitDebug::Kind::Sleep,
+                                               static_cast<u64>(ns)};
         static_cast<void>(GetCurrentThread(kernel).Sleep(kernel, timeout));
     } else if (yield_type == Svc::YieldType::WithoutCoreMigration) {
         KScheduler::YieldWithoutCoreMigration(kernel);

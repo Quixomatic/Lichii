@@ -230,11 +230,18 @@ bool Swapchain::AcquireNextImage(bool may_flush) {
     return false;
 }
 
-void Swapchain::Present(VkSemaphore render_semaphore) {
+u64 Swapchain::Present(VkSemaphore render_semaphore) {
     const auto present_queue{device.GetPresentQueue()};
+    const u64 present_id = device.HasPresentWait() ? ++next_present_id : 0;
+    const VkPresentIdKHR present_id_info{
+        .sType = VK_STRUCTURE_TYPE_PRESENT_ID_KHR,
+        .pNext = nullptr,
+        .swapchainCount = 1,
+        .pPresentIds = &present_id,
+    };
     const VkPresentInfoKHR present_info{
         .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
-        .pNext = nullptr,
+        .pNext = present_id != 0 ? &present_id_info : nullptr,
         .waitSemaphoreCount = render_semaphore ? 1U : 0U,
         .pWaitSemaphores = &render_semaphore,
         .swapchainCount = 1,
@@ -263,9 +270,22 @@ void Swapchain::Present(VkSemaphore render_semaphore) {
     if (frame_index >= image_count) {
         frame_index = 0;
     }
+    return present_id;
+}
+
+bool Swapchain::WaitForPresent(u64 id, u64 timeout_ns) {
+    if (id == 0 || !swapchain) {
+        return true;
+    }
+    const VkResult result = device.GetDispatchLoader().vkWaitForPresentKHR(
+        *device.GetLogical(), *swapchain, id, timeout_ns);
+    return result == VK_SUCCESS || result == VK_SUBOPTIMAL_KHR ||
+           result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_ERROR_SURFACE_LOST_KHR;
 }
 
 void Swapchain::CreateSwapchain(const VkSurfaceCapabilitiesKHR& capabilities) {
+    ++generation;
+    next_present_id = 0;
     const auto physical_device{device.GetPhysical()};
     const auto formats{physical_device.GetSurfaceFormatsKHR(VkSurfaceKHR(surface))};
     const auto present_modes = physical_device.GetSurfacePresentModesKHR(VkSurfaceKHR(surface));

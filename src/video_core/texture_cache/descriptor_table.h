@@ -36,6 +36,7 @@ public:
         // Cleared on the next read: the texture cache invalidates every channel's tables for
         // each image it deletes, dozens of times a frame while its collector runs.
         invalidated = true;
+        ++changes;
     }
 
     std::span<Id> LiveBoundIds() noexcept {
@@ -73,9 +74,29 @@ public:
         return result;
     }
 
+    /// Pipeline v2 P5a: what Read would return, without caching anything (a pure lookup).
+    template <class MemoryManager>
+    [[nodiscard]] std::pair<T, bool> Peek(const MemoryManager& gpu_memory, u32 index) const noexcept {
+        const GPUVAddr gpu_addr = current_gpu_addr + index * sizeof(T);
+        std::pair<T, bool> result;
+        const bool one_page =
+            (gpu_addr & Core::Memory::YUZU_PAGEMASK) + sizeof(T) <= Core::Memory::YUZU_PAGESIZE;
+        if (const u8* const host = one_page ? gpu_memory.GetPointer(gpu_addr) : nullptr) {
+            std::memcpy(std::addressof(result.first), host, sizeof(T));
+        } else {
+            gpu_memory.ReadBlockUnsafe(gpu_addr, std::addressof(result.first), sizeof(T));
+        }
+        const bool known =
+            !invalidated && index / 64 < read_descriptors.size() &&
+            (read_descriptors[index / 64] & (1ULL << (index % 64))) != 0;
+        result.second = !known || result.first != descriptors[index];
+        return result;
+    }
+
     void Refresh(GPUVAddr gpu_addr, u32 limit) noexcept {
         current_gpu_addr = gpu_addr;
         current_limit = limit;
+        ++changes;
         // Mario Brothership reallocates a lot of times, so use aggressive pre-alloc sizes
         // std::vector<T> by default uses quadratic growth, but that isn't even enough to satisfy brothership
         const size_t num_descriptors = ((limit + 0x80000) & (~0x7ffff)) + 1;
@@ -93,6 +114,9 @@ public:
     GPUVAddr current_gpu_addr{};
     u32 current_limit{};
     bool invalidated{}; ///< read_descriptors is to be cleared before the next read
+    /// Bumped by every Invalidate and Refresh: the ids and descriptors read before are only good
+    /// while it stays the same.
+    u64 changes{};
 
 private:
     void ClearReadDescriptors() noexcept {

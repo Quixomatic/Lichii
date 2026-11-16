@@ -12,6 +12,7 @@
 #include <catch2/generators/catch_generators.hpp>
 
 #include "common/page_table.h"
+#include "common/scope_exit.h"
 #include "core/core.h"
 #include "core/device_memory.h"
 #include "core/hle/kernel/k_process.h"
@@ -23,6 +24,9 @@
 #include "video_core/control/channel_state.h"
 #include "video_core/gpu.h"
 #include "video_core/renderer_null/null_rasterizer.h"
+#include "video_core/v2/draw_cache.h"
+#include "video_core/v2/v2_switches.h"
+#include "video_core/v2/versions.h"
 
 namespace {
 
@@ -129,13 +133,50 @@ struct Runtime {
         ++host_read_barriers;
         Finish();
     }
-    void BindUniformBuffer(Buffer&, u32, u32) {}
+    void BindUniformBuffer(Buffer&, u32, u32) {
+        ++uniform_binds;
+    }
     std::span<u8> BindMappedUniformBuffer(size_t, u32, u32 size) {
         stream.resize(size);
+        ++stream_copies;
+        last_ref = StreamUniformRef{stream_copies};
         return stream;
     }
+    // Stream uniform references (P3 versions, P4 buffer replay).
+    struct StreamUniformRef {
+        u32 serial;
+    };
+    StreamUniformRef LastStreamUniformRef() const {
+        return last_ref;
+    }
+    void RebindStreamUniform(const StreamUniformRef&, u32) {
+        ++stream_rebinds;
+    }
+    u64 CurrentTick() const {
+        return current_tick;
+    }
+    void ClearBuffer(Buffer&, u64, u64, u32) {}
+    void CopyBuffer(Buffer& dst, Buffer& src, std::span<const VideoCommon::BufferCopy> copies, bool) {
+        for (const auto& copy : copies) {
+            std::memcpy(dst.bytes.data() + copy.dst_offset, src.bytes.data() + copy.src_offset,
+                        copy.size);
+        }
+    }
+    bool AnyVertexRepacked() const {
+        return false;
+    }
+    bool WidensUint8IndicesOnHost() const {
+        return false;
+    }
+    void BindStorageBuffer(Buffer&, u32, u32, bool) {
+        ++storage_binds;
+    }
+    void BindTextureBuffer(Buffer&, u32, u32, VideoCore::Surface::PixelFormat) {}
 
     u32 alignment{256};
+    u32 uniform_binds{}, stream_copies{}, stream_rebinds{}, storage_binds{};
+    u64 current_tick{1};
+    StreamUniformRef last_ref{};
     u32 allocations{}, downloads{}, uploads{}, finishes{}, waits{};
     u32 host_read_barriers{};
     u64 upload_bytes{}, waited_tick{};
@@ -229,11 +270,36 @@ struct BufferCacheTestAccess {
         channel.uniform_buffers[0][0] = {.device_addr = address, .size = size, .buffer_id = id};
         cache.BindHostGraphicsUniformBuffer(0, 0, 0, true);
     }
+    static void UseChannel(Cache& cache, BufferCacheChannelInfo& channel) {
+        cache.channel_state = &channel;
+        cache.maxwell3d = &channel.maxwell3d;
+        cache.gpu_memory = &channel.gpu_memory;
+    }
+    static void BindStage(Cache& cache) {
+        cache.BindHostStageBuffers(0);
+    }
+    static void MarkCpuModifiedSilently(Cache& cache, DAddr address, u64 size) {
+        cache.memory_tracker.MarkRegionAsCpuModified(address, size);
+    }
     static void NextFrame(Cache& cache) {
         cache.native_indirect_uniforms_this_frame.clear();
     }
     static u32 CpuMarks(Cache& cache) {
         return cache.memory_tracker.cpu_marks;
+    }
+    /// U-01: a page learned for early downloads (Preflushable by learning).
+    static void Learn(Cache& cache, DAddr address, u64 size) {
+        cache.memory_tracker.MarkRegionAsPreflushable(address, size);
+        cache.learned_marked = 1;
+    }
+    static void GpuWrite(Cache& cache, DAddr address, u64 size) {
+        cache.gpu_modified_ranges.Add(address, size);
+    }
+    static void Landed(Cache& cache, DAddr address, u64 size) {
+        cache.gpu_modified_ranges.Subtract(address, size);
+    }
+    static bool Preemptive(Cache& cache, DAddr address, u64 size) {
+        return cache.GetFlushArea(address, size)->preemtive;
     }
 };
 
@@ -626,4 +692,469 @@ TEST_CASE("Downloads keep CPU writes collected and not yet applied", "[buffer_po
     REQUIRE(f.bytes[0x20ff7] == 0x34);
     REQUIRE(std::all_of(f.bytes + 0x20ff8, f.bytes + 0x21008, [](u8 b) { return b == 0xee; }));
     REQUIRE(f.bytes[0x21008] == 0x34);
+}
+
+TEST_CASE("Draw cache buffer replay binds unchanged cached uniforms without syncing",
+          "[buffer_ports][v2_p4]") {
+    namespace V2 = VideoCommon::V2;
+    const auto saved = V2::g_modes;
+    V2::g_modes[static_cast<size_t>(V2::Switch::DrawCache)] = V2::Mode::On;
+    SCOPE_EXIT {
+        V2::g_modes = saved;
+    };
+    Fixture f;
+    Tegra::Control::ChannelState state{0};
+    state.memory_manager = &*f.memory;
+    state.payload.emplace(f.system, *f.memory, state);
+    VideoCommon::BufferCacheChannelInfo channel{state};
+    VideoCommon::UniformBufferSizes sizes{};
+    sizes[0][0] = 0x2000; // over the skip-cache size: the cached path
+    channel.uniform_buffer_sizes = &sizes;
+    channel.enabled_uniform_buffer_masks[0] = 1;
+    const auto id = Access::Add(*f.cache, 0x20000, 0x10000);
+    Access::UseChannel(*f.cache, channel);
+    channel.uniform_buffers[0][0] = {.device_addr = 0x20000, .size = 0x2000, .buffer_id = id};
+    V2::Versions::EpochMemo memo{V2::Versions::Pages()};
+
+    // A resolve: the guest wrote the range, the bind uploads it; the recipe records it.
+    std::memset(f.bytes + 0x10000, 0x11, 0x2000);
+    f.cache->WriteMemory(0x20000, 0x2000);
+    const u64 stamp = V2::Versions::Pages().Stamp();
+    Access::BindStage(*f.cache);
+    REQUIRE(f.runtime.uploads == 1);
+    REQUIRE(f.runtime.uniform_binds == 1);
+    V2::DrawCache::BufferRecipe recipe;
+    f.cache->RecordGraphicsBuffers(recipe, false, stamp);
+    REQUIRE(recipe.valid);
+    REQUIRE(recipe.uniform.size() == 1);
+    REQUIRE(recipe.uniform[0].kind == V2::DrawCache::BufferBind::Kind::Cached);
+    REQUIRE(f.cache->CountStaleRecipeRanges(recipe, memo) == 0);
+
+    // A replay with nothing written: bound from the recipe, no upload.
+    f.cache->ReplayHostStageBuffers(0, recipe, memo);
+    REQUIRE(f.runtime.uploads == 1);
+    REQUIRE(f.runtime.uniform_binds == 2);
+    REQUIRE(f.cache->TakeReplayCounts() == std::pair<u32, u32>{1, 0});
+
+    // A guest write (any path that marks it CPU-modified moves its version): synced again.
+    f.bytes[0x10010] = 0x22;
+    f.cache->WriteMemory(0x20010, 4);
+    f.cache->ReplayHostStageBuffers(0, recipe, memo);
+    REQUIRE(f.runtime.uploads == 2);
+    REQUIRE(Access::Get(*f.cache, id).bytes[0x10] == 0x22);
+    REQUIRE(f.cache->TakeReplayCounts() == std::pair<u32, u32>{0, 1});
+
+    // Recorded again after the sync (new stamp): replayed again.
+    const u64 restamp = V2::Versions::Pages().Stamp();
+    f.cache->RecordGraphicsBuffers(recipe, false, restamp);
+    f.cache->ReplayHostStageBuffers(0, recipe, memo);
+    REQUIRE(f.runtime.uploads == 2);
+    REQUIRE(f.cache->TakeReplayCounts() == std::pair<u32, u32>{1, 0});
+
+    // A rebound buffer (other range) takes the existing path.
+    channel.uniform_buffers[0][0] = {.device_addr = 0x24000, .size = 0x2000, .buffer_id = id};
+    f.cache->ReplayHostStageBuffers(0, recipe, memo);
+    REQUIRE(f.cache->TakeReplayCounts() == std::pair<u32, u32>{0, 1});
+    channel.uniform_buffers[0][0] = {.device_addr = 0x20000, .size = 0x2000, .buffer_id = id};
+
+    // Verify's byte check: CPU-modified behind unchanged versions is counted as stale.
+    Access::MarkCpuModifiedSilently(*f.cache, 0x20000, 0x1000);
+    REQUIRE(f.cache->CountStaleRecipeRanges(recipe, memo) == 1);
+
+    // Fix pass 1 (Ocarina of Time, ~79% of sampled hits "CPU-modified behind unchanged
+    // versions"): bindings the replay doesn't take from the host buffer are no stale ranges.
+    // A constant buffer version (or a stream copy) reads guest memory and never syncs the
+    // buffer, so its CPU-modified bits stay set by design.
+    V2::DrawCache::BufferRecipe versioned = recipe;
+    versioned.uniform[0].kind = V2::DrawCache::BufferBind::Kind::Version;
+    REQUIRE(f.cache->CountStaleRecipeRanges(versioned, memo) == 0);
+    versioned.uniform[0].kind = V2::DrawCache::BufferBind::Kind::Normal;
+    REQUIRE(f.cache->CountStaleRecipeRanges(versioned, memo) == 0);
+    // A recipe whose buffer slot moved on (generation) is never replayed.
+    V2::DrawCache::BufferRecipe moved = recipe;
+    ++moved.uniform[0].generation;
+    REQUIRE(f.cache->CountStaleRecipeRanges(moved, memo) == 0);
+}
+
+TEST_CASE("A recipe records only the stages its pipeline binds", "[buffer_ports][v2_p4]") {
+    // S0-G17 (DRAWREC=1 + DRAWCACHE=verify on eac4735c2b): the first stale binding was a storage
+    // buffer at stage 2 of a pipeline without that stage. The channel state keeps an unused
+    // stage's storage bits from an earlier draw; the draw neither binds nor syncs them, so a
+    // recipe that recorded them vouched for a range nobody uploaded.
+    namespace V2 = VideoCommon::V2;
+    const auto saved = V2::g_modes;
+    V2::g_modes[static_cast<size_t>(V2::Switch::DrawCache)] = V2::Mode::On;
+    SCOPE_EXIT {
+        V2::g_modes = saved;
+    };
+    Fixture f;
+    Tegra::Control::ChannelState state{0};
+    state.memory_manager = &*f.memory;
+    state.payload.emplace(f.system, *f.memory, state);
+    VideoCommon::BufferCacheChannelInfo channel{state};
+    VideoCommon::UniformBufferSizes sizes{};
+    sizes[0][0] = 0x2000;
+    channel.uniform_buffer_sizes = &sizes;
+    channel.enabled_uniform_buffer_masks[0] = 1;
+    const auto id = Access::Add(*f.cache, 0x20000, 0x10000);
+    Access::UseChannel(*f.cache, channel);
+    channel.uniform_buffers[0][0] = {.device_addr = 0x20000, .size = 0x2000, .buffer_id = id};
+    // Left behind by a draw whose pipeline had stage 2.
+    channel.enabled_storage_buffers[2] = 1U << 1;
+    channel.storage_buffers[2][1] = {.device_addr = 0x24000, .size = 0x4000, .buffer_id = id};
+    V2::Versions::EpochMemo memo{V2::Versions::Pages()};
+    const u64 stamp = V2::Versions::Pages().Stamp();
+
+    V2::DrawCache::BufferRecipe recipe;
+    f.cache->RecordGraphicsBuffers(recipe, false, stamp, 1U << 0 | 1U << 4);
+    REQUIRE(recipe.valid);
+    REQUIRE(recipe.uniform.size() == 1);
+    REQUIRE(recipe.storage.empty());
+    // Never uploaded by this draw: not a range the recipe vouches for.
+    Access::MarkCpuModifiedSilently(*f.cache, 0x24000, 0x1000);
+    REQUIRE(f.cache->CountStaleRecipeRanges(recipe, memo) == 0);
+
+    // The pipeline with stage 2 records it.
+    f.cache->RecordGraphicsBuffers(recipe, false, stamp, 1U << 0 | 1U << 2 | 1U << 4);
+    REQUIRE(recipe.storage.size() == 1);
+    REQUIRE(recipe.storage[0].stage == 2);
+    REQUIRE(recipe.storage[0].index == 1);
+}
+
+TEST_CASE("Index and vertex ranges are computed as the update passes compute them",
+          "[buffer_ports][v2_drawrec]") {
+    // P6 Step 0: UpdateIndexBuffer/UpdateVertexBuffer and the record resolve share these.
+    Fixture f;
+    // 16-bit indices 4..11 of a 0x400-byte buffer: what the draw reads, within the buffer.
+    auto range = Cache::IndexRange(*f.memory, 0x100000, 0x100400, 4, 8, 2);
+    REQUIRE(range.valid);
+    REQUIRE(range.device_addr == 0x10000);
+    REQUIRE(range.size == 24);
+    // A buffer shorter than the draw: the buffer's size.
+    range = Cache::IndexRange(*f.memory, 0x100000, 0x100010, 4, 8, 2);
+    REQUIRE(range.size == 0x10);
+    REQUIRE_FALSE(Cache::IndexRange(*f.memory, 0x100000, 0x100400, 0, 0, 2).valid);
+    REQUIRE_FALSE(Cache::IndexRange(*f.memory, 0x900000, 0x900400, 0, 8, 2).valid);
+
+    // A vertex stream ends at its limit (inclusive), a native one after its size.
+    range = Cache::VertexRange(*f.memory, 0x100000, true, 0x1000ff, false, 0);
+    REQUIRE(range.valid);
+    REQUIRE(range.device_addr == 0x10000);
+    REQUIRE(range.size == 0x100);
+    range = Cache::VertexRange(*f.memory, 0x100100, true, 0, true, 0x80);
+    REQUIRE(range.device_addr == 0x10100);
+    REQUIRE(range.size == 0x80);
+    REQUIRE_FALSE(Cache::VertexRange(*f.memory, 0x100000, false, 0x1000ff, false, 0).valid);
+    REQUIRE_FALSE(Cache::VertexRange(*f.memory, 0x900000, true, 0x9000ff, false, 0).valid);
+    // A stream of 64 MiB or more stops where the mapping does.
+    range = Cache::VertexRange(*f.memory, 0x10f000, true, 0x10f000 + 0x4000000ULL - 1, false, 0);
+    REQUIRE(range.size == 0x1000);
+    REQUIRE_THROWS(Cache::VertexRange(*f.memory, 0x100000, true, 0, true, 0x100000000ULL));
+}
+
+TEST_CASE("Record buffer twins peek, resolve and encode without the update passes",
+          "[buffer_ports][v2_drawrec]") {
+    namespace R = VideoCommon::V2::Resolve;
+    Fixture f;
+    Tegra::Control::ChannelState state{0};
+    state.memory_manager = &*f.memory;
+    state.payload.emplace(f.system, *f.memory, state);
+    VideoCommon::BufferCacheChannelInfo channel{state};
+    VideoCommon::UniformBufferSizes sizes{};
+    channel.uniform_buffer_sizes = &sizes;
+    const auto id = Access::Add(*f.cache, 0x20000, 0x10000);
+    Access::UseChannel(*f.cache, channel);
+
+    // PeekBuffer: the holding buffer, a creation due, or no address.
+    REQUIRE(f.cache->PeekBuffer(0x20100, 0x100, false) == id);
+    REQUIRE_FALSE(static_cast<bool>(f.cache->PeekBuffer(0x2ff00, 0x200, false)));
+    REQUIRE(f.cache->PeekBuffer(0, 0x100, false) == VideoCommon::NULL_BUFFER_ID);
+
+    // A storage descriptor read through the view gives StorageBufferBinding's binding.
+    f.Descriptor(0x100040, 0x80);
+    const R::LiveView view{channel.maxwell3d};
+    bool multi_range = true;
+    const R::ResolvedSsbo ssbo =
+        f.cache->ResolveStorageBinding(view, 0, 0, 0, 0x100000, false, ~0U, multi_range);
+    const VideoCommon::Binding expected = f.Bind();
+    REQUIRE(ssbo.daddr == expected.device_addr);
+    REQUIRE(ssbo.gpu_addr == expected.gpu_addr);
+    REQUIRE(ssbo.size == expected.size);
+    // Disabled bindings resolve to nothing.
+    REQUIRE(f.cache->ResolveUniformBinding(view, 0, 3).size == 0);
+    REQUIRE_FALSE(f.cache->ResolveVertexBinding(view, 0).has_value());
+    REQUIRE_FALSE(f.cache->ResolveIndexBinding(view).valid);
+
+    // The record's bindings land in the channel state as the update passes leave them.
+    R::ResolvedDraw record;
+    record.h.stages[0] = true;
+    const std::array vertex{R::ResolvedVertex{
+        .slot = 2, .buffer = {id.index, 0}, .daddr = 0x20000, .size = 0x400, .stride = 16}};
+    record.h.vertex = record.Push(std::span<const R::ResolvedVertex>(vertex));
+    const std::array ubo{R::ResolvedUbo{
+        .stage = 0, .slot = 1, .daddr = 0x20400, .size = 0x100, .buffer = {id.index, 0}}};
+    record.h.ubo = record.Push(std::span<const R::ResolvedUbo>(ubo));
+    const std::array storage{R::ResolvedSsbo{.stage = 0, .index = 3, .written = 1,
+                                             .daddr = 0x20800, .gpu_addr = 0x100800,
+                                             .size = 0x40, .buffer = {id.index, 0}}};
+    record.h.ssbo = record.Push(std::span<const R::ResolvedSsbo>(storage));
+    channel.vertex_buffers[5] = {.device_addr = 0x20000, .size = 4, .buffer_id = id};
+    f.cache->EncodeGraphicsBindings(record);
+    REQUIRE(channel.vertex_buffers[2].device_addr == 0x20000);
+    REQUIRE(channel.vertex_buffers[2].buffer_id == id);
+    REQUIRE(channel.vertex_buffers[5].buffer_id == VideoCommon::NULL_BUFFER_ID);
+    REQUIRE(channel.uniform_buffers[0][1].device_addr == 0x20400);
+    REQUIRE(channel.enabled_storage_buffers[0] == (u64{1} << 3));
+    REQUIRE(channel.written_storage_buffers[0] == (u64{1} << 3));
+    REQUIRE(channel.storage_buffers[0][3].gpu_addr == 0x100800);
+
+    // A creation request applies as V2ApplyCreates does: the lookup creates.
+    VideoCommon::V2::Commit::Request create{};
+    create.kind = VideoCommon::V2::Commit::Kind::BufferCreate;
+    create.address = 0x40000;
+    create.size = 0x100;
+    const VideoCommon::BufferId created{f.cache->ApplyDrawRequest(create)};
+    REQUIRE(static_cast<bool>(created));
+    REQUIRE(f.cache->PeekBuffer(0x40000, 0x100, false) == created);
+}
+
+TEST_CASE("The record's index binding takes the draw's index range, not the vertex range",
+          "[buffer_ports][v2_drawrec]") {
+    // F2e (c236 DRAWREC=verify: index mismatches on 96% of draws): DrawPredicted, DrawIndex and
+    // DrawIndexSmall never set draw_state.draw_indexed, so a view reading that flag sized the
+    // index range from vertex_buffer.first/count. The view takes the rasterizer's is_indexed.
+    namespace R = VideoCommon::V2::Resolve;
+    Fixture f;
+    Tegra::Control::ChannelState state{0};
+    state.memory_manager = &*f.memory;
+    state.payload.emplace(f.system, *f.memory, state);
+    VideoCommon::BufferCacheChannelInfo channel{state};
+    VideoCommon::UniformBufferSizes sizes{};
+    channel.uniform_buffer_sizes = &sizes;
+    f.memory->Map(0x110000, 0x20000, 0x10000, Tegra::PTEKind::PITCH, true);
+    const auto id = Access::Add(*f.cache, 0x20000, 0x10000);
+    Access::UseChannel(*f.cache, channel);
+    auto& engine = channel.maxwell3d;
+    auto& regs = engine.regs;
+    regs.index_buffer.start_addr_high = 0;
+    regs.index_buffer.start_addr_low = 0x110000;
+    regs.index_buffer.limit_addr_high = 0;
+    regs.index_buffer.limit_addr_low = 0x110400;
+    regs.index_buffer.format = R::MaxwellRegs::IndexFormat::UnsignedShort;
+    auto& draw = engine.draw_manager.draw_state;
+    draw.index_buffer = regs.index_buffer;
+    draw.index_buffer.first = 4;
+    draw.index_buffer.count = 8;
+    draw.vertex_buffer.first = 0;
+    draw.vertex_buffer.count = 300;
+    draw.draw_indexed = false; // as DrawPredicted leaves it
+
+    const R::ResolvedIndex index = f.cache->ResolveIndexBinding(R::LiveView{engine, true});
+    REQUIRE(index.valid);
+    REQUIRE(index.first == 4);
+    REQUIRE(index.count == 8);
+    REQUIRE(index.daddr == 0x20000);
+    // UpdateIndexBuffer's range: (first + count) * 2 bytes.
+    const auto range = Cache::IndexRange(*f.memory, 0x110000, 0x110400, 4, 8, 2);
+    REQUIRE(index.size == range.size);
+    REQUIRE(index.size == 24);
+    REQUIRE(index.buffer.id == id.index);
+    REQUIRE(R::LiveView{engine, true}.Draw().indexed);
+    REQUIRE_FALSE(R::LiveView{engine}.Draw().indexed);
+}
+
+TEST_CASE("Draw cache buffer replay binds a uniform on the path its bind takes now",
+          "[buffer_ports][v2_p4]") {
+    // F2-X1: a recorded uniform is replayed only on the path BindHostGraphicsUniformBuffer
+    // takes for it now (the stream for a small range nobody on the GPU wrote, the host buffer
+    // once the GPU wrote it).
+    namespace V2 = VideoCommon::V2;
+    using Kind = V2::DrawCache::BufferBind::Kind;
+    const auto saved = V2::g_modes;
+    V2::g_modes[static_cast<size_t>(V2::Switch::DrawCache)] = V2::Mode::On;
+    SCOPE_EXIT {
+        V2::g_modes = saved;
+    };
+    Fixture f;
+    Tegra::Control::ChannelState state{0};
+    state.memory_manager = &*f.memory;
+    state.payload.emplace(f.system, *f.memory, state);
+    VideoCommon::BufferCacheChannelInfo channel{state};
+    VideoCommon::UniformBufferSizes sizes{};
+    sizes[0][0] = 0x100; // under the skip-cache size: the stream path while not GPU-modified
+    channel.uniform_buffer_sizes = &sizes;
+    channel.enabled_uniform_buffer_masks[0] = 1;
+    const auto id = Access::Add(*f.cache, 0x20000, 0x10000);
+    Access::UseChannel(*f.cache, channel);
+    const VideoCommon::Binding binding{.device_addr = 0x20000, .size = 0x100, .buffer_id = id};
+    channel.uniform_buffers[0][0] = binding;
+    REQUIRE(f.cache->UniformBindKind(0, 0, binding) == Kind::Version);
+    REQUIRE(f.cache->UniformBindKind(
+                0, 0,
+                VideoCommon::Binding{.device_addr = 0x20000,
+                                     .size = 0x100,
+                                     .buffer_id = VideoCommon::NULL_BUFFER_ID}) == Kind::Normal);
+
+    // A recipe that recorded the host buffer (the range was GPU-modified then).
+    V2::Versions::EpochMemo memo{V2::Versions::Pages()};
+    V2::DrawCache::BufferRecipe recipe;
+    recipe.valid = true;
+    recipe.stamp = V2::Versions::Pages().Stamp();
+    recipe.uniform.push_back({
+        .stage = 0,
+        .index = 0,
+        .kind = Kind::Cached,
+        .buffer_id = id.index,
+        .generation = V2::Versions::Gens().Get(V2::Versions::Kind::Buffer, id.index),
+        .device_addr = 0x20000,
+        .size = 0x100,
+    });
+    recipe.MergeRanges();
+    // Not GPU-modified any more: the resolve streams it, so the replay does too.
+    f.cache->ReplayHostStageBuffers(0, recipe, memo);
+    REQUIRE(f.runtime.uniform_binds == 0);
+    REQUIRE(f.cache->TakeReplayCounts() == std::pair<u32, u32>{0, 1});
+
+    // S0-04 with CBUFRING: the replay asks the ring first; on a miss (no ring here) the binding
+    // is bound once through the stream path, as without the ring.
+    {
+        V2::g_modes[static_cast<size_t>(V2::Switch::CbufRing)] = V2::Mode::On;
+        const u32 copies = f.runtime.stream_copies;
+        const u32 rebinds = f.runtime.stream_rebinds;
+        f.cache->ReplayHostStageBuffers(0, recipe, memo);
+        REQUIRE(f.runtime.uniform_binds == 0);
+        REQUIRE(f.runtime.stream_copies + f.runtime.stream_rebinds == copies + rebinds + 1);
+        REQUIRE(f.cache->TakeReplayCounts() == std::pair<u32, u32>{0, 1});
+        V2::g_modes[static_cast<size_t>(V2::Switch::CbufRing)] = V2::Mode::Off;
+    }
+
+    // GPU-modified: the host buffer, from the recipe.
+    Access::Dirty(*f.cache, 0x20000, 0x100);
+    REQUIRE(f.cache->UniformBindKind(0, 0, binding) == Kind::Cached);
+    f.cache->ReplayHostStageBuffers(0, recipe, memo);
+    REQUIRE(f.runtime.uniform_binds == 1);
+    REQUIRE(f.cache->TakeReplayCounts() == std::pair<u32, u32>{1, 0});
+}
+
+namespace {
+namespace Commit = VideoCommon::V2::Commit;
+
+struct CommitChannel {
+    Tegra::Control::ChannelState state{0};
+    std::optional<VideoCommon::BufferCacheChannelInfo> channel;
+    VideoCommon::UniformBufferSizes sizes{};
+
+    explicit CommitChannel(Fixture& f) {
+        state.memory_manager = &*f.memory;
+        state.payload.emplace(f.system, *f.memory, state);
+        channel.emplace(state);
+        channel->uniform_buffer_sizes = &sizes;
+        Access::UseChannel(*f.cache, *channel);
+    }
+};
+} // namespace
+
+TEST_CASE("Commit: a missing buffer is a proxy patched at the end of the update pass",
+          "[buffer_ports][v2_p5]") {
+    Fixture f;
+    CommitChannel c{f};
+    Commit::Context context;
+    f.cache->SetCommit(&context);
+    c.sizes[0][0] = 0x2000;
+    c.channel->enabled_uniform_buffer_masks[0] = 1;
+    c.channel->uniform_buffers[0][0] = {.device_addr = 0x20000, .size = 0x2000, .buffer_id = {}};
+    f.cache->UpdateGraphicsBuffers(false);
+    const auto counters = context.stage.TakeCounters();
+    REQUIRE(counters.requests[static_cast<size_t>(Commit::Kind::BufferCreate)] == 1);
+    REQUIRE(counters.proxies_patched == 1);
+    const VideoCommon::BufferId id = c.channel->uniform_buffers[0][0].buffer_id;
+    REQUIRE(id);
+    REQUIRE_FALSE(Commit::IsProxy(id.index));
+    REQUIRE(Access::Get(*f.cache, id).IsInBounds(0x20000, 0x2000));
+    REQUIRE(f.cache->LookupBuffer(0x20000, 0x2000) == id);
+    f.cache->CommitBinds();
+    f.cache->SetCommit(nullptr);
+}
+
+TEST_CASE("Commit: a proxy whose creation merges a bound buffer resolves both to the merge",
+          "[buffer_ports][v2_p5]") {
+    Fixture f;
+    CommitChannel c{f};
+    Commit::Context context;
+    const VideoCommon::BufferId old_id = Access::Add(*f.cache, 0x20000, 0x10000);
+    f.cache->SetCommit(&context);
+    c.sizes[0][0] = 0x2000;
+    c.sizes[0][1] = 0x1000;
+    c.channel->enabled_uniform_buffer_masks[0] = 0b11;
+    // Binding 0 crosses the existing buffer's end: a miss whose creation joins it. Binding 1
+    // hits the existing buffer, which the merge deletes.
+    c.channel->uniform_buffers[0][0] = {.device_addr = 0x2f000, .size = 0x2000, .buffer_id = {}};
+    c.channel->uniform_buffers[0][1] = {.device_addr = 0x20000, .size = 0x1000, .buffer_id = {}};
+    f.cache->UpdateGraphicsBuffers(false);
+    const VideoCommon::BufferId merged = c.channel->uniform_buffers[0][0].buffer_id;
+    REQUIRE(merged);
+    REQUIRE_FALSE(Commit::IsProxy(merged.index));
+    REQUIRE(c.channel->uniform_buffers[0][1].buffer_id == merged);
+    REQUIRE(Access::Get(*f.cache, merged).IsInBounds(0x20000, 0x11000));
+    REQUIRE(f.cache->LookupBuffer(0x20000, 0x1000) == merged);
+    REQUIRE(f.cache->LookupBuffer(0x2f000, 0x2000) == merged);
+    // The binding's offset comes from its address in the merged buffer.
+    REQUIRE(Access::Get(*f.cache, merged).Offset(0x2f000) == 0xf000);
+    static_cast<void>(old_id);
+    f.cache->CommitBinds();
+    f.cache->SetCommit(nullptr);
+}
+
+TEST_CASE("Commit: bind uploads are ordered requests applied before the draw",
+          "[buffer_ports][v2_p5]") {
+    Fixture f;
+    CommitChannel c{f};
+    Commit::Context context;
+    const VideoCommon::BufferId id = Access::Add(*f.cache, 0x20000, 0x10000);
+    f.cache->SetCommit(&context);
+    c.sizes[0][0] = 0x2000; // over the skip-cache size: the cached path syncs
+    c.channel->enabled_uniform_buffer_masks[0] = 1;
+    c.channel->uniform_buffers[0][0] = {.device_addr = 0x20000, .size = 0x2000, .buffer_id = id};
+    std::memset(f.bytes + 0x10000, 0x33, 0x2000);
+    f.cache->WriteMemory(0x20000, 0x2000);
+    f.cache->UpdateGraphicsBuffers(false);
+    REQUIRE(f.cache->HasDeferredBinds());
+    Access::BindStage(*f.cache);
+    // Bound (buffer + offset) at once; the upload waits for the commit.
+    REQUIRE(f.runtime.uniform_binds == 1);
+    REQUIRE(f.runtime.uploads == 0);
+    f.cache->CommitBinds();
+    REQUIRE_FALSE(f.cache->HasDeferredBinds());
+    REQUIRE(f.runtime.uploads == 1);
+    REQUIRE(Access::Get(*f.cache, id).bytes[0] == 0x33);
+    // Off the scope, a bind syncs at once again.
+    f.bytes[0x10000] = 0x44;
+    f.cache->WriteMemory(0x20000, 4);
+    Access::BindStage(*f.cache);
+    REQUIRE(f.runtime.uploads == 2);
+    f.cache->SetCommit(nullptr);
+}
+
+TEST_CASE("U-01: a learned page read before its early download landed is read back",
+          "[buffer_ports][v2_p5b]") {
+    namespace V2 = VideoCommon::V2;
+    const auto saved = V2::g_modes;
+    const bool saved_ampere = Tegra::g_nx2_ampere.load();
+    V2::g_modes[static_cast<size_t>(V2::Switch::Readback)] = V2::Mode::On;
+    Tegra::g_nx2_ampere.store(true);
+    SCOPE_EXIT {
+        V2::g_modes = saved;
+        Tegra::g_nx2_ampere.store(saved_ampere);
+    };
+    Fixture f;
+    Access::Add(*f.cache, 0x20000, 0x10000);
+    Access::Learn(*f.cache, 0x21000, 0x1000);
+    // Learned and nothing owed: memory is current, no readback.
+    REQUIRE(Access::Preemptive(*f.cache, 0x21000, 0x100));
+    // A GPU write whose download has not landed: the old answer ("preemptive") was a stale read.
+    Access::GpuWrite(*f.cache, 0x21000, 0x1000);
+    REQUIRE_FALSE(Access::Preemptive(*f.cache, 0x21000, 0x100));
+    // Landed: preemptive again.
+    Access::Landed(*f.cache, 0x21000, 0x1000);
+    REQUIRE(Access::Preemptive(*f.cache, 0x21000, 0x100));
 }

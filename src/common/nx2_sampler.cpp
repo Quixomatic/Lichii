@@ -142,10 +142,43 @@ std::vector<Target> FindThreads(const std::vector<std::string>& patterns) {
     return targets;
 }
 
+/// Committed executable memory: a loaded module's code or JIT code (VirtualQuery takes no
+/// user-mode lock the suspended thread could hold).
+bool IsCode(DWORD64 address) {
+    MEMORY_BASIC_INFORMATION info{};
+    if (VirtualQuery(reinterpret_cast<LPCVOID>(address), &info, sizeof(info)) == 0) {
+        return false;
+    }
+    constexpr DWORD executable =
+        PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+    return info.State == MEM_COMMIT && (info.Protect & executable) != 0 &&
+           (info.Protect & (PAGE_GUARD | PAGE_NOACCESS)) == 0;
+}
+
+/// One unwind step; false when it faulted. Unwind data can make RtlVirtualUnwind read through
+/// a register that holds garbage in this frame (a frame pointer, say), which crashed the process.
+bool UnwindStep(DWORD64 image_base, PRUNTIME_FUNCTION function, CONTEXT* context) {
+    PVOID handler_data{};
+    DWORD64 establisher_frame{};
+#ifdef _MSC_VER
+    __try {
+        RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, context->Rip, function, context,
+                         &handler_data, &establisher_frame, nullptr);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+#else
+    RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, context->Rip, function, context,
+                     &handler_data, &establisher_frame, nullptr);
+#endif
+    return true;
+}
+
 // Walks a suspended thread's stack from its context. Nothing here may allocate: the thread
 // could be paused holding the heap lock. A wrong unwind step (code with missing or wrong unwind
-// data) leaves a garbage stack pointer: reading through it crashed the process, so the walk
-// stops once the stack pointer leaves the thread's stack.
+// data) leaves a garbage stack pointer or return address: the walk stops at the first frame
+// whose stack pointer leaves the thread's stack or doesn't move up it, or whose instruction
+// pointer isn't code, and an unwind step that faults ends it too.
 unsigned Walk(CONTEXT context, std::array<DWORD64, MaxDepth>& frames, const NT_TIB* tib) {
     if (tib == nullptr) {
         return 0;
@@ -155,8 +188,9 @@ unsigned Walk(CONTEXT context, std::array<DWORD64, MaxDepth>& frames, const NT_T
                rsp + 8 <= reinterpret_cast<DWORD64>(tib->StackBase) && (rsp & 7) == 0;
     };
     unsigned depth = 0;
-    while (depth < MaxDepth && context.Rip != 0 && on_stack(context.Rsp)) {
+    while (depth < MaxDepth && context.Rip != 0 && on_stack(context.Rsp) && IsCode(context.Rip)) {
         frames[depth++] = context.Rip;
+        const DWORD64 rsp = context.Rsp;
         DWORD64 image_base{};
         const PRUNTIME_FUNCTION function = RtlLookupFunctionEntry(context.Rip, &image_base, nullptr);
         if (function == nullptr) {
@@ -169,10 +203,9 @@ unsigned Walk(CONTEXT context, std::array<DWORD64, MaxDepth>& frames, const NT_T
             context.Rsp += 8;
             continue;
         }
-        PVOID handler_data{};
-        DWORD64 establisher_frame{};
-        RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, context.Rip, function, &context,
-                         &handler_data, &establisher_frame, nullptr);
+        if (!UnwindStep(image_base, function, &context) || context.Rsp <= rsp) {
+            break;
+        }
     }
     return depth;
 }

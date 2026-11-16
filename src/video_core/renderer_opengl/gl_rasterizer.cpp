@@ -29,6 +29,7 @@
 #include "video_core/renderer_opengl/gl_shader_cache.h"
 #include "video_core/renderer_opengl/gl_staging_buffer_pool.h"
 #include "video_core/renderer_opengl/gl_texture_cache.h"
+#include "video_core/v2/v2_switches.h"
 #include "video_core/renderer_opengl/maxwell_to_gl.h"
 #include "video_core/renderer_opengl/renderer_opengl.h"
 #include "video_core/shader_cache.h"
@@ -519,12 +520,19 @@ bool RasterizerOpenGL::MustFlushRegion(DAddr addr, u64 size, VideoCommon::CacheT
 }
 
 VideoCore::RasterizerDownloadArea RasterizerOpenGL::GetFlushArea(DAddr addr, u64 size) {
+    std::optional<VideoCore::RasterizerDownloadArea> texture_area;
     {
         std::scoped_lock lock{texture_cache.mutex};
-        auto area = texture_cache.GetFlushArea(addr, size);
-        if (area) {
-            return *area;
-        }
+        texture_area = texture_cache.GetFlushArea(addr, size);
+    }
+    if (texture_area) {
+        // The core disarmed the read's pages before asking, and skips later reads in this area,
+        // even through another device alias of those pages. The buffer cache arms only pages it
+        // doesn't count as armed, so it must forget the whole area.
+        std::scoped_lock lock{buffer_cache.mutex};
+        buffer_cache.ForgetReadTraps(texture_area->start_address,
+                                     texture_area->end_address - texture_area->start_address);
+        return *texture_area;
     }
     {
         std::scoped_lock lock{buffer_cache.mutex};
@@ -1210,6 +1218,7 @@ void RasterizerOpenGL::SyncLogicOpState() {
 
     auto& regs = maxwell3d->regs;
 
+    bool enable = regs.logic_op.enable != 0;
     if (device.IsAmd()) {
         using namespace Tegra::Engines;
 
@@ -1221,10 +1230,14 @@ void RasterizerOpenGL::SyncLogicOpState() {
             }
         );
 
-        regs.logic_op.enable = static_cast<u32>(!has_float);
+        // Pipeline v2 (G3): the effective value only; the guest register is the front's.
+        if (!VideoCommon::V2::On(VideoCommon::V2::Switch::RegSem)) {
+            regs.logic_op.enable = static_cast<u32>(!has_float);
+        }
+        enable = !has_float;
     }
 
-    if (regs.logic_op.enable) {
+    if (enable) {
         glEnable(GL_COLOR_LOGIC_OP);
         glLogicOp(MaxwellToGL::LogicOp(regs.logic_op.op));
     } else {

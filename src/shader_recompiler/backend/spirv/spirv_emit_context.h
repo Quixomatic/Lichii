@@ -8,10 +8,15 @@
 
 #include <array>
 #include <optional>
+#include <utility>
+#include <vector>
+
+#include <boost/container/static_vector.hpp>
 
 #include <sirit/sirit.h>
 #include "common/container/unordered_set.h"
 
+#include "shader_recompiler/backend/spirv/bindless_heap.h"
 #include "shader_recompiler/backend/bindings.h"
 #include "shader_recompiler/frontend/ir/program.h"
 #include "shader_recompiler/profile.h"
@@ -19,8 +24,6 @@
 #include "shader_recompiler/shader_info.h"
 
 namespace Shader::Backend::SPIRV {
-
-static std::bitset<8> clip_distance_written;
 
 using Sirit::Id;
 
@@ -44,11 +47,17 @@ struct TextureDefinition {
     u32 count;
     bool is_multisample;
     bool is_integer;
+    /// EDEN_NX2_V2_BINDLESS: `id` is the heap image array of the descriptor's class and
+    /// `pointer_type` points to one of its images; `heap_word` is its first word in the table.
+    bool heap{};
+    u32 heap_word{};
 };
 
 struct TextureBufferDefinition {
     Id id;
     u32 count;
+    bool heap{};     ///< P5a: an element of the heap's uniform texel buffer array
+    u32 heap_word{}; ///< its first word in the heap word table
 };
 
 struct ImageBufferDefinition {
@@ -57,6 +66,8 @@ struct ImageBufferDefinition {
     Id pointer_type;
     u32 count;
     bool is_integer;
+    bool heap{};     ///< P5a: elements of the heap's storage texel buffer array
+    u32 heap_word{};
 };
 
 struct ImageDefinition {
@@ -65,6 +76,9 @@ struct ImageDefinition {
     Id pointer_type;
     u32 count;
     bool is_integer;
+    /// EDEN_NX2_V2_BINDLESS: `id` is the heap storage image array; `heap_word` its first word.
+    bool heap{};
+    u32 heap_word{};
 };
 
 struct UniformDefinitions {
@@ -181,6 +195,13 @@ public:
 
     [[nodiscard]] Id BitOffset8(const IR::Value& offset);
     [[nodiscard]] Id BitOffset16(const IR::Value& offset);
+
+    /// Whether this stage has subgroup operations. Mesh emulation runs task and mesh programs
+    /// as compute shaders, so they have what compute shaders have.
+    [[nodiscard]] bool SupportsSubgroups() const {
+        return profile.SupportsSubgroupStage(runtime_info.mesh_as_compute ? Stage::Compute
+                                                                          : stage);
+    }
 
     Id Const(u32 value) {
         return Constant(U32[1], value);
@@ -320,6 +341,54 @@ public:
     Id render_area_push_constant{};
     u32 render_are_member_index{};
 
+    // EDEN_NX2_V2_BINDLESS (bindless_heap.h): the heap's sampler and image arrays and the draw's
+    // heap word table.
+    Id heap_sampler_type{};
+    Id heap_sampler_pointer{};
+    Id heap_samplers{};
+    std::vector<std::pair<u32, Id>> heap_image_variables; ///< (image type id, array variable)
+    Id heap_words{};
+    Id heap_word_pointer{};
+    /// The push constant block holding the heap words (or the table base), its member and a
+    /// pointer type to one of its words.
+    Id heap_push_block{};
+    u32 heap_push_member{};
+    Id heap_push_pointer{};
+    bool heap_push_needed{}; ///< the stage reads the heap (a heap push member is declared)
+    bool heap_words_pushed{}; ///< Info::heap_words_pushed
+    bool uses_heap{};
+    /// P5a: a heap texel buffer array was declared (needs the dynamic indexing capabilities).
+    bool uses_heap_uniform_texel{};
+    bool uses_heap_storage_texel{};
+
+    /// The heap word of element `index` (when `arrayed`) of a heap descriptor whose first word is
+    /// `word`.
+    Id HeapWord(u32 word, const IR::Value& index, bool arrayed);
+
+    // EDEN_NX2_V2_CBUFBDA (cbuf_bda.h): constant buffers read through addresses. Per element
+    // type, PhysicalStorageBuffer pointers to the constant buffer block and to one element; the
+    // push constant block holding the addresses (or the table pointer), its member, a pointer
+    // type to one of them; the address table's pointer types.
+    UniformDefinitions cbuf_bda_blocks;
+    UniformDefinitions cbuf_bda_elements;
+    Id cbuf_bda_push_block{};
+    u32 cbuf_bda_push_member{};
+    bool cbuf_bda_push_placed{};
+    Id cbuf_bda_push_pointer{};
+    Id cbuf_bda_table_type{};
+    Id cbuf_bda_table_element{};
+    u32 cbuf_bda_mask{};
+    u32 cbuf_bda_base{};
+    u32 cbuf_bda_offset{};
+    u32 cbuf_bda_count{}; ///< the pipeline's pushed addresses (cbuf_bda_pushed), else 1
+    bool cbuf_bda_pushed{};
+
+    [[nodiscard]] bool UsesCbufBdaSlot(u32 index) const {
+        return index < 32 && ((cbuf_bda_mask >> index) & 1) != 0;
+    }
+    /// A PhysicalStorageBuffer pointer to constant buffer `index` as a block of `member` elements.
+    Id CbufBdaBlock(u32 index, Id UniformDefinitions::*member);
+
     Id local_memory{};
 
     bool uses_explicit_workgroup_layout{};
@@ -364,6 +433,8 @@ public:
     bool need_input_position_indirect{};
     Id input_position{};
     std::array<InputGenericInfo, 32> input_generics{};
+    /// Screen-linear fragment inputs read through perspective interpolation, times FragCoord.w.
+    std::array<bool, 32> noperspective_as_smooth_inputs{};
 
     Id output_point_size{};
     Id output_position{};
@@ -412,6 +483,16 @@ public:
     std::vector<MeshLineTarget> mesh_primitive_targets;
     std::array<Id, 2> mesh_outputs_marker{};
     std::array<Id, 4> mesh_tasks_marker{};
+    /// Mesh emulation (RuntimeInfo::mesh_as_compute): the output storage buffer and the
+    /// pointer type to one of its words.
+    Id mesh_output_buffer{};
+    Id mesh_output_u32{};
+    // With a task program: its payload, offset and argument buffers (RuntimeInfo), and the mesh
+    // workgroup's index within its task (what the mesh program reads at input address 0).
+    Id mesh_task_payload_buffer{};
+    Id mesh_task_offsets_buffer{};
+    Id mesh_task_args_buffer{};
+    Id mesh_group_index{};
 
     Id load_const_func_u8{};
     Id load_const_func_u16{};
@@ -441,6 +522,20 @@ private:
     void DefineTextureBuffers(const Info& info, u32& binding);
     void DefineImageBuffers(const Info& info, u32& binding);
     void DefineTextures(const Info& info, u32& binding, u32& scaling_index);
+    void DefineHeapTexture(const Info& info, const TextureDescriptor& desc, size_t index);
+    void DefineHeapImage(const Info& info, const ImageDescriptor& desc, size_t index);
+    void DefineHeapWords();
+    /// Appends the heap push member to a push constant block being built (`members`), when the
+    /// stage needs it and no block holds it yet; DecorateHeapPushMember decorates it once the
+    /// block's struct exists. The same for the constant buffer address member (CBUFBDA).
+    void AddHeapPushMember(boost::container::static_vector<Id, 5>& members, u32& member_index);
+    void DecorateHeapPushMember(Id struct_type, Id block);
+    /// A push constant block of its own for the heap and address members (no other block in the
+    /// stage).
+    void DefineHeapPush();
+    /// EDEN_NX2_V2_CBUFBDA: the addressing model, the address member's and table's types.
+    void DefineCbufBda(const Info& info);
+    Id HeapArray(Id image_type, u32 heap_binding, bool coherent);
     void DefineImages(const Info& info, u32& binding, u32& scaling_index);
     void DefineAttributeMemAccess(const Info& info);
     void DefineWriteStorageCasLoopFunction(const Info& info);
@@ -453,6 +548,7 @@ private:
     void DefineInputs(const IR::Program& program);
     void DefineOutputs(const IR::Program& program);
     void DefineMesh(const IR::Program& program);
+    void DefineMeshEmulationOutput();
 };
 
 } // namespace Shader::Backend::SPIRV

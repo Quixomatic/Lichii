@@ -7,6 +7,7 @@
 #pragma once
 
 #include <memory>
+#include "video_core/v2/resolve/multifront.h"
 #include "video_core/macro_memo.h"
 #include "video_core/macro_turing.h"
 
@@ -229,6 +230,8 @@ struct MacroEngine {
     MacroEngine(bool is_interpreted_) noexcept : is_interpreted{is_interpreted_} {}
     // Store the uploaded macro code to compile them when they're called.
     inline void AddCode(u32 method, u32 data) noexcept {
+        VideoCommon::V2::Resolve::MultiFront::Note(
+            VideoCommon::V2::Resolve::MultiFront::EventKind::MacroUpload, method);
         if (native_turing) {
             if (native_write_offset < native_code.size()) native_code[native_write_offset++] = data;
             ++native_code_generation;

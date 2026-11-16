@@ -115,3 +115,28 @@ TEST_CASE("Syncpoint action IDs stay distinct across counters and host guest ban
     REQUIRE(guest_calls == 1);
     REQUIRE(host_calls == 1);
 }
+
+TEST_CASE("Host syncpoint waits are counted until they fire or are cancelled",
+          "[video_core][syncpoint_actions]") {
+    // Pipeline v2 R2-F4-02: only a wait on a host value (which fence completions advance) makes
+    // fence submissions urgent; guest actions (vi2's present wait) don't count.
+    SyncpointManager manager;
+    REQUIRE_FALSE(manager.HasHostWaiters());
+    const auto guest = manager.RegisterGuestAction(2, 1, [] {});
+    REQUIRE_FALSE(manager.HasHostWaiters());
+    // Already reached: runs at once, nothing waits.
+    REQUIRE(manager.RegisterHostAction(2, 0, [] {}) == 0);
+    REQUIRE_FALSE(manager.HasHostWaiters());
+    const auto first = manager.RegisterHostAction(2, 1, [] {});
+    const auto second = manager.RegisterHostAction(2, 2, [] {});
+    REQUIRE(manager.HasHostWaiters());
+    manager.IncrementHost(2); // fires the first
+    REQUIRE(manager.HasHostWaiters());
+    manager.DeregisterHostAction(2, first); // already fired: no change
+    REQUIRE(manager.HasHostWaiters());
+    manager.DeregisterHostAction(2, second);
+    REQUIRE_FALSE(manager.HasHostWaiters());
+    manager.IncrementGuest(2);
+    manager.DeregisterGuestAction(2, guest);
+    REQUIRE_FALSE(manager.HasHostWaiters());
+}

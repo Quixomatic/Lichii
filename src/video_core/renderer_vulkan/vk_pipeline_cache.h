@@ -32,6 +32,7 @@
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/renderer_vulkan/fixed_pipeline_state.h"
+#include "video_core/v2/pipeline_lookup.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
@@ -135,13 +136,32 @@ public:
 
     void TickFrame();
 
-    [[nodiscard]] ComputePipeline* CurrentComputePipeline();
+    [[nodiscard]] ComputePipeline* CurrentComputePipeline(u64& native_key);
+
+    /// EDEN_NX2_V2_DRAWCACHE: a recipe replay used `pipeline` without a lookup (eviction age).
+    void NoteRecipeUse(GraphicsPipeline* pipeline);
+    /// EDEN_NX2_V2_DRAWCACHE: whether the last CurrentComputePipeline's entry can be replayed
+    /// (no null pointer slots a later dispatch may rebuild it for).
+    [[nodiscard]] bool LastComputeTakesRecipes() const noexcept {
+        return last_compute_takes_recipes;
+    }
 
     void LoadDiskResources(u64 title_id, std::stop_token stop_loading,
                            const VideoCore::DiskResourceLoadCallback& callback);
 
 private:
     [[nodiscard]] GraphicsPipeline* CurrentGraphicsPipelineSlowPath();
+
+    /// EDEN_NX2_V2_PIPEKEY: CurrentGraphicsPipeline with the incremental key and the two-level
+    /// lookup.
+    [[nodiscard]] GraphicsPipeline* CurrentGraphicsPipelineV2();
+
+    /// The pipeline for graphics_key from graphics_cache, created when it is new; nullptr when
+    /// its creation failed.
+    [[nodiscard]] GraphicsPipeline* FindOrCreateGraphicsPipeline();
+
+    /// Makes `pipeline` the current one (the slow path's bookkeeping).
+    void ActivateGraphicsPipeline(GraphicsPipeline* pipeline, bool add_transition);
 
     /// Returns `pipeline` when it is built or its draw must wait for it, nullptr when the draw
     /// may be skipped while it builds (asynchronous shaders, CanDiscardPendingDraw).
@@ -177,6 +197,28 @@ private:
 
     void QueueVulkanPipelineCacheFlush();
 
+    /// Queues one write of the driver pipeline cache file on the serialization thread, with no
+    /// throttle. For the end of a precache: its builds never reach the timed flush, which counts
+    /// only pipelines built during play.
+    void QueueVulkanPipelineCacheSave();
+
+    /// One build of the shader precache: builds a pipeline and destroys it, true when it built.
+    struct PrecacheJob {
+        u64 graphics_hash{}; ///< The cached graphics pipeline it builds, 0 for a compute program
+        Common::UniqueFunction<bool> build;
+    };
+
+    /// Shader precache before the game starts (precache_shaders), on every CPU thread: the cached
+    /// graphics pipelines this boot skipped (`jobs`; `precached` holds those built by earlier
+    /// precaches) and the compute programs of the title's precache file (made from the game files,
+    /// missing reads guessed) are built, then thrown away. They only fill the driver's shader
+    /// cache, so a later build of the same pipeline finds the driver's work done. Reports progress
+    /// through `callback` and returns when it is done, skipped from the loading screen or the load
+    /// is stopped.
+    void PrecacheShaders(u64 title_id, std::vector<PrecacheJob> jobs,
+                         std::unordered_set<u64> precached, std::stop_token stop_loading,
+                         const VideoCore::DiskResourceLoadCallback& callback);
+
     const Device& device;
     Scheduler& scheduler;
     DescriptorPool& descriptor_pool;
@@ -194,9 +236,35 @@ private:
     GraphicsPipelineCacheKey graphics_key{};
     GraphicsPipeline* current_pipeline{};
 
+    /// EDEN_NX2_V2_PIPEKEY state: what the persistent key was built from and the last result.
+    struct V2Key {
+        const Tegra::Engines::Maxwell3D* engine{}; ///< The channel's engine the key belongs to
+        KeyInputs inputs{};
+        bool valid{};
+        FixedPipelineState shadow{}; ///< verify: the incremental key (graphics_key has Refresh's)
+        std::array<u64, 6> hashes{};
+        GraphicsPipeline* pipeline{}; ///< The last pipeline found for (hashes, key)
+    };
+    V2Key v2_key{};
+    VideoCommon::V2::PipelineLookup<GraphicsPipeline> v2_lookup;
+    /// EDEN_NX2_V2_PARALLEL R3: the shader hashes last published for the shards (and the engine).
+    std::array<u64, 6> v2_published_hashes{};
+    const Tegra::Engines::Maxwell3D* v2_published_engine{};
+
+public:
+    /// EDEN_NX2_V2_PARALLEL R3: the v2 lookup, for the shards' FindShared.
+    [[nodiscard]] const VideoCommon::V2::PipelineLookup<GraphicsPipeline>& V2Lookup() const noexcept {
+        return v2_lookup;
+    }
+
+private:
+    /// Forgets the v2 lookup tables (pipelines were destroyed).
+    void ClearV2Lookup();
+
     /// Destroys graphics pipelines unused for a while, once the GPU is done with them.
     void EvictUnusedPipelines();
     u64 frame_count{};
+    bool last_compute_takes_recipes{};
     /// Wait budget of native draws for unbuilt pipelines left in this frame, in microseconds
     /// (native_async_draws = Bounded). Only touched on the GPU thread; reset in TickFrame.
     s64 native_wait_budget_us{8000};
@@ -236,6 +304,9 @@ private:
     std::atomic<size_t> last_cache_size{};
     std::atomic_bool flush_in_flight{};
 
+    /// Requested first when the cache is destroyed, to stop a rewrite of the disk cache: Android
+    /// and yuzu_cmd load with a stop token that never stops
+    std::stop_source serialization_stop;
     Common::ThreadWorker workers;
     Common::ThreadWorker serialization_thread;
     DynamicFeatures dynamic_features;

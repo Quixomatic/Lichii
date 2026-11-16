@@ -149,6 +149,11 @@ public:
     boost::container::small_vector<std::pair<GPUVAddr, std::size_t>, 32> GetSubmappedRange(
         GPUVAddr gpu_addr, std::size_t size) const;
 
+    /// The device ranges [gpu_addr, gpu_addr + size) maps to (contiguous pages merged), up to the
+    /// end of the address space.
+    boost::container::small_vector<std::pair<DAddr, std::size_t>, 32> GetSubmappedDeviceRange(
+        GPUVAddr gpu_addr, std::size_t size) const;
+
     GPUVAddr Map(GPUVAddr gpu_addr, DAddr dev_addr, std::size_t size,
                  PTEKind kind = PTEKind::INVALID, bool is_big_pages = true);
     GPUVAddr MapSparse(GPUVAddr gpu_addr, std::size_t size, bool is_big_pages = true);
@@ -169,6 +174,12 @@ public:
         return map_serial.load(std::memory_order_acquire);
     }
 
+    /// Changes whenever this address space or the device memory behind it is mapped or unmapped:
+    /// a host pointer GetPointer returned is only good while it stays the same.
+    [[nodiscard]] u64 HostPointerSerial() const {
+        return MapSerial() + memory.TranslationGeneration();
+    }
+
     /// MaxContinuousRange by walking the page tables (the answer with Nx2Perf off).
     size_t MaxContinuousRangeUncached(GPUVAddr gpu_addr, size_t size) const;
 
@@ -185,6 +196,10 @@ public:
     size_t GetMemoryLayoutSizeUncached(GPUVAddr gpu_addr) const;
 
     void FlushCaching();
+    /// U-04: whether FlushCaching has anything to invalidate (inline writes since the last one).
+    [[nodiscard]] bool HasPendingInvalidation() const noexcept {
+        return !accumulator.Empty();
+    }
 
     /// Leaves the caches' invalidation of a range already written for the next FlushCaching
     /// (before every draw, dispatch, clear and copy), merged with neighbouring ranges.
@@ -216,7 +231,10 @@ private:
 
     void ReadBlockImpl(GPUVAddr gpu_src_addr, void* dest_buffer, std::size_t size, VideoCommon::CacheType which, bool unsafe,
                        std::source_location caller) const;
-    void WriteBlockImpl(GPUVAddr gpu_dest_addr, const void* src_buffer, std::size_t size, VideoCommon::CacheType which, bool unsafe);
+    /// `cached`: constant buffer data (the decode-time versions patch themselves), not a foreign
+    /// write for F2-03's write watch.
+    void WriteBlockImpl(GPUVAddr gpu_dest_addr, const void* src_buffer, std::size_t size, VideoCommon::CacheType which, bool unsafe,
+                        bool cached = false);
 
     [[nodiscard]] std::size_t PageEntryIndex(GPUVAddr gpu_addr, bool is_big_page) const {
         if (is_big_page) {

@@ -26,8 +26,8 @@ class Scheduler {
 public:
     void Push(GPU& gpu, s32 channel, CommandList&& entries);
 
-    /// Runs channels whose pending semaphore acquire is now met.
-    void ResumePending(GPU& gpu);
+    /// Runs channels whose pending semaphore acquire is now met; true if any channel moved.
+    bool ResumePending(GPU& gpu);
     [[nodiscard]] bool HasPendingChannels() const {
         return !pending_channels.empty();
     }
@@ -37,6 +37,10 @@ public:
     }
 
     void DeclareChannel(std::shared_ptr<ChannelState> new_channel);
+
+    /// Binds the rasterizer to a channel under the scheduling lock (with the split, on its back:
+    /// a Channel IR record or a deferred call).
+    void BindChannelOnBack(GPU& gpu, s32 bind_id);
 
 private:
     void BindChannel(GPU& gpu, s32 bind_id);

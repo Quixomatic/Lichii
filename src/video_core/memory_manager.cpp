@@ -24,6 +24,7 @@
 #include "video_core/rasterizer_interface.h"
 #include "video_core/renderer_base.h"
 #include "video_core/texture_cache/util.h"
+#include "video_core/v2/cbuf_watch.h"
 
 namespace Tegra {
 bool MemoryManager::IsShuttingDown() const {
@@ -326,17 +327,33 @@ T MemoryManager::Read(GPUVAddr addr) const {
     return {};
 }
 
+namespace {
+/// EDEN_NX2_V2_CBUFRING (F2-03): a guest word the GPU side wrote, noted after it landed.
+void NoteRingWrite(const MemoryManager& memory, GPUVAddr addr, std::size_t size) {
+    if (const auto device = memory.GpuToCpuAddress(addr)) {
+        VideoCommon::V2::CbufWatch::Get().NoteForeign(*device, size);
+    }
+}
+} // Anonymous namespace
+
 template <typename T>
 void MemoryManager::Write(GPUVAddr addr, T data) {
     if (auto page_pointer{GetPointer(addr)}; page_pointer) {
         // NOTE: Avoid adding any extra logic to this fast-path block
         std::memcpy(page_pointer, &data, sizeof(T));
+        // F2-03 (R2-F2-03): semaphore, report and query words move the watch's page words.
+        if (VideoCommon::V2::On(VideoCommon::V2::Switch::CbufRing)) [[unlikely]] {
+            NoteRingWrite(*this, addr, sizeof(T));
+        }
         return;
     }
     // A Switch 2 sparse block nobody wrote yet gets its memory now.
     Tegra::Nx2BackSparseWrite(addr, sizeof(T), &data);
     if (auto page_pointer{GetPointer(addr)}; page_pointer) {
         std::memcpy(page_pointer, &data, sizeof(T));
+        if (VideoCommon::V2::On(VideoCommon::V2::Switch::CbufRing)) [[unlikely]] {
+            NoteRingWrite(*this, addr, sizeof(T));
+        }
         return;
     }
 
@@ -522,9 +539,16 @@ void MemoryManager::ReadWordsUnsafe(GPUVAddr gpu_src_addr, u32* dest, std::size_
     ReadBlockUnsafe(gpu_src_addr, dest, size, caller);
 }
 
-void MemoryManager::WriteBlockImpl(GPUVAddr gpu_dest_addr, const void* src_buffer, std::size_t size, [[maybe_unused]] VideoCommon::CacheType which, bool unsafe) {
+void MemoryManager::WriteBlockImpl(GPUVAddr gpu_dest_addr, const void* src_buffer, std::size_t size, [[maybe_unused]] VideoCommon::CacheType which, bool unsafe,
+                                   bool cached) {
     // Give Switch 2 sparse pages the write lands on their memory first (otherwise it is dropped).
     Tegra::Nx2BackSparseWrite(gpu_dest_addr, size, src_buffer);
+    // F2-03: noted after each copy (a version snapshot in between sees the page disarmed).
+    const bool foreign = !cached && VideoCommon::V2::On(VideoCommon::V2::Switch::CbufRing);
+    // CBUFRING=verify: constant buffer data the back applies is named as the page's last writer.
+    const bool note_cached = cached && VideoCommon::V2::On(VideoCommon::V2::Switch::CbufRing) &&
+                             VideoCommon::V2::CbufWatch::Get().track_writers.load(
+                                 std::memory_order_relaxed);
     auto just_advance = [&]([[maybe_unused]] std::size_t page_index, [[maybe_unused]] std::size_t offset, std::size_t copy_amount) {
         src_buffer = static_cast<const u8*>(src_buffer) + copy_amount;
     };
@@ -535,6 +559,12 @@ void MemoryManager::WriteBlockImpl(GPUVAddr gpu_dest_addr, const void* src_buffe
         }
         if (u8* physical = memory.GetPointer<u8>(dev_addr_base)) [[likely]] {
             std::memcpy(physical, src_buffer, copy_amount);
+        }
+        if (foreign) [[unlikely]] {
+            VideoCommon::V2::CbufWatch::Get().NoteForeign(dev_addr_base, copy_amount);
+        } else if (note_cached) [[unlikely]] {
+            VideoCommon::V2::CbufWatch::Get().NoteWriter(dev_addr_base, copy_amount,
+                                                         VideoCommon::V2::CbufWatch::Writer::Cached);
         }
         // After the copy: the buffer cache may upload the written bytes from guest memory.
         if (!unsafe) {
@@ -553,6 +583,12 @@ void MemoryManager::WriteBlockImpl(GPUVAddr gpu_dest_addr, const void* src_buffe
             std::memcpy(physical, src_buffer, copy_amount);
         } else {
             memory.WriteBlockUnsafe(dev_addr_base, src_buffer, copy_amount);
+        }
+        if (foreign) [[unlikely]] {
+            VideoCommon::V2::CbufWatch::Get().NoteForeign(dev_addr_base, copy_amount);
+        } else if (note_cached) [[unlikely]] {
+            VideoCommon::V2::CbufWatch::Get().NoteWriter(dev_addr_base, copy_amount,
+                                                         VideoCommon::V2::CbufWatch::Writer::Cached);
         }
         if (!unsafe) {
             rasterizer->InvalidateRegion(dev_addr_base, copy_amount, which);
@@ -575,7 +611,7 @@ void MemoryManager::WriteBlockUnsafe(GPUVAddr gpu_dest_addr, const void* src_buf
 }
 
 void MemoryManager::WriteBlockCached(GPUVAddr gpu_dest_addr, const void* src_buffer, std::size_t size) {
-    WriteBlockImpl(gpu_dest_addr, src_buffer, size, VideoCommon::CacheType::None, true);
+    WriteBlockImpl(gpu_dest_addr, src_buffer, size, VideoCommon::CacheType::None, true, true);
     accumulator.Add(gpu_dest_addr, size);
 }
 
@@ -589,7 +625,7 @@ void MemoryManager::WriteWordsCached(GPUVAddr gpu_dest_addr, const u32* words, s
         }
         return;
     }
-    WriteBlockImpl(gpu_dest_addr, words, size, VideoCommon::CacheType::None, true);
+    WriteBlockImpl(gpu_dest_addr, words, size, VideoCommon::CacheType::None, true, true);
     // The accumulator merges word by word differently from one range: keep its ranges.
     for (std::size_t i = 0; i < count; ++i) {
         accumulator.Add(gpu_dest_addr + i * sizeof(u32), sizeof(u32));
@@ -946,6 +982,16 @@ boost::container::small_vector<std::pair<GPUVAddr, std::size_t>, 32>
 MemoryManager::GetSubmappedRange(GPUVAddr gpu_addr, std::size_t size) const {
     boost::container::small_vector<std::pair<GPUVAddr, std::size_t>, 32> result{};
     GetSubmappedRangeImpl<true>(gpu_addr, size, result);
+    return result;
+}
+
+boost::container::small_vector<std::pair<DAddr, std::size_t>, 32>
+MemoryManager::GetSubmappedDeviceRange(GPUVAddr gpu_addr, std::size_t size) const {
+    boost::container::small_vector<std::pair<DAddr, std::size_t>, 32> result{};
+    if (IsWithinGPUAddressRange(gpu_addr)) {
+        GetSubmappedRangeImpl<false>(
+            gpu_addr, (std::min<u64>)(size, address_space_size - gpu_addr), result);
+    }
     return result;
 }
 

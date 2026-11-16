@@ -15,6 +15,7 @@
 #include <mutex>
 #include <numeric>
 #include <optional>
+#include <source_location>
 #include <span>
 #include <unordered_map>
 #include <unordered_set>
@@ -47,6 +48,12 @@
 #include "video_core/nx2_download_trace.h"
 #include "video_core/surface.h"
 #include "video_core/texture_cache/types.h"
+#include "video_core/v2/cbuf_ring.h"
+#include "video_core/v2/cbuf_watch.h"
+#include "video_core/v2/commit.h"
+#include "video_core/v2/draw_cache.h"
+#include "video_core/v2/resolve/draw_record.h"
+#include "video_core/v2/va_map.h"
 
 namespace VideoCommon {
 
@@ -156,6 +163,10 @@ public:
     std::array<u64, NUM_STAGES> written_storage_buffers{};
     u64 enabled_compute_storage_buffers = 0;
     u64 written_compute_storage_buffers = 0;
+    // Bound by a native (Switch 2) compute program, whose pointers carry no size.
+    u64 native_compute_storage_buffers = 0;
+    // Bytes from each compute storage binding's start that a dispatch marks GPU-written.
+    std::array<u32, NUM_STORAGE_BUFFERS> compute_storage_write_marks{};
 
     u32 total_graphics_storage_buffers = 0;
     u32 total_compute_storage_buffers = 0;
@@ -178,6 +189,17 @@ public:
     std::array<u32, NUM_STAGES> fast_bound_uniform_buffers{};
     std::array<std::array<u32, NUM_GRAPHICS_UNIFORM_BUFFERS>, NUM_STAGES>
         uniform_buffer_binding_sizes{};
+};
+
+/// The staging buffer type a runtime's deferred downloads use (EDEN_NX2_V2_READBACK).
+template <typename R>
+struct ReadbackStaging {
+    using type = int;
+};
+template <typename R>
+    requires requires(R& runtime) { runtime.DownloadStagingBuffer(size_t{}, true); }
+struct ReadbackStaging<R> {
+    using type = decltype(std::declval<R&>().DownloadStagingBuffer(size_t{}, true));
 };
 
 template <class P>
@@ -238,7 +260,8 @@ public:
     void TickFrame();
 
     bool BindMultiRangeStorage(const Binding& binding, bool is_written,
-                               std::span<const MultiRangeSegment> pool);
+                               std::span<const MultiRangeSegment> pool,
+                               u64 write_mark_limit = ~u64{0});
 
     void ResolveMultiRangeStorage(Binding& binding, bool is_written,
                                   std::vector<MultiRangeSegment>& pool);
@@ -267,7 +290,25 @@ public:
 
     void DownloadMemory(DAddr device_addr, u64 size);
 
+    /// Pipeline v2 (EDEN_NX2_V2_READBACK): records the download of the GPU-modified parts of
+    /// the range into a staging buffer and submits it without waiting for the GPU. `land`
+    /// (called on the reading thread) waits for that submission and writes guest memory. Returns
+    /// false, recording nothing, where the old path must run (buffers read in place, nothing
+    /// GPU-modified, no async runtime). `verify`: also download synchronously as before, write
+    /// that, and have `land` compare the asynchronous copy with it.
+    bool DownloadMemoryAsync(DAddr device_addr, u64 size, std::function<void()>& land,
+                             bool verify);
+
     std::optional<VideoCore::RasterizerDownloadArea> GetFlushArea(DAddr device_addr, u64 size);
+
+    /// The core consumed the read traps of these pages for a read the texture cache answered:
+    /// the next GPU write here must arm them again (GetFlushArea forgets them otherwise).
+    void ForgetReadTraps(DAddr device_addr, u64 size) {
+        read_trapped_ranges.Subtract(
+            Common::AlignDown(device_addr, Core::DEVICE_PAGESIZE),
+            Common::AlignUp(device_addr + size, Core::DEVICE_PAGESIZE) -
+                Common::AlignDown(device_addr, Core::DEVICE_PAGESIZE));
+    }
 
     /// Without downloads at every fence, a guest CPU read is the only way GPU-written buffer
     /// data reaches guest memory, so reads must ask the buffer cache (GetFlushArea).
@@ -282,6 +323,14 @@ public:
     void DisableGraphicsUniformBuffer(size_t stage, u32 index);
 
     void UpdateGraphicsBuffers(bool is_indexed);
+
+    /// Pipeline v2 P5a (EDEN_NX2_V2_COMMIT=1): applies, in order, the bind mutations deferred
+    /// since the last buffer update (uploads, geometry syncs, written marks, LRU touches, usage
+    /// marks), before the draw or dispatch is encoded. No-op otherwise.
+    void CommitBinds();
+    [[nodiscard]] bool HasDeferredBinds() const noexcept {
+        return v2_defer;
+    }
 
     void UpdateComputeBuffers();
 
@@ -298,6 +347,62 @@ public:
 
     void UnbindGraphicsStorageBuffers(size_t stage);
 
+    /// EDEN_NX2_V2_DRAWCACHE: binds a storage buffer as BindGraphicsStorageBuffer bound it for a
+    /// draw recipe, without reading its descriptor (the recipe proved it unchanged).
+    void ReplayGraphicsStorageBuffer(size_t stage, size_t ssbo_index, DAddr device_addr,
+                                     GPUVAddr gpu_addr, u32 size, u32 segment_first,
+                                     u32 segment_count, bool is_written);
+
+    /// EDEN_NX2_V2_DRAWCACHE buffer replay. Records the graphics buffer bindings the last
+    /// UpdateGraphicsBuffers/BindHost* resolved and bound (with `stamp`, taken before them).
+    /// `stage_mask`: the stages the draw binds (bit per stage). The channel state keeps the
+    /// storage and texture buffer bits of stages the pipeline lacks from earlier draws; those were
+    /// neither bound nor synchronized by this draw, so they are not recorded (S0-G17).
+    void RecordGraphicsBuffers(VideoCommon::V2::DrawCache::BufferRecipe& recipe, bool is_indexed,
+                               u64 stamp, u32 stage_mask = ~0U);
+    /// Replaces UpdateGraphicsBuffers + BindHostGeometryBuffers for a recipe replay. A binding
+    /// whose buffer generation matches and whose guest range is unchanged since the recipe's stamp
+    /// (and lies within the recorded one) is bound from the recipe: no FindBuffer, no
+    /// SynchronizeBuffer. Any other binding takes the existing lookup and sync. False when the
+    /// replay can't run (the caller takes the existing calls; nothing was bound).
+    [[nodiscard]] bool ReplayGraphicsBuffers(const VideoCommon::V2::DrawCache::BufferRecipe& recipe,
+                                             bool is_indexed,
+                                             VideoCommon::V2::Versions::EpochMemo& memo);
+    /// Replaces BindHostStageBuffers(stage) after ReplayGraphicsBuffers returned true: uniform
+    /// versions of this tick are referenced and cached uniform, storage and texture buffers bound
+    /// without SynchronizeBuffer when unchanged; anything else is bound as always.
+    void ReplayHostStageBuffers(size_t stage,
+                                const VideoCommon::V2::DrawCache::BufferRecipe& recipe,
+                                VideoCommon::V2::Versions::EpochMemo& memo);
+    /// Bindings ReplayGraphicsBuffers/ReplayHostStageBuffers bound from the recipe and through
+    /// the sync path since the last call (stats; any synced one means the recipe is recorded again).
+    [[nodiscard]] std::pair<u32, u32> TakeReplayCounts() noexcept {
+        return {std::exchange(replay_binds_replayed, 0), std::exchange(replay_binds_synced, 0)};
+    }
+    /// Verify: recipe bindings the versions vouch for whose ranges the tracker still holds
+    /// CPU-modified (a skipped upload would have been needed).
+    /// `detail` (optional) names the first stale binding (S0-G17 diagnostics).
+    [[nodiscard]] u32 CountStaleRecipeRanges(const VideoCommon::V2::DrawCache::BufferRecipe& recipe,
+                                             VideoCommon::V2::Versions::EpochMemo& memo,
+                                             std::string* detail = nullptr);
+    /// F2-X1: the path BindHostGraphicsUniformBuffer takes for this uniform binding now, as a
+    /// recipe kind: Normal (root-table bank, native bank, no host buffer), Version (the stream
+    /// path; a recipe holds Version only when a version was found) or Cached (the host buffer).
+    /// A replay takes a recorded uniform only on the path the binding takes now.
+    [[nodiscard]] VideoCommon::V2::DrawCache::BufferBind::Kind UniformBindKind(
+        size_t stage, u32 index, const Binding& binding);
+
+    /// EDEN_NX2_V2_DRAWCACHE: visits the graphics storage buffer bindings of `stage` as
+    /// func(index, is_written, binding).
+    template <typename Func>
+    void ForEachGraphicsStorageBinding(size_t stage, Func&& func) const {
+        ForEachEnabledBit(channel_state->enabled_storage_buffers[stage], [&](u32 index) {
+            const bool is_written =
+                ((channel_state->written_storage_buffers[stage] >> index) & 1) != 0;
+            func(index, is_written, channel_state->storage_buffers[stage][index]);
+        });
+    }
+
     bool BindGraphicsStorageBuffer(size_t stage, size_t ssbo_index, u32 cbuf_index, u32 cbuf_offset,
                                    bool is_written, u32 indirect_offset = ~0U);
 
@@ -308,8 +413,10 @@ public:
 
     void UnbindComputeStorageBuffers();
 
+    /// write_extent: how far the program's stores reach past the pointer (native programs).
     void BindComputeStorageBuffer(size_t ssbo_index, u32 cbuf_index, u32 cbuf_offset,
-                                  bool is_written, u32 indirect_offset = ~0U);
+                                  bool is_written, u32 indirect_offset = ~0U,
+                                  const Shader::StorageWriteExtent& write_extent = {});
 
     void UnbindComputeTextureBuffers();
 
@@ -340,6 +447,14 @@ public:
     /// Return true when there are uncommitted buffers to be downloaded
     [[nodiscard]] bool HasUncommittedFlushes() const noexcept;
 
+    /// SYNC §15.2: whether a queued fence download is a range a CPU consumer reads: always for
+    /// Preflushable-only downloads (ranges the guest read), else per Tegra::Nx2IsCpuReadPage.
+    [[nodiscard]] bool UncommittedFlushesCpuRead() const;
+
+    /// Whether the fence downloads queued are all learned early downloads (EDEN_NX2_V2_READBACK):
+    /// Switch 2 titles without async buffer downloads mark pages Preflushable only by learning.
+    [[nodiscard]] bool FlushesAreEarlyDownloads() const;
+
     void AccumulateFlushes();
 
     /// Return true when the caller should wait for async downloads
@@ -368,13 +483,16 @@ public:
     }
     /// True when it recorded copies, which the GPU completes at `tick` (the caller submits).
     bool Nx2CopyListPages(u64 tick);
-    enum class Nx2ListRead { Unknown, Copied, Synced, NeedsSync };
+    enum class Nx2ListRead { Unknown, Copied, Synced, NeedsSync, Pending };
     /// Front thread: Synced when guest memory holds the page `device_addr` lies in (flushed and
     /// written by no GPU work since), else Copied with `out` filled from the copy of its last
     /// write once the GPU is done with it. Unknown otherwise: the caller drains and flushes.
     /// Pages draws write are only Synced or Unknown, and NeedsSync until `past_sync`: the
     /// split's back ran the work before the last host-level wait (GpuSplit::WaitForSync).
-    Nx2ListRead Nx2ReadListCopy(DAddr device_addr, std::span<u8> out, bool past_sync);
+    /// With `pending_tick`, a copy the GPU has not finished returns Pending and sets the tick
+    /// instead of waiting for it.
+    Nx2ListRead Nx2ReadListCopy(DAddr device_addr, std::span<u8> out, bool past_sync,
+                                u64* pending_tick = nullptr);
     /// Front thread, the split drained: the command list page was flushed to guest memory.
     void Nx2NoteListSynced(DAddr page);
 
@@ -452,6 +570,9 @@ public:
 
     [[nodiscard]] std::pair<Buffer*, u32> GetDrawIndirectBuffer();
 
+    /// Fast draw verify (nx2_fast_draw.h): a hash of the bindings a delta draw keeps.
+    [[nodiscard]] u64 KeptGraphicsBindingsHash(bool vertex, bool storage, bool texture) const;
+
     template <typename Func>
     void BufferOperations(Func&& func) {
         do {
@@ -461,7 +582,113 @@ public:
     }
 
     Common::SpinRecursiveMutex mutex;
+
+    /// Pipeline v2 P5a (EDEN_NX2_V2_COMMIT): the renderer's commit state (null: old path). Builds
+    /// the lock-free page map from the page table.
+    void SetCommit(V2::Commit::Context* context);
+
+    /// P5a pure lookup: the registered buffer covering [device_addr, device_addr + size) from
+    /// the lock-free page map (NULL_BUFFER_ID when none does; any thread reads it, P6 shards
+    /// validate the slot by its generation).
+    [[nodiscard]] BufferId LookupBuffer(DAddr device_addr, u32 size) const;
+
+    // Pipeline v2 P6 Step 0 (EDEN_NX2_V2_DRAWREC, notes/STEP0_SPEC.md §2 items 11-12): pure
+    // twins of the fused update calls, and the appliers ApplyDraw/EncodeDraw run.
+    /// FindBuffer's owner-side lookup without creating: the buffer holding the range,
+    /// NULL_BUFFER_ID for no address, an invalid id when a creation is due.
+    [[nodiscard]] BufferId PeekBuffer(DAddr device_addr, u32 size, bool sparse_compatible) const;
+    /// The BufferCreate request FindBuffer queues for a range (with its predicted effects).
+    [[nodiscard]] V2::Commit::Request MakeCreateRequest(DAddr device_addr, u32 size,
+                                                        bool sparse_compatible) const;
+    /// An index or vertex buffer range as UpdateIndexBuffer / UpdateVertexBuffer compute it.
+    struct GeometryRange {
+        DAddr device_addr{};
+        u32 size{};
+        bool valid{}; ///< false: NULL_BINDING
+    };
+    template <class Memory>
+    [[nodiscard]] static GeometryRange IndexRange(Memory& memory, GPUVAddr begin, GPUVAddr end,
+                                                  u32 first, u32 count, u32 format_size);
+    template <class Memory>
+    [[nodiscard]] static GeometryRange VertexRange(Memory& memory, GPUVAddr begin, bool enabled,
+                                                   GPUVAddr limit_address, bool native,
+                                                   u64 native_size);
+    template <class View>
+    [[nodiscard]] V2::Resolve::ResolvedIndex ResolveIndexBinding(const View& view) const;
+    template <class View>
+    [[nodiscard]] std::optional<V2::Resolve::ResolvedVertex> ResolveVertexBinding(
+        const View& view, u32 slot) const;
+    template <class View>
+    [[nodiscard]] V2::Resolve::ResolvedUbo ResolveUniformBinding(const View& view, size_t stage,
+                                                                 u32 slot) const;
+    /// BindGraphicsStorageBuffer + UpdateStorageBuffers without writing anything.
+    /// `multi_range`: the binding may need split segments (the record path can't take it).
+    template <class View>
+    [[nodiscard]] V2::Resolve::ResolvedSsbo ResolveStorageBinding(
+        const View& view, size_t stage, u32 ssbo_index, u32 cbuf_index, u32 cbuf_offset,
+        bool is_written, u32 indirect_offset, bool& multi_range) const;
+    /// A texture buffer binding of a ready view (BindGraphicsTextureBuffer + UpdateTextureBuffers).
+    [[nodiscard]] V2::Resolve::ResolvedTbo ResolveTextureBufferBinding(size_t stage, u32 index,
+                                                                       GPUVAddr gpu_addr, u32 size,
+                                                                       PixelFormat format,
+                                                                       bool is_written,
+                                                                       bool is_image) const;
+    /// Applies one request of a draw record's buffer list (BufferCreate as V2ApplyCreates does).
+    u32 ApplyDrawRequest(const V2::Commit::Request& request);
+    /// Whether a buffer was deleted since the last call (and clears it).
+    [[nodiscard]] bool TakeDeletedBuffers() noexcept {
+        return std::exchange(channel_state->has_deleted_buffers, false);
+    }
+    /// Opens a deferred bind scope as DoUpdateGraphicsBuffers leaves one (with COMMIT=1).
+    void BeginBindScope() {
+        if (V2Defers()) {
+            V2BeginBindScope();
+        }
+    }
+    /// Writes the graphics bindings of a record into the channel state as the Update* calls
+    /// leave them (in BufferOperations, as DoUpdateGraphicsBuffers runs).
+    void EncodeGraphicsBindings(const V2::Resolve::ResolvedDraw& record);
+    /// DRAWREC=verify (step 11): the graphics bindings the old configure left in the channel
+    /// state, in a record's shape (index, vertex, uniform, storage and texture buffers of
+    /// `stages`), into `observed`.
+    void ObserveGraphicsBindings(V2::Resolve::ResolvedDraw& observed, bool is_indexed,
+                                 const std::array<bool, NUM_STAGES>& stages) const;
+    [[nodiscard]] u32 BufferGeneration(BufferId id) const noexcept {
+        return V2::Versions::Gens().Get(V2::Versions::Kind::Buffer, id.index);
+    }
+    [[nodiscard]] u64 BufferDeletions() const noexcept {
+        return buffer_deletions;
+    }
+    /// DRAWREC=verify: buffers created so far (a join during a draw creates one and deletes
+    /// others, so the live count need not grow).
+    [[nodiscard]] size_t BufferSlots() const noexcept {
+        return buffers_created;
+    }
+    /// DRAWREC=verify (step 10): a hash of what a cache mutation moves; a pure resolve leaves
+    /// it unchanged.
+    [[nodiscard]] u64 DrawRecPurity() const noexcept {
+        u64 hash = 0xcbf29ce484222325ULL;
+        const auto mix = [&](u64 value) { hash = (hash ^ value) * 0x100000001b3ULL; };
+        mix(slot_buffers.size());
+        mix(vertex_buffers_serial);
+        mix(buffer_deletions);
+        mix(enabled_vertex_buffers_mask);
+        mix(v2_binds.Requests().size());
+        mix(v2_creates.Requests().size());
+        mix(v2_defer ? 1 : 0);
+        mix(channel_state->has_deleted_buffers ? 1 : 0);
+        return hash;
+    }
+
     Runtime& runtime;
+    // EDEN_NX2_V2_DRAWCACHE buffer replay (ReplayGraphicsBuffers): bindings bound from the recipe
+    // or synced, and the vertex buffers that skip their synchronization in this replay.
+    u32 replay_binds_replayed{};
+    u32 replay_binds_synced{};
+    u32 replay_skip_vertex_mask{};
+    bool replay_skip_index{};
+    bool replay_all_unchanged{}; ///< F2-07: this replay's recipe ranges are all unchanged
+    bool replay_all_alive{};     ///< F2-07: and its recorded buffers all alive
     bool any_buffer_uploaded = false;
     /// Indirectly read banks of native programs already uploaded this frame.
     std::unordered_set<DAddr> native_indirect_uniforms_this_frame;
@@ -511,6 +738,24 @@ private:
 
     void BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 binding_index, bool needs_bind);
 
+    /// EDEN_NX2_V2_CBUFVER: binds a small constant buffer through its version (v2/cbuf_version.h).
+    /// True when an unchanged version was referenced; false when it bound a new copy.
+    bool BindUniformVersion(size_t stage, u32 index, u32 binding_index, DAddr device_addr,
+                            u32 size);
+    /// EDEN_NX2_V2_CBUFRING: binds the decode-time version of the range (v2/cbuf_ring.h) while
+    /// its bytes equal guest memory. False when there is none or it differs.
+    bool BindRingVersion(size_t stage, u32 index, DAddr device_addr, u32 size);
+    /// EDEN_NX2_V2_CBUFVER: what guest memory holds at [device_addr, device_addr + size) now
+    /// (a direct span, or a copy in version_scratch).
+    const u8* V2GuestBytes(DAddr device_addr, u32 size);
+    /// F2-03: once per frame, the write watch's arming (v2/cbuf_watch.h).
+    void V2TickCbufWatch();
+    /// F2-03, CBUFRING=verify: a ring version that differs from guest memory, by how it was
+    /// validated (first 32, then every 4096th).
+    void V2RingVerifyLog(size_t stage, u32 index, DAddr device_addr, u32 size,
+                         const VideoCommon::V2::CbufRing::BackTable::Entry& entry,
+                         const char* path, u64 words_now, u64 epoch_now);
+
     void BindHostGraphicsStorageBuffers(size_t stage);
 
     void BindHostGraphicsTextureBuffers(size_t stage);
@@ -555,6 +800,52 @@ private:
 
     void MarkWrittenBuffer(BufferId buffer_id, DAddr device_addr, u32 size, bool needs_sync = false);
 
+    /// EDEN_NX2_V2_READBACK: frees the staging of readbacks their readers landed.
+    void FreeLandedReadbacks();
+    /// EDEN_NX2_V2_READBACK early downloads (Switch 2): a guest read of [begin, end); pages read
+    /// back twice become Preflushable, so the fences download their later GPU writes.
+    void LearnReadback(DAddr begin, DAddr end);
+
+public:
+    /// EDEN_NX2_V2_XREADBACK: records the queued fence downloads right behind their writers.
+    void RecordWriterDownloads();
+    bool v2_writer_downloads = false;
+    /// R2-F4-07 (EDEN_NX2_V2_ADAPTSUBMIT): reads of mapped buffers wait for their producer's
+    /// submission, not a Finish.
+    bool v2_producer_reads = V2::On(V2::Switch::AdaptSubmit);
+
+private:
+    /// R2-F4-07: waits for the mapped buffers' newest GPU writes (`producer`, a scheduler tick)
+    /// to be host-visible: the producer's submission only, else FinishForHostRead.
+    void WaitMappedHostRead(u64 producer);
+
+public:
+
+private:
+    struct PreparedDownload {
+        Async_Buffer staging{};
+        boost::container::small_vector<BufferCopy, 4> copies;
+        Common::RangeSet<DAddr> ranges;
+    };
+    std::vector<PreparedDownload> writer_downloads_open;
+    std::deque<std::vector<PreparedDownload>> writer_downloads_fenced;
+    /// ...and GPU writes to them: four writes nobody read in between drop a page again.
+    void NoteLearnedWrite(DAddr device_addr, u64 size);
+
+    struct ReadbackState;
+    std::vector<std::shared_ptr<ReadbackState>> readbacks_in_flight;
+    struct LearnedPage {
+        u8 reads{};
+        u8 unread_writes{}; ///< Frames with GPU writes and no read since
+        bool marked{};
+        u64 write_frame{};  ///< learned_frame of the last write counted
+    };
+    u64 learned_frame{1}; ///< +1 per TickFrame
+    std::unordered_map<u64, LearnedPage> learned_pages;
+    size_t learned_marked{};
+    DAddr learned_lowest{~DAddr{0}};
+    DAddr learned_highest{};
+
     /// Counts a GPU write to the command list pages in the range (invalidating their copies) and,
     /// while collecting, asks for new copies.
     void Nx2NoteListWrite(BufferId buffer_id, DAddr device_addr, u64 size);
@@ -580,6 +871,10 @@ private:
     void TouchBuffer(Buffer& buffer, BufferId buffer_id) noexcept;
 
     bool SynchronizeBuffer(Buffer& buffer, DAddr device_addr, u32 size);
+    bool SynchronizeBufferImpl(Buffer& buffer, DAddr device_addr, u32 size);
+
+    /// SynchronizeBuffer for vertex buffer slots 0-31 and the index buffer (slot 32).
+    void SynchronizeGeometryBuffer(u32 slot, BufferId buffer_id, DAddr device_addr, u32 size);
 
     void UploadMemory(Buffer& buffer, u64 total_size_bytes, u64 largest_copy,
                       std::span<BufferCopy> copies);
@@ -596,7 +891,9 @@ private:
     /// Downloads the GPU-written data of several buffers with one wait for the GPU.
     void DownloadBuffersMemory(std::span<const BufferId> buffer_ids);
 
-    void DownloadRangesMemory(std::span<const std::pair<DAddr, u64>> ranges);
+    /// `location` (SYNC Step 8): the caller, named in the STATS "finishes by site".
+    void DownloadRangesMemory(std::span<const std::pair<DAddr, u64>> ranges,
+                              std::source_location location = std::source_location::current());
 
     void DeleteBuffer(BufferId buffer_id, bool do_not_mark = false);
 
@@ -651,6 +948,23 @@ private:
     u32 stale_vertex_buffers_mask = 0;
     u64 vertex_buffers_serial = 0;
     std::array<Binding, 32> v_buffer{};
+
+    /// The range each geometry slot last scanned for uploads (SynchronizeGeometryBuffer).
+    struct GeometrySync {
+        BufferId buffer_id{};
+        DAddr device_addr{};
+        u32 size{};
+        u64 deletions{};
+    };
+    std::array<GeometrySync, NUM_VERTEX_BUFFERS + 1> geometry_syncs{};
+    /// Counts DeleteBuffer calls: a buffer id older than this count may have been freed or reused.
+    u64 buffer_deletions = 0;
+    u64 buffers_created = 0; ///< BufferSlots
+    struct GeometryStats {
+        u64 syncs{};
+        u64 syncs_skipped{};
+        u64 verify_mismatches{};
+    } geometry_stats;
 
     boost::container::small_vector<BufferCopy, 4> upload_copies;
 
@@ -725,10 +1039,11 @@ private:
     void ArmReadTraps(DAddr device_addr, u64 size) {
         const DAddr begin = Common::AlignDown(device_addr, Core::DEVICE_PAGESIZE);
         const DAddr end = Common::AlignUp(device_addr + size, Core::DEVICE_PAGESIZE);
-        if (!read_trapped_ranges.Arm(begin, end - begin)) {
-            return;
-        }
-        device_memory.ArmReadTraps(begin, end - begin);
+        // Only the parts not armed yet: the core visits each page it is given, and a buffer the
+        // GPU rewrites every frame is mostly still armed (the guest read a few of its pages).
+        read_trapped_ranges.Arm(begin, end - begin, [this](DAddr part, u64 part_size) {
+            device_memory.ArmReadTraps(part, part_size);
+        });
     }
 
     ReadTrapTracker read_trapped_ranges;
@@ -779,7 +1094,45 @@ private:
 
     // Covers the device address space (MaxwellDeviceTraits::device_virtual_bits).
     std::array<BufferId, ((1ULL << 36) >> CACHING_PAGEBITS)> page_table;
+    /// P5a: page_table published for lock-free readers (written with it by the commit owner).
+    V2::Commit::Context* commit = nullptr;
+    std::unique_ptr<V2::VaMap<CACHING_PAGEBITS, 36>> v2_pages;
+    /// P5a buffer requests. Lookups of the update pass return proxy ids for missing buffers
+    /// (BufferCreate requests in v2_creates), created and patched into the bindings at its end.
+    /// Bind mutations after it are requests in v2_binds, applied by CommitBinds.
+    V2::Commit::RequestList v2_creates;
+    V2::Commit::RequestList v2_binds;
+    std::vector<u32> v2_scope_uploads; ///< F2-19: buffers with an upload queued in the scope
+    u64 v2_scope_deletions = 0; ///< F2-19: buffer_deletions when the scope began
+    /// Perf fix C: the scope's pending written marks, so a GPU-modified test scans only them.
+    boost::container::small_vector<std::pair<DAddr, u64>, 8> v2_written_marks;
+    u64 v2_segment = 1;
+    bool v2_proxy_finds = false;
+    u64 v2_upload_count = 0; ///< uploads applied (verify)
+    bool v2_defer = false;
+
+    /// Whether COMMIT=1 (not verify) defers buffer mutations.
+    [[nodiscard]] bool V2Defers() const noexcept {
+        return commit != nullptr && !commit->verify;
+    }
+    void V2BeginBindScope();
+    void V2ApplyCreates();
+    void V2PatchBindings(u32 proxy, BufferId id);
+    /// Defers a bind mutation on `buffer` (by device address); false when it can't be (apply now).
+    bool V2DeferBind(V2::Commit::Kind kind, Buffer& buffer, DAddr device_addr, u64 size, u32 arg);
+    /// The buffer serving `device_addr` now (the request's own while it lives and covers it).
+    BufferId V2CurrentBuffer(BufferId id, DAddr device_addr, u64 size);
+    /// A GPU-modified test that also sees the written marks deferred in this bind scope.
+    [[nodiscard]] bool V2PendingGpuWrite(DAddr device_addr, u64 size) const;
+    void V2NoteUsage(Buffer& buffer, u32 offset, u64 size);
     Common::ScratchBuffer<u8> tmp_buffer;
+    std::vector<u8> verify_scratch; ///< EDEN_NX2_V2_CBUFVER=verify
+    std::vector<u8> version_scratch; ///< EDEN_NX2_V2_CBUFVER: guest bytes of a bind
+    /// EDEN_NX2_V2_CBUFRING: ReplayHostStageBuffers missed the ring for the binding it now hands
+    /// to BindHostGraphicsUniformBuffer, which then skips its own ring lookup.
+    bool v2_ring_missed = false;
+    /// F2-03: the constant buffer write watch's arming (v2/cbuf_watch.h), made on first use.
+    std::unique_ptr<VideoCommon::V2::CbufWatch::Arming> v2_cbuf_arming;
 
     /// A command list page (Nx2CopyListPages): the GPU writes noted to it and the last copy.
     using Nx2Staging = decltype(std::declval<Runtime&>().DownloadStagingBuffer(size_t{}, true));

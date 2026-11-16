@@ -71,6 +71,15 @@ public:
     /// @param size Number of bytes of the invalidation
     void InvalidateRegion(VAddr addr, size_t size);
 
+    /// Device address of graphics program `index` as the last RefreshStages found it (0: none).
+    [[nodiscard]] VAddr ProgramDeviceAddress(size_t index) const {
+        return program_device_addresses[index];
+    }
+    /// Device address of the program the last ComputeShader looked up.
+    [[nodiscard]] VAddr ComputeDeviceAddress() const {
+        return compute_device_address;
+    }
+
     void InvalidateRegions(std::span<const std::pair<DAddr, size_t>> sequences);
 
     /// @brief Unmarks a memory region as cached and marks it for removal
@@ -112,6 +121,10 @@ protected:
                                  const std::array<u64, NUM_PROGRAMS>& unique_hashes);
 
     std::array<const ShaderInfo*, NUM_PROGRAMS> shader_infos{};
+    /// Device addresses of the programs RefreshStages and ComputeShader found (0: none), for
+    /// pipeline v2's shader write summaries (v2/shader_writes.h).
+    std::array<VAddr, NUM_PROGRAMS> program_device_addresses{};
+    VAddr compute_device_address{};
     bool last_shaders_valid = false;
 
 private:

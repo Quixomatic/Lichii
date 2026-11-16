@@ -6,7 +6,11 @@
 
 #pragma once
 
+#include <bit>
 #include <limits>
+#include <source_location>
+#include <span>
+#include <utility>
 
 #include <boost/container/small_vector.hpp>
 
@@ -78,11 +82,35 @@ public:
     }
 
 private:
+    /// P5a (EDEN_NX2_V2_HEAP_TEXEL): frees a view's bindless heap slot when the view is destroyed
+    /// (with its buffer, which the cache destroys once the GPU is done with it). Moved-from
+    /// holders forget nothing, so vector growth and buffer moves keep the slot.
+    struct HeapSlotOwner {
+        VkBufferView view{};
+        HeapSlotOwner() = default;
+        explicit HeapSlotOwner(VkBufferView view_) noexcept : view{view_} {}
+        HeapSlotOwner(HeapSlotOwner&& other) noexcept : view{std::exchange(other.view, {})} {}
+        HeapSlotOwner& operator=(HeapSlotOwner&& other) noexcept {
+            if (this != &other) {
+                Forget();
+                view = std::exchange(other.view, {});
+            }
+            return *this;
+        }
+        HeapSlotOwner(const HeapSlotOwner&) = delete;
+        HeapSlotOwner& operator=(const HeapSlotOwner&) = delete;
+        ~HeapSlotOwner() {
+            Forget();
+        }
+        void Forget() noexcept;
+    };
+
     struct BufferView {
         u32 offset;
         u32 size;
         VideoCore::Surface::PixelFormat format;
         vk::BufferView handle;
+        HeapSlotOwner heap_slot; ///< destroyed before the handle
     };
 
     const Device* device{};
@@ -102,6 +130,22 @@ class QuadStripIndexBuffer;
 class BufferCacheRuntime {
     friend Buffer;
 
+    /// EDEN_NX2_V2_XFERQ: CanReorderUpload's answer for the CopyBuffer that follows it.
+    bool reorder_to_transfer = false;
+
+public:
+    /// EDEN_NX2_V2_XREADBACK: buffer readbacks copied on the transfer queue.
+    [[nodiscard]] bool TransferReadbacks() const noexcept;
+    void TransferReadbackCopy(VkBuffer staging, Buffer& src, const VideoCommon::BufferCopy& copy,
+                              bool mapped);
+    /// Submits the job: {semaphore, value}. F4-04: `producer_tick` is the newest tick that used
+    /// the buffers read; `ride_tick` gets the open tick the job rode (0: none), which the reader
+    /// passes back to WaitTransferReadback.
+    std::pair<u64, u64> SubmitTransferReadback(u64 producer_tick, u64& ride_tick);
+    void WaitTransferReadback(u64 semaphore, u64 value, u64 ride_tick);
+
+private:
+
     using PrimitiveTopology = Tegra::Engines::Maxwell3D::Regs::PrimitiveTopology;
     using IndexFormat = Tegra::Engines::Maxwell3D::Regs::IndexFormat;
 
@@ -111,6 +155,7 @@ public:
                                 GuestDescriptorQueue& guest_descriptor_queue,
                                 ComputePassDescriptorQueue& compute_pass_descriptor_queue,
                                 DescriptorPool& descriptor_pool);
+    ~BufferCacheRuntime();
 
     void TickFrame(Common::SlotVector<Buffer>& slot_buffers) noexcept;
 
@@ -119,6 +164,10 @@ public:
 
     bool IsVertexRepacked(u32 binding) const {
         return (vertex_repack_mask & (1U << binding)) != 0;
+    }
+
+    bool AnyVertexRepacked() const {
+        return vertex_repack_mask != 0;
     }
 
     u64 CurrentTick();
@@ -130,9 +179,21 @@ public:
     /// Waits for a submitted tick without flushing: safe on threads other than the GPU thread.
     void WaitSubmittedTick(u64 tick);
 
-    void Finish();
+    /// SYNC Step 8: `location` names the buffer cache's caller in the STATS "finishes by site".
+    void Finish(std::source_location location = std::source_location::current());
 
-    void FinishForHostRead();
+    void FinishForHostRead(std::source_location location = std::source_location::current());
+    /// R2-F4-07: a mapped buffer was written by the GPU in the open submission.
+    void NoteMappedGpuWrite();
+    /// R2-F4-07, recording thread: waits for `producer` (a scheduler tick) when it is submitted
+    /// and its writes are host-visible. False: the caller takes FinishForHostRead.
+    [[nodiscard]] bool WaitForProducerHostRead(u64 producer);
+    /// R2-F4-11: whether a transfer-queue readback for `producer` needs no flush (Direct).
+    [[nodiscard]] bool TransferReadbackDirect(u64 producer);
+    /// As FinishForHostRead without waiting: submits and returns the tick to wait for.
+    [[nodiscard]] u64 SubmitForHostRead();
+    /// Any thread: waits until the GPU passed `tick` (SubmitForHostRead).
+    void WaitForHostRead(u64 tick);
 
     u64 GetDeviceLocalMemory() const;
 
@@ -159,7 +220,7 @@ public:
 
     void CopyBuffer(VkBuffer dst_buffer, VkBuffer src_buffer,
                     std::span<const VideoCommon::BufferCopy> copies, bool barrier,
-                    bool can_reorder_upload = false);
+                    bool can_reorder_upload = false, bool hazard_free = false);
 
     void PostCopyBarrier();
 
@@ -195,14 +256,58 @@ public:
     std::span<u8> BindMappedUniformBuffer([[maybe_unused]] size_t stage,
                                           [[maybe_unused]] u32 binding_index,
                                           u32 size) {
+        if (cbuf_addresses != nullptr) [[unlikely]] {
+            if (const CbufSlot slot = NextCbufSlot(); slot.bda) {
+                return BindMappedCbufAddress(size, slot.used);
+            }
+        }
         const StagingBufferRef ref = staging_pool.Request(size, MemoryUsage::Upload);
         last_stream_uniform = StreamUniformRef{
             .buffer = ref.buffer,
             .device_address = ref.device_address,
             .offset = static_cast<u32>(ref.offset),
         };
-        RebindStreamUniform(last_stream_uniform, size);
+        AddStreamUniform(last_stream_uniform, size);
         return ref.mapped_span;
+    }
+
+    /// EDEN_NX2_V2_CBUFBDA (shader_recompiler/backend/spirv/cbuf_bda.h): the uniform buffers
+    /// bound until EndCbufAddresses (one stage, in cbuf index order over `stage_mask`) whose cbuf
+    /// is in `bda_mask` write their device address to `addresses` (in order) instead of adding a
+    /// descriptor; verify adds the descriptor too and compares. A bind shorter than the shader
+    /// reads (`used_sizes`, by cbuf index) is read from a copy with a zero tail: what a bounded
+    /// uniform buffer gives past its range.
+    void BeginCbufAddresses(u64* addresses, u32 stage_mask, u32 bda_mask, const u32* used_sizes,
+                            bool verify) noexcept {
+        cbuf_addresses = addresses;
+        cbuf_remaining = stage_mask;
+        cbuf_bda_mask = bda_mask;
+        cbuf_used_sizes = used_sizes;
+        cbuf_verify = verify;
+    }
+    void EndCbufAddresses() noexcept {
+        cbuf_addresses = nullptr;
+    }
+
+    /// Verify (Step 0 R-8): the bytes of `size` at `offset` of `buffer` when it is the stream
+    /// buffer, else an empty span.
+    [[nodiscard]] std::span<const u8> StreamBytes(VkBuffer buffer, u64 offset,
+                                                  u64 size) const noexcept {
+        const std::span<const u8> mapped = staging_pool.StreamMapped();
+        if (buffer != staging_pool.StreamBuf() || offset + size > mapped.size()) {
+            return {};
+        }
+        return mapped.subspan(offset, size);
+    }
+
+    /// EDEN_NX2_V2_CBUFRING: the ring range at `offset` as a stream reference (BufferCache's
+    /// BindRingVersion; the ring retires a version only after the ticks that bound it).
+    [[nodiscard]] StreamUniformRef CbufRingRef(u64 offset) const noexcept {
+        return StreamUniformRef{
+            .buffer = *cbuf_ring_buffer,
+            .device_address = cbuf_ring_address,
+            .offset = static_cast<u32>(offset),
+        };
     }
 
     /// The allocation of the latest BindMappedUniformBuffer call.
@@ -215,7 +320,15 @@ public:
     /// live: made on the scheduler tick that is current now, so the staging pool has not recycled
     /// it and the GPU has not even started on it.
     void RebindStreamUniform(const StreamUniformRef& ref, u32 size) {
-        guest_descriptor_queue.AddBuffer(ref.buffer, ref.device_address, ref.offset, size);
+        if (cbuf_addresses != nullptr) [[unlikely]] {
+            if (const CbufSlot slot = NextCbufSlot(); slot.bda) {
+                CbufAddressFromStream(ref, size, slot.used);
+                if (!cbuf_verify) {
+                    return;
+                }
+            }
+        }
+        AddStreamUniform(ref, size);
     }
 
     [[nodiscard]] VkDeviceSize SparseAlignmentFor(bool sparse_compatible) const noexcept {
@@ -259,6 +372,14 @@ public:
     }
 
     void BindUniformBuffer(const Buffer& buffer, u32 offset, u32 size) {
+        if (cbuf_addresses != nullptr) [[unlikely]] {
+            if (const CbufSlot slot = NextCbufSlot(); slot.bda) {
+                CbufAddressFromBuffer(buffer, offset, size, slot.used);
+                if (!cbuf_verify) {
+                    return;
+                }
+            }
+        }
         BindBuffer(buffer, offset, size);
     }
 
@@ -273,9 +394,33 @@ public:
         if (format == VideoCore::Surface::PixelFormat::Invalid) {
             format = VideoCore::Surface::PixelFormat::R8_UNORM;
         }
+        if (heap_texel_words != nullptr) [[unlikely]] {
+            // EDEN_NX2_V2_HEAP_TEXEL: a heap element instead of a descriptor (bindless_heap.h).
+            const u32 index = heap_texel_index++;
+            if (index < 64 && ((heap_texel_mask >> index) & 1) != 0) {
+                BindHeapTexelBuffer(buffer, offset, size, format, index);
+                return;
+            }
+        }
         guest_descriptor_queue.AddTexelBuffer(buffer.View(offset, size, format),
                                               buffer.DeviceAddress(), offset, size,
                                               TexelBufferFormat(format));
+    }
+
+    /// P5a (EDEN_NX2_V2_HEAP_TEXEL): the texture buffers bound until EndHeapTexels (one stage, in
+    /// binding index order) whose bit is in `heap` push a heap word to `words` instead of a
+    /// descriptor; `storage` marks image buffers (storage texel buffers), `integer` their type.
+    void BeginHeapTexels(std::vector<u32>& words, u64 heap, u64 storage, u64 integer,
+                         bool verify) noexcept {
+        heap_texel_words = &words;
+        heap_texel_mask = heap;
+        heap_texel_storage = storage;
+        heap_texel_integer = integer;
+        heap_texel_verify = verify;
+        heap_texel_index = 0;
+    }
+    void EndHeapTexels() noexcept {
+        heap_texel_words = nullptr;
     }
 
     bool ShouldLimitDynamicStorageBuffers() const {
@@ -287,6 +432,49 @@ public:
     }
 
 private:
+    void BindHeapTexelBuffer(Buffer& buffer, u32 offset, u32 size,
+                             VideoCore::Surface::PixelFormat format, u32 index);
+
+    std::vector<u32>* heap_texel_words{};
+    u64 heap_texel_mask{};
+    u64 heap_texel_storage{};
+    u64 heap_texel_integer{};
+    u32 heap_texel_index{};
+    bool heap_texel_verify{};
+
+    void AddStreamUniform(const StreamUniformRef& ref, u32 size) {
+        guest_descriptor_queue.AddBuffer(ref.buffer, ref.device_address, ref.offset, size);
+    }
+
+    /// EDEN_NX2_V2_CBUFBDA: the next uniform bind of the stage (BeginCbufAddresses).
+    struct CbufSlot {
+        bool bda;
+        u32 used;
+    };
+    [[nodiscard]] CbufSlot NextCbufSlot() noexcept {
+        if (cbuf_remaining == 0) {
+            return CbufSlot{false, 0};
+        }
+        const u32 index = static_cast<u32>(std::countr_zero(cbuf_remaining));
+        cbuf_remaining &= cbuf_remaining - 1;
+        return CbufSlot{((cbuf_bda_mask >> index) & 1) != 0, cbuf_used_sizes[index]};
+    }
+    std::span<u8> BindMappedCbufAddress(u32 size, u32 used);
+    void CbufAddressFromStream(const StreamUniformRef& ref, u32 size, u32 used);
+    void CbufAddressFromBuffer(const Buffer& buffer, u32 offset, u32 size, u32 used);
+    /// A stream copy of `used` bytes: `size` from `source` (none: zeros), then zeros.
+    [[nodiscard]] StagingBufferRef PaddedCbufCopy(const u8* source, u32 size, u32 used);
+    /// Verify: the bytes the shader reads at the address against the old binding's.
+    void VerifyCbufAddress(const u8* bound, const u8* addressed, u32 size, u32 used);
+    [[nodiscard]] std::span<const u8> MappedBytes(VkBuffer buffer, u64 offset,
+                                                  u64 size) const noexcept;
+
+    u64* cbuf_addresses{};
+    u32 cbuf_remaining{};
+    u32 cbuf_bda_mask{};
+    const u32* cbuf_used_sizes{};
+    bool cbuf_verify{};
+
     void BindBuffer(const Buffer& buffer, u32 offset, u32 size) {
         const VkBuffer handle = buffer.Handle();
         if (handle == VK_NULL_HANDLE) {
@@ -323,6 +511,10 @@ private:
     VkDeviceSize multi_range_total{};
 
     StreamUniformRef last_stream_uniform{};
+
+    /// EDEN_NX2_V2_CBUFRING: the decode-time constant buffer version ring (v2/cbuf_ring.h).
+    vk::Buffer cbuf_ring_buffer;
+    VkDeviceAddress cbuf_ring_address{};
 
     bool limit_dynamic_storage_buffers = false;
     u32 max_dynamic_storage_buffers = (std::numeric_limits<u32>::max)();

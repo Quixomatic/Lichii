@@ -16,6 +16,7 @@
 #include "common/common_types.h"
 #include "common/div_ceil.h"
 #include "shader_recompiler/backend/nvn_storage_descriptor.h"
+#include "shader_recompiler/backend/spirv/cbuf_bda.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/backend/spirv/emit_spirv_instructions.h"
 #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
@@ -285,11 +286,26 @@ void DefineConstBuffers(EmitContext& ctx, const Info& info, Id UniformDefinition
     ctx.MemberName(struct_type, 0, "data");
     ctx.MemberDecorate(struct_type, 0, spv::Decoration::Offset, 0U);
 
+    if (info.cbuf_bda_mask != 0) [[unlikely]] {
+        // EDEN_NX2_V2_CBUFBDA: the same block read through an address (cbuf_bda.h).
+        ctx.cbuf_bda_blocks.*member_type =
+            ctx.TypePointer(spv::StorageClass::PhysicalStorageBuffer, struct_type);
+        ctx.cbuf_bda_elements.*member_type =
+            ctx.TypePointer(spv::StorageClass::PhysicalStorageBuffer, type);
+        if (CbufBoundCount(info) == 0) {
+            return;
+        }
+    }
     const Id struct_pointer_type{ctx.TypePointer(spv::StorageClass::Uniform, struct_type)};
     const Id uniform_type{ctx.TypePointer(spv::StorageClass::Uniform, type)};
     ctx.uniform_types.*member_type = uniform_type;
 
     for (const ConstantBufferDescriptor& desc : info.constant_buffer_descriptors) {
+        if (UsesCbufBda(info, desc.index)) [[unlikely]] {
+            // No uniform buffer: verify keeps its binding (bound the old way too).
+            binding += info.cbuf_bda_keep_bindings ? desc.count : 0;
+            continue;
+        }
         const Id id{ctx.AddGlobalVariable(struct_pointer_type, spv::StorageClass::Uniform)};
         ctx.Decorate(id, spv::Decoration::Binding, binding);
         ctx.Decorate(id, spv::Decoration::DescriptorSet, 0U);
@@ -484,6 +500,9 @@ EmitContext::EmitContext(const Profile& profile_, const RuntimeInfo& runtime_inf
     u32& texture_binding{is_unified ? bindings.unified : bindings.texture};
     u32& image_binding{is_unified ? bindings.unified : bindings.image};
     AddCapability(spv::Capability::Shader);
+    heap_push_needed = UsesAnyHeap(program.info);
+    heap_words_pushed = program.info.heap_words_pushed;
+    cbuf_bda_mask = program.info.cbuf_bda_mask;
     DefineCommonTypes(program.info);
     DefineCommonConstants();
     DefineInterfaces(program);
@@ -501,8 +520,10 @@ EmitContext::EmitContext(const Profile& profile_, const RuntimeInfo& runtime_inf
     DefineAttributeMemAccess(program.info);
     DefineWriteStorageCasLoopFunction(program.info);
     DefineGlobalMemoryFunctions(program);
+    DefineMeshEmulationOutput();
     DefineRescalingInput(program.info);
     DefineRenderArea(program.info);
+    DefineHeapPush();
 }
 
 EmitContext::~EmitContext() = default;
@@ -573,7 +594,8 @@ void EmitContext::DefineCommonTypes(const Info& info) {
         U16 = Name(TypeInt(16, false), "u16");
         S16 = Name(TypeInt(16, true), "s16");
     }
-    if (info.uses_int64 && profile.support_int64) {
+    // EDEN_NX2_V2_CBUFBDA addresses are 64-bit (the host marks constant buffers only with int64).
+    if ((info.uses_int64 || info.cbuf_bda_mask != 0) && profile.support_int64) {
         AddCapability(spv::Capability::Int64);
         U64 = Name(TypeInt(64, false), "u64");
     }
@@ -1269,7 +1291,7 @@ void EmitContext::DefineRescalingInput(const Info& info) {
 }
 
 void EmitContext::DefineRescalingInputPushConstant() {
-    boost::container::static_vector<Id, 3> members{};
+    boost::container::static_vector<Id, 5> members{};
     u32 member_index{0};
 
     rescaling_textures_type = TypeArray(U32[1], Const(4u));
@@ -1286,6 +1308,7 @@ void EmitContext::DefineRescalingInputPushConstant() {
         members.push_back(F32[1]);
         rescaling_downfactor_member_index = member_index++;
     }
+    AddHeapPushMember(members, member_index);
     const Id push_constant_struct{TypeStruct(std::span(members.data(), members.size()))};
     Decorate(push_constant_struct, spv::Decoration::Block);
     Name(push_constant_struct, "ResolutionInfo");
@@ -1307,6 +1330,7 @@ void EmitContext::DefineRescalingInputPushConstant() {
     const Id pointer_type{TypePointer(spv::StorageClass::PushConstant, push_constant_struct)};
     rescaling_push_constants = AddGlobalVariable(pointer_type, spv::StorageClass::PushConstant);
     Name(rescaling_push_constants, "rescaling_push_constants");
+    DecorateHeapPushMember(push_constant_struct, rescaling_push_constants);
 
     if (profile.supported_spirv >= 0x00010400) {
         interfaces.push_back(rescaling_push_constants);
@@ -1330,11 +1354,12 @@ void EmitContext::DefineRenderArea(const Info& info) {
     }
 
     if (profile.unified_descriptor_binding) {
-        boost::container::static_vector<Id, 1> members{};
+        boost::container::static_vector<Id, 5> members{};
         u32 member_index{0};
 
         members.push_back(F32[4]);
         render_are_member_index = member_index++;
+        AddHeapPushMember(members, member_index);
 
         const Id push_constant_struct{TypeStruct(std::span(members.data(), members.size()))};
         Decorate(push_constant_struct, spv::Decoration::Block);
@@ -1347,6 +1372,7 @@ void EmitContext::DefineRenderArea(const Info& info) {
         render_area_push_constant =
             AddGlobalVariable(pointer_type, spv::StorageClass::PushConstant);
         Name(render_area_push_constant, "render_area_push_constants");
+        DecorateHeapPushMember(push_constant_struct, render_area_push_constant);
 
         if (profile.supported_spirv >= 0x00010400) {
             interfaces.push_back(render_area_push_constant);
@@ -1358,9 +1384,16 @@ void EmitContext::DefineConstantBuffers(const Info& info, u32& binding) {
     if (info.constant_buffer_descriptors.empty()) {
         return;
     }
+    if (info.cbuf_bda_mask != 0) [[unlikely]] {
+        DefineCbufBda(info);
+    }
     if (!profile.support_descriptor_aliasing) {
         DefineConstBuffers(*this, info, &UniformDefinitions::U32x4, binding, U32[4], 'u',
                            sizeof(u32[4]));
+        if (info.cbuf_bda_mask != 0) [[unlikely]] {
+            binding += CbufBoundCount(info);
+            return;
+        }
         for (const ConstantBufferDescriptor& desc : info.constant_buffer_descriptors) {
             binding += desc.count;
         }
@@ -1396,6 +1429,10 @@ void EmitContext::DefineConstantBuffers(const Info& info, u32& binding) {
     if (True(types & IR::Type::U32x2)) {
         DefineConstBuffers(*this, info, &UniformDefinitions::U32x2, binding, U32[2], 'u',
                            sizeof(u32[2]));
+    }
+    if (info.cbuf_bda_mask != 0) [[unlikely]] {
+        binding += CbufBoundCount(info);
+        return;
     }
     binding += static_cast<u32>(info.constant_buffer_descriptors.size());
 }
@@ -1565,9 +1602,23 @@ void EmitContext::DefineTextureBuffers(const Info& info, u32& binding) {
 
     const Id type{TypePointer(spv::StorageClass::UniformConstant, image_buffer_type)};
     texture_buffers.reserve(info.texture_buffer_descriptors.size());
-    for (const TextureBufferDescriptor& desc : info.texture_buffer_descriptors) {
+    for (size_t index = 0; index < info.texture_buffer_descriptors.size(); ++index) {
+        const TextureBufferDescriptor& desc{info.texture_buffer_descriptors[index]};
         if (desc.count != 1) {
             throw NotImplementedException("Array of texture buffers");
+        }
+        if (UsesHeapTexel(info, index)) [[unlikely]] {
+            // EDEN_NX2_V2_HEAP_TEXEL: an element of the heap's uniform texel buffer array.
+            uses_heap = true;
+            uses_heap_uniform_texel = true;
+            DefineHeapWords();
+            texture_buffers.push_back({
+                .id = HeapArray(image_buffer_type, HEAP_UNIFORM_TEXEL_BINDING, false),
+                .count = desc.count,
+                .heap = true,
+                .heap_word = HeapTexelWord(info, index),
+            });
+            continue;
         }
         const Id id{AddGlobalVariable(type, spv::StorageClass::UniformConstant)};
         Decorate(id, spv::Decoration::Binding, binding);
@@ -1586,12 +1637,30 @@ void EmitContext::DefineTextureBuffers(const Info& info, u32& binding) {
 
 void EmitContext::DefineImageBuffers(const Info& info, u32& binding) {
     image_buffers.reserve(info.image_buffer_descriptors.size());
-    for (const ImageBufferDescriptor& desc : info.image_buffer_descriptors) {
+    for (size_t index = 0; index < info.image_buffer_descriptors.size(); ++index) {
+        const ImageBufferDescriptor& desc{info.image_buffer_descriptors[index]};
         const spv::ImageFormat format{GetImageFormat(desc.format)};
         const Id sampled_type{desc.is_integer ? U32[1] : F32[1]};
         const Id image_type{
             TypeImage(sampled_type, spv::Dim::Buffer, false, false, false, 2, format)};
         const Id pointer_type{TypePointer(spv::StorageClass::UniformConstant, image_type)};
+        if (UsesHeapImageBuffer(info, index)) [[unlikely]] {
+            // EDEN_NX2_V2_HEAP_TEXEL: elements of the heap's storage texel buffer array.
+            uses_heap = true;
+            uses_heap_storage_texel = true;
+            DefineHeapWords();
+            image_buffers.push_back({
+                .id = HeapArray(image_type, HeapStorageTexelBinding(desc.is_integer),
+                                info.requires_coherent_image_memory),
+                .image_type = image_type,
+                .pointer_type = pointer_type,
+                .count = desc.count,
+                .is_integer = desc.is_integer,
+                .heap = true,
+                .heap_word = HeapImageBufferWord(info, index),
+            });
+            continue;
+        }
         const Id id{AddGlobalVariable(pointer_type, spv::StorageClass::UniformConstant)};
         Decorate(id, spv::Decoration::Binding, binding);
         Decorate(id, spv::Decoration::DescriptorSet, 0U);
@@ -1615,7 +1684,15 @@ void EmitContext::DefineImageBuffers(const Info& info, u32& binding) {
 
 void EmitContext::DefineTextures(const Info& info, u32& binding, u32& scaling_index) {
     textures.reserve(info.texture_descriptors.size());
-    for (const TextureDescriptor& desc : info.texture_descriptors) {
+    for (size_t index = 0; index < info.texture_descriptors.size(); ++index) {
+        const TextureDescriptor& desc{info.texture_descriptors[index]};
+        if (UsesHeap(info, index)) [[unlikely]] {
+            // EDEN_NX2_V2_BINDLESS: an element of the heap's image array of its class; no
+            // binding of its own (the host skips it too), its rescaling bit as before.
+            DefineHeapTexture(info, desc, index);
+            ++scaling_index;
+            continue;
+        }
         const Id image_type{ImageType(*this, desc)};
         const Id sampled_type{TypeSampledImage(image_type)};
         const Id pointer_type{TypePointer(spv::StorageClass::UniformConstant, sampled_type)};
@@ -1644,9 +1721,282 @@ void EmitContext::DefineTextures(const Info& info, u32& binding, u32& scaling_in
     }
 }
 
+void EmitContext::AddHeapPushMember(boost::container::static_vector<Id, 5>& members,
+                                    u32& member_index) {
+    if (cbuf_bda_mask != 0 && !cbuf_bda_push_placed) [[unlikely]] {
+        // The address member goes into the same block (one push constant block per stage).
+        if (heap_push_needed && !Sirit::ValidId(heap_push_block) && heap_push_member == 0) {
+            const Id array_type{
+                TypeArray(U32[1], Const(heap_words_pushed ? HEAP_PUSH_WORDS : 1U))};
+            Decorate(array_type, spv::Decoration::ArrayStride, 4U);
+            members.push_back(array_type);
+            heap_push_member = member_index++;
+        }
+        const Id array_type{TypeArray(U64, Const(cbuf_bda_count))};
+        Decorate(array_type, spv::Decoration::ArrayStride, CBUF_BDA_ADDRESS_BYTES);
+        members.push_back(array_type);
+        cbuf_bda_push_member = member_index++;
+        cbuf_bda_push_placed = true;
+        return;
+    }
+    if (!heap_push_needed || Sirit::ValidId(heap_push_block) || heap_push_member != 0) {
+        return;
+    }
+    const Id array_type{TypeArray(U32[1], Const(heap_words_pushed ? HEAP_PUSH_WORDS : 1U))};
+    Decorate(array_type, spv::Decoration::ArrayStride, 4U);
+    members.push_back(array_type);
+    heap_push_member = member_index++;
+}
+
+void EmitContext::DecorateHeapPushMember(Id struct_type, Id block) {
+    if (cbuf_bda_push_placed && !Sirit::ValidId(cbuf_bda_push_block)) [[unlikely]] {
+        MemberDecorate(struct_type, cbuf_bda_push_member, spv::Decoration::Offset,
+                       cbuf_bda_offset);
+        MemberName(struct_type, cbuf_bda_push_member, "cbuf_addresses");
+        cbuf_bda_push_block = block;
+        cbuf_bda_push_pointer = TypePointer(spv::StorageClass::PushConstant, U64);
+    }
+    if (!heap_push_needed || Sirit::ValidId(heap_push_block) || heap_push_member == 0) {
+        return;
+    }
+    MemberDecorate(struct_type, heap_push_member, spv::Decoration::Offset, HEAP_PUSH_OFFSET);
+    MemberName(struct_type, heap_push_member, "heap_words");
+    heap_push_block = block;
+    heap_push_pointer = TypePointer(spv::StorageClass::PushConstant, U32[1]);
+}
+
+void EmitContext::DefineHeapPush() {
+    if (cbuf_bda_mask != 0 && !cbuf_bda_push_placed) [[unlikely]] {
+        // A block of its own for the address member, with the heap member when the stage has it.
+        boost::container::static_vector<Id, 5> members{};
+        u32 member_index{0};
+        AddHeapPushMember(members, member_index);
+        const Id struct_type{TypeStruct(std::span(members.data(), members.size()))};
+        Decorate(struct_type, spv::Decoration::Block);
+        Name(struct_type, "CbufAddressPush");
+        const Id block{AddGlobalVariable(TypePointer(spv::StorageClass::PushConstant, struct_type),
+                                         spv::StorageClass::PushConstant)};
+        Name(block, "cbuf_address_push_constants");
+        if (heap_push_needed && !Sirit::ValidId(heap_push_block)) {
+            // Member 0: DecorateHeapPushMember's "already placed" test can't see it.
+            MemberDecorate(struct_type, heap_push_member, spv::Decoration::Offset,
+                           HEAP_PUSH_OFFSET);
+            MemberName(struct_type, heap_push_member, "heap_words");
+            heap_push_block = block;
+            heap_push_pointer = TypePointer(spv::StorageClass::PushConstant, U32[1]);
+        }
+        DecorateHeapPushMember(struct_type, block);
+        if (profile.supported_spirv >= 0x00010400) {
+            interfaces.push_back(block);
+        }
+        return;
+    }
+    if (!heap_push_needed || Sirit::ValidId(heap_push_block)) {
+        return;
+    }
+    // No rescaling or render area block in this stage: a block holding only the heap member.
+    const Id array_type{TypeArray(U32[1], Const(heap_words_pushed ? HEAP_PUSH_WORDS : 1U))};
+    Decorate(array_type, spv::Decoration::ArrayStride, 4U);
+    const Id struct_type{TypeStruct(array_type)};
+    Decorate(struct_type, spv::Decoration::Block);
+    Name(struct_type, "HeapPush");
+    MemberDecorate(struct_type, 0, spv::Decoration::Offset, HEAP_PUSH_OFFSET);
+    MemberName(struct_type, 0, "heap_words");
+    heap_push_block = AddGlobalVariable(TypePointer(spv::StorageClass::PushConstant, struct_type),
+                                        spv::StorageClass::PushConstant);
+    Name(heap_push_block, "heap_push_constants");
+    heap_push_member = 0;
+    heap_push_pointer = TypePointer(spv::StorageClass::PushConstant, U32[1]);
+    if (profile.supported_spirv >= 0x00010400) {
+        interfaces.push_back(heap_push_block);
+    }
+}
+
+void EmitContext::DefineCbufBda(const Info& info) {
+    AddExtension("SPV_KHR_physical_storage_buffer");
+    AddCapability(spv::Capability::PhysicalStorageBufferAddresses);
+    SetMemoryModel(spv::AddressingModel::PhysicalStorageBuffer64, spv::MemoryModel::GLSL450);
+    cbuf_bda_base = info.cbuf_bda_base;
+    cbuf_bda_offset = info.cbuf_bda_offset;
+    cbuf_bda_pushed = info.cbuf_bda_pushed;
+    // Pushed: every address the push constants hold (the stages index one array); else the
+    // table's pointer.
+    cbuf_bda_count = cbuf_bda_pushed ? CbufBdaPushCapacity(cbuf_bda_offset) : 1U;
+    if (cbuf_bda_pushed) {
+        return;
+    }
+    const Id array_type{TypeRuntimeArray(U64)};
+    Decorate(array_type, spv::Decoration::ArrayStride, CBUF_BDA_ADDRESS_BYTES);
+    const Id struct_type{TypeStruct(array_type)};
+    Decorate(struct_type, spv::Decoration::Block);
+    MemberDecorate(struct_type, 0, spv::Decoration::Offset, 0U);
+    MemberDecorate(struct_type, 0, spv::Decoration::NonWritable);
+    Name(struct_type, "CbufAddressTable");
+    cbuf_bda_table_type = TypePointer(spv::StorageClass::PhysicalStorageBuffer, struct_type);
+    cbuf_bda_table_element = TypePointer(spv::StorageClass::PhysicalStorageBuffer, U64);
+}
+
+Id EmitContext::CbufBdaBlock(u32 index, Id UniformDefinitions::*member) {
+    const u32 slot{cbuf_bda_base +
+                   static_cast<u32>(std::popcount(cbuf_bda_mask & ((1U << index) - 1)))};
+    const Id push_member{Const(cbuf_bda_push_member)};
+    Id address{};
+    if (cbuf_bda_pushed) {
+        address = OpLoad(U64, OpAccessChain(cbuf_bda_push_pointer, cbuf_bda_push_block,
+                                            push_member, Const(slot)));
+    } else {
+        // The draw's table: one address per index.
+        const Id table_address{OpLoad(U64, OpAccessChain(cbuf_bda_push_pointer,
+                                                         cbuf_bda_push_block, push_member,
+                                                         u32_zero_value))};
+        const Id table{OpConvertUToPtr(cbuf_bda_table_type, table_address)};
+        const Id entry{
+            OpAccessChain(cbuf_bda_table_element, table, u32_zero_value, Const(slot))};
+        address = OpLoad(U64, entry, spv::MemoryAccessMask::Aligned, CBUF_BDA_ADDRESS_BYTES);
+    }
+    return OpConvertUToPtr(cbuf_bda_blocks.*member, address);
+}
+
+void EmitContext::DefineHeapWords() {
+    if (Sirit::ValidId(heap_words) || heap_words_pushed) {
+        // Pushed words need no table.
+        return;
+    }
+    AddExtension("SPV_KHR_storage_buffer_storage_class");
+    const Id array_type{TypeRuntimeArray(U32[1])};
+    Decorate(array_type, spv::Decoration::ArrayStride, 4U);
+    const Id struct_type{TypeStruct(array_type)};
+    Decorate(struct_type, spv::Decoration::Block);
+    MemberDecorate(struct_type, 0, spv::Decoration::Offset, 0U);
+    MemberDecorate(struct_type, 0, spv::Decoration::NonWritable);
+    Name(struct_type, "HeapWords");
+    heap_word_pointer = TypePointer(spv::StorageClass::StorageBuffer, U32[1]);
+    heap_words = AddGlobalVariable(TypePointer(spv::StorageClass::StorageBuffer, struct_type),
+                                   spv::StorageClass::StorageBuffer);
+    Decorate(heap_words, spv::Decoration::Binding, HEAP_WORDS_BINDING);
+    Decorate(heap_words, spv::Decoration::DescriptorSet, 0U);
+    Decorate(heap_words, spv::Decoration::NonWritable);
+    Decorate(heap_words, spv::Decoration::Restrict);
+    Name(heap_words, "heap_words");
+    if (profile.supported_spirv >= 0x00010400) {
+        interfaces.push_back(heap_words);
+    }
+}
+
+Id EmitContext::HeapArray(Id image_type, u32 heap_binding, bool coherent) {
+    // One variable per image type: depth and colour views of a class (or storage formats of a
+    // dimension) alias one binding, which Vulkan allows for compatible descriptor types.
+    for (const auto& [type, variable] : heap_image_variables) {
+        if (type == image_type.value) {
+            return variable;
+        }
+    }
+    const Id array_type{TypeArray(image_type, Const(MAX_HEAP_ARRAY_LENGTH))};
+    const Id array{AddGlobalVariable(TypePointer(spv::StorageClass::UniformConstant, array_type),
+                                     spv::StorageClass::UniformConstant)};
+    Decorate(array, spv::Decoration::Binding, heap_binding);
+    Decorate(array, spv::Decoration::DescriptorSet, HEAP_SET);
+    if (coherent) {
+        Decorate(array, spv::Decoration::Coherent);
+    }
+    Name(array, fmt::format("heap_images_{}", heap_binding));
+    heap_image_variables.emplace_back(image_type.value, array);
+    if (profile.supported_spirv >= 0x00010400) {
+        interfaces.push_back(array);
+    }
+    return array;
+}
+
+Id EmitContext::HeapWord(u32 word, const IR::Value& index, bool arrayed) {
+    const bool dynamic{arrayed && !(index.IsImmediate() && index.U32() == 0)};
+    const Id member{Const(heap_push_member)};
+    if (heap_words_pushed) {
+        // A push constant: no memory load before the descriptor fetch (a constant offset for
+        // non-arrayed descriptors, resolved when the pipeline is compiled).
+        Id element{Const(word)};
+        if (dynamic) {
+            element = index.IsImmediate() ? Const(word + index.U32())
+                                          : OpIAdd(U32[1], element, Def(index));
+        }
+        const Id pointer{OpAccessChain(heap_push_pointer, heap_push_block, member, element)};
+        return OpLoad(U32[1], pointer);
+    }
+    // The table: the draw's first word comes from the push constants.
+    const Id base_pointer{OpAccessChain(heap_push_pointer, heap_push_block, member,
+                                        u32_zero_value)};
+    Id element{OpIAdd(U32[1], OpLoad(U32[1], base_pointer), Const(word))};
+    if (dynamic) {
+        element = OpIAdd(U32[1], element, index.IsImmediate() ? Const(index.U32()) : Def(index));
+    }
+    const Id pointer{OpAccessChain(heap_word_pointer, heap_words, u32_zero_value, element)};
+    return OpLoad(U32[1], pointer);
+}
+
+void EmitContext::DefineHeapImage(const Info& info, const ImageDescriptor& desc, size_t index) {
+    uses_heap = true;
+    DefineHeapWords();
+    const Id sampled_type{desc.is_integer ? U32[1] : F32[1]};
+    const Id image_type{ImageType(*this, desc, sampled_type)};
+    const Id array{HeapArray(image_type, HeapStorageBinding(desc.type, desc.is_integer),
+                             info.requires_coherent_image_memory)};
+    images.push_back({
+        .id = array,
+        .image_type = image_type,
+        .pointer_type = TypePointer(spv::StorageClass::UniformConstant, image_type),
+        .count = desc.count,
+        .is_integer = desc.is_integer,
+        .heap = true,
+        .heap_word = HeapImageWord(info, index),
+    });
+}
+
+void EmitContext::DefineHeapTexture(const Info& info, const TextureDescriptor& desc,
+                                    size_t index) {
+    uses_heap = true;
+    DefineHeapWords();
+    const Id image_type{ImageType(*this, desc)};
+    const Id sampled_type{TypeSampledImage(image_type)};
+    const Id image_pointer{TypePointer(spv::StorageClass::UniformConstant, image_type)};
+    const Id array{HeapArray(image_type,
+                             HeapImageBinding(desc.type, desc.is_multisample, desc.is_integer),
+                             false)};
+    if (!Sirit::ValidId(heap_samplers)) {
+        heap_sampler_type = TypeSampler();
+        heap_sampler_pointer = TypePointer(spv::StorageClass::UniformConstant, heap_sampler_type);
+        const Id sampler_array{TypeArray(heap_sampler_type, Const(MAX_HEAP_ARRAY_LENGTH))};
+        heap_samplers = AddGlobalVariable(
+            TypePointer(spv::StorageClass::UniformConstant, sampler_array),
+            spv::StorageClass::UniformConstant);
+        Decorate(heap_samplers, spv::Decoration::Binding, HEAP_SAMPLER_BINDING);
+        Decorate(heap_samplers, spv::Decoration::DescriptorSet, HEAP_SET);
+        Name(heap_samplers, "heap_samplers");
+        if (profile.supported_spirv >= 0x00010400) {
+            interfaces.push_back(heap_samplers);
+        }
+    }
+    textures.push_back({
+        .id = array,
+        .sampled_type = sampled_type,
+        .pointer_type = image_pointer,
+        .image_type = image_type,
+        .count = desc.count,
+        .is_multisample = desc.is_multisample,
+        .is_integer = desc.is_integer,
+        .heap = true,
+        .heap_word = HeapTextureWord(info, index),
+    });
+}
+
 void EmitContext::DefineImages(const Info& info, u32& binding, u32& scaling_index) {
     images.reserve(info.image_descriptors.size());
-    for (const ImageDescriptor& desc : info.image_descriptors) {
+    for (size_t index = 0; index < info.image_descriptors.size(); ++index) {
+        const ImageDescriptor& desc{info.image_descriptors[index]};
+        if (UsesHeapImage(info, index)) [[unlikely]] {
+            // EDEN_NX2_V2_BINDLESS: elements of the heap's storage image array of its dimension.
+            DefineHeapImage(info, desc, index);
+            ++scaling_index;
+            continue;
+        }
         const Id sampled_type{desc.is_integer ? U32[1] : F32[1]};
         const Id image_type{ImageType(*this, desc, sampled_type)};
         const Id pointer_type{TypePointer(spv::StorageClass::UniformConstant, image_type)};
@@ -1698,7 +2048,7 @@ void EmitContext::DefineInputs(const IR::Program& program) {
     if (info.uses_is_helper_invocation) {
         is_helper_invocation = DefineInput(*this, U1, false, spv::BuiltIn::HelperInvocation);
     }
-    if (info.uses_subgroup_mask && profile.SupportsSubgroupStage(stage)) {
+    if (info.uses_subgroup_mask && SupportsSubgroups()) {
         subgroup_mask_eq = DefineInput(*this, U32[4], false, spv::BuiltIn::SubgroupEqMaskKHR);
         subgroup_mask_lt = DefineInput(*this, U32[4], false, spv::BuiltIn::SubgroupLtMaskKHR);
         subgroup_mask_le = DefineInput(*this, U32[4], false, spv::BuiltIn::SubgroupLeMaskKHR);
@@ -1715,7 +2065,7 @@ void EmitContext::DefineInputs(const IR::Program& program) {
     if ((info.uses_fswzadd || info.uses_subgroup_invocation_id || info.uses_subgroup_shuffles ||
          (profile.warp_size_potentially_larger_than_guest &&
           (info.uses_subgroup_vote || info.uses_subgroup_mask))) &&
-        profile.SupportsSubgroupStage(stage)) {
+        SupportsSubgroups()) {
         AddCapability(spv::Capability::GroupNonUniform);
         subgroup_local_invocation_id =
             DefineInput(*this, U32[1], false, spv::BuiltIn::SubgroupLocalInvocationId);
@@ -1744,8 +2094,13 @@ void EmitContext::DefineInputs(const IR::Program& program) {
         layer = DefineInput(*this, U32[1], false, spv::BuiltIn::Layer);
         Decorate(layer, spv::Decoration::Flat);
     }
+    const bool noperspective_as_smooth{
+        stage == Stage::Fragment && runtime_info.scaled_noperspective_inputs &&
+        std::ranges::any_of(info.interpolation, [](Interpolation mode) {
+            return mode == Interpolation::NoPerspective;
+        })};
     if (loads.AnyComponent(IR::Attribute::PositionX) ||
-        info.passthrough.AnyComponent(IR::Attribute::PositionX)) {
+        info.passthrough.AnyComponent(IR::Attribute::PositionX) || noperspective_as_smooth) {
         const bool is_fragment{stage == Stage::Fragment};
         if (!is_fragment && profile.has_broken_spirv_position_input) {
             need_input_position_indirect = true;
@@ -1855,7 +2210,12 @@ void EmitContext::DefineInputs(const IR::Program& program) {
             case Interpolation::Smooth:
                 break;
             case Interpolation::NoPerspective:
-                Decorate(id, spv::Decoration::NoPerspective);
+                // The previous stage may write it times Position.w (noperspective_outputs).
+                if (!runtime_info.scaled_noperspective_inputs) {
+                    Decorate(id, spv::Decoration::NoPerspective);
+                } else {
+                    noperspective_as_smooth_inputs[index] = true;
+                }
                 break;
             case Interpolation::Flat:
                 Decorate(id, spv::Decoration::Flat);
@@ -1880,16 +2240,22 @@ void EmitContext::DefineMesh(const IR::Program& program) {
     if (stage != Stage::Task && stage != Stage::Mesh) {
         return;
     }
-    AddExtension("SPV_EXT_mesh_shader");
-    AddCapability(spv::Capability::MeshShadingEXT);
+    // Mesh emulation: a compute shader with the same workgroup memory, writing a storage buffer.
+    const bool as_compute{runtime_info.mesh_as_compute};
+    if (!as_compute) {
+        AddExtension("SPV_EXT_mesh_shader");
+        AddCapability(spv::Capability::MeshShadingEXT);
+    }
     mesh_info = program.mesh;
     mesh_threads = program.workgroup_size[0];
-    // The task's output region, which its mesh workgroups read as their input region.
-    const Id payload_type{TypeArray(U32[1], Const(mesh_info.payload_words))};
-    mesh_payload = DefineVariable(*this, payload_type, std::nullopt,
-                                  spv::StorageClass::TaskPayloadWorkgroupEXT);
+    // The task's output region, which its mesh workgroups read as their input region. In the
+    // emulation it is plain workgroup memory, copied through the task payload buffer.
+    const spv::StorageClass payload_class{as_compute ? spv::StorageClass::Workgroup
+                                                     : spv::StorageClass::TaskPayloadWorkgroupEXT};
+    const Id payload_type{TypeArray(U32[1], Const((std::max)(mesh_info.payload_words, 1U)))};
+    mesh_payload = DefineVariable(*this, payload_type, std::nullopt, payload_class);
     Name(mesh_payload, "task_payload");
-    mesh_payload_u32 = TypePointer(spv::StorageClass::TaskPayloadWorkgroupEXT, U32[1]);
+    mesh_payload_u32 = TypePointer(payload_class, U32[1]);
     if (stage == Stage::Task) {
         return;
     }
@@ -1912,6 +2278,10 @@ void EmitContext::DefineMesh(const IR::Program& program) {
     mesh_primitive_count =
         DefineVariable(*this, U32[1], std::nullopt, spv::StorageClass::Workgroup);
     Name(mesh_primitive_count, "isbe_primitive_count");
+
+    if (as_compute) {
+        return; // the output buffer: DefineMeshEmulationOutput, after the storage buffers
+    }
 
     const Id vertex_count{Const(mesh_info.max_vertices)};
     const Id primitive_count{Const(mesh_info.max_primitives)};
@@ -1991,6 +2361,58 @@ void EmitContext::DefineMesh(const IR::Program& program) {
     }
     for (const u32 line : mesh_info.primitive_lines) {
         mesh_primitive_targets.push_back(target(line, true));
+    }
+}
+
+void EmitContext::DefineMeshEmulationOutput() {
+    if ((stage != Stage::Mesh && stage != Stage::Task) || !runtime_info.mesh_as_compute) {
+        return;
+    }
+    // u32 arrays: the output MeshEpilogue writes each workgroup's block to
+    // (EmitMeshEmulationVertex) and the task payload, offset and argument buffers (RuntimeInfo).
+    // Sirit shares identical types, so reuse the u32 storage buffer type when the program's own
+    // storage buffers declared it: decorating it again would be invalid SPIR-V.
+    AddExtension("SPV_KHR_storage_buffer_storage_class");
+    Id struct_pointer{storage_types.U32.array};
+    if (!Sirit::ValidId(struct_pointer)) {
+        const Id array_type{TypeRuntimeArray(U32[1])};
+        Decorate(array_type, spv::Decoration::ArrayStride, 4U);
+        const Id struct_type{TypeStruct(array_type)};
+        Decorate(struct_type, spv::Decoration::Block);
+        MemberDecorate(struct_type, 0, spv::Decoration::Offset, 0U);
+        struct_pointer = TypePointer(spv::StorageClass::StorageBuffer, struct_type);
+    }
+    const auto define = [&](u32 binding, std::string_view name) {
+        const Id buffer{AddGlobalVariable(struct_pointer, spv::StorageClass::StorageBuffer)};
+        Decorate(buffer, spv::Decoration::Binding, binding);
+        Decorate(buffer, spv::Decoration::DescriptorSet, 0U);
+        Name(buffer, name);
+        if (profile.supported_spirv >= 0x00010400) {
+            interfaces.push_back(buffer);
+        }
+        return buffer;
+    };
+    mesh_output_u32 = TypePointer(spv::StorageClass::StorageBuffer, U32[1]);
+    const bool has_task{runtime_info.mesh_task_payload_binding != ~0U};
+    if (has_task) {
+        mesh_task_payload_buffer =
+            define(runtime_info.mesh_task_payload_binding, "mesh_emulation_task_payload");
+    }
+    if (stage == Stage::Task) {
+        return;
+    }
+    mesh_output_buffer = define(runtime_info.mesh_output_binding, "mesh_emulation_output");
+    if (has_task) {
+        mesh_task_offsets_buffer =
+            define(runtime_info.mesh_task_offsets_binding, "mesh_emulation_task_offsets");
+        mesh_task_args_buffer =
+            define(runtime_info.mesh_task_args_binding, "mesh_emulation_task_args");
+        mesh_group_index = AddGlobalVariable(TypePointer(spv::StorageClass::Private, U32[1]),
+                                             spv::StorageClass::Private);
+        Name(mesh_group_index, "mesh_group_index");
+        if (profile.supported_spirv >= 0x00010400) {
+            interfaces.push_back(mesh_group_index);
+        }
     }
 }
 

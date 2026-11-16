@@ -13,6 +13,9 @@
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/render_trace.h"
+#include "video_core/v2/ir_check.h"
+#include "video_core/v2/s1_deltas.h"
+#include "video_core/v2/v2_stats.h"
 
 namespace Tegra::Engines {
 namespace {
@@ -92,6 +95,10 @@ void Maxwell3D::DrawManager::ProcessMethodCall(Maxwell3D& maxwell3d, u32 method,
 }
 
 void Maxwell3D::DrawManager::Clear(Maxwell3D& maxwell3d, u32 layer_count) {
+    if (VideoCommon::V2::IrCheck::g_active) [[unlikely]] {
+        VideoCommon::V2::IrCheck::NoteDraw(
+            {.kind = VideoCommon::V2::Ir::DrawKind::Clear, .first = layer_count}, nullptr);
+    }
     if (maxwell3d.ShouldExecute()) {
         maxwell3d.rasterizer->Clear(layer_count);
     }
@@ -309,6 +316,10 @@ void Maxwell3D::DrawManager::DrawTexture(Maxwell3D& maxwell3d) {
     draw_texture_state.src_y1 = (f32(maxwell3d.regs.draw_texture.dy_dv) / 4294967296.f) * dst_height + draw_texture_state.src_y0;
     draw_texture_state.src_sampler = maxwell3d.regs.draw_texture.src_sampler;
     draw_texture_state.src_texture = maxwell3d.regs.draw_texture.src_texture;
+    if (VideoCommon::V2::IrCheck::g_active) [[unlikely]] {
+        VideoCommon::V2::IrCheck::NoteDraw({.kind = VideoCommon::V2::Ir::DrawKind::Texture},
+                                           nullptr);
+    }
     maxwell3d.rasterizer->DrawTexture();
 }
 
@@ -337,15 +348,93 @@ void Maxwell3D::DrawManager::UpdateTopology(Maxwell3D& maxwell3d) {
     }
 }
 
+void Maxwell3D::DrawManager::NoteV2DrawCheck(Maxwell3D& maxwell3d,
+                                              VideoCommon::V2::Ir::DrawKind kind,
+                                              u32 instance_count) {
+    // EDEN_NX2_V2_IR_DRAWS=verify: the draw as the front's Draw records describe it.
+    const bool indexed = kind == VideoCommon::V2::Ir::DrawKind::Indexed;
+    const bool array = kind == VideoCommon::V2::Ir::DrawKind::Array;
+    VideoCommon::V2::IrCheck::NoteDraw(
+        {.kind = kind,
+         .topology = static_cast<u8>(draw_state.topology),
+         .reserved = 0,
+         .first = indexed ? draw_state.index_buffer.first
+                          : (array ? draw_state.vertex_buffer.first : 0),
+         .count = indexed ? draw_state.index_buffer.count
+                          : (array ? draw_state.vertex_buffer.count : 0),
+         .instances = instance_count,
+         .base_vertex = draw_state.base_index,
+         .base_instance = draw_state.base_instance},
+        VideoCommon::V2::On(VideoCommon::V2::Switch::RegSem) ? &maxwell3d.v2_groups : nullptr);
+}
+
 void Maxwell3D::DrawManager::ProcessDraw(Maxwell3D& maxwell3d, bool draw_indexed, u32 instance_count) {
     draw_state.draw_element_count =
         draw_indexed ? draw_state.index_buffer.count : draw_state.vertex_buffer.count;
     LOG_TRACE(HW_GPU, "called, topology={}, count={}", draw_state.topology, draw_indexed ? draw_state.index_buffer.count : draw_state.vertex_buffer.count);
     UpdateTopology(maxwell3d);
+    if (VideoCommon::V2::IrCheck::g_active) [[unlikely]] {
+        NoteV2DrawCheck(maxwell3d, draw_indexed ? VideoCommon::V2::Ir::DrawKind::Indexed
+                                                : VideoCommon::V2::Ir::DrawKind::Array,
+                        instance_count);
+    }
     if (maxwell3d.ShouldExecute()) {
+        const bool v2_stats = VideoCommon::V2::Stats::Enabled();
+        if (v2_stats) [[unlikely]] {
+            VideoCommon::V2::Stats::NoteDraw(maxwell3d, static_cast<u32>(draw_state.topology),
+                                             draw_indexed, false);
+        }
+        if (VideoCommon::V2::TrackGroups()) [[unlikely]] {
+            VideoCommon::V2::RegSem::NoteDraw3D(maxwell3d.v2_groups,
+                                                maxwell3d.regs.reg_array.data());
+        }
+        const VideoCommon::V2::Stats::DrawScope v2_scope{v2_stats};
         maxwell3d.rasterizer->Draw(draw_indexed, instance_count);
     } else {
         TraceSuppressedDraw(maxwell3d, false);
+    }
+}
+
+void Maxwell3D::DrawManager::DrawPredicted(Maxwell3D& maxwell3d,
+                                           const VideoCommon::V2::Ir::PredictedDraw& draw,
+                                           u8 variant) {
+    // The draw state DrawEnd, DrawDeferred, DrawIndexSmall and DrawArrayInstanced would leave,
+    // from the front's DrawModel; the registers are the ones they read.
+    using Kind = VideoCommon::V2::Ir::DrawKind;
+    namespace S1 = VideoCommon::V2::S1;
+    switch (draw.kind) {
+    case Kind::Clear:
+        return Clear(maxwell3d, draw.first);
+    case Kind::Texture:
+        return DrawTexture(maxwell3d);
+    case Kind::Array:
+        draw_state.topology = static_cast<Maxwell3D::Regs::PrimitiveTopology>(draw.topology);
+        draw_state.vertex_buffer.first = draw.first;
+        draw_state.vertex_buffer.count = draw.count;
+        draw_state.base_index = draw.base_vertex;
+        draw_state.base_instance = draw.base_instance;
+        return ProcessDraw(maxwell3d, false, draw.instances);
+    case Kind::Indexed:
+        draw_state.topology = static_cast<Maxwell3D::Regs::PrimitiveTopology>(draw.topology);
+        draw_state.index_buffer = maxwell3d.regs.index_buffer;
+        draw_state.index_buffer.first = draw.first;
+        draw_state.index_buffer.count = draw.count;
+        draw_state.base_index = draw.base_vertex;
+        draw_state.base_instance = draw.base_instance;
+        if ((variant & S1::DrawInline) != 0) {
+            draw_state.index_buffer.format = Maxwell3D::Regs::IndexFormat::UnsignedInt;
+        }
+        if ((variant & (S1::DrawInline | S1::DrawIndexDirty)) != 0) {
+            maxwell3d.dirty.flags[VideoCommon::Dirty::IndexBuffer] = true;
+        }
+        ProcessDraw(maxwell3d, true, draw.instances);
+        if ((variant & S1::DrawInline) != 0) {
+            draw_state.inline_index_draw_indexes.clear();
+        }
+        return;
+    default:
+        // Indirect draws come as their own records (HostIndirect).
+        return;
     }
 }
 
@@ -353,7 +442,23 @@ void Maxwell3D::DrawManager::ProcessDrawIndirect(Maxwell3D& maxwell3d) {
     draw_state.draw_element_count = 0;
     LOG_TRACE(HW_GPU, "called, topology={}, is_indexed={}, includes_count={}, buffer_size={}, max_draw_count={}", draw_state.topology, indirect_state.is_indexed, indirect_state.include_count, indirect_state.buffer_size, indirect_state.max_draw_counts);
     UpdateTopology(maxwell3d);
+    if (VideoCommon::V2::IrCheck::g_active) [[unlikely]] {
+        NoteV2DrawCheck(maxwell3d,
+                        indirect_state.is_indexed ? VideoCommon::V2::Ir::DrawKind::IndexedIndirect
+                                                  : VideoCommon::V2::Ir::DrawKind::Indirect,
+                        0);
+    }
     if (maxwell3d.ShouldExecute()) {
+        const bool v2_stats = VideoCommon::V2::Stats::Enabled();
+        if (v2_stats) [[unlikely]] {
+            VideoCommon::V2::Stats::NoteDraw(maxwell3d, static_cast<u32>(draw_state.topology),
+                                             indirect_state.is_indexed, true);
+        }
+        if (VideoCommon::V2::TrackGroups()) [[unlikely]] {
+            VideoCommon::V2::RegSem::NoteDraw3D(maxwell3d.v2_groups,
+                                                maxwell3d.regs.reg_array.data());
+        }
+        const VideoCommon::V2::Stats::DrawScope v2_scope{v2_stats};
         maxwell3d.rasterizer->DrawIndirect();
     } else {
         TraceSuppressedDraw(maxwell3d, true);

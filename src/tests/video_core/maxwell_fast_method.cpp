@@ -8,6 +8,7 @@
 #include <functional>
 #include <memory>
 #include <random>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -22,11 +23,19 @@
 #include "core/memory.h"
 #include "tests/core/system_test_context.h"
 #include "video_core/dirty_flags.h"
+#include "video_core/engines/kepler_compute.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/gpu.h"
 #include "video_core/gpu_split.h"
+#include "video_core/native_qmd.h"
+#include "video_core/v2/front_writes.h"
+#include "video_core/gpu_thread.h"
 #include "video_core/memory_manager.h"
 #include "video_core/renderer_null/null_rasterizer.h"
+#include "video_core/v2/draw_model.h"
+#include "video_core/v2/ir_check.h"
+#include "video_core/v2/regsem_3d.h"
+#include "video_core/v2/v2_switches.h"
 
 namespace VideoCommon {
 
@@ -43,6 +52,27 @@ struct GpuSplitTestAccess {
     static u64 End(const GpuSplit& split) {
         return split.write_position;
     }
+    /// What the back may run (GpuSplit::Publish).
+    static u64 Published(const GpuSplit& split) {
+        return split.published.load();
+    }
+    /// As if entries up to `position` were sent.
+    static void SetEnd(GpuSplit& split, u64 position) {
+        split.write_position = position;
+    }
+    /// As if the back consumed up to `position` and runs (or not).
+    static void SetBack(GpuSplit& split, u64 consumed, bool running) {
+        split.consumed.store(consumed);
+        split.consumed_cache = consumed;
+        split.back_running.store(running);
+    }
+    /// A front job queued for a running back, as RequestBackJob does.
+    static void QueueBackJob(GpuSplit& split, void (*job)(void*), void* argument) {
+        split.back_job = job;
+        split.back_job_argument = argument;
+        split.back_job_requested.store(true);
+        split.hook_requested.store(true);
+    }
 
     static void Start(GpuSplit& split, Core::System& system) {
         Initialize(split, system);
@@ -54,7 +84,86 @@ struct GpuSplitTestAccess {
         return GpuSplit::RingWords - 1;
     }
 
+    static void ServeHookRequests(GpuSplit& split) {
+        split.ServeHookRequests();
+    }
+
+    /// The front records writes (EDEN_NX2_V2_HAZARD on): syncs reach the hazard table.
+    static void SetTracksWrites(GpuSplit& split, bool on) {
+        split.tracks_writes = on;
+    }
+
+    static void SetIr(GpuSplit& split, bool ir) {
+        split.ir = ir;
+        split.ir_verify = ir;
+        if (ir) {
+            split.AllocateIr();
+        }
+    }
+
+    static const u64* Ring(const GpuSplit& split) {
+        return split.ring.get();
+    }
+
+    static void SetDrawRecords(GpuSplit& split, bool verify) {
+        split.front_macros = true;
+        split.draw_records = true;
+        split.draw_verify = verify;
+        split.full_draw_records = verify;
+        if (verify) {
+            V2::IrCheck::Start();
+        }
+    }
+
+    static void SetFullDrawRecords(GpuSplit& split, bool full) {
+        split.full_draw_records = full;
+    }
+
+    static void SetS1(GpuSplit& split, bool exec, bool check) {
+        split.s1_exec = exec;
+        split.s1_check = check;
+    }
+
+    /// The back records every IR record it executes (EDEN_NX2_V2_IR_TRACE without files).
+    static void StartTrace(GpuSplit& split) {
+        split.ir_trace = std::make_unique<V2::IrTrace::Recorder>();
+        split.ir_checks = true; // as MaybeStart: the trace is one of the per-record checks
+    }
+    static const V2::IrTrace::Recorder& Trace(const GpuSplit& split) {
+        return *split.ir_trace;
+    }
+    /// Interns `object` in the object table (a replay's objects, in the recording's order).
+    static void Intern(GpuSplit& split, const void* object) {
+        static_cast<void>(split.IrRef(object));
+    }
+
+    /// Runs everything sent so far on the calling thread as the back.
+    static void RunBack(GpuSplit& split) {
+        split.Publish();
+        SetBackThread(true);
+        u64 position = split.consumed.load();
+        while (position < split.write_position) {
+            const size_t index = position & GpuSplit::RingMask;
+            const size_t size = split.Execute(
+                &split.ring[index],
+                std::min<u64>(split.write_position - position, GpuSplit::RingWords - index));
+            position += size != 0 ? size : GpuSplit::RingWords - index;
+        }
+        split.consumed.store(position);
+        split.consumed_cache = position;
+        SetBackThread(false);
+    }
+
+    static void SetBackThread(bool back) {
+        GpuSplit::on_back_thread = back;
+    }
+
+    static u64 IrBadRecords(const GpuSplit& split) {
+        return split.ir_bad_records;
+    }
+
     static u64 Execute(GpuSplit& split, u64 position, u64 available) {
+
         const size_t index = position & GpuSplit::RingMask;
         const size_t size = split.Execute(
             &split.ring[index], std::min<u64>(available - position, GpuSplit::RingWords - index));
@@ -836,4 +945,2394 @@ TEST_CASE("Maxwell3D's split front uploads macro code sent as one multi-method r
     const auto& macros = engine.GetNativeMacroEngine();
     REQUIRE(macros.native_write_offset == pointer * 3 + code.size());
     CHECK(std::equal(code.begin(), code.end(), macros.native_code.begin() + pointer * 3));
+}
+
+namespace {
+
+/// Sets a v2 switch for the scope.
+struct V2SwitchScope {
+    VideoCommon::V2::Switch name;
+    VideoCommon::V2::Mode previous;
+
+    V2SwitchScope(VideoCommon::V2::Switch name_, VideoCommon::V2::Mode mode)
+        : name{name_}, previous{VideoCommon::V2::Get(name_)} {
+        VideoCommon::V2::g_modes[static_cast<size_t>(name)] = mode;
+    }
+    ~V2SwitchScope() {
+        VideoCommon::V2::g_modes[static_cast<size_t>(name)] = previous;
+    }
+};
+
+} // Anonymous namespace
+
+TEST_CASE("V2 typed IR runs the same engine calls as the word stream",
+          "[video_core][gpu_split_dispatch][v2_ir]") {
+    using Access = VideoCommon::GpuSplitTestAccess;
+    Fixture f;
+    f.system.Initialize();
+    VideoCommon::GpuSplit words;
+    VideoCommon::GpuSplit typed;
+    Access::Initialize(words, f.system);
+    Access::Initialize(typed, f.system);
+    Access::SetIr(typed, true);
+    std::vector<u32> words_calls;
+    std::vector<u32> typed_calls;
+    u64 words_read = 0;
+    u64 typed_read = 0;
+    std::mt19937 rng{1234};
+    // The word stream runs on f.slow, the IR on f.fast: Compare checks they end up equal.
+    for (u32 round = 0; round < 20; ++round) {
+        for (u32 i = 0; i < 300; ++i) {
+            const u32 choice = static_cast<u32>(rng() % 16);
+            if (choice < 7) {
+                const u32 method = f.state_methods[rng() % f.state_methods.size()];
+                const u32 argument = RandomArgument(rng, method, f.slow);
+                const bool is_last = rng() % 4 != 0;
+                words.Method(&f.slow, method, argument, is_last, nullptr);
+                typed.Method(&f.fast, method, argument, is_last, nullptr);
+            } else if (choice < 10) {
+                const u32 method = executable_methods[rng() % executable_methods.size()];
+                const u32 argument = RandomArgument(rng, method, f.slow);
+                if (choice == 9) {
+                    words.MacroWrite(&f.slow, method, argument);
+                    typed.MacroWrite(&f.fast, method, argument);
+                } else {
+                    words.Method(&f.slow, method, argument, true, nullptr);
+                    typed.Method(&f.fast, method, argument, true, nullptr);
+                }
+            } else if (choice < 13) {
+                // Constant buffer words one by one (the back batches them) or as one run.
+                const u32 count = 1 + static_cast<u32>(rng() % 20);
+                std::vector<u32> data(count);
+                for (auto& word : data) {
+                    word = static_cast<u32>(rng());
+                }
+                if (choice == 12) {
+                    words.MultiMethod(&f.slow, CbData, data.data(), count, count, nullptr);
+                    typed.MultiMethod(&f.fast, CbData, data.data(), count, count, nullptr);
+                } else {
+                    for (const u32 word : data) {
+                        const u32 method = CbData + static_cast<u32>(rng() % 16);
+                        words.MacroWrite(&f.slow, method, word);
+                        typed.MacroWrite(&f.fast, method, word);
+                    }
+                }
+            } else if (choice < 15) {
+                const u32 value = static_cast<u32>(rng());
+                words.Defer([&words_calls, value] { words_calls.push_back(value); });
+                typed.Defer([&typed_calls, value] { typed_calls.push_back(value); });
+            } else {
+                // A typed record the back only reads, between the others.
+                const u32 value = static_cast<u32>(rng());
+                const VideoCommon::V2::Ir::CopyBody body{.source = value, .destination = value};
+                typed.Note(VideoCommon::V2::Ir::Kind::Copy, body);
+                words.Defer([&words_calls, value] { words_calls.push_back(~value); },
+                            VideoCommon::GpuSplit::FastDrawNeutral);
+                typed.Defer([&typed_calls, value] { typed_calls.push_back(~value); },
+                            VideoCommon::GpuSplit::FastDrawNeutral);
+            }
+        }
+        // Execute what both sent, as the back would (a publish closes the open StateRun).
+        words.Publish();
+        typed.Publish();
+        while (words_read != Access::End(words)) {
+            words_read = Access::Execute(words, words_read, Access::End(words));
+        }
+        while (typed_read != Access::End(typed)) {
+            typed_read = Access::Execute(typed, typed_read, Access::End(typed));
+        }
+        f.slow.ConsumeSink(f.system);
+        f.fast.ConsumeSink(f.system);
+        f.Compare();
+        REQUIRE(words_calls == typed_calls);
+        REQUIRE(Access::IrBadRecords(typed) == 0);
+        REQUIRE(typed.Mark().sequence != 0);
+        REQUIRE(words.Mark().sequence == 0);
+    }
+}
+
+TEST_CASE("V2 table-driven 3D front mirror sends what the hand-written one sends",
+          "[video_core][gpu_split_dependencies][v2_regsem]") {
+    using Access = VideoCommon::GpuSplitTestAccess;
+    using VideoCommon::V2::Mode;
+    using VideoCommon::V2::Switch;
+    Fixture f;
+    Maxwell3D table_engine{f.memory};
+    Maxwell3D verify_engine{f.memory};
+    VideoCommon::GpuSplit hand;
+    VideoCommon::GpuSplit table;
+    VideoCommon::GpuSplit verify;
+    Access::Initialize(hand, f.system);
+    Access::Initialize(table, f.system);
+    Access::Initialize(verify, f.system);
+    std::mt19937 rng{99};
+    const auto call = [&](Maxwell3D& engine, VideoCommon::GpuSplit& split, Mode mode, u32 method,
+                          u32 argument, bool is_last) {
+        const V2SwitchScope scope{Switch::RegSem, mode};
+        engine.FrontCallMethod(f.system, split, method, argument, is_last);
+    };
+    const auto multi = [&](Maxwell3D& engine, VideoCommon::GpuSplit& split, Mode mode, u32 method,
+                           const std::vector<u32>& data) {
+        const V2SwitchScope scope{Switch::RegSem, mode};
+        const u32 amount = static_cast<u32>(data.size());
+        engine.FrontCallMultiMethod(f.system, split, method, data.data(), amount, amount);
+    };
+    constexpr u32 StartAddressPointer = MAXWELL3D_REG_INDEX(load_mme.start_address_ptr);
+    constexpr u32 StartAddress = MAXWELL3D_REG_INDEX(load_mme.start_address);
+    constexpr u32 Falcon4 = MAXWELL3D_REG_INDEX(falcon[4]);
+    for (u32 i = 0; i < 20000; ++i) {
+        const u32 choice = static_cast<u32>(rng() % 20);
+        u32 method;
+        u32 argument;
+        if (choice < 10) {
+            method = f.state_methods[rng() % f.state_methods.size()];
+            argument = rng() % 3 == 0 ? static_cast<u32>(rng()) : static_cast<u32>(rng() % 3);
+        } else if (choice < 14) {
+            method = executable_methods[rng() % executable_methods.size()];
+            argument = RandomArgument(rng, method, f.fast);
+        } else if (choice == 14) {
+            method = ShadowControl;
+            argument = static_cast<u32>(rng() % 4);
+        } else if (choice == 15) {
+            method = rng() % 2 ? StartAddressPointer : StartAddress;
+            argument = static_cast<u32>(rng() % 8);
+        } else if (choice == 16) {
+            method = rng() % 2 ? Falcon4 : CbData + static_cast<u32>(rng() % 16);
+            argument = static_cast<u32>(rng());
+        } else {
+            method = rng() % 2 ? CbData : f.state_methods[rng() % f.state_methods.size()];
+            std::vector<u32> data(1 + rng() % 6);
+            for (auto& word : data) {
+                word = static_cast<u32>(rng() % 3);
+            }
+            multi(f.fast, hand, Mode::Off, method, data);
+            multi(table_engine, table, Mode::On, method, data);
+            multi(verify_engine, verify, Mode::Verify, method, data);
+            continue;
+        }
+        const bool is_last = rng() % 4 != 0;
+        call(f.fast, hand, Mode::Off, method, argument, is_last);
+        call(table_engine, table, Mode::On, method, argument, is_last);
+        call(verify_engine, verify, Mode::Verify, method, argument, is_last);
+    }
+    // The same ring entries: the same writes dropped and sent, with the same values.
+    REQUIRE(Access::End(hand) == Access::End(table));
+    REQUIRE(Access::End(hand) == Access::End(verify));
+    const auto words = static_cast<size_t>(Access::End(hand));
+    for (size_t i = 0; i < words; ++i) {
+        const u64 a = Access::Ring(hand)[i];
+        if ((a & 0xf) == 1) { // Engine entries hold each ring's own engine pointer
+            ++i;
+            continue;
+        }
+        REQUIRE(a == Access::Ring(table)[i]);
+        REQUIRE(a == Access::Ring(verify)[i]);
+    }
+    CHECK(std::equal(f.fast.GetNativeMacroPositions().begin(),
+                     f.fast.GetNativeMacroPositions().end(),
+                     table_engine.GetNativeMacroPositions().begin()));
+}
+
+TEST_CASE("V2 register groups: compare-on-write and incremental fingerprints",
+          "[video_core][v2_regsem]") {
+    namespace RegSem = VideoCommon::V2::RegSem;
+    using VideoCommon::V2::GroupBit;
+    using VideoCommon::V2::RegGroup;
+    Fixture f; // Constructs a Maxwell3D, which builds the table.
+    const RegSem::Table3D& table = RegSem::GetTable3D();
+    auto mirror = std::make_unique<RegSem::Mirror3D>();
+    mirror->skip_same = true;
+    RegSem::Rehash3D(mirror->v2_groups, mirror->regs.data());
+    mirror->v2_groups.TakeDirty();
+    const auto none = [](RegSem::Effect, u32, u32) { return true; };
+    const u32 state = MAXWELL3D_REG_INDEX(viewport_transform);
+    const u32 viewport = GroupBit(RegGroup::Viewport);
+    REQUIRE(table.groups[state] == RegGroup::Viewport);
+    REQUIRE(table.const_buffer_offset == CbOffset);
+    REQUIRE(table.instruction_ptr == MAXWELL3D_REG_INDEX(load_mme.instruction_ptr));
+    REQUIRE((table.flags[DrawEnd] & (RegSem::LoopSkippable | RegSem::DrawEnd)) ==
+            (RegSem::LoopSkippable | RegSem::DrawEnd));
+    REQUIRE((table.flags[MAXWELL3D_REG_INDEX(bind_groups[2].raw_config)] &
+             RegSem::CbufBindFlag) != 0);
+    // A changed write dirties its group and is sent; the same value again does neither.
+    REQUIRE(RegSem::Write3D(*mirror, table, state, 5, false, none));
+    REQUIRE(mirror->v2_groups.TakeDirty() == viewport);
+    const u64 all = mirror->v2_groups.Fingerprint(VideoCommon::V2::HashedGroups);
+    REQUIRE_FALSE(RegSem::Write3D(*mirror, table, state, 5, false, none));
+    REQUIRE(mirror->v2_groups.TakeDirty() == 0);
+    REQUIRE(mirror->v2_groups.Fingerprint(VideoCommon::V2::HashedGroups) == all);
+    // Writing the old value back restores the old fingerprint.
+    const u64 before = mirror->v2_groups.Fingerprint(viewport);
+    REQUIRE(RegSem::Write3D(*mirror, table, state, 6, false, none));
+    REQUIRE(mirror->v2_groups.Fingerprint(viewport) != before);
+    REQUIRE(RegSem::Write3D(*mirror, table, state, 5, false, none));
+    REQUIRE(mirror->v2_groups.Fingerprint(viewport) == before);
+    mirror->v2_groups.TakeDirty();
+    // Constant buffer data dirties CbufData whatever the words; it is always sent.
+    REQUIRE(RegSem::Write3D(*mirror, table, CbData, 0, false, none));
+    REQUIRE(mirror->v2_groups.TakeDirty() == GroupBit(RegGroup::CbufData));
+    // Random writes: the incremental hashes equal the ones computed from scratch.
+    std::mt19937 rng{7};
+    for (u32 i = 0; i < 100000; ++i) {
+        const u32 method = f.state_methods[rng() % f.state_methods.size()];
+        RegSem::Write3D(*mirror, table, method, static_cast<u32>(rng() % 4), false, none);
+    }
+    VideoCommon::V2::GroupTracker check = mirror->v2_groups;
+    REQUIRE(RegSem::Rehash3D(check, mirror->regs.data()) == 0);
+}
+
+namespace {
+/// A mirror whose group hashes wait in a HashLog3D, as the front's FrontState keeps them.
+struct LoggedMirror3D : VideoCommon::V2::RegSem::Mirror3D {
+    VideoCommon::V2::RegSem::HashLog3D v2_hash_log;
+};
+} // Anonymous namespace
+
+TEST_CASE("V2 deferred group hashes equal the per-write ones at every fold",
+          "[video_core][v2_regsem]") {
+    namespace RegSem = VideoCommon::V2::RegSem;
+    Fixture f; // Constructs a Maxwell3D, which builds the table.
+    const RegSem::Table3D& table = RegSem::GetTable3D();
+    auto eager = std::make_unique<RegSem::Mirror3D>();
+    auto logged = std::make_unique<LoggedMirror3D>();
+    eager->skip_same = true;
+    logged->skip_same = true;
+    RegSem::Rehash3D(eager->v2_groups, eager->regs.data());
+    RegSem::Rehash3D(logged->v2_groups, logged->regs.data());
+    const auto none = [](RegSem::Effect, u32, u32) { return true; };
+    std::mt19937 rng{11};
+    for (u32 round = 0; round < 200; ++round) {
+        // Few values, so registers often change back; long rounds overflow the log.
+        const u32 writes = rng() % 2 == 0 ? rng() % 16 : 1000;
+        for (u32 i = 0; i < writes; ++i) {
+            const u32 method = f.state_methods[rng() % f.state_methods.size()];
+            const u32 value = static_cast<u32>(rng() % 3);
+            REQUIRE(RegSem::Write3D(*eager, table, method, value, false, none) ==
+                    RegSem::Write3D(*logged, table, method, value, false, none));
+        }
+        // The dirty bits never wait; the hashes match after a fold.
+        REQUIRE(logged->v2_groups.dirty == eager->v2_groups.dirty);
+        logged->v2_hash_log.Fold(logged->v2_groups, table, logged->regs.data());
+        REQUIRE(logged->v2_hash_log.Size() == 0);
+        REQUIRE(logged->v2_groups.hashes == eager->v2_groups.hashes);
+        REQUIRE(logged->v2_groups.Fingerprint(VideoCommon::V2::HashedGroups) ==
+                eager->v2_groups.Fingerprint(VideoCommon::V2::HashedGroups));
+        eager->v2_groups.TakeDirty();
+        logged->v2_groups.TakeDirty();
+    }
+    VideoCommon::V2::GroupTracker check = logged->v2_groups;
+    REQUIRE(RegSem::Rehash3D(check, logged->regs.data()) == 0);
+}
+
+TEST_CASE("V2 typed records run on the back without thunks, as their deferred calls do",
+          "[video_core][gpu_split_dispatch][v2_ir]") {
+    using Access = VideoCommon::GpuSplitTestAccess;
+    namespace Ir = VideoCommon::V2::Ir;
+    Fixture f;
+    f.system.Initialize();
+    f.memory.BindRasterizer(&f.rasterizer);
+    for (const bool ir : {false, true}) {
+        VideoCommon::GpuSplit split;
+        Access::SetIr(split, ir);
+        Access::Start(split, f.system);
+        SCOPE_EXIT { split.Stop(); };
+        // Barriers on the rasterizer (WFI, invalidations, fences, reference).
+        for (const auto op : {Ir::BarrierOp::WaitForIdle, Ir::BarrierOp::InvalidateCaches,
+                              Ir::BarrierOp::ReleaseFences, Ir::BarrierOp::SignalReference}) {
+            const Ir::BarrierBody body{.op = op, .object = split.Ref(&f.rasterizer), .a = 0, .b = 0};
+            split.Emit(Ir::Kind::Barrier, body, [] {});
+        }
+        // A readback that sets an engine's dirty flag from the caches (none dirty here).
+        f.fast.current_dirty = true;
+        const Ir::ReadbackBody dirty{.op = Ir::ReadbackOp::SegmentDirty,
+                                     .object = split.Ref(&f.fast),
+                                     .object2 = split.Ref(&f.memory),
+                                     .cache = 0,
+                                     .address = 0x2000'0000,
+                                     .bytes = 64};
+        split.Emit(Ir::Kind::Readback, dirty, [engine = &f.fast, memory = &f.memory] {
+            engine->current_dirty = memory->IsMemoryDirty(0x2000'0000, 64);
+        });
+        // Command list pages in the payload arena.
+        const std::array<u64, 3> pages{0x1000, 0x2000, 0x3000};
+        const Ir::ReadbackBody list{.op = Ir::ReadbackOp::ListPages,
+                                    .object = split.Ref(&f.rasterizer)};
+        split.EmitPayload(Ir::Kind::Readback, list, pages.data(), pages.size(), [] {});
+        // The CPU queue's command fence.
+        auto state_storage = std::make_unique<VideoCommon::GPUThread::SynchState>();
+        auto& state = *state_storage;
+        const Ir::SyncPointBody signal{.id = 0,
+                                       .value = 0,
+                                       .op = Ir::SyncPointOp::CommandSignal,
+                                       .object = split.Ref(&state),
+                                       .a = 77,
+                                       .b = 0};
+        split.Emit(Ir::Kind::SyncPoint, signal, [&state] {
+            VideoCommon::GPUThread::SignalCommandFence(state, 77, false);
+        });
+        // A record the back only reads.
+        split.Note(Ir::Kind::Acquire, Ir::AcquireBody{.address = 0x40, .value = 1});
+        split.Drain(VideoCommon::DrainSite::Other);
+        CHECK(!f.fast.current_dirty);
+        CHECK(state.signaled_fence.load() == 77);
+        CHECK(Access::IrBadRecords(split) == 0);
+    }
+    // Map records: what the GPU runs for a map and an unmap.
+    const Ir::MapBody map{.op = Ir::MapOp::GmmuMap,
+                          .flags = 0,
+                          .gpu_address = 0x4000'0000,
+                          .device_address = 0x30'0000,
+                          .size = 0x10000,
+                          .object = reinterpret_cast<u64>(&f.memory)};
+    f.gpu.ExecuteMap(map);
+    REQUIRE(f.memory.GpuToCpuAddress(0x4000'0000 + 0x1234) == DAddr{0x30'1234});
+    Ir::MapBody unmap = map;
+    unmap.op = Ir::MapOp::GmmuUnmap;
+    f.gpu.ExecuteMap(unmap);
+    REQUIRE(!f.memory.GpuToCpuAddress(0x4000'0000 + 0x1234));
+}
+
+TEST_CASE("V2 front Draw records predict every draw the back performs",
+          "[video_core][gpu_split_dispatch][v2_ir]") {
+    using Access = VideoCommon::GpuSplitTestAccess;
+    using VideoCommon::V2::Mode;
+    using VideoCommon::V2::Switch;
+    namespace IrCheck = VideoCommon::V2::IrCheck;
+    constexpr std::array<u32, 20> draw_methods{
+        DrawBegin,
+        DrawEnd,
+        MAXWELL3D_REG_INDEX(vertex_buffer.first),
+        MAXWELL3D_REG_INDEX(vertex_buffer.count),
+        MAXWELL3D_REG_INDEX(index_buffer.first),
+        MAXWELL3D_REG_INDEX(index_buffer.count),
+        MAXWELL3D_REG_INDEX(index_buffer32_first),
+        MAXWELL3D_REG_INDEX(index_buffer16_subsequent),
+        MAXWELL3D_REG_INDEX(draw_inline_index),
+        MAXWELL3D_REG_INDEX(inline_index_2x16.even),
+        MAXWELL3D_REG_INDEX(vertex_array_instance_first),
+        MAXWELL3D_REG_INDEX(vertex_array_instance_subsequent),
+        MAXWELL3D_REG_INDEX(global_base_vertex_index),
+        MAXWELL3D_REG_INDEX(global_base_instance_index),
+        MAXWELL3D_REG_INDEX(clear_surface),
+        MAXWELL3D_REG_INDEX(draw_texture.src_y0),
+        MAXWELL3D_REG_INDEX(topology_override),
+        MAXWELL3D_REG_INDEX(primitive_topology_control),
+        MAXWELL3D_REG_INDEX(bind_groups[0].raw_config),
+        ShadowControl,
+    };
+    for (const Mode regsem : {Mode::Off, Mode::On, Mode::Verify}) {
+        const V2SwitchScope scope{Switch::RegSem, regsem};
+        Fixture f;
+        f.system.Initialize();
+        VideoCommon::GpuSplit split;
+        Access::Initialize(split, f.system);
+        Access::SetIr(split, true);
+        Access::SetDrawRecords(split, true);
+        auto& engine = f.fast;
+        engine.SetNativeTuringMacroMode(true);
+        std::mt19937 rng{static_cast<u32>(regsem) + 21};
+        u64 read = 0;
+        for (u32 round = 0; round < 40; ++round) {
+            for (u32 i = 0; i < 400; ++i) {
+                const u32 choice = static_cast<u32>(rng() % 10);
+                if (choice < 3) {
+                    const u32 method = f.state_methods[rng() % f.state_methods.size()];
+                    engine.FrontCallMethod(f.system, split, method, rng() % 3 == 0 ? rng() : rng() % 4,
+                                           true);
+                    continue;
+                }
+                const u32 method = draw_methods[rng() % draw_methods.size()];
+                u32 argument = static_cast<u32>(rng() % 8);
+                if (method == DrawBegin) {
+                    argument = (static_cast<u32>(rng() % 3) << 26) | (rng() % 8);
+                } else if (method == ShadowControl) {
+                    argument = rng() % 8 == 0 ? static_cast<u32>(rng() % 4) : 0;
+                } else if (method == MAXWELL3D_REG_INDEX(index_buffer32_first) ||
+                           method == MAXWELL3D_REG_INDEX(index_buffer16_subsequent) ||
+                           method == MAXWELL3D_REG_INDEX(vertex_array_instance_first) ||
+                           method == MAXWELL3D_REG_INDEX(vertex_array_instance_subsequent)) {
+                    argument = static_cast<u32>(rng());
+                } else if (method == MAXWELL3D_REG_INDEX(primitive_topology_control)) {
+                    argument = rng() % 2;
+                }
+                if (choice == 9) {
+                    std::vector<u32> words(1 + rng() % 4);
+                    for (auto& word : words) {
+                        word = method == DrawBegin ? argument : static_cast<u32>(rng() % 8);
+                    }
+                    const u32 amount = static_cast<u32>(words.size());
+                    engine.FrontCallMultiMethod(f.system, split, method, words.data(), amount,
+                                                amount);
+                } else {
+                    engine.FrontCallMethod(f.system, split, method, argument, rng() % 4 != 0);
+                }
+            }
+            // The back runs what the front sent.
+            split.Publish();
+            Access::SetBackThread(true);
+            while (read != Access::End(split)) {
+                read = Access::Execute(split, read, Access::End(split));
+            }
+            Access::SetBackThread(false);
+        }
+        Access::SetBackThread(true);
+        engine.ConsumeSink(f.system);
+        Access::SetBackThread(false);
+        const IrCheck::Counters counters = IrCheck::GetCounters();
+        INFO("regsem mode " << static_cast<u32>(regsem));
+        CHECK(counters.draws_matched > 1000);
+        CHECK(counters.draws_mismatched == 0);
+        CHECK(counters.draws_unexpected == 0);
+        CHECK(counters.draws_missing == 0);
+        CHECK(IrCheck::PendingDraws() == 0);
+        if (regsem != Mode::Off) {
+            CHECK(counters.fingerprints_compared > 1000);
+            CHECK(counters.fingerprints_mismatched == 0);
+        }
+        CHECK(Access::IrBadRecords(split) == 0);
+        IrCheck::Stop();
+    }
+}
+
+// Fix pass 1 (Ocarina of Time, "dispatches N in 0 windows, N unexpected"): the back's executor
+// must open the dispatch window for a Dispatch record it runs (only the never-called
+// IrExec::IsInformational did).
+TEST_CASE("V2 IR dispatch records open the check's window on the back",
+          "[video_core][v2_ir][maxwell_fast_method]") {
+    namespace Ir = VideoCommon::V2::Ir;
+    namespace IrCheck = VideoCommon::V2::IrCheck;
+    using Access = VideoCommon::GpuSplitTestAccess;
+    Fixture f;
+    f.system.Initialize();
+    VideoCommon::GpuSplit split;
+    Access::Initialize(split, f.system);
+    Access::SetIr(split, true);
+    Access::SetDrawRecords(split, true);
+    Ir::DispatchBody body{};
+    body.method = 0x107;
+    body.min_dispatches = 1;
+    body.max_dispatches = ~0U;
+    split.Note(Ir::Kind::Dispatch, body);
+    split.Publish();
+    Access::SetBackThread(true);
+    u64 read = 0;
+    while (read != Access::End(split)) {
+        read = Access::Execute(split, read, Access::End(split));
+    }
+    IrCheck::NoteDispatch(0x1000); // the launch the record predicted
+    Access::SetBackThread(false);
+    const IrCheck::Counters counters = IrCheck::GetCounters();
+    CHECK(counters.dispatch_windows == 1);
+    CHECK(counters.dispatches == 1);
+    CHECK(counters.dispatches_unexpected == 0);
+    CHECK(Access::IrBadRecords(split) == 0);
+    IrCheck::Stop();
+}
+
+TEST_CASE("V2 draw trigger table and the back's draw/dispatch checks",
+          "[video_core][v2_ir]") {
+    namespace Ir = VideoCommon::V2::Ir;
+    namespace IrCheck = VideoCommon::V2::IrCheck;
+    using VideoCommon::V2::DrawModel;
+    Fixture f; // Builds the register table.
+    const auto& table = VideoCommon::V2::RegSem::GetTable3D();
+    // Every method the model acts on is executable and handled by the draw manager, and every
+    // draw manager method that draws is in the model.
+    u32 draw_methods = 0;
+    for (u32 method = 0; method < Maxwell3D::Regs::NUM_REGS; ++method) {
+        if (DrawModel::IsDrawMethod(method)) {
+            ++draw_methods;
+            REQUIRE((table.flags[method] & VideoCommon::V2::RegSem::Exec) != 0);
+            REQUIRE((table.flags[method] & VideoCommon::V2::RegSem::DrawManager) != 0);
+        }
+    }
+    REQUIRE(draw_methods == 16);
+    REQUIRE(DrawModel::IsDrawMethod(DrawEnd));
+    REQUIRE(DrawModel::IsDrawMethod(MAXWELL3D_REG_INDEX(clear_surface)));
+    REQUIRE(DrawModel::IsInstanceLoopMethod(DrawBegin));
+    REQUIRE(!DrawModel::IsInstanceLoopMethod(MAXWELL3D_REG_INDEX(clear_surface)));
+    // Draw checks: in order, parameters compared, unexpected and missing draws counted.
+    IrCheck::Start();
+    Ir::DrawBody body{};
+    body.num_draws = 2;
+    body.draws[0] = {.kind = Ir::DrawKind::Array, .first = 1, .count = 3, .instances = 1};
+    body.draws[1] = {.kind = Ir::DrawKind::Clear, .first = 1};
+    IrCheck::OnRecord(Ir::Kind::Draw);
+    IrCheck::NoteDrawRecord(body);
+    IrCheck::NoteDraw(body.draws[0], nullptr);
+    IrCheck::NoteDraw({.kind = Ir::DrawKind::Clear, .first = 2}, nullptr); // a different clear
+    IrCheck::NoteDraw(body.draws[0], nullptr);                             // nothing predicted
+    IrCheck::NoteDrawRecord(body);
+    for (u32 i = 0; i < 300; ++i) {
+        IrCheck::OnRecord(Ir::Kind::StateRun);
+    }
+    auto counters = IrCheck::GetCounters();
+    CHECK(counters.draws_matched == 1);
+    CHECK(counters.draws_mismatched == 1);
+    CHECK(counters.draws_unexpected == 1);
+    CHECK(counters.draws_missing == 2);
+    // Dispatch windows: a record covers the method after it; engine records don't count.
+    Ir::DispatchBody dispatch{};
+    dispatch.min_dispatches = 1;
+    dispatch.max_dispatches = ~0U;
+    IrCheck::OnRecord(Ir::Kind::Dispatch);
+    IrCheck::NoteDispatchRecord(dispatch);
+    IrCheck::OnRecord(Ir::Kind::Engine);
+    IrCheck::OnRecord(Ir::Kind::StateRun);
+    IrCheck::NoteDispatch(0x1000);
+    IrCheck::NoteDispatch(0x2000);
+    IrCheck::OnRecord(Ir::Kind::StateRun); // closes the window: 2 dispatches, fine
+    IrCheck::NoteDispatch(0x3000);         // outside any window
+    IrCheck::OnRecord(Ir::Kind::Dispatch);
+    IrCheck::NoteDispatchRecord(dispatch);
+    IrCheck::OnRecord(Ir::Kind::StateRun);
+    IrCheck::OnRecord(Ir::Kind::StateRun); // closes it with none: below the minimum
+    counters = IrCheck::GetCounters();
+    CHECK(counters.dispatches == 3);
+    CHECK(counters.dispatch_windows == 2);
+    CHECK(counters.dispatches_unexpected == 1);
+    CHECK(counters.dispatch_count_mismatches == 1);
+    IrCheck::Stop();
+}
+
+namespace {
+
+void SetupEngine(Fixture& f, Maxwell3D& engine, bool fast) {
+    engine.fast_maxwell3d = fast;
+    engine.BindRasterizer(&f.rasterizer);
+    VideoCommon::Dirty::SetupDirtyFlags(engine.dirty.tables);
+    for (u32 method = 0; method < Maxwell3D::Regs::NUM_REGS; ++method) {
+        if (engine.dirty.tables[1][method] == 0) {
+            engine.dirty.tables[1][method] =
+                static_cast<u8>(VideoCommon::Dirty::LastCommonEntry + method % 61);
+        }
+    }
+    engine.dirty.flags.reset();
+    engine.CallMethod(f.system, CbAddressHigh, 0x1, true);
+    engine.CallMethod(f.system, CbAddressLow, 0x2000'0000, true);
+    engine.CallMethod(f.system, CbSize, 0x10000, true);
+}
+
+void CompareEngines(const Maxwell3D& a, const Maxwell3D& b) {
+    REQUIRE(a.regs.reg_array == b.regs.reg_array);
+    REQUIRE(a.shadow_state.reg_array == b.shadow_state.reg_array);
+    REQUIRE(a.dirty.flags == b.dirty.flags);
+    const auto& x = a.draw_manager.draw_state;
+    const auto& y = b.draw_manager.draw_state;
+    REQUIRE(x.topology == y.topology);
+    REQUIRE(x.draw_mode == y.draw_mode);
+    REQUIRE(x.draw_indexed == y.draw_indexed);
+    REQUIRE(x.instance_count == y.instance_count);
+    REQUIRE(x.drawn_instances == y.drawn_instances);
+    REQUIRE(x.base_index == y.base_index);
+    REQUIRE(x.base_instance == y.base_instance);
+    for (size_t stage = 0; stage < a.state.shader_stages.size(); ++stage) {
+        for (size_t slot = 0; slot < Maxwell3D::Regs::MaxConstBuffers; ++slot) {
+            REQUIRE(a.state.shader_stages[stage].const_buffers[slot].address ==
+                    b.state.shader_stages[stage].const_buffers[slot].address);
+        }
+    }
+    REQUIRE(a.root_tables.tables == b.root_tables.tables);
+    REQUIRE(a.root_tables.offset == b.root_tables.offset);
+}
+
+/// A recorded random stream of what the back's engines receive: method writes (fast and macro
+/// paths), multi-method runs and sink consumption.
+struct Step {
+    u32 kind; ///< 0 call, 1 multi, 2 sink write, 3 consume sink
+    u32 method;
+    std::vector<u32> words;
+    bool is_last;
+};
+
+std::vector<Step> RecordStream(Fixture& f, u32 seed, u32 count) {
+    std::mt19937 rng{seed};
+    std::vector<Step> steps;
+    const std::array<u32, 6> specials{ShadowControl, MAXWELL3D_REG_INDEX(falcon[4]),
+                                      MAXWELL3D_REG_INDEX(load_mme.start_address),
+                                      MAXWELL3D_REG_INDEX(load_mme.start_address_ptr),
+                                      CbData, CbData + 3};
+    for (u32 i = 0; i < count; ++i) {
+        const u32 choice = static_cast<u32>(rng() % 20);
+        Step step{};
+        step.is_last = rng() % 4 != 0;
+        if (choice < 8) {
+            step.kind = 0;
+            step.method = f.state_methods[rng() % f.state_methods.size()];
+            step.words = {rng() % 3 == 0 ? static_cast<u32>(rng()) : static_cast<u32>(rng() % 3)};
+        } else if (choice < 13) {
+            step.kind = 0;
+            step.method = executable_methods[rng() % executable_methods.size()];
+            step.words = {RandomArgument(rng, step.method, f.slow)};
+        } else if (choice < 15) {
+            step.kind = 0;
+            step.method = specials[rng() % specials.size()];
+            step.words = {step.method == ShadowControl ? static_cast<u32>(rng() % 4)
+                                                       : static_cast<u32>(rng() % 8)};
+        } else if (choice < 17) {
+            step.kind = 1;
+            step.method = rng() % 2 ? CbData : f.state_methods[rng() % f.state_methods.size()];
+            step.words.resize(1 + rng() % 6);
+            for (auto& word : step.words) {
+                word = static_cast<u32>(rng() % 3);
+            }
+        } else if (choice < 19) {
+            step.kind = 2;
+            step.method = f.state_methods[rng() % f.state_methods.size()];
+            step.words = {static_cast<u32>(rng() % 3)};
+        } else {
+            step.kind = 3;
+        }
+        steps.push_back(std::move(step));
+    }
+    return steps;
+}
+
+void Play(Fixture& f, Maxwell3D& engine, const Step& step) {
+    switch (step.kind) {
+    case 0:
+        engine.CallMethod(f.system, step.method, step.words[0], step.is_last);
+        break;
+    case 1:
+        engine.CallMultiMethod(f.system, step.method, step.words.data(),
+                               static_cast<u32>(step.words.size()),
+                               static_cast<u32>(step.words.size()));
+        break;
+    case 2:
+        engine.method_sink.emplace_back(step.method, step.words[0]);
+        break;
+    default:
+        engine.ConsumeSink(f.system);
+        break;
+    }
+}
+
+} // Anonymous namespace
+
+TEST_CASE("V2 back table path matches the engine's register path on recorded streams",
+          "[video_core][v2_regsem]") {
+    using VideoCommon::V2::Mode;
+    using VideoCommon::V2::Switch;
+    Fixture f;
+    for (const bool fast : {true, false}) {
+        const auto steps = RecordStream(f, fast ? 3 : 4, 30000);
+        auto legacy = std::make_unique<Maxwell3D>(f.memory);
+        std::unique_ptr<Maxwell3D> table;
+        std::unique_ptr<Maxwell3D> verify;
+        {
+            const V2SwitchScope scope{Switch::RegSem, Mode::On};
+            table = std::make_unique<Maxwell3D>(f.memory);
+        }
+        {
+            const V2SwitchScope scope{Switch::RegSem, Mode::Verify};
+            verify = std::make_unique<Maxwell3D>(f.memory);
+        }
+        for (auto* engine : {legacy.get(), table.get(), verify.get()}) {
+            SetupEngine(f, *engine, fast);
+        }
+        for (size_t i = 0; i < steps.size(); ++i) {
+            Play(f, *legacy, steps[i]);
+            {
+                const V2SwitchScope scope{Switch::RegSem, Mode::On};
+                Play(f, *table, steps[i]);
+            }
+            {
+                const V2SwitchScope scope{Switch::RegSem, Mode::Verify};
+                Play(f, *verify, steps[i]);
+            }
+            if ((i & 1023) == 0) {
+                CompareEngines(*legacy, *table);
+                CompareEngines(*legacy, *verify);
+            }
+        }
+        CompareEngines(*legacy, *table);
+        CompareEngines(*legacy, *verify);
+        CHECK(verify->V2BackMismatches() == 0);
+    }
+    // The compute table gives the engine's plain stores.
+    Tegra::Engines::KeplerCompute compute{f.memory};
+    CHECK(compute.NativePlainMethods() == VideoCommon::V2::RegSem::TableComputePlain());
+}
+
+TEST_CASE("V2 back table path cost per write", "[.][v2_regsem_bench]") {
+    using VideoCommon::V2::Mode;
+    using VideoCommon::V2::Switch;
+    Fixture f;
+    const auto steps = RecordStream(f, 9, 200000);
+    std::vector<Step> calls;
+    for (const auto& step : steps) {
+        if (step.kind == 0) {
+            calls.push_back(step);
+        }
+    }
+    // The engine's path against the table path, without the group trackers (the global switch
+    // is off while the writes run; the engine took its back mode when constructed).
+    const auto run = [&](Mode mode) {
+        std::unique_ptr<Maxwell3D> engine;
+        {
+            const V2SwitchScope scope{Switch::RegSem, mode};
+            engine = std::make_unique<Maxwell3D>(f.memory);
+        }
+        SetupEngine(f, *engine, true);
+        const auto start = std::chrono::steady_clock::now();
+        for (u32 pass = 0; pass < 20; ++pass) {
+            for (const auto& step : calls) {
+                engine->CallMethod(f.system, step.method, step.words[0], step.is_last);
+            }
+        }
+        const auto elapsed = std::chrono::steady_clock::now() - start;
+        return std::chrono::duration<double, std::nano>(elapsed).count() /
+               (20.0 * static_cast<double>(calls.size()));
+    };
+    run(Mode::Off); // warm up
+    const double legacy = run(Mode::Off);
+    const double table = run(Mode::On);
+    const double legacy2 = run(Mode::Off);
+    const double table2 = run(Mode::On);
+    WARN("V2 back register path: engine " << legacy << " / " << legacy2 << " ns per write, table "
+                                          << table << " / " << table2 << " ns per write");
+}
+
+TEST_CASE("V2 IR: a noted release keeps the StateRun open; its position covers it",
+          "[video_core][gpu_split_dispatch][v2_ir]") {
+    using Access = VideoCommon::GpuSplitTestAccess;
+    Fixture f;
+    f.system.Initialize();
+    VideoCommon::GpuSplit split;
+    Access::Initialize(split, f.system);
+    Access::SetIr(split, true);
+    constexpr u32 first = MAXWELL3D_REG_INDEX(vertex_buffer.first);
+    constexpr u32 count = MAXWELL3D_REG_INDEX(vertex_buffer.count);
+    split.Method(&f.fast, first, 11, true, nullptr);
+    split.Method(&f.fast, count, 12, true, nullptr);
+    // P2 notes a write at the position after the method that made it: the open run's end. Fix
+    // F3-11: releases no longer cut the run (landing tickets number them within it).
+    const u32 payload = 7;
+    split.NoteKnownWrite(0x1000, &payload, sizeof(payload), VideoCommon::V2::Producer::Release);
+    const u64 noted = split.WritePosition();
+    split.Method(&f.fast, first, 21, true, nullptr);
+    split.Method(&f.fast, count, 22, true, nullptr);
+    split.Publish();
+    REQUIRE(Access::End(split) == noted);
+    // Waiting for the noted position runs the release and at most the rest of its run.
+    u64 read = 0;
+    while (read < noted) {
+        read = Access::Execute(split, read, Access::End(split));
+    }
+    REQUIRE(read == noted);
+    CHECK(f.fast.regs.vertex_buffer.first == 21);
+    CHECK(f.fast.regs.vertex_buffer.count == 22);
+    CHECK(Access::IrBadRecords(split) == 0);
+}
+
+TEST_CASE("V2 IR: constant buffer and other non-landing notes keep the StateRun open",
+          "[video_core][gpu_split_dispatch][v2_ir]") {
+    using Access = VideoCommon::GpuSplitTestAccess;
+    using VideoCommon::V2::Producer;
+    Fixture f;
+    f.system.Initialize();
+    VideoCommon::GpuSplit split;
+    Access::Initialize(split, f.system);
+    Access::SetIr(split, true);
+    constexpr u32 first = MAXWELL3D_REG_INDEX(vertex_buffer.first);
+    constexpr u32 count = MAXWELL3D_REG_INDEX(vertex_buffer.count);
+    split.Method(&f.fast, first, 11, true, nullptr);
+    split.NoteRangeWrite(0x2000, 4, Producer::CbData);
+    split.NoteUnboundedWrite(Producer::Upload);
+    split.NoteWriter();
+    split.NoteSync();
+    const u64 noted = split.WritePosition();
+    split.Method(&f.fast, count, 12, true, nullptr);
+    split.NoteRangeWrite(0x2004, 4, Producer::CbData);
+    // Both methods are one run: the write position (the run record's end) did not move, so the
+    // noted position covers the write and the rest of the run.
+    CHECK(split.WritePosition() == noted);
+    split.Publish();
+    CHECK(Access::End(split) == noted);
+    u64 read = 0;
+    while (read < noted) {
+        read = Access::Execute(split, read, Access::End(split));
+    }
+    CHECK(read == noted);
+    CHECK(f.fast.regs.vertex_buffer.first == 11);
+    CHECK(f.fast.regs.vertex_buffer.count == 12);
+    CHECK(Access::IrBadRecords(split) == 0);
+}
+
+TEST_CASE("GpuSplit: a CPU lane request runs the lane hook, not the idle hook (no submit)",
+          "[video_core][gpu_split_dispatch]") {
+    using Access = VideoCommon::GpuSplitTestAccess;
+    VideoCommon::GpuSplit split;
+    int lane = 0;
+    int idle = 0;
+    split.SetCpuLaneHook([](void* argument) { ++*static_cast<int*>(argument); }, &lane);
+    split.SetIdleHook([](void* argument) { ++*static_cast<int*>(argument); }, &idle);
+    split.RequestCpuLane();
+    Access::ServeHookRequests(split);
+    CHECK(lane == 1);
+    CHECK(idle == 0);
+    // A WaitSubmitted-style request still runs the idle hook (the deferred submit).
+    split.RequestIdleHook();
+    Access::ServeHookRequests(split);
+    CHECK(lane == 1);
+    CHECK(idle == 1);
+    split.RequestCpuLane();
+    split.RequestIdleHook();
+    Access::ServeHookRequests(split);
+    CHECK(lane == 2);
+    CHECK(idle == 2);
+    Access::ServeHookRequests(split);
+    CHECK(lane == 2);
+    CHECK(idle == 2);
+}
+
+TEST_CASE("V2 IR: without a consumer, draw records are compact and run the same",
+          "[video_core][gpu_split_dispatch][v2_ir]") {
+    using Access = VideoCommon::GpuSplitTestAccess;
+    struct Result {
+        u64 words;
+        u32 first;
+        u32 count;
+        u64 bad;
+    };
+    const auto run = [](bool full) {
+        Fixture f;
+        f.system.Initialize();
+        VideoCommon::GpuSplit split;
+        Access::Initialize(split, f.system);
+        Access::SetIr(split, true);
+        Access::SetDrawRecords(split, false);
+        Access::SetFullDrawRecords(split, full);
+        auto& engine = f.fast;
+        engine.SetNativeTuringMacroMode(true);
+        for (u32 i = 0; i < 64; ++i) {
+            engine.FrontCallMethod(f.system, split, MAXWELL3D_REG_INDEX(vertex_buffer.first), i,
+                                   true);
+            engine.FrontCallMethod(f.system, split, MAXWELL3D_REG_INDEX(vertex_buffer.count),
+                                   3 + i, true);
+            engine.FrontCallMethod(f.system, split, DrawBegin, 4, true);
+            engine.FrontCallMethod(f.system, split, DrawEnd, 0, true);
+        }
+        split.Publish();
+        Access::SetBackThread(true);
+        u64 read = 0;
+        while (read != Access::End(split)) {
+            read = Access::Execute(split, read, Access::End(split));
+        }
+        engine.ConsumeSink(f.system);
+        Access::SetBackThread(false);
+        return Result{Access::End(split), engine.regs.vertex_buffer.first,
+                      engine.regs.vertex_buffer.count, Access::IrBadRecords(split)};
+    };
+    const Result full = run(true);
+    const Result compact = run(false);
+    CHECK(full.bad == 0);
+    CHECK(compact.bad == 0);
+    CHECK(compact.first == full.first);
+    CHECK(compact.count == full.count);
+    CHECK(compact.first == 63);
+    // 5 ring words per compact record instead of 27.
+    CHECK(compact.words + 64 * 20 <= full.words);
+}
+
+namespace Tegra::Engines {
+
+struct Maxwell3DTestAccess {
+    static void MacroWrite(Maxwell3D& engine, Core::System& system,
+                           VideoCommon::GpuSplit& split, u32 method, u32 value) {
+        engine.FrontWrite(split, engine.Front(system, split), method, value, true, true);
+    }
+    static bool EndMacro(Maxwell3D& engine, Core::System& system, VideoCommon::GpuSplit& split) {
+        return engine.FrontEndMacro(system, split, engine.Front(system, split));
+    }
+    static u32 FrontRegister(Maxwell3D& engine, Core::System&, VideoCommon::GpuSplit&,
+                             u32 method) {
+        return engine.FrontRegisterForTest(method);
+    }
+    static u32 FrontShadow(Maxwell3D& engine, Core::System&, VideoCommon::GpuSplit&, u32 method) {
+        return engine.FrontShadowForTest(method);
+    }
+    static bool RenderEnableUnknown(Maxwell3D& engine, Core::System&, VideoCommon::GpuSplit&) {
+        return engine.FrontRenderEnableUnknownForTest();
+    }
+    static u32 TrackedMode(const Maxwell3D& engine) {
+        return engine.v2_hle_tracked_mode;
+    }
+};
+
+} // namespace Tegra::Engines
+
+namespace {
+
+/// The draws a Maxwell3D makes, with the draw state the rasterizer reads.
+class RecordingRasterizer final : public Null::RasterizerNull {
+public:
+    struct Record {
+        u32 kind; ///< 0 draw, 1 clear, 2 texture
+        bool indexed;
+        u32 instances;
+        u32 topology;
+        u32 vertex_first;
+        u32 vertex_count;
+        u32 index_first;
+        u32 index_count;
+        u32 index_format;
+        u64 index_address;
+        u32 base_index;
+        u32 base_instance;
+        size_t inline_bytes;
+        bool operator==(const Record&) const = default;
+    };
+
+    explicit RecordingRasterizer(Tegra::GPU& gpu) : RasterizerNull{gpu} {}
+
+    void Draw(bool is_indexed, u32 instance_count) override {
+        const auto& state = engine->draw_manager.draw_state;
+        draws.push_back({
+            .kind = 0,
+            .indexed = is_indexed,
+            .instances = instance_count,
+            .topology = static_cast<u32>(state.topology),
+            .vertex_first = is_indexed ? 0 : state.vertex_buffer.first,
+            .vertex_count = is_indexed ? 0 : state.vertex_buffer.count,
+            .index_first = is_indexed ? state.index_buffer.first : 0,
+            .index_count = is_indexed ? state.index_buffer.count : 0,
+            .index_format = is_indexed ? static_cast<u32>(state.index_buffer.format) : 0,
+            .index_address = is_indexed ? state.index_buffer.StartAddress() : 0,
+            .base_index = state.base_index,
+            .base_instance = state.base_instance,
+            .inline_bytes = state.inline_index_draw_indexes.size(),
+        });
+        if (check_groups && engine->v2_groups.valid) {
+            // The front's hashes, as the back holds them at the draw, are the registers'.
+            VideoCommon::V2::GroupTracker copy = engine->v2_groups;
+            REQUIRE(VideoCommon::V2::RegSem::Rehash3D(copy, engine->regs.reg_array.data()) == 0);
+        }
+    }
+    void Clear(u32 layer_count) override {
+        draws.push_back({.kind = 1, .instances = layer_count});
+    }
+    void DrawTexture() override {
+        draws.push_back({.kind = 2});
+    }
+
+    Maxwell3D* engine{};
+    bool check_groups{};
+    std::vector<Record> draws;
+};
+
+} // Anonymous namespace
+
+TEST_CASE("V2 S1 check: constant buffer runs of any length check exactly against the executor",
+          "[video_core][gpu_split_dispatch][v2_s1]") {
+    // F1-12 (in game: every mismatch on const_buffer.offset): S1Check compares after each
+    // entry, while the back already ran a whole multi-word CB run. Runs longer than one Cbuf
+    // entry (256 words) or cut by a publish made the check see part of the run's offset.
+    using Access = VideoCommon::GpuSplitTestAccess;
+    using M3Access = Tegra::Engines::Maxwell3DTestAccess;
+    using VideoCommon::V2::Mode;
+    using VideoCommon::V2::Switch;
+    Fixture f;
+    f.system.Initialize();
+    auto& engine = f.fast;
+    RecordingRasterizer draws{f.gpu};
+    draws.engine = &engine;
+    engine.BindRasterizer(&draws);
+    const V2SwitchScope regsem{Switch::RegSem, Mode::On};
+    VideoCommon::GpuSplit split;
+    Access::Initialize(split, f.system);
+    Access::SetIr(split, true);
+    Access::SetDrawRecords(split, false);
+    Access::SetS1(split, false, true);
+    std::mt19937 rng{17};
+    for (u32 step = 0; step < 3000; ++step) {
+        CAPTURE(step);
+        const u32 kind = rng() % 10;
+        if (kind < 4) {
+            std::vector<u32> words(1 + (rng() % 4 == 0 ? rng() % 1200 : rng() % 40));
+            for (u32& word : words) {
+                word = rng();
+            }
+            const u32 amount = static_cast<u32>(words.size());
+            engine.FrontCallMultiMethod(f.system, split, CbData + rng() % 16, words.data(),
+                                        amount, amount);
+        } else if (kind < 6) {
+            engine.FrontCallMethod(f.system, split, CbData + rng() % 16, rng(), true);
+        } else if (kind < 7) {
+            M3Access::MacroWrite(engine, f.system, split, CbData + rng() % 16, rng());
+        } else if (kind < 9) {
+            engine.FrontCallMethod(f.system, split, CbOffset, (rng() % 0x800) * 4, true);
+        } else {
+            Access::RunBack(split);
+        }
+    }
+    Access::RunBack(split);
+    const auto [entries, mismatches] = engine.S1CheckCounts();
+    CHECK(entries > 1000);
+    REQUIRE(mismatches == 0);
+}
+
+TEST_CASE("V2 macro HLE: a conditional render under shadow RAM tracking runs on the back",
+          "[video_core][gpu_split_dispatch][v2_macro]") {
+    // F3F5b-4 (report 7833a32: no HLE line at all): the entry applied only under Passthrough,
+    // and OoT runs with shadow RAM tracking (the default), so every call ran the macro and its
+    // front DMA read. Under Track the front makes the macro's register writes, the back
+    // evaluates the mode; a Replay of the front's unknown shadow copy resolves on the back.
+    using Access = VideoCommon::GpuSplitTestAccess;
+    using M3Access = Tegra::Engines::Maxwell3DTestAccess;
+    using VideoCommon::V2::Mode;
+    using VideoCommon::V2::Switch;
+    // 966aeb0e43e7a13c as dumped (three words per instruction).
+    constexpr std::array<u32, 27> code{
+        0x00940003, 0x18c00455, 0x31c10300, 0x8a600003, 0x18c01856, 0x318c0300,
+        0x00000007, 0x18c00400, 0x359c1f00, 0x00000003, 0x1d000000, 0x31c08300,
+        0x00000003, 0x18c00000, 0x3bcc0300, 0x00000003, 0xa003c000, 0x3810bf00,
+        0x00000003, 0x18c00000, 0x0010bb00, 0x0018155b, 0x18c00000, 0x72213c29,
+        0x00200003, 0x18c00000, 0x302c0300,
+    };
+    constexpr u32 Mode556 = MAXWELL3D_REG_INDEX(render_enable.mode);
+    Fixture f;
+    f.system.Initialize();
+    auto& engine = f.fast;
+    RecordingRasterizer draws{f.gpu};
+    draws.engine = &engine;
+    engine.BindRasterizer(&draws);
+    const V2SwitchScope hle{Switch::MacroHle, Mode::On};
+    VideoCommon::GpuSplit split;
+    Access::Initialize(split, f.system);
+    engine.SetNativeTuringMacroMode(true);
+    engine.FrontCallMethod(f.system, split, MAXWELL3D_REG_INDEX(load_mme.instruction_ptr), 0,
+                           true);
+    engine.FrontCallMultiMethod(f.system, split, MAXWELL3D_REG_INDEX(load_mme.instruction),
+                                code.data(), code.size(), code.size());
+    engine.FrontCallMethod(f.system, split, MAXWELL3D_REG_INDEX(load_mme.start_address_ptr), 0,
+                           true);
+    engine.FrontCallMethod(f.system, split, MAXWELL3D_REG_INDEX(load_mme.start_address), 0,
+                           true);
+    engine.FrontCallMethod(f.system, split, ShadowControl,
+                           static_cast<u32>(Maxwell3D::Regs::ShadowRamControl::Track), true);
+    Access::RunBack(split);
+    // IfEqual (p0 = 1) on the pair at 0x21'13760dc0 (unmapped here: the back reads zeros,
+    // equal pairs, mode 1).
+    engine.FrontCallMethod(f.system, split, 0xe00, 1, false);
+    engine.FrontCallMethod(f.system, split, 0xe01, 0x21, false);
+    engine.FrontCallMethod(f.system, split, 0xe01, 0x13760dc0, true);
+    CHECK(M3Access::FrontRegister(engine, f.system, split, 0x154) == 0x21);
+    CHECK(M3Access::FrontRegister(engine, f.system, split, 0x155) == 0x13760dc0);
+    CHECK(M3Access::RenderEnableUnknown(engine, f.system, split));
+    CHECK(M3Access::FrontShadow(engine, f.system, split, Mode556) == ~0U);
+    Access::RunBack(split);
+    CHECK(engine.regs.reg_array[Mode556] == 1);
+    CHECK(M3Access::TrackedMode(engine) == 1);
+    // F3F5b-6: a switch to Replay costs the front nothing (it drained ~495 times a second); a
+    // replayed write of the mode the front doesn't know is resolved on the back.
+    engine.FrontCallMethod(f.system, split, ShadowControl,
+                           static_cast<u32>(Maxwell3D::Regs::ShadowRamControl::Replay), true);
+    CHECK(M3Access::FrontShadow(engine, f.system, split, Mode556) == ~0U);
+    engine.FrontCallMethod(f.system, split, Mode556, 0, true);
+    CHECK(M3Access::FrontRegister(engine, f.system, split, Mode556) == ~0U);
+    Access::RunBack(split);
+    CHECK(engine.regs.reg_array[Mode556] == 1);
+}
+
+TEST_CASE("V2 S1 deltas applied on the back match the method executor on random streams",
+          "[video_core][gpu_split_dispatch][v2_s1]") {
+    // Fix F1: the front runs the register semantics and sends classified entries; the back
+    // applies them without executing methods. The reference is the v1 engine executing every
+    // method itself (CallMethod / CallMultiMethod, DrawDeferred at macro ends).
+    using Access = VideoCommon::GpuSplitTestAccess;
+    using M3Access = Tegra::Engines::Maxwell3DTestAccess;
+    using VideoCommon::V2::Mode;
+    using VideoCommon::V2::Switch;
+    constexpr std::array<u32, 22> draw_methods{
+        DrawBegin,
+        DrawEnd,
+        MAXWELL3D_REG_INDEX(vertex_buffer.first),
+        MAXWELL3D_REG_INDEX(vertex_buffer.count),
+        MAXWELL3D_REG_INDEX(index_buffer.first),
+        MAXWELL3D_REG_INDEX(index_buffer.count),
+        MAXWELL3D_REG_INDEX(index_buffer.format),
+        MAXWELL3D_REG_INDEX(index_buffer32_first),
+        MAXWELL3D_REG_INDEX(index_buffer16_subsequent),
+        MAXWELL3D_REG_INDEX(draw_inline_index),
+        MAXWELL3D_REG_INDEX(inline_index_2x16.even),
+        MAXWELL3D_REG_INDEX(inline_index_4x8.index0),
+        MAXWELL3D_REG_INDEX(vertex_array_instance_first),
+        MAXWELL3D_REG_INDEX(vertex_array_instance_subsequent),
+        MAXWELL3D_REG_INDEX(global_base_vertex_index),
+        MAXWELL3D_REG_INDEX(global_base_instance_index),
+        MAXWELL3D_REG_INDEX(clear_surface),
+        MAXWELL3D_REG_INDEX(draw_texture.src_y0),
+        MAXWELL3D_REG_INDEX(topology_override),
+        MAXWELL3D_REG_INDEX(primitive_topology_control),
+        MAXWELL3D_REG_INDEX(load_mme.start_address),
+        MAXWELL3D_REG_INDEX(falcon[4]),
+    };
+    for (const u32 seed : {1u, 2u, 3u, 4u}) {
+        CAPTURE(seed);
+        Fixture f;
+        f.system.Initialize();
+        auto& ref = f.slow; // v1: executes every method
+        auto& s1 = f.fast;  // the front's deltas, applied on its back
+        RecordingRasterizer ref_draws{f.gpu};
+        RecordingRasterizer s1_draws{f.gpu};
+        ref_draws.engine = &ref;
+        s1_draws.engine = &s1;
+        s1_draws.check_groups = true;
+        ref.BindRasterizer(&ref_draws);
+        s1.BindRasterizer(&s1_draws);
+        // The split's front drops unchanged instance loop writes (draw.end in a loop, vertex
+        // first/count), as it did before S1: the real tables give them no flag, the fixture's
+        // flag for every register would tell the reference apart.
+        for (auto* engine : {&ref, &s1}) {
+            constexpr std::array<u32, 3> skippable{DrawEnd,
+                                                   MAXWELL3D_REG_INDEX(vertex_buffer.first),
+                                                   MAXWELL3D_REG_INDEX(vertex_buffer.count)};
+            for (const u32 method : skippable) {
+                REQUIRE(engine->dirty.tables[0][method] == 0);
+                engine->dirty.tables[1][method] = 0;
+            }
+        }
+        // The engines exist (v1 executors); the front and the split take S1 from here.
+        const V2SwitchScope regsem{Switch::RegSem, Mode::On};
+        const V2SwitchScope draws{Switch::IrDraws, Mode::On};
+        VideoCommon::GpuSplit split;
+        Access::Initialize(split, f.system);
+        Access::SetIr(split, true);
+        Access::SetDrawRecords(split, false);
+        Access::SetS1(split, true, false);
+        Access::StartTrace(split);
+        std::mt19937 rng{seed};
+        const auto call = [&](u32 method, u32 value, bool is_last) {
+            ref.CallMethod(f.system, method, value, is_last);
+            s1.FrontCallMethod(f.system, split, method, value, is_last);
+        };
+        const auto multi = [&](u32 method, const std::vector<u32>& words) {
+            const u32 amount = static_cast<u32>(words.size());
+            ref.CallMultiMethod(f.system, method, words.data(), amount, amount);
+            s1.FrontCallMultiMethod(f.system, split, method, words.data(), amount, amount);
+        };
+        const auto compare = [&] {
+            Access::RunBack(split);
+            REQUIRE(s1.regs.reg_array == ref.regs.reg_array);
+            // Flag 0 is the null entry every unmapped register marks; nothing reads it.
+            auto s1_flags = s1.dirty.flags;
+            auto ref_flags = ref.dirty.flags;
+            s1_flags.reset(VideoCommon::Dirty::NullEntry);
+            ref_flags.reset(VideoCommon::Dirty::NullEntry);
+            REQUIRE(s1_flags == ref_flags);
+            REQUIRE(s1_draws.draws.size() == ref_draws.draws.size());
+            for (size_t i = 0; i < ref_draws.draws.size(); ++i) {
+                CAPTURE(i);
+                const auto& a = s1_draws.draws[i];
+                const auto& b = ref_draws.draws[i];
+                CAPTURE(a.kind, a.indexed, a.instances, a.topology, a.vertex_first,
+                        a.vertex_count, a.index_first, a.index_count, a.index_format,
+                        a.base_index, a.base_instance, a.inline_bytes);
+                CAPTURE(b.kind, b.indexed, b.instances, b.topology, b.vertex_first,
+                        b.vertex_count, b.index_first, b.index_count, b.index_format,
+                        b.base_index, b.base_instance, b.inline_bytes);
+                REQUIRE(a == b);
+            }
+            for (size_t stage = 0; stage < s1.state.shader_stages.size(); ++stage) {
+                for (size_t slot = 0; slot < Maxwell3D::Regs::MaxConstBuffers; ++slot) {
+                    const auto& x = s1.state.shader_stages[stage].const_buffers[slot];
+                    const auto& y = ref.state.shader_stages[stage].const_buffers[slot];
+                    REQUIRE(x.address == y.address);
+                    REQUIRE(x.size == y.size);
+                    REQUIRE(x.enabled == y.enabled);
+                }
+            }
+            REQUIRE(s1.root_tables.tables == ref.root_tables.tables);
+            REQUIRE(s1.root_tables.offset == ref.root_tables.offset);
+        };
+        // 600 steps per seed (was 6000, ~110 s and 18M assertions): every method class still
+        // appears many times per seed.
+        for (u32 step = 0; step < 600; ++step) {
+            CAPTURE(step);
+            const u32 kind = rng() % 100;
+            const bool from_macro = rng() % 2 == 0;
+            const auto write = [&](u32 method, u32 value) {
+                if (from_macro) {
+                    ref.CallMethod(f.system, method, value, true);
+                    M3Access::MacroWrite(s1, f.system, split, method, value);
+                } else {
+                    call(method, value, rng() % 4 != 0);
+                }
+            };
+            if (kind < 30) {
+                const u32 method = f.state_methods[rng() % f.state_methods.size()];
+                write(method, RandomArgument(rng, method, ref));
+            } else if (kind < 60) {
+                const u32 method = draw_methods[rng() % draw_methods.size()];
+                write(method, RandomArgument(rng, method, ref));
+            } else if (kind < 68) {
+                const u32 method = executable_methods[rng() % executable_methods.size()];
+                write(method, RandomArgument(rng, method, ref));
+            } else if (kind < 78) {
+                write(CbData + rng() % 16, rng());
+            } else if (kind < 80) {
+                write(CbOffset, (rng() % 0x4000) * 4);
+            } else if (kind < 86) {
+                std::vector<u32> words(1 + rng() % 8);
+                for (u32& word : words) {
+                    word = rng() % 3 == 0 ? rng() : rng() % 4;
+                }
+                const u32 pick = rng() % 4;
+                const u32 method =
+                    pick == 0   ? CbData + rng() % 16
+                    : pick == 1 ? MAXWELL3D_REG_INDEX(draw_inline_index)
+                    : pick == 2 ? draw_methods[rng() % draw_methods.size()]
+                                : f.state_methods[rng() % f.state_methods.size()];
+                // Topologies are bytes (Ir::PredictedDraw): draw.begin's 16-bit field and the
+                // override hold small values.
+                if (method == MAXWELL3D_REG_INDEX(topology_override)) {
+                    for (u32& word : words) {
+                        word &= 0xff;
+                    }
+                } else if (method == DrawBegin) {
+                    for (u32& word : words) {
+                        word &= ~0xff00U;
+                    }
+                }
+                multi(method, words);
+            } else if (kind < 89) {
+                call(ShadowControl, rng() % 4, true);
+            } else if (kind < 96) {
+                if (M3Access::EndMacro(s1, f.system, split)) {
+                    ref.draw_manager.DrawDeferred(ref);
+                }
+            } else {
+                Access::RunBack(split);
+                ref.dirty.flags.reset();
+                s1.dirty.flags.reset();
+            }
+            compare();
+        }
+        REQUIRE(!ref_draws.draws.empty());
+
+        // U-08: the back's IR trace, replayed into another split and engine, reproduces the
+        // registers and every draw.
+        Maxwell3D replay{f.memory};
+        RecordingRasterizer replay_draws{f.gpu};
+        replay_draws.engine = &replay;
+        replay.fast_maxwell3d = true;
+        replay.BindRasterizer(&replay_draws);
+        VideoCommon::Dirty::SetupDirtyFlags(replay.dirty.tables);
+        replay.CallMethod(f.system, CbAddressHigh, 0x1, true);
+        replay.CallMethod(f.system, CbAddressLow, 0x2000'0000, true);
+        replay.CallMethod(f.system, CbSize, 0x10000, true);
+        VideoCommon::GpuSplit replay_split;
+        Access::Initialize(replay_split, f.system);
+        Access::SetIr(replay_split, true);
+        // The recording's object 0 is its engine: the replay's engine takes that index.
+        Access::Intern(replay_split, &replay);
+        const auto& trace = Access::Trace(split);
+        REQUIRE(trace.Records() != 0);
+        const bool parsed = VideoCommon::V2::IrTrace::ForEach(
+            trace.Words(), [&](const VideoCommon::V2::IrTrace::TraceRecord& record) {
+                replay_split.ReplayIrRecord(record.record, record.payload);
+            });
+        REQUIRE(parsed);
+        Access::RunBack(replay_split);
+        REQUIRE(replay.regs.reg_array == s1.regs.reg_array);
+        REQUIRE(replay_draws.draws == s1_draws.draws);
+
+        // F1-X1: the same classified runs on a Maxwell3D without its fast path (profile builds,
+        // EDEN_NX2_GPU_PROFILE) go to the 3D executor, not the compute class's.
+        Maxwell3D slow{f.memory};
+        RecordingRasterizer slow_draws{f.gpu};
+        slow_draws.engine = &slow;
+        slow.fast_maxwell3d = false;
+        slow.BindRasterizer(&slow_draws);
+        VideoCommon::Dirty::SetupDirtyFlags(slow.dirty.tables);
+        slow.CallMethod(f.system, CbAddressHigh, 0x1, true);
+        slow.CallMethod(f.system, CbAddressLow, 0x2000'0000, true);
+        slow.CallMethod(f.system, CbSize, 0x10000, true);
+        VideoCommon::GpuSplit slow_split;
+        Access::Initialize(slow_split, f.system);
+        Access::SetIr(slow_split, true);
+        Access::Intern(slow_split, &slow);
+        REQUIRE(VideoCommon::V2::IrTrace::ForEach(
+            trace.Words(), [&](const VideoCommon::V2::IrTrace::TraceRecord& record) {
+                slow_split.ReplayIrRecord(record.record, record.payload);
+            }));
+        Access::RunBack(slow_split);
+        REQUIRE(slow.regs.reg_array == s1.regs.reg_array);
+        REQUIRE(slow_draws.draws == s1_draws.draws);
+    }
+}
+
+TEST_CASE("V2 hazard: unknown reports block reads of their bytes until they land, not their page",
+          "[video_core][gpu_split_dispatch][v2_hazard]") {
+    using Access = VideoCommon::GpuSplitTestAccess;
+    namespace V2 = VideoCommon::V2;
+    Fixture f;
+    f.system.Initialize();
+    VideoCommon::GpuSplit split;
+    Access::Initialize(split, f.system, 100);
+    V2::Landing::landed.store(0);
+    constexpr u64 report = 0x5'0000'0010;
+    const u64 ticket = split.NextLandingTicket();
+    split.NoteUnlandedRange(report, 8, ticket);
+    std::array<u8, 8> bytes{};
+    V2::HazardFilter reports;
+    reports.ranged = V2::ProducerBit(V2::Producer::Report);
+    const V2::HazardResult blocked = split.FindWrites(report, 4, reports, bytes.data());
+    CHECK(blocked.kind == V2::HazardResult::Kind::Wait);
+    CHECK(blocked.landing); // waiting for the back to consume would not settle it
+    CHECK(split.FindWrites(report + 4, 4, reports, bytes.data()).kind ==
+          V2::HazardResult::Kind::Wait);
+    // The rest of the page is not a report page for good.
+    CHECK(split.FindWrites(report + 0x40, 8, reports, bytes.data()).kind ==
+          V2::HazardResult::Kind::Clear);
+    CHECK(split.FindWrites(report - 0x10, 8, reports, bytes.data()).kind ==
+          V2::HazardResult::Kind::Clear);
+    // Its operation ran (landing its ticket): memory has it.
+    V2::Landing::Note(ticket);
+    CHECK(split.FindWrites(report, 8, reports, bytes.data()).kind ==
+          V2::HazardResult::Kind::Clear);
+    V2::Landing::landed.store(0);
+}
+
+// SYNC_SUBMIT_SPEC §12 R2 (df94: the front's list-writer wait was 22% of its samples): every
+// MetByQueued acquire moves the last sync forward, and a CPU-written list fetched after it
+// waited for every unbounded dispatch sent before it.
+TEST_CASE("SYNC §12 R2: a CPU-written list waits only for its exact producer",
+          "[video_core][gpu_split_dispatch][v2_hazard]") {
+    using Access = VideoCommon::GpuSplitTestAccess;
+    using VideoCommon::GpuSplit;
+    namespace V2 = VideoCommon::V2;
+    using Kind = V2::HazardResult::Kind;
+    Fixture f;
+    f.system.Initialize();
+    GpuSplit split;
+    Access::Initialize(split, f.system, 100);
+    Access::SetTracksWrites(split, true);
+    constexpr u64 list = 0x7'4000'0000;     // CPU-written command memory
+    constexpr u64 data = 0x7'4800'0000;     // a buffer GPU work writes
+    constexpr u64 elsewhere = 0x7'4900'0000; // another buffer
+    REQUIRE(!split.MayBeGpuWrittenPage(list, 0x100));
+    // An unbounded dispatch, then a MetByQueued acquire's sync (NoteSyncAt).
+    Access::SetEnd(split, 110);
+    split.NoteUnboundedWrite(V2::Producer::Dispatch);
+    Access::SetEnd(split, 120);
+    split.NoteSync();
+    const auto fetch = [&](u64 address) {
+        return split.FindWrites(address, 0x100,
+                                GpuSplit::ListFetchFilter(true,
+                                                          split.MayBeGpuWrittenPage(address, 0x100)));
+    };
+    SECTION("an unbounded dispatch to other pages: no wait") {
+        CHECK(fetch(list).kind == Kind::Clear);
+        // The full wait (before R2) would have waited for it.
+        CHECK(split.FindWrites(list, 0x100, GpuSplit::ListFetchFilter(true, true)).kind ==
+              Kind::Wait);
+    }
+    SECTION("a dispatch whose QMD range overlaps the list: waits for that dispatch only") {
+        Access::SetEnd(split, 130);
+        split.NoteRangeWrite(list + 0x40, 0x20, V2::Producer::Dispatch);
+        Access::SetEnd(split, 140);
+        split.NoteRangeWrite(elsewhere, 0x1000, V2::Producer::Dispatch);
+        const V2::HazardResult result = fetch(list);
+        CHECK(result.kind == Kind::Wait);
+        CHECK(result.position == 130);
+        // The back ran it: the fetch reads memory (an idle back has consumed what was sent).
+        Access::SetBack(split, 130, false);
+        CHECK(fetch(list).kind == Kind::Clear);
+    }
+    SECTION("pages GPU work wrote: unbounded dispatches before the sync still count") {
+        split.NoteRangeWrite(data, 0x10, V2::Producer::Copy);
+        const V2::HazardResult result = fetch(data + 0x200);
+        CHECK(result.kind == Kind::Wait);
+        CHECK(result.position <= 120);
+    }
+    SECTION("unbounded copies and uploads mark no page: they always count") {
+        Access::SetEnd(split, 150);
+        split.NoteUnboundedWrite(V2::Producer::Copy);
+        Access::SetEnd(split, 160);
+        split.NoteSync();
+        CHECK(fetch(list).kind == Kind::Wait);
+    }
+    SECTION("GPU-written lists wait for every unbounded writer still queued") {
+        CHECK(split.FindWrites(list, 0x100, GpuSplit::ListFetchFilter(false, true)).kind ==
+              Kind::Wait);
+    }
+}
+
+// SYNC_SUBMIT_SPEC §13.5 #5 as corrected by §14.5 (95a3 quiet deadlock): 9c43454877 narrowed a
+// GPU-written list's wait by the kind of the page's last executed writer and skipped a queued
+// unbounded writer, so OoT's culling lists were read a frame stale and its QMD launches went
+// missing (waiters 0x13 short). A fetch waits for every queued writer that may reach the page.
+TEST_CASE("SYNC §14.5: a GPU-written list waits for every queued writer that may reach it",
+          "[video_core][gpu_split_dispatch][v2_hazard]") {
+    using Access = VideoCommon::GpuSplitTestAccess;
+    using VideoCommon::GpuSplit;
+    namespace V2 = VideoCommon::V2;
+    using Kind = V2::HazardResult::Kind;
+    Fixture f;
+    f.system.Initialize();
+    GpuSplit split;
+    Access::Initialize(split, f.system, 100);
+    Access::SetTracksWrites(split, true);
+    constexpr u64 list = 0x7'6000'0000;     // culling output: a command list page
+    constexpr u64 elsewhere = 0x7'6200'0000; // a buffer far from it
+    Tegra::Nx2MarkCommandListPage(list);
+    Access::SetEnd(split, 110);
+    split.NoteUnboundedWrite(V2::Producer::Dispatch); // an unknown dispatch
+    Access::SetEnd(split, 120);
+    split.NoteRangeWrite(list + 0x40, 0x20, V2::Producer::Dispatch); // a ranged writer
+    Access::SetEnd(split, 130);
+    split.NoteUnboundedWrite(V2::Producer::Copy);
+    bool unbounded = false;
+    SECTION("a queued unbounded writer after a ranged one: waits for the unbounded one") {
+        const V2::HazardResult result = split.FindGpuListWriters(list, 0x100, unbounded);
+        REQUIRE(result.kind == Kind::Wait);
+        CHECK(result.position == 130);
+        CHECK(unbounded);
+    }
+    SECTION("the page's last executed writer was ranged, an unbounded dispatch still queued") {
+        // The back ran the ranged copy over the page (its copy record's newest write); the
+        // culling dispatch that rewrites the page is queued, unbounded.
+        Access::SetBack(split, 130, false);
+        Access::SetEnd(split, 140);
+        split.NoteRangeWrite(list, 0x1000, V2::Producer::Copy);
+        Access::SetBack(split, 140, false);
+        Access::SetEnd(split, 150);
+        split.NoteUnboundedWrite(V2::Producer::Dispatch);
+        const V2::HazardResult result = split.FindGpuListWriters(list, 0x100, unbounded);
+        REQUIRE(result.kind == Kind::Wait);
+        CHECK(result.position == 150);
+        CHECK(unbounded);
+        // The idle back runs it: then the fetch reads the copy.
+        Access::SetBack(split, 150, false);
+        CHECK(split.FindGpuListWriters(list, 0x100, unbounded).kind == Kind::Clear);
+    }
+    SECTION("only ranged writers whose range misses the page are excluded") {
+        Access::SetBack(split, 130, false);
+        Access::SetEnd(split, 140);
+        split.NoteRangeWrite(elsewhere, 0x1000, V2::Producer::Dispatch);
+        CHECK(split.FindGpuListWriters(list, 0x100, unbounded).kind == Kind::Clear);
+        Access::SetEnd(split, 150);
+        split.NoteRangeWrite(list + 0x80, 0x10, V2::Producer::Copy);
+        const V2::HazardResult result = split.FindGpuListWriters(list, 0x100, unbounded);
+        REQUIRE(result.kind == Kind::Wait);
+        CHECK(result.position == 150);
+        CHECK_FALSE(unbounded);
+    }
+}
+
+// SYNC_SUBMIT_SPEC §13.5 #1 / §14.6 (95a3: 78,664 hazard table overflows/s; every CPU-written
+// list wait was the overflow marker): list fetches look writers up in their own table.
+TEST_CASE("SYNC §14.6: constant buffer notes don't make list fetches wait on the overflow marker",
+          "[video_core][gpu_split_dispatch][v2_hazard]") {
+    using Access = VideoCommon::GpuSplitTestAccess;
+    using VideoCommon::GpuSplit;
+    namespace V2 = VideoCommon::V2;
+    using Kind = V2::HazardResult::Kind;
+    Fixture f;
+    f.system.Initialize();
+    GpuSplit split;
+    Access::Initialize(split, f.system, 100);
+    Access::SetTracksWrites(split, true);
+    constexpr u64 list = 0x7'6800'0000;
+    // More constant buffer data notes than the shared table holds, none consumed.
+    for (u64 i = 0; i <= V2::HazardTable::Capacity; ++i) {
+        Access::SetEnd(split, 110 + i);
+        split.NoteRangeWrite(0x7'7000'0000 + i * 0x1000, 16, V2::Producer::CbData);
+    }
+    REQUIRE(split.HazardOverflows() >= 1);
+    const V2::HazardFilter filter = GpuSplit::ListFetchFilter(true, false);
+    // The shared table answers the overflow marker; the writer table holds no writer.
+    const V2::HazardResult shared = split.FindWrites(list, 0x100, filter);
+    REQUIRE(shared.kind == Kind::Wait);
+    CHECK(shared.cause == V2::CauseOverflow);
+    CHECK(split.FindListWriters(list, 0x100, filter).kind == Kind::Clear);
+    CHECK(split.WriterTableOverflows() == 0);
+    // A writer over the list is still found, at its position.
+    Access::SetEnd(split, 9000);
+    split.NoteRangeWrite(list + 0x20, 0x20, V2::Producer::Dispatch);
+    const V2::HazardResult writer = split.FindListWriters(list, 0x100, filter);
+    REQUIRE(writer.kind == Kind::Wait);
+    CHECK(writer.position == 9000);
+    CHECK(writer.cause == V2::CauseRanged);
+    // GPU-written lists use the same table (FindGpuListWriters).
+    bool unbounded = true;
+    CHECK(split.FindGpuListWriters(list, 0x100, unbounded).position == 9000);
+    CHECK_FALSE(unbounded);
+}
+
+// SYNC_SUBMIT_SPEC §15.5 (bd24: 190-251k upload notes/s, 28-64k writer table overflows/s): an
+// upload's data words make one note, and it enters the list writer table only over pages a list
+// is fetched from; the first fetch from a page waits for the uploads left out before it.
+TEST_CASE("SYNC §15.5: upload notes merge and stay out of the list writer table off list pages",
+          "[video_core][gpu_split_dispatch][v2_hazard]") {
+    using Access = VideoCommon::GpuSplitTestAccess;
+    using VideoCommon::GpuSplit;
+    namespace V2 = VideoCommon::V2;
+    using Kind = V2::HazardResult::Kind;
+    Fixture f;
+    f.system.Initialize();
+    constexpr GPUVAddr gpu = 0x2000'0000;
+    constexpr u64 device = 0x10000;
+    Kernel::KProcess process{f.system.Kernel()};
+    SCOPE_EXIT { f.system.Kernel().UnregisterKernelObject(&process); };
+    auto& table = process.GetPageTable().GetImpl();
+    table.Resize(20, 12);
+    for (u64 page = 0; page < 2; ++page) {
+        auto* backing = f.physical.GetPointerFromRaw<u8>(0x10000 + page * 0x1000);
+        table.entries.GetAndFault(4 + page).Store(false, Common::PageType::Memory, 1,
+                                                  reinterpret_cast<uintptr_t>(backing) -
+                                                      (0x4000 + page * 0x1000));
+    }
+    process.GetMemory().SetCurrentPageTable(process);
+    const auto asid = f.device_memory.RegisterProcess(&process.GetMemory());
+    f.device_memory.BindInterface(&f.rasterizer);
+    SCOPE_EXIT {
+        f.device_memory.Unmap(device, 0x2000);
+        f.device_memory.UnregisterProcess(asid);
+    };
+    f.device_memory.Map(device, 0x4000, 0x2000, asid);
+    f.memory.BindRasterizer(&f.rasterizer);
+    f.memory.Map(gpu, device, 0x2000, Tegra::PTEKind::PITCH, false);
+    Tegra::Nx2ClearGpuWrittenPages();
+    GpuSplit split;
+    Access::Initialize(split, f.system, 100);
+    Access::SetTracksWrites(split, true);
+    // Three data words of one upload, then a contiguous upload: one pending note.
+    Access::SetEnd(split, 110);
+    split.NoteUploadWrite(f.memory, gpu, 0x100);
+    Access::SetEnd(split, 111);
+    split.NoteUploadWrite(f.memory, gpu, 0x100);
+    Access::SetEnd(split, 112);
+    split.NoteUploadWrite(f.memory, gpu + 0x100, 0x100);
+    Access::SetEnd(split, 115); // later work: the note keeps the newest word's position
+    V2::HazardFilter uploads;
+    uploads.ranged = V2::ProducerBit(V2::Producer::Upload);
+    const V2::HazardResult shared = split.FindWrites(device + 0x180, 8, uploads);
+    REQUIRE(shared.kind == Kind::Wait);
+    CHECK(shared.position == 112);
+    CHECK(split.FindWrites(device + 0x200, 8, uploads).kind == Kind::Clear);
+    // Not a list page and not GPU-written: the writer table holds nothing, but the first fetch
+    // from the page waits for the upload left out.
+    const V2::HazardFilter filter = GpuSplit::ListFetchFilter(true, false);
+    const V2::HazardResult first = split.FindListWriters(device, 0x100, filter);
+    REQUIRE(first.kind == Kind::Wait);
+    CHECK(first.position == 112);
+    CHECK((first.producers & V2::ProducerBit(V2::Producer::Upload)) != 0);
+    CHECK(split.FindListWriters(device, 0x100, filter).kind == Kind::Clear);
+    CHECK(split.WriterTableOverflows() == 0);
+    // Now a list page: later uploads over it are list writers.
+    Access::SetEnd(split, 120);
+    split.NoteUploadWrite(f.memory, gpu + 0x10, 0x10);
+    const V2::HazardResult listed = split.FindListWriters(device, 0x100, filter);
+    REQUIRE(listed.kind == Kind::Wait);
+    CHECK(listed.position == 120);
+    Access::SetBack(split, 120, false);
+    CHECK(split.FindListWriters(device, 0x100, filter).kind == Kind::Clear);
+    // An upload to a GPU-written page goes to the writer table at once (the page's first fetch
+    // comes after the uploads left out ran: only the table's writer is waited for).
+    Access::SetEnd(split, 130);
+    Tegra::Nx2MarkGpuWritten(device + 0x1000, 0x1000);
+    split.NoteUploadWrite(f.memory, gpu + 0x1800, 0x20);
+    const V2::HazardResult written = split.FindListWriters(device + 0x1800, 0x10, filter);
+    REQUIRE(written.kind == Kind::Wait);
+    CHECK(written.position == 130);
+    Access::SetBack(split, 130, false);
+    CHECK(split.FindListWriters(device + 0x1800, 0x10, filter).kind == Kind::Clear);
+
+    // §15.8 (1): an unmap of the first page's GPU range makes it a new page again: an upload
+    // there is left out of the table, and the page's next fetch is a first fetch that waits.
+    V2::Ir::MapBody unmap{};
+    unmap.op = V2::Ir::MapOp::GmmuUnmap;
+    unmap.gpu_address = gpu;
+    unmap.size = 0x1000;
+    unmap.object = reinterpret_cast<u64>(&f.memory);
+    split.FlushBeforeMap(unmap);
+    Access::SetEnd(split, 140);
+    split.NoteUploadWrite(f.memory, gpu + 0x20, 0x10);
+    Access::SetEnd(split, 145);
+    const V2::HazardResult again = split.FindListWriters(device + 0x800, 0x10, filter);
+    REQUIRE(again.kind == Kind::Wait);
+    CHECK(again.position == 140);
+    // A device range a release frees is forgotten too.
+    Access::SetBack(split, 145, false);
+    V2::Ir::MapBody release{};
+    release.op = V2::Ir::MapOp::SmmuRelease;
+    release.device_address = device;
+    release.size = 0x1000;
+    split.FlushBeforeMap(release);
+    Access::SetEnd(split, 150);
+    split.NoteUploadWrite(f.memory, gpu + 0x40, 0x10);
+    const V2::HazardResult released = split.FindListWriters(device, 0x10, filter);
+    REQUIRE(released.kind == Kind::Wait);
+    CHECK(released.position == 150);
+    CHECK((released.producers & V2::ProducerBit(V2::Producer::Upload)) != 0);
+    Tegra::Nx2ClearGpuWrittenPages();
+}
+
+// SYNC_SUBMIT_SPEC §15.9 (bc80 diag hang, 0x13 family): WaitForListWriters returned at once when
+// no compute or copy method was queued (IsMemoryWriter), so a CPU-written list whose only queued
+// writer was a 3D inline-to-memory or KeplerMemory upload was read before the upload ran.
+TEST_CASE("SYNC §15.9: an upload alone keeps a list fetch from the writers' early-out",
+          "[video_core][gpu_split_dispatch][v2_hazard]") {
+    using Access = VideoCommon::GpuSplitTestAccess;
+    using VideoCommon::GpuSplit;
+    namespace V2 = VideoCommon::V2;
+    using Kind = V2::HazardResult::Kind;
+    Fixture f;
+    f.system.Initialize();
+    constexpr GPUVAddr gpu = 0x2000'0000;
+    constexpr u64 device = 0x10000;
+    Kernel::KProcess process{f.system.Kernel()};
+    SCOPE_EXIT { f.system.Kernel().UnregisterKernelObject(&process); };
+    auto& table = process.GetPageTable().GetImpl();
+    table.Resize(20, 12);
+    for (u64 page = 0; page < 2; ++page) {
+        auto* backing = f.physical.GetPointerFromRaw<u8>(0x10000 + page * 0x1000);
+        table.entries.GetAndFault(4 + page).Store(false, Common::PageType::Memory, 1,
+                                                  reinterpret_cast<uintptr_t>(backing) -
+                                                      (0x4000 + page * 0x1000));
+    }
+    process.GetMemory().SetCurrentPageTable(process);
+    const auto asid = f.device_memory.RegisterProcess(&process.GetMemory());
+    f.device_memory.BindInterface(&f.rasterizer);
+    SCOPE_EXIT {
+        f.device_memory.Unmap(device, 0x2000);
+        f.device_memory.UnregisterProcess(asid);
+    };
+    f.device_memory.Map(device, 0x4000, 0x2000, asid);
+    f.memory.BindRasterizer(&f.rasterizer);
+    f.memory.Map(gpu, device, 0x2000, Tegra::PTEKind::PITCH, false);
+    Tegra::Nx2ClearGpuWrittenPages();
+    GpuSplit split;
+    Access::Initialize(split, f.system, 100);
+    Access::SetTracksWrites(split, true);
+    const V2::HazardFilter filter = GpuSplit::ListFetchFilter(true, false);
+    REQUIRE(split.ListWritersIdle());
+
+    // (a) A 3D inline upload to a list page never fetched; no compute or copy queued.
+    Access::SetEnd(split, 110);
+    split.NoteUploadWrite(f.memory, gpu + 0x100, 0x40);
+    Access::SetEnd(split, 112);
+    CHECK_FALSE(split.ListWritersIdle());
+    CHECK(split.WriterPosition() == 110);
+    const V2::HazardResult first = split.FindListWriters(device + 0x100, 0x40, filter);
+    REQUIRE(first.kind == Kind::Wait);
+    CHECK(first.position == 110);
+    // Idle-back progress: the back reaching the upload ends the wait; nothing else is waited
+    // for (the target is a position already sent).
+    Access::SetBack(split, 110, false);
+    CHECK(split.ListWritersIdle());
+    CHECK(split.FindListWriters(device + 0x100, 0x40, filter).kind == Kind::Clear);
+
+    // (b) A KeplerMemory (I2M) upload to the page, now a list page: linear, one 0x40-byte line.
+    V2::UploadWriteTracker kepler_memory;
+    kepler_memory.registers[0x60] = 0x40;                          // line length in
+    kepler_memory.registers[0x61] = 1;                             // line count
+    kepler_memory.registers[0x62] = static_cast<u32>(gpu >> 32);   // offset out high
+    kepler_memory.registers[0x63] = static_cast<u32>(gpu + 0x100); // offset out low
+    kepler_memory.registers[0x64] = 0x40;                          // pitch out
+    Access::SetEnd(split, 120);
+    kepler_memory.Note(split, f.memory, 0x6c, 1); // launch: linear
+    Access::SetEnd(split, 121);
+    kepler_memory.Note(split, f.memory, 0x6d, 0xdeadbeef); // data word
+    Access::SetEnd(split, 125);
+    CHECK_FALSE(split.ListWritersIdle());
+    const V2::HazardResult listed = split.FindListWriters(device + 0x100, 0x40, filter);
+    REQUIRE(listed.kind == Kind::Wait);
+    CHECK(listed.position == 121);
+    CHECK((listed.producers & V2::ProducerBit(V2::Producer::Upload)) != 0);
+    Access::SetBack(split, 121, false);
+    CHECK(split.ListWritersIdle());
+    Tegra::Nx2ClearGpuWrittenPages();
+}
+
+// SYNC_SUBMIT_SPEC §15.10 (fc1f: 4.3-10k/s "early-outs with an upload queued"): the general
+// table's overflow marker answers Wait to an Upload-only filter; the gate counter asks the
+// list-writer table and counts only Upload answers that aren't overflow.
+TEST_CASE("SYNC §15.10: the early-out upload check ignores the general table's overflow",
+          "[video_core][gpu_split_dispatch][v2_hazard]") {
+    using Access = VideoCommon::GpuSplitTestAccess;
+    using VideoCommon::GpuSplit;
+    namespace V2 = VideoCommon::V2;
+    using Kind = V2::HazardResult::Kind;
+    Fixture f;
+    f.system.Initialize();
+    Tegra::Nx2ClearGpuWrittenPages();
+    GpuSplit split;
+    Access::Initialize(split, f.system, 100);
+    Access::SetTracksWrites(split, true);
+    constexpr u64 list = 0x7'6a00'0000;
+    // More constant buffer notes than the general table holds, none consumed; no writer queued.
+    for (u64 i = 0; i <= V2::HazardTable::Capacity; ++i) {
+        Access::SetEnd(split, 110 + i);
+        split.NoteRangeWrite(0x7'7000'0000 + i * 0x1000, 16, V2::Producer::CbData);
+    }
+    REQUIRE(split.HazardOverflows() >= 1);
+    REQUIRE(split.ListWritersIdle());
+    V2::HazardFilter uploads;
+    uploads.ranged = V2::ProducerBit(V2::Producer::Upload);
+    uploads.unbounded = V2::ProducerBit(V2::Producer::Upload);
+    // d303's check: the general table answers Wait (its overflow marker).
+    const V2::HazardResult old_check = split.FindWrites(list, 0x100, uploads);
+    CHECK(old_check.kind == Kind::Wait);
+    CHECK(old_check.cause == V2::CauseOverflow);
+    // The corrected check: no queued upload; the overflow is context only.
+    CHECK_FALSE(split.ListUploadQueued(list, 0x100));
+    CHECK(split.HazardOverflowPending());
+
+    // Positive control: one inline upload to the page ends the early-out and the fetch waits.
+    Access::SetEnd(split, 9000);
+    split.NoteRangeWrite(list + 0x40, 0x20, V2::Producer::Upload);
+    CHECK_FALSE(split.ListWritersIdle());
+    const V2::HazardResult fetch =
+        split.FindListWriters(list, 0x100, GpuSplit::ListFetchFilter(true, false));
+    REQUIRE(fetch.kind == Kind::Wait);
+    CHECK(fetch.position == 9000);
+    // Now a list page: a later upload over it is in the list-writer table, and the check finds
+    // it.
+    Access::SetEnd(split, 9010);
+    split.NoteRangeWrite(list + 0x80, 0x20, V2::Producer::Upload);
+    CHECK(split.ListUploadQueued(list, 0x100));
+    Access::SetBack(split, 9010, false);
+    CHECK_FALSE(split.ListUploadQueued(list, 0x100));
+    CHECK(split.ListWritersIdle());
+}
+
+TEST_CASE("V2 landing: the front remembers its releases, the back's captured operations count",
+          "[video_core][gpu_split_dispatch][v2_hazard]") {
+    using Access = VideoCommon::GpuSplitTestAccess;
+    namespace V2 = VideoCommon::V2;
+    Fixture f;
+    f.system.Initialize();
+    VideoCommon::GpuSplit split;
+    Access::Initialize(split, f.system, 100);
+    V2::Landing::landed.store(0);
+    V2::Landing::issued.store(0);
+    constexpr u64 word = 0x5'0000'0040;
+    const u32 first = 0x778;
+    const u32 second = 0x779;
+    split.NoteUnlandedWrite(word, &first, sizeof(first), split.NextLandingTicket());
+    split.NoteKnownWrite(word + 4, &first, sizeof(first), V2::Producer::Release);
+    const u64 ticket = split.NextLandingTicket();
+    split.NoteUnlandedWrite(word, &second, sizeof(second), ticket);
+    CHECK(split.LastLandingTicket() == ticket);
+    // The newest landing release is forwarded until it lands (SYNC Step 10: the release ring
+    // the resume line read is gone; the semaphore view and the write tables hold them).
+    u32 forwarded = 0;
+    V2::HazardFilter filter;
+    filter.ranged = V2::ProducerBit(V2::Producer::Release);
+    const auto found =
+        split.FindWrites(word, sizeof(u32), filter, reinterpret_cast<u8*>(&forwarded));
+    CHECK(found.kind == V2::HazardResult::Kind::Forward);
+    CHECK(forwarded == second);
+    // The back's capture is what decides, not the front's note.
+    CHECK(!VideoCommon::GpuSplit::CapturedLandingPending());
+    const u64 saved_tag = V2::Landing::tag;
+    const u64 saved_captured = V2::Landing::captured_tag;
+    const u64 saved_pending = V2::Landing::pending;
+    V2::Landing::tag = 900;
+    const u64 captured = V2::Landing::Capture();
+    CHECK(V2::Landing::issued.load() == captured);
+    CHECK(VideoCommon::GpuSplit::CapturedLandingPending());
+    V2::Landing::Note(captured);
+    CHECK(!VideoCommon::GpuSplit::CapturedLandingPending());
+    V2::Landing::tag = saved_tag;
+    V2::Landing::captured_tag = saved_captured;
+    V2::Landing::pending = saved_pending;
+    V2::Landing::landed.store(0);
+    V2::Landing::issued.store(0);
+}
+
+TEST_CASE("SYNC 20c0 boot hang: words a suspending channel sent reach the back before the "
+          "suspended channels are polled",
+          "[video_core][gpu_split_dispatch][v2_hazard]") {
+    // 20c0746b9e: ch1 left 9 words written but unpublished while the front looped in
+    // ResumePending (a channel resuming and suspending every pass); the back never ran them.
+    // Control::Scheduler::ResumePending now publishes before the poll loop and after every
+    // resumed channel's commands; this checks what that Publish guarantees.
+    using Access = VideoCommon::GpuSplitTestAccess;
+    Fixture f;
+    f.system.Initialize();
+    VideoCommon::GpuSplit split;
+    Access::Initialize(split, f.system, 100);
+    struct Noop {
+        void operator()() const {}
+    };
+    split.Defer(Noop{});
+    split.Defer(Noop{});
+    // Below publish_every: nothing is visible to the back yet.
+    REQUIRE(Access::End(split) > 100);
+    REQUIRE(Access::Published(split) < Access::End(split));
+    split.Publish(); // what ResumePending does before polling suspended channels
+    REQUIRE(Access::Published(split) == Access::End(split));
+    // Publishing again with nothing new changes nothing (the per-pass cost is one compare).
+    const u64 published = Access::Published(split);
+    split.Publish();
+    REQUIRE(Access::Published(split) == published);
+}
+
+TEST_CASE("V2 landing: a QMD reduction deferred to its fence reports its landing (F3-X1)",
+          "[video_core][gpu_split_dispatch][v2_hazard]") {
+    using Access = VideoCommon::GpuSplitTestAccess;
+    namespace V2 = VideoCommon::V2;
+    Fixture f;
+    f.system.Initialize();
+    VideoCommon::GpuSplit split;
+    Access::Initialize(split, f.system, 100);
+    constexpr u64 word = 0x21'13cd'1000;
+    // The back reports a reduction's fence like an Untracked query: pending until it ran.
+    const u64 saved_tag = V2::Landing::tag;
+    const u64 issued = V2::Landing::untracked_issued.load();
+    const u64 landed = V2::Landing::untracked_landed.load();
+    V2::Landing::untracked_issued.store(0);
+    V2::Landing::untracked_landed.store(0);
+    V2::Landing::untracked_captured_tag = 0;
+    V2::Landing::tag = 300;
+    u64 position = 0;
+    {
+        const V2::Landing::Untracked untracked;
+        position = V2::Landing::CaptureUntracked(word, sizeof(u32));
+    }
+    CHECK(position == V2::Landing::UntrackedTicket(300, 0));
+    CHECK(split.UntrackedReleasePending());
+    V2::Landing::NoteUntracked(position);
+    CHECK(!split.UntrackedReleasePending());
+    V2::Landing::tag = saved_tag;
+    V2::Landing::untracked_issued.store(issued);
+    V2::Landing::untracked_landed.store(landed);
+}
+
+TEST_CASE("V2 landing: one write table, tickets without IR cuts, ordered landing",
+          "[video_core][gpu_split_dispatch][v2_hazard]") {
+    using Access = VideoCommon::GpuSplitTestAccess;
+    namespace V2 = VideoCommon::V2;
+    using Kind = V2::HazardResult::Kind;
+    Fixture f;
+    f.system.Initialize();
+    VideoCommon::GpuSplit split;
+    Access::Initialize(split, f.system, 100);
+    V2::Landing::landed.store(0);
+    V2::HazardFilter releases;
+    releases.ranged = V2::ProducerBit(V2::Producer::Release);
+    constexpr u64 word_a = 0x7'0000'0100;
+    constexpr u64 word_b = 0x7'0000'0200;
+
+    SECTION("two landing releases in one entry: distinct tickets, landing one keeps the other") {
+        const u32 one = 1;
+        const u32 two = 2;
+        const u64 first = split.NextLandingTicket();
+        split.NoteUnlandedWrite(word_a, &one, 4, first);
+        const u64 second = split.NextLandingTicket();
+        split.NoteUnlandedWrite(word_b, &two, 4, second);
+        CHECK(Access::End(split) == 100); // no IR cut: the same entry
+        CHECK(first != second);
+        CHECK(V2::Landing::RingPosition(first) == 100);
+        CHECK(V2::Landing::RingPosition(second) == 100);
+        CHECK(split.LandingPending());
+        V2::Landing::Note(first);
+        u32 value = 0;
+        CHECK(split.FindWrites(word_a, 4, releases, reinterpret_cast<u8*>(&value)).kind ==
+              Kind::Clear);
+        const V2::HazardResult b =
+            split.FindWrites(word_b, 4, releases, reinterpret_cast<u8*>(&value));
+        CHECK(b.kind == Kind::Forward);
+        CHECK(b.landing);
+        CHECK(value == 2);
+        V2::Landing::Note(second);
+        CHECK(!split.LandingPending());
+        // A new entry starts at index 0 again.
+        Access::SetEnd(split, 120);
+        CHECK(split.NextLandingTicket() == V2::Landing::Ticket(120, 0));
+    }
+
+    SECTION("one table per release: queued stores newer than the landing ones win") {
+        const u32 landing_value = 5;
+        split.NoteUnlandedWrite(word_a, &landing_value, 4, split.NextLandingTicket());
+        Access::SetEnd(split, 110);
+        const u32 queued_value = 9;
+        split.NoteKnownWrite(word_a, &queued_value, 4, V2::Producer::Release);
+        u32 value = 0;
+        const V2::HazardResult newer =
+            split.FindWrites(word_a, 4, releases, reinterpret_cast<u8*>(&value));
+        CHECK(newer.kind == Kind::Forward);
+        CHECK(value == 9);
+        // A landing release in the same entry as a queued store: their order is unknown, so
+        // the answer waits for the queued one (after which only the landing release remains).
+        const u32 later = 7;
+        split.NoteUnlandedWrite(word_a, &later, 4, split.NextLandingTicket());
+        const V2::HazardResult same_entry = split.FindWrites(word_a, 4, releases, nullptr);
+        CHECK(same_entry.kind == Kind::Wait);
+        CHECK(!same_entry.landing);
+        CHECK(same_entry.position == 110);
+    }
+
+    SECTION("back: tickets per entry, deferral behind an unlanded ticket, untracked writes") {
+        namespace Landing = V2::Landing;
+        Landing::tag = 0;
+        CHECK(Landing::Capture() == 0); // the front records nothing: v1 behaviour
+        CHECK(!Landing::MustDefer());
+        Landing::tag = 300;
+        const u64 a = Landing::Capture();
+        const u64 b = Landing::Capture();
+        CHECK(a == Landing::Ticket(300, 0));
+        CHECK(b == Landing::Ticket(300, 1));
+        // A CPU-visible write made now would pass them: it lands behind them instead.
+        CHECK(Landing::MustDefer());
+        {
+            const Landing::Untracked untracked;
+            CHECK(Landing::Capture() == 0);
+        }
+        Landing::tag = 310;
+        CHECK(Landing::Capture() == Landing::Ticket(310, 0));
+        // Operations land in order; the last ticket ends the deferral.
+        Landing::Note(a);
+        CHECK(Landing::MustDefer());
+        Landing::Note(Landing::Ticket(310, 0));
+        CHECK(!Landing::MustDefer());
+        // Landing-order verify: a ticket below one already landed is counted.
+        Landing::verify = true;
+        const u64 violations = Landing::order_violations.load();
+        Landing::Note(b);
+        CHECK(Landing::order_violations.load() == violations + 1);
+        Landing::verify = false;
+        Landing::tag = 0;
+        Landing::captured_tag = 0;
+        Landing::pending = 0;
+    }
+
+    SECTION("valve replacement: the front waits for a landing, never for a drain") {
+        // The back ran the release's entry (consumed 100) but much more is queued (end 5000):
+        // waiting for the landing must not wait for the back to consume the rest.
+        Access::SetEnd(split, 5000);
+        Access::SetBack(split, 100, true);
+        const u64 ticket = V2::Landing::Ticket(100, 0);
+        std::jthread fence_thread([ticket] {
+            std::this_thread::sleep_for(std::chrono::milliseconds{5});
+            V2::Landing::Note(ticket);
+        });
+        CHECK(split.WaitLanded(ticket, VideoCommon::DrainSite::Acquire, 2'000'000));
+        CHECK(split.ConsumedNow() == 100);
+        fence_thread.join();
+        // A landing that never comes times out instead of hanging.
+        CHECK(!split.WaitLanded(V2::Landing::Ticket(100, 1), VideoCommon::DrainSite::Acquire,
+                                1'000));
+        Access::SetBack(split, 0, false);
+    }
+
+    SECTION("class D landing wait makes its producer complete (bf6e22effa regression)") {
+        // A counter report the back ran (consumed 100) whose operation waits for a fence an
+        // idle back never makes: the wait must make the back write it out, not spin.
+        Access::SetEnd(split, 100);
+        Access::SetBack(split, 100, true);
+        const u64 ticket = V2::Landing::Ticket(100, 0);
+        struct Flush {
+            std::atomic<bool> ran{false};
+        } flush;
+        std::atomic<bool> stop{false};
+        // The back: idle, serving front requests after its (empty) entry.
+        std::jthread back([&] {
+            while (!stop.load()) {
+                Access::ServeHookRequests(split);
+                std::this_thread::yield();
+            }
+        });
+        const auto begin = std::chrono::steady_clock::now();
+        CHECK(split.CompleteLanding(
+            ticket, VideoCommon::DrainSite::MacroDmaRead,
+            [](void* argument) -> u64 {
+                static_cast<Flush*>(argument)->ran.store(true);
+                return 0;
+            },
+            &flush));
+        CHECK(flush.ran.load());
+        CHECK(V2::Landing::landed.load() < ticket); // completed by the flush, not by a landing
+        CHECK(std::chrono::steady_clock::now() - begin < std::chrono::seconds{1});
+        stop.store(true);
+        back.join();
+        // Already landed: nothing to run.
+        V2::Landing::Note(ticket);
+        Flush unused;
+        CHECK(split.CompleteLanding(
+            ticket, VideoCommon::DrainSite::MacroDmaRead,
+            [](void* argument) -> u64 {
+                static_cast<Flush*>(argument)->ran.store(true);
+                return 0;
+            },
+            &unused));
+        CHECK(!unused.ran.load());
+        Access::SetBack(split, 0, false);
+    }
+
+    SECTION("a landing whose bytes only its operation writes waits for that operation (F3F5b-1)") {
+        // HAZARD=verify's ~4,900 macro DMA mismatches: a 16-byte report whose final value the
+        // query cache writes early (semi-flush) but whose timestamp (word 2) only its operation
+        // writes. The job returns the back's newest ticket; the front waits for it to land.
+        Access::SetEnd(split, 200);
+        Access::SetBack(split, 200, true);
+        const u64 ticket = V2::Landing::Ticket(200, 0);
+        const u64 back_ticket = V2::Landing::Ticket(200, 0);
+        std::atomic<bool> stop{false};
+        std::atomic<bool> fence_signalled{false};
+        std::jthread back([&] {
+            while (!stop.load()) {
+                Access::ServeHookRequests(split);
+                std::this_thread::yield();
+            }
+        });
+        // The fencing thread: the signalled fence completes a little later, then its operation
+        // writes the timestamp and reports the landing.
+        std::jthread fencing([&] {
+            while (!fence_signalled.load() && !stop.load()) {
+                std::this_thread::yield();
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds{5});
+            V2::Landing::Note(back_ticket);
+        });
+        struct Job {
+            std::atomic<bool>* signalled;
+            u64 target;
+        } job{&fence_signalled, back_ticket};
+        CHECK(split.CompleteLanding(
+            ticket, VideoCommon::DrainSite::MacroDmaRead,
+            [](void* argument) -> u64 {
+                auto& self = *static_cast<Job*>(argument);
+                self.signalled->store(true);
+                return self.target;
+            },
+            &job));
+        CHECK(V2::Landing::landed.load() >= back_ticket); // returned only once it landed
+        fencing.join();
+        // A stopped back: no wait for a landing that can't come, the caller drains.
+        const u64 later = V2::Landing::Ticket(300, 0);
+        Access::SetEnd(split, 300);
+        Access::SetBack(split, 300, true);
+        struct Never {
+            u64 target;
+        } never{V2::Landing::Ticket(300, 1)};
+        std::jthread stopper([&] {
+            std::this_thread::sleep_for(std::chrono::milliseconds{20});
+            stop.store(true);
+            back.join();
+            Access::SetBack(split, 300, false);
+        });
+        const auto begin = std::chrono::steady_clock::now();
+        CHECK(!split.CompleteLanding(
+            later, VideoCommon::DrainSite::MacroDmaRead,
+            [](void* argument) -> u64 { return static_cast<Never*>(argument)->target; }, &never));
+        CHECK(std::chrono::steady_clock::now() - begin < std::chrono::seconds{1});
+        stopper.join();
+    }
+
+    SECTION("F3-X6: a QMD release holds a read until its operation ran (idle back, submit asked)") {
+        // b0dac33's HAZARD=verify line: a four-word QMD release (no landing ticket) the back had
+        // run but whose operation, which writes the timestamp, waited for its fence: the read
+        // took memory's older words. The read must wait for that operation, and the wait must
+        // make the idle back submit (F4-02 lazy fences), never spin on a timeout.
+        namespace Landing = V2::Landing;
+        Landing::ResetUntracked();
+        Landing::untracked_captured_tag = 0;
+        V2::HazardFilter reads;
+        reads.unbounded = V2::ProducerBit(V2::Producer::QmdRelease);
+        Access::SetEnd(split, 200);
+        split.NoteRangeWrite(word_a, 16, V2::Producer::QmdRelease);
+        CHECK(split.FindWrites(word_a, 16, reads).kind == Kind::Wait); // queued
+        // The back ran the entry: the release's operation is queued behind its fence.
+        Landing::tag = 200;
+        u64 ticket = 0;
+        {
+            const Landing::Untracked untracked;
+            ticket = Landing::CaptureUntracked(word_a, 16);
+        }
+        Landing::tag = 0;
+        CHECK(ticket == Landing::UntrackedTicket(200, 0));
+        Access::SetBack(split, 200, true);
+        const V2::HazardResult pending = split.FindWrites(word_a, 16, reads);
+        CHECK(pending.kind == Kind::Wait);
+        CHECK(pending.untracked);
+        CHECK(pending.position == 200);
+        CHECK(split.FindWrites(word_b, 4, reads).kind == Kind::Clear); // another word
+        // The back is idle: it serves front requests. SYNC_SUBMIT_SPEC §11 (invariant S): the
+        // back's sleep point fenced and submitted the operation itself, so it lands without any
+        // front ask, and the waiter asks for nothing while no fence tick is known (F3).
+        struct Hook {
+            std::atomic<bool> asked{false};
+        } hook;
+        split.SetIdleHook([](void* argument) { static_cast<Hook*>(argument)->asked.store(true); },
+                          &hook);
+        std::atomic<bool> stop{false};
+        std::jthread back([&] {
+            while (!stop.load()) {
+                Access::ServeHookRequests(split);
+                std::this_thread::yield();
+            }
+        });
+        std::jthread fencing([&] {
+            std::this_thread::sleep_for(std::chrono::milliseconds{2});
+            Landing::NoteUntracked(ticket); // S submitted it; the fencing thread pops it
+        });
+        u64 settled = 0;
+        const auto begin = std::chrono::steady_clock::now();
+        CHECK(split.CompleteLanding(
+            0, VideoCommon::DrainSite::MacroDmaRead, [](void*) -> u64 { return 0; }, nullptr,
+            pending.position, word_a, 16, &settled));
+        CHECK(Landing::untracked_landed.load() >= ticket); // returned only once it landed
+        CHECK(settled >= 200);
+        CHECK(std::chrono::steady_clock::now() - begin < std::chrono::seconds{1});
+        fencing.join();
+        CHECK(split.FindQueuedWrites(word_a, 16, reads, nullptr, settled).kind == Kind::Clear);
+        CHECK(split.FindWrites(word_a, 16, reads).kind == Kind::Clear);
+        // An unbounded QMD release (an unknown QMD): while queued it may write any word.
+        Access::SetEnd(split, 300);
+        split.NoteUnboundedWrite(V2::Producer::QmdRelease);
+        CHECK(split.FindWrites(word_a, 16, reads).kind == Kind::Wait);
+        Landing::tag = 300;
+        u64 other = 0;
+        {
+            const Landing::Untracked untracked;
+            other = Landing::CaptureUntracked(word_b, 4);
+        }
+        Landing::tag = 0;
+        Access::SetBack(split, 300, true);
+        // Fix F3h (F3-X1): once the back ran it, its operations' ranges are known: a range none
+        // of them writes needs no landing wait, the word one writes waits for it.
+        CHECK(split.FindWrites(word_a, 16, reads).kind == Kind::Clear);
+        const V2::HazardResult unbounded = split.FindWrites(word_b, 4, reads);
+        CHECK(unbounded.kind == Kind::Wait);
+        CHECK(unbounded.untracked);
+        CHECK(unbounded.position == 300);
+        hook.asked.store(false);
+        std::jthread fencing_b([&] {
+            std::this_thread::sleep_for(std::chrono::milliseconds{2});
+            Landing::NoteUntracked(other);
+        });
+        settled = 0;
+        CHECK(split.CompleteLanding(
+            0, VideoCommon::DrainSite::MacroDmaRead, [](void*) -> u64 { return 0; }, nullptr,
+            unbounded.position, word_b, 4, &settled));
+        CHECK(Landing::untracked_landed.load() >= other);
+        fencing_b.join();
+        CHECK(split.FindQueuedWrites(word_b, 4, reads, nullptr, settled).kind == Kind::Clear);
+        stop.store(true);
+        back.join();
+        // A stopped back: the wait for an operation that can't land returns false at once.
+        Access::SetEnd(split, 310);
+        split.NoteUnboundedWrite(V2::Producer::QmdRelease);
+        Landing::tag = 310;
+        {
+            const Landing::Untracked untracked;
+            (void)Landing::CaptureUntracked(word_b, 4);
+        }
+        Landing::tag = 0;
+        Access::SetBack(split, 310, false);
+        const V2::HazardResult never = split.FindWrites(word_b, 4, reads);
+        CHECK(never.untracked);
+        CHECK(!split.CompleteLanding(
+            0, VideoCommon::DrainSite::MacroDmaRead, [](void*) -> u64 { return 0; }, nullptr,
+            never.position, word_b, 4, &settled));
+        split.SetIdleHook(nullptr, nullptr);
+        Landing::ResetUntracked();
+    }
+
+    SECTION("F3-X1b: only a QMD release that may write the word asks for its submit") {
+        namespace Landing = V2::Landing;
+        Landing::ResetUntracked();
+        Landing::untracked_captured_tag = 0;
+        Access::SetEnd(split, 200);
+        split.NoteRangeWrite(word_a, 4, V2::Producer::QmdRelease);
+        CHECK(split.QmdReleaseMayWrite(word_a, 4)); // queued
+        CHECK(!split.QmdReleaseMayWrite(word_b, 4)); // placed elsewhere
+        CHECK(split.UntrackedReleasePending());      // the old, global answer held both
+        // Run, its operation still to land: it may still write the word (the latch resumes it).
+        Landing::tag = 200;
+        u64 ticket = 0;
+        {
+            const Landing::Untracked untracked;
+            ticket = Landing::CaptureUntracked(word_a, 4);
+        }
+        Landing::tag = 0;
+        Access::SetBack(split, 200, false);
+        CHECK(split.QmdReleaseMayWrite(word_a, 4));
+        Landing::NoteUntracked(ticket);
+        CHECK(!split.QmdReleaseMayWrite(word_a, 4)); // landed
+        // An unknown QMD may write any word until the back ran its entry...
+        Access::SetEnd(split, 300);
+        split.NoteUnboundedWrite(V2::Producer::QmdRelease);
+        CHECK(split.QmdReleaseMayWrite(word_a, 4));
+        CHECK(split.QmdReleaseMayWrite(word_b, 4));
+        Landing::tag = 300;
+        u64 later = 0;
+        {
+            const Landing::Untracked untracked;
+            later = Landing::CaptureUntracked(word_a, 16);
+        }
+        Landing::tag = 0;
+        Access::SetBack(split, 300, false);
+        // ...then only the words its operations still to land write (F3h, F3-X1: 0fe4 held
+        // every word for about a frame, until the operations landed).
+        CHECK(split.QmdReleaseMayWrite(word_a, 4));
+        CHECK(!split.QmdReleaseMayWrite(word_b, 4));
+        Landing::NoteUntracked(later);
+        CHECK(!split.QmdReleaseMayWrite(word_a, 4));
+        Landing::ResetUntracked();
+    }
+
+    SECTION("SYNC: the split's semaphore view holds what pending QMD reductions leave") {
+        // Replaces the release ring's QueuedQmdAdds / QmdReductionView (SYNC Step 10): the view
+        // is retired by consumed + untracked settlement and cleared with the split.
+        namespace Landing = V2::Landing;
+        using Retire = V2::SemView::Retire;
+        using SemKind = V2::SemView::Kind;
+        Landing::ResetUntracked();
+        Access::SetBack(split, 100, true);
+        const auto reduce = [](u32 op, u32 base, u32 operand) {
+            return Tegra::ReduceSemaphore(op, false, base, operand);
+        };
+        Access::SetEnd(split, 200);
+        split.Sem().NoteReduction(word_a, false, 0, 3, 200, Retire::Untracked, 200,
+                                  SemKind::QmdReduction, split.SemNow(), true, reduce,
+                                  [] { return 0U; });
+        Access::SetEnd(split, 210);
+        split.Sem().NoteReduction(word_a, false, 0, 2, 210, Retire::Untracked, 210,
+                                  SemKind::QmdReduction, split.SemNow(), true, reduce,
+                                  [] { return 0U; });
+        auto answer = split.Sem().Find(word_a, split.SemNow());
+        REQUIRE(answer.pending);
+        CHECK(answer.writer.value == 5);
+        CHECK(answer.writer.position == 210);
+        CHECK(!split.Sem().Find(word_b, split.SemNow()).pending);
+        // The back ran both entries and nothing is left to land: in memory.
+        Access::SetBack(split, 210, false);
+        CHECK(!split.Sem().Find(word_a, split.SemNow()).pending);
+    }
+
+    SECTION("SYNC: a QMD operation of a consumed entry still to land keeps its word pending") {
+        // Chunk C2's part-landed case, on the semaphore view: an entry the back ran whose
+        // untracked operations haven't all landed is not in memory yet.
+        namespace Landing = V2::Landing;
+        using Retire = V2::SemView::Retire;
+        using SemKind = V2::SemView::Kind;
+        Landing::ResetUntracked();
+        Landing::untracked_captured_tag = 0;
+        Access::SetBack(split, 100, true);
+        Access::SetEnd(split, 200);
+        split.Sem().Note(word_a, 9, true, 200, Retire::Untracked, 200, SemKind::QmdMax,
+                         split.SemNow());
+        Landing::tag = 200;
+        u64 first = 0;
+        {
+            const Landing::Untracked untracked;
+            first = Landing::CaptureUntracked(word_a, 4);
+            (void)Landing::CaptureUntracked(word_a, 4);
+        }
+        Landing::tag = 0;
+        Access::SetBack(split, 205, true);
+        Landing::NoteUntracked(first);
+        CHECK(split.Sem().Find(word_a, split.SemNow()).pending);
+        CHECK(split.Sem().Find(word_a, split.SemNow()).writer.value == 9);
+        Landing::ResetUntracked();
+        Access::SetBack(split, 230, false);
+    }
+
+    SECTION("R2-F3-03: an unmapped acquire word waits only for a map still queued") {
+        // 0fe4: unmapped words took the v1 drain and forced fences (50/s). Now the view decides
+        // on the guest's read unless a Map record the back hasn't run may map the word.
+        Access::SetEnd(split, 100);
+        Access::SetBack(split, 100, false);
+        CHECK(!split.MapQueued());
+        Access::SetEnd(split, 120);
+        split.NoteMapSent();
+        CHECK(split.MapQueued());
+        Access::SetBack(split, 110, false);
+        CHECK(split.MapQueued());
+        // The back ran it: its `consumed` store is the progress path (it rings the front).
+        Access::SetBack(split, 120, false);
+        CHECK(!split.MapQueued());
+    }
+
+    SECTION("F3-X1: an Equal acquire's QMD producer is fixed at the acquire and settles on an idle "
+            "back") {
+        // 0fe4: Equal/Mask acquires compared against the newest unknown QMD release the front
+        // noted, which every later signal moved; with memory already meeting them nothing wrote
+        // the word, so no latch fired and only the 2/22 ms net resumed them.
+        namespace Landing = V2::Landing;
+        Landing::ResetUntracked();
+        Landing::untracked_captured_tag = 0;
+        Access::SetEnd(split, 200);
+        split.NoteUnboundedWrite(V2::Producer::QmdRelease);
+        Access::SetEnd(split, 204); // the acquire
+        const u64 target = split.QmdTargetFor(word_a, 4);
+        CHECK(target == 200);
+        CHECK(!split.QmdTargetSettled(target));
+        CHECK(split.QmdTargetSettled(0));
+        // Another channel's unknown QMD, parsed after the acquire, doesn't move it.
+        Access::SetEnd(split, 210);
+        split.NoteUnboundedWrite(V2::Producer::QmdRelease);
+        CHECK(split.QmdTargetFor(word_a, 4) == 210); // what a new acquire would take
+        // The back ran entry 200; its four-word release waits for its fence.
+        Landing::tag = 200;
+        u64 ticket = 0;
+        {
+            const Landing::Untracked untracked;
+            ticket = Landing::CaptureUntracked(word_a, 16);
+        }
+        Landing::tag = 0;
+        Access::SetBack(split, 205, true);
+        CHECK(!split.QmdTargetSettled(target));
+        // While it may land the suspended poll asks for its fence's submit (SYNC Step 4: once per
+        // tick; tick 7 stands for the fence that carries it), not a drain.
+        CHECK(V2::PlanSuspendedPoll(false, !split.QmdTargetSettled(target), 7, 0) ==
+              V2::SuspendedPoll::Request);
+        // The idle back serves the request; the fencing thread lands the operation only then.
+        struct Hook {
+            std::atomic<bool> asked{false};
+        } hook;
+        split.SetIdleHook([](void* argument) { static_cast<Hook*>(argument)->asked.store(true); },
+                          &hook);
+        std::atomic<bool> stop{false};
+        std::jthread back([&] {
+            while (!stop.load()) {
+                Access::ServeHookRequests(split);
+                std::this_thread::yield();
+            }
+        });
+        std::jthread fencing([&] {
+            while (!hook.asked.load() && !stop.load()) {
+                std::this_thread::yield();
+            }
+            Landing::NoteUntracked(ticket);
+        });
+        split.RequestIdleHook();
+        const auto begin = std::chrono::steady_clock::now();
+        while (!split.QmdTargetSettled(target) &&
+               std::chrono::steady_clock::now() - begin < std::chrono::seconds{1}) {
+            std::this_thread::yield();
+        }
+        CHECK(hook.asked.load());
+        // Settled although entry 210 is still queued: memory decides the acquire now.
+        CHECK(split.QmdTargetSettled(target));
+        CHECK(!split.QmdTargetSettled(210));
+        fencing.join();
+        stop.store(true);
+        back.join();
+        split.SetIdleHook(nullptr, nullptr);
+        Landing::ResetUntracked();
+    }
+
+    SECTION("class C readback: a front job runs on the back after its current entry") {
+        struct Job {
+            bool ran = false;
+        } job;
+        Access::QueueBackJob(split, [](void* argument) { static_cast<Job*>(argument)->ran = true; },
+                             &job);
+        Access::ServeHookRequests(split);
+        CHECK(job.ran);
+        // Without a running back, the front runs it itself.
+        Job here;
+        split.RequestBackJob([](void* argument) { static_cast<Job*>(argument)->ran = true; },
+                             &here);
+        CHECK(here.ran);
+    }
+    V2::Landing::landed.store(0);
 }

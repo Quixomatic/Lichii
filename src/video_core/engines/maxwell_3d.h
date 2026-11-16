@@ -26,7 +26,14 @@
 #include "video_core/engines/engine_upload.h"
 #include "video_core/gpu.h"
 #include "video_core/macro.h"
+#include "video_core/nx2_fast_draw.h"
+#include "video_core/nx2_perf.h"
 #include "video_core/textures/texture.h"
+#include "video_core/v2/ir.h"
+#include "video_core/v2/macro_hle.h"
+#include "video_core/v2/regsem.h"
+#include "video_core/v2/v2_switches.h"
+#include "video_core/v2/v2_stats.h"
 #include "video_core/engines/maxwell_3d.h"
 
 namespace Core {
@@ -39,6 +46,9 @@ class MemoryManager;
 
 namespace VideoCommon {
 class GpuSplit;
+namespace V2 {
+struct DrawOutput;
+}
 }
 
 namespace VideoCore {
@@ -3120,6 +3130,13 @@ public:
         void UpdateTopology(Maxwell3D& maxwell3d);
         void ProcessDraw(Maxwell3D& maxwell3d, bool draw_indexed, u32 instance_count);
         void ProcessDrawIndirect(Maxwell3D& maxwell3d);
+        /// S1 single owner (v2/s1_deltas.h Draw entries): a draw the front's DrawModel decided,
+        /// on registers already current; the state machine above doesn't run.
+        void DrawPredicted(Maxwell3D& maxwell3d, const VideoCommon::V2::Ir::PredictedDraw& draw,
+                           u8 variant);
+        /// EDEN_NX2_V2_IR_DRAWS=verify: hands the draw about to happen to V2::IrCheck.
+        void NoteV2DrawCheck(Maxwell3D& maxwell3d, VideoCommon::V2::Ir::DrawKind kind,
+                             u32 instance_count);
         State draw_state{};
         DrawTextureState draw_texture_state{};
         IndirectParams indirect_state{};
@@ -3160,6 +3177,21 @@ public:
     };
 
     State state{};
+
+    /// EDEN_NX2_V2_STATS: register groups changed since the last draw, state hashes.
+    VideoCommon::V2::Stats::DrawTracker v2_draw_tracker;
+    /// EDEN_NX2_V2_REGSEM: register groups changed since the last draw (draw_dirty for the draw
+    /// being resolved) and their fingerprints, kept by the thread executing the methods.
+    VideoCommon::V2::GroupTracker v2_groups;
+
+    /// S1 single owner (Fix F1, v2/s1_deltas.h), on the split's back: applies a classified
+    /// StateRun (register deltas and typed entries).
+    void ExecuteS1Run(const u64* it, const u64* end);
+    /// GpuSplit::S1Check: a classified entry sent beside the method words this engine executes;
+    /// applies it to a register copy and compares. Returns its size in words.
+    size_t S1CheckEntry(const u64* entry);
+    /// GpuSplit::S1Check: the entries checked and the mismatches found so far (tests, logs).
+    [[nodiscard]] std::pair<u64, u64> S1CheckCounts() const;
 
     /// Reads a register value located at the input method address
     u32 GetRegisterValue(u32 method) const;
@@ -3270,11 +3302,37 @@ public:
     /// Handles a write to the CB_BIND register.
     void ProcessCBBind(size_t stage_index);
 
+    /// Fast draw (nx2_fast_draw.h): registers that only parameterize the next draw, the next
+    /// constant buffer bind or the buffers a delta draw binds again, or that ProcessMethodCall
+    /// handles, so writing them doesn't end draw reuse.
+    static bool IsFastDrawParameter(u32 method);
+    /// Methods fast draw records as light changes (constant buffer data and binds).
+    static bool IsFastDrawDeltaMethod(u32 method);
+    /// A vertex stream's address, size or limit (not its stride or enable).
+    static bool IsFastDrawVertexBuffer(u32 method);
+    void NoteFastDrawConstantData(GPUVAddr begin, GPUVAddr end);
+
     /// Handles a write to the CB_DATA[i] register.
     void ProcessCBData(u32 value);
     void ProcessCBMultiData(const u32* start_base, u32 amount);
 
     void ProcessInlineIndexMultiData(u32 method, const u32* start_base, u32 amount);
+
+    /// The back's work at the end of a front macro: consume the sink, issue a deferred draw
+    /// (a MacroEnd Draw IR record or a deferred call).
+    void FinishFrontMacro(Core::System& system);
+    /// EDEN_NX2_V2_MACROHLE (back): a host indirect draw replacing an identified NVN2 macro.
+    void RunMacroHleDraw(Core::System& system, const VideoCommon::V2::MacroHle::Draw& draw);
+    /// EDEN_NX2_V2_MACROHLE (back): the render enable mode a conditional render macro computes
+    /// from the report pair at `source` (its MME DMA read), written as the macro writes it.
+    /// `tracked`: the front ran it under shadow RAM tracking (v2_hle_tracked_mode keeps it).
+    void RunMacroHleRenderEnable(Core::System& system, GPUVAddr source, u32 bytes, bool invert,
+                                 bool s1, bool tracked);
+
+    /// EDEN_NX2_V2_REGSEM=verify: register file mismatches the table-driven copy found.
+    [[nodiscard]] u64 V2BackMismatches() const {
+        return v2_back_mirror ? v2_back_mirror->mismatches : 0;
+    }
 
 private:
     void InitializeRegisterDefaults();
@@ -3310,12 +3368,8 @@ private:
     void CallMacroMethod(Core::System& system, u32 method, std::span<const u32> parameters);
 
     /// Whether state register writes that keep the register's value are dropped (CallMethod).
-    static bool SkipSameValueWrites() {
-        static const bool skip = [] {
-            const char* value = std::getenv("EDEN_NX2_SKIP_SAME");
-            return value == nullptr || value[0] != '0';
-        }();
-        return skip;
+    bool SkipSameValueWrites() const {
+        return skip_same_value_writes;
     }
 
     /// Handles writes to the macro uploading register.
@@ -3348,6 +3402,10 @@ private:
 
     MemoryManager& memory_manager;
 
+    /// Device memory of the texture and sampler header tables (NoteFastDrawConstantData).
+    VideoCommon::Nx2FastDraw::DeviceSpans fast_draw_header_spans;
+    VideoCommon::Nx2FastDraw::DeviceSpans fast_draw_sampler_spans;
+
     VideoCore::RasterizerInterface* rasterizer = nullptr;
 
     /// Start offsets of each macro in macro_memory
@@ -3378,6 +3436,17 @@ private:
         recent_writes[recent_write_index++ % recent_writes.size()] = {method, argument, amount, pending};
     }
     void DumpRecentWrites(u32 method);
+    // EDEN_NX2_3D_METHODS: log the first write to each 3D register (finds methods Eden doesn't
+    // model). Read per engine, not at static initialization, which runs before the frontend
+    // loads nx2_switches.txt.
+    const bool trace_first_method_writes = std::getenv("EDEN_NX2_3D_METHODS") != nullptr;
+    // EDEN_NX2_SKIP_SAME and EDEN_NX2_PERF_VERIFY, read per engine like the switch above. Every
+    // method checks them, so they are members rather than statics with a guard on the hot path.
+    const bool skip_same_value_writes = [] {
+        const char* value = std::getenv("EDEN_NX2_SKIP_SAME");
+        return value == nullptr || value[0] != '0';
+    }();
+    const bool perf_verify = VideoCommon::Nx2Perf::Verify();
     /// Parameters that have been submitted to the macro call so far.
     std::vector<u32> macro_params;
 
@@ -3400,15 +3469,149 @@ private:
     void ReleaseFront();
     void FrontWrite(VideoCommon::GpuSplit& split, FrontState& state, u32 method, u32 argument,
                     bool is_last_call, bool from_macro);
+    void FrontWriteV1(VideoCommon::GpuSplit& split, FrontState& state, u32 method, u32 argument,
+                      bool is_last_call, bool from_macro);
+    // EDEN_NX2_V2_REGSEM: the table-driven mirror (v2/regsem_3d.h).
+    void FrontWriteRegSem(VideoCommon::GpuSplit& split, FrontState& state, u32 method,
+                          u32 argument, bool is_last_call, bool from_macro);
+    void FrontWriteRegSemOn(VideoCommon::GpuSplit& split, FrontState& state, u32 method,
+                            u32 argument, bool is_last_call, bool from_macro);
+    void FrontMultiRegSem(FrontState& state, u32 method, const u32* base_start, u32 amount,
+                          bool apply);
+    void FrontRegSemResync(FrontState& state);
+    bool FrontRegSemEffect(VideoCommon::V2::RegSem::Effect effect, u32 a, u32 b);
+
     void FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split, FrontState& state);
+    // EDEN_NX2_V2_IR_DRAWS: Draw records for what the back's draw manager will do.
+    /// Before the front mirror takes a write (`value` after the shadow RAM): a deferred batch
+    /// the write ends.
+    void FrontDrawPre(VideoCommon::GpuSplit& split, FrontState& state, u32 method, u32 value);
+    /// After the mirror took a sent write, before it is sent: the draws the method triggers.
+    void FrontDrawPost(VideoCommon::GpuSplit& split, FrontState& state, u32 method, u32 value);
+    /// Before a multi-method run is applied and sent.
+    void FrontDrawMulti(VideoCommon::GpuSplit& split, FrontState& state, u32 method,
+                        const u32* base_start, u32 amount);
+    void FrontEmitDraws(VideoCommon::GpuSplit& split, FrontState& state, u32 method, u32 value,
+                        const VideoCommon::V2::DrawOutput& out,
+                        const VideoCommon::V2::GroupTracker* hashes);
+    /// EDEN_NX2_V2_PARALLEL: the segmenter sees the draws before their Draw records (a cut
+    /// snapshots the mirror and sends a Segment record).
+    void FrontParallelDraw(VideoCommon::GpuSplit& split, FrontState& state,
+                           const VideoCommon::V2::DrawOutput& out, u32 pending_method,
+                           bool may_cut);
+    bool FrontProgramsUnbounded(const Regs& regs, bool native);
+    VideoCommon::V2::Ir::CompactBody FrontCompactDraw(VideoCommon::GpuSplit& split,
+                                                      FrontState& state,
+                                                      VideoCommon::V2::Ir::DrawOp op, u32 count);
+    void FrontFillDraw(FrontState& state, VideoCommon::V2::Ir::DrawBody& body, u32 method,
+                       u32 value, const VideoCommon::V2::DrawOutput& out, u32 first,
+                       const VideoCommon::V2::GroupTracker* hashes);
+    VideoCommon::V2::GroupTracker* FrontDrawGroups(FrontState& state);
+    /// Sends the end of a front macro that may leave a deferred draw (a MacroEnd Draw record).
+    void FrontEmitMacroEnd(Core::System& system, VideoCommon::GpuSplit& split, FrontState& state);
+    /// Sends a macro HLE host indirect draw (a HostIndirect Draw record).
+    void FrontEmitHostIndirect(Core::System& system, VideoCommon::GpuSplit& split,
+                               FrontState& state, const VideoCommon::V2::MacroHle::Draw& draw);
+    /// Macro HLE of a conditional render macro (Kind::RenderEnableCompare): the macro's
+    /// register writes, then a record the back evaluates the render enable mode from.
+    void FrontHleRenderEnable(Core::System& system, VideoCommon::GpuSplit& split,
+                              FrontState& state, const VideoCommon::V2::MacroHle::Entry& entry);
+    /// MACROHLE=verify: what the macro did against what its entry would have done.
+    void FrontCheckHle(const VideoCommon::V2::MacroHle::Entry& entry, u64 hash,
+                       std::span<const u32> parameters,
+                       const VideoCommon::V2::MacroHle::Observation& observation);
+    /// Fix F3h (R2-F5-03): macro HLE of a pure macro (ConstantBufferBind, SurfaceBind): its
+    /// data RAM writes and register writes as the macro makes them; and its verify check.
+    void FrontHlePure(Core::System& system, VideoCommon::GpuSplit& split, FrontState& state,
+                      const VideoCommon::V2::MacroHle::Effects& effects);
+    void FrontCheckHlePure(u64 hash, const VideoCommon::V2::MacroHle::Effects& predicted,
+                           const VideoCommon::V2::MacroHle::Observation& observation);
+    /// MACROHLE: the back's render_enable.mode into the front's registers (drains; before an
+    /// MME read of it while FrontState::v2_render_enable_unknown).
+    void FrontSyncRenderEnable(VideoCommon::GpuSplit& split, FrontState& state);
+    /// MACROHLE (back only): the mode the last conditional render HLE call evaluated under
+    /// shadow RAM tracking. A Replay of the front's unknown shadow copy (ShadowUnknown) resolves
+    /// to it in ProcessQueryCondition; ReleaseFront takes it (the back is idle then).
+    u32 v2_hle_tracked_mode{};
+    /// Tests: the split front's register, shadow copy and render-enable flag (front taken).
+    [[nodiscard]] u32 FrontRegisterForTest(u32 method) const;
+    [[nodiscard]] u32 FrontShadowForTest(u32 method) const;
+    [[nodiscard]] bool FrontRenderEnableUnknownForTest() const;
+    // EDEN_NX2_V2_REGSEM on the executing engine: the register update through the semantics
+    // table (=1), or the engine's own path compared with it on a register copy (verify).
+    void CallMethodV2(u32 method, u32 method_argument, bool is_last_call, bool fast);
+    void CallMethodSlowTail(u32 method, u32 method_argument, bool is_last_call);
+    void TableWrite(u32 method, u32 method_argument, bool is_last_call, bool fast);
+    void TableMethodCall(VideoCommon::V2::RegSem::Action3D action, u32 method, u32 argument,
+                         u32 nonshadow_argument, bool is_last_call);
+    void ConsumeSinkV2();
+    // S1 single owner (Fix F1): the front classifies, the back applies (v2/s1_deltas.h).
+    struct S1Sink;
+    struct S1CheckState;
+    void FrontWriteS1(VideoCommon::GpuSplit& split, FrontState& state, u32 method, u32 argument,
+                      bool is_last_call, bool from_macro);
+    void FrontMultiS1(VideoCommon::GpuSplit& split, FrontState& state, u32 method,
+                      const u32* base_start, u32 amount, u32 methods_pending);
+    static constexpr u8 S1HookNotes = 1 << 1; ///< FrontNoteWrites (GpuSplit::TracksWrites)
+    static constexpr u8 S1HookStats = 1 << 2; ///< V2 stats report semaphores
+    /// After a sent write to a register with hooks (notes, stats).
+    void FrontS1Hooks(VideoCommon::GpuSplit& split, FrontState& state, u32 method, u8 hooks);
+    /// S1Check: the classified entries of a write the table-driven registers `regs` took.
+    void FrontCheckS1(VideoCommon::GpuSplit& split, FrontState& fs, const u32* table_regs,
+                      u32 method, u32 old_value, u32 old_offset, bool is_last_call);
+    /// S1Check after a multi-method run: the registers it left, as deltas.
+    void FrontCheckMultiS1(VideoCommon::GpuSplit& split, const u32* table_regs, u32 method,
+                           const u32* base_start, u32 amount, u32 old_offset);
+    void FrontS1Draws(VideoCommon::GpuSplit& split, FrontState& state,
+                      const VideoCommon::V2::DrawOutput& out);
+    /// The dirty groups, hashes and fast draw breaks the next draw sees (an S1 Groups entry).
+    void FrontS1Groups(VideoCommon::GpuSplit& split, FrontState& state);
+    /// EDEN_NX2_V2_CBUFRING: constant buffer data written to the selected window at decode
+    /// (v2/cbuf_ring.h), and the changed windows' versions sent before a draw.
+    void FrontCbufVersion(VideoCommon::GpuSplit& split, FrontState& state, u64 buffer,
+                          u32 offset, const u32* words, u32 count);
+    void FrontPublishCbufVersions(VideoCommon::GpuSplit& split, FrontState& state);
+    /// Before a draw: versions for the windows bound since the last one (Decode::Bind).
+    void FrontCbufBindVersions(VideoCommon::GpuSplit& split, FrontState& state);
+    /// The end of a front macro: sends what the back does there (a deferred instanced batch the
+    /// macro left) when it can do anything. Returns whether it did.
+    bool FrontEndMacro(Core::System& system, VideoCommon::GpuSplit& split, FrontState& state);
+    void S1CbufWrite(GPUVAddr buffer, u32 offset, const u32* words, u32 count);
+    std::unique_ptr<S1CheckState> s1_check;
+    void VerifyMultiV2(VideoCommon::V2::RegSem::BackMirror3D& mirror, u32 method, const u32* base_start,
+                       u32 amount);
+    VideoCommon::V2::RegSem::BackMirror3D& BackMirror();
+    VideoCommon::V2::Mode v2_back_mode{};
+    const VideoCommon::V2::RegSem::Table3D* v2_table{};
+    std::unique_ptr<VideoCommon::V2::RegSem::BackMirror3D> v2_back_mirror;
     void FrontTrackInstanceLoop(FrontState& state, u32 method, u32 value);
     bool FrontSkipsLoopWrite(FrontState& state, u32 method, u32 value, bool shadow_kept);
     void FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& state, u32 macro, u32 method,
                       u32 count);
     void FrontVerify(VideoCommon::GpuSplit& split, FrontState& state);
-    void FinishFrontMacro(Core::System& system);
+    /// EDEN_NX2_V2_ACQUIRE/HAZARD: records the guest memory writes of `amount` words just sent
+    /// to `method` (GpuSplit::TracksWrites).
+    void FrontNoteWrites(VideoCommon::GpuSplit& split, FrontState& state, u32 method,
+                         u32 amount);
+    /// A draw or clear was sent: its render targets, and whether its programs store elsewhere.
+    void FrontNoteDraw(VideoCommon::GpuSplit& split, FrontState& state);
+    /// EDEN_NX2_V2_HAZARD: FrontDmaRead without the drain where the hazard table allows it.
+    /// Returns false when the old path must read.
+    bool FrontDmaReadHazard(VideoCommon::GpuSplit& split, GPUVAddr source, size_t bytes,
+                            std::span<u32> out);
+    /// Fix F3-08: reads GPU-written words back into guest memory through the readback path,
+    /// recorded by the back after its current entry; waits for that download only.
+    void FrontReadBack(VideoCommon::GpuSplit& split, DAddr device, size_t bytes);
+    /// Fix F3-08: makes the reports in [source, source + bytes) reach memory (the back writes
+    /// them out after its current entry, GpuSplit::CompleteLanding) and waits for that, their
+    /// operations included. False when they didn't land (the caller drains). Fix F3f (F3-X6):
+    /// `untracked_position` != 0: the QMD release operations writing [device, device + bytes)
+    /// too; `*settled` gets what FindQueuedWrites may then take as settled.
+    bool FrontFlushReports(VideoCommon::GpuSplit& split, GPUVAddr source, size_t bytes,
+                           u64 ticket, u64 untracked_position, DAddr device, u64* settled);
     std::unique_ptr<FrontState> front;
     bool front_macros{};
+    friend struct Maxwell3DTestAccess;
     // EDEN_NX2_SPLIT_VERIFY: the last SET_SHADOW_RAM_CONTROL writes each side saw (argument,
     // mode before, path), printed when the sides disagree.
     struct ControlWrite {

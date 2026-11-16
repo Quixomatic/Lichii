@@ -30,6 +30,7 @@
 #include "video_core/query_cache/query_cache_base.h"
 #include "video_core/query_cache/query_stream.h"
 #include "video_core/query_cache/types.h"
+#include "video_core/v2/landing.h"
 
 namespace VideoCommon {
 
@@ -268,6 +269,20 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
         return;
     }
     DAddr cpu_addr = *cpu_addr_opt;
+    // A payload written at once below High accuracy, unless an earlier write that lands at an
+    // operation hasn't landed yet (v2/landing.h, MASTER_PLAN §6 class B): then it lands at an
+    // operation behind it, so the guest CPU never sees it first. Fix F3h (F3-X6b): the split's
+    // front decided which, and the back obeys it.
+    const bool at_once = !is_fence && !Settings::IsGPULevelHigh() &&
+                         counter_type == QueryType::Payload;
+    const bool deferred = at_once && VideoCommon::V2::Landing::DeferAtOnceWrite();
+    const bool immediate = at_once && !deferred;
+    const u64 landing = immediate ? 0 : VideoCommon::V2::Landing::Capture();
+    // QMD releases (Landing::Untracked) take no ticket; their landing is still reported.
+    const u64 untracked = immediate || landing != 0
+                              ? 0
+                              : VideoCommon::V2::Landing::CaptureUntracked(
+                                    cpu_addr, has_timestamp ? 16 : sizeof(u32));
     const size_t new_query_id = streamer->WriteCounter(cpu_addr, has_timestamp, payload, subreport);
     auto* query = streamer->GetQuery(new_query_id);
     if (is_fence) {
@@ -282,10 +297,20 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
     };
     u8* pointer = impl->device_memory.template GetPointer<u8>(cpu_addr);
     u8* pointer_timestamp = impl->device_memory.template GetPointer<u8>(cpu_addr + 8);
-    bool is_synced = (Settings::IsGPUFenceBehaviorDefault() ? !Settings::IsGPULevelHigh() : !Settings::IsGPUFenceBehaviorBalanced() && !Settings::IsGPUFenceBehaviorAccurate()) && is_fence;
-    std::function<void()> operation([this, is_synced, streamer, query_base = query, query_location,
+    std::function<void()> operation([this, streamer, query_base = query, query_location,
                                      pointer, pointer_timestamp, cpu_addr, addr,
-                                     asid = gpu_memory->GetID(), counter_type] {
+                                     asid = gpu_memory->GetID(), counter_type, landing,
+                                     untracked] {
+        // An untracked write's landing is reported on every exit, once its bytes are written.
+        struct NoteOnExit {
+            u64 position;
+            ~NoteOnExit() {
+                if (position != 0) {
+                    VideoCommon::V2::Landing::NoteUntracked(position);
+                }
+            }
+        };
+        [[maybe_unused]] const NoteOnExit untracked_note{untracked};
         if (True(query_base->flags & QueryFlagBits::IsInvalidated)) {
             if (const u64 trace = QueryTrace::Sample(QueryTrace::Event::Discard)) {
                 LOG_INFO(HW_GPU,
@@ -294,8 +319,10 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
                          trace, asid, addr, cpu_addr, static_cast<u32>(counter_type),
                          static_cast<u32>(query_base->flags));
             }
-            if (!is_synced) [[likely]] {
-                impl->pending_unregister.push_back(query_location);
+            impl->pending_unregister.push_back(query_location);
+            if (landing != 0) {
+                // No bytes come: the front reads memory from now on, as a drain would.
+                VideoCommon::V2::Landing::Note(landing);
             }
             return;
         }
@@ -309,8 +336,9 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
             }
             LOG_ERROR(HW_GPU,
                       "Query report value not synchronized. Consider increasing GPU accuracy.");
-            if (!is_synced) [[likely]] {
-                impl->pending_unregister.push_back(query_location);
+            impl->pending_unregister.push_back(query_location);
+            if (landing != 0) {
+                VideoCommon::V2::Landing::Note(landing);
             }
             return;
         }
@@ -325,6 +353,10 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
             std::memcpy(pointer, &value, sizeof(value));
         }
         Tegra::Nx2SemaphoreWaiters::Get().OnWrite(cpu_addr, static_cast<u32>(query_base->value));
+        if (landing != 0) {
+            // EDEN_NX2_V2_ACQUIRE/HAZARD: the split's front forwards this write until now.
+            VideoCommon::V2::Landing::Note(landing);
+        }
         if (const u64 trace = QueryTrace::Sample(QueryTrace::Event::Write)) {
             const bool wide = True(query_base->flags & QueryFlagBits::HasTimestamp);
             LOG_INFO(HW_GPU,
@@ -334,14 +366,14 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
                      wide ? query_base->value : static_cast<u32>(query_base->value),
                      static_cast<u32>(query_base->flags));
         }
-        if (!is_synced) [[likely]] {
-            impl->pending_unregister.push_back(query_location);
-        }
+        impl->pending_unregister.push_back(query_location);
     });
-    if (is_fence) {
+    if (is_fence || deferred) {
+        VideoCore::g_signaling_query_report_fence = true;
         impl->rasterizer.SignalFence(std::move(operation));
+        VideoCore::g_signaling_query_report_fence = false;
     } else {
-        if (!Settings::IsGPULevelHigh() && counter_type == QueryType::Payload) {
+        if (immediate) {
             if (has_timestamp) {
                 u64 timestamp = impl->gpu.GetTicks();
                 u64 value = static_cast<u64>(payload);
@@ -363,10 +395,6 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
             return;
         }
         impl->rasterizer.SyncOperation(std::move(operation));
-    }
-    if (is_synced) {
-        streamer->Free(new_query_id);
-        return;
     }
     auto [cont_addr, base] = gen_caching_indexing(cpu_addr);
     {
@@ -415,14 +443,33 @@ void QueryCacheBase<Traits>::UnregisterPending() {
 }
 
 template <typename Traits>
-void QueryCacheBase<Traits>::NotifyWFI() {
+void QueryCacheBase<Traits>::NotifyWFI(bool at_pass_end) {
     bool should_sync = false;
     impl->ForEachStreamer(
         [&should_sync](StreamerInterface* streamer) { should_sync |= streamer->HasPendingSync(); });
     if (!should_sync) {
         return;
     }
+    // SYNC_SUBMIT_SPEC Step 9: the query result copies (class D: they reach the guest at a host
+    // fence) run at the open pass's end instead of ending it (26 pass ends/f at eefa).
+    if constexpr (requires { impl->runtime.DeferToPassEnd(nullptr, nullptr); }) {
+        if (at_pass_end && impl->runtime.DeferToPassEnd(
+                [](void* self) { static_cast<QueryCacheBase*>(self)->SyncQueryWrites(); },
+                this)) {
+            return;
+        }
+    }
+    SyncQueryWrites();
+}
 
+template <typename Traits>
+void QueryCacheBase<Traits>::SyncQueryWrites() {
+    bool should_sync = false;
+    impl->ForEachStreamer(
+        [&should_sync](StreamerInterface* streamer) { should_sync |= streamer->HasPendingSync(); });
+    if (!should_sync) {
+        return;
+    }
     impl->ForEachStreamer([](StreamerInterface* streamer) { streamer->PresyncWrites(); });
     impl->runtime.Barriers(true);
     impl->ForEachStreamer([](StreamerInterface* streamer) { streamer->SyncWrites(); });

@@ -10,8 +10,11 @@
 #include <deque>
 #include <memory>
 #include <optional>
+#include <source_location>
 #include <span>
 
+#include "video_core/v2/tick_ring.h"
+#include "video_core/texture_cache/util.h"
 #include "video_core/texture_cache/texture_cache_base.h"
 
 #include "shader_recompiler/shader_info.h"
@@ -85,7 +88,19 @@ public:
                                  DescriptorPool& descriptor_pool,
                                  ComputePassDescriptorQueue& compute_pass_descriptor_queue);
 
-    void Finish();
+    /// SYNC §12 R4: named by the caller in "finishes by site".
+    void Finish(std::source_location location = std::source_location::current());
+
+    /// SYNC §12 R4 (MP §6: guest CPU reads served on the reading thread): image downloads
+    /// recorded for a reader ride the open submission; the reader asks for it (rule W) and
+    /// waits for the tick itself.
+    [[nodiscard]] u64 SubmitForHostRead();
+    void WaitForHostRead(u64 tick);
+
+    /// EDEN_NX2_V2_XREADBACK: a synchronous image download on the transfer queue (Finish waits
+    /// for it). False when the image must take the graphics path.
+    bool TryTransferDownload(Image& image, const StagingBufferRef& map,
+                             std::span<const VideoCommon::BufferImageCopy> copies);
 
     StagingBufferRef UploadStagingBuffer(size_t size, bool deferred = false);
 
@@ -232,7 +247,8 @@ public:
         return view_formats[static_cast<std::size_t>(format)];
     }
 
-    void BarrierFeedbackLoop();
+    /// A draw samples the bound depth image `depth` after depth/stencil writes to it.
+    void BarrierFeedbackLoop(Image& depth);
 
     bool IsFormatDitherable(VideoCore::Surface::PixelFormat format);
     bool IsFormatScalable(VideoCore::Surface::PixelFormat format);
@@ -307,6 +323,45 @@ public:
     std::vector<PendingTranscode> free_transcodes;
 
     std::optional<BlockLinearUnswizzle3DPass> bl3d_unswizzle_pass;
+
+public:
+    /// EDEN_NX2_V2_DYNRENDER: a draw/dispatch uses `image` (pending attachment writes it overlaps
+    /// need a barrier first).
+    void NoteImageUse(const Image& image);
+    /// F4-09 (MASTER_PLAN §5.5 S6 retires lifetimes): with the finish thread, a deleted image is
+    /// destroyed there once the GPU passed `tick` (moved out of `image`). False: the caller keeps
+    /// it as before.
+    bool RetireImage(u64 tick, Image& image);
+    /// F2-09: what NoteImageUse could still find (0: nothing).
+    [[nodiscard]] u64 ReadHazardSerial() const noexcept;
+
+    /// EDEN_NX2_V2_GPUDECODE: whether `image` can be untiled by the compute path.
+    [[nodiscard]] bool GpuDecodeAvailable(const Image& image) const noexcept;
+    /// Untiles `raw` (the guest bytes) with compute into a fence-tracked scratch ring and copies
+    /// it into the image: hoisted into the submission's upload stream (batched) when the open
+    /// submission hasn't used the image, else in order. False (nothing recorded) when the ring
+    /// has no free space: the caller takes the CPU path.
+    bool GpuDecode(Image& image, const StagingBufferRef& raw,
+                   const VideoCommon::GpuUnswizzlePlan& plan);
+
+private:
+    struct DecodeJob {
+        const void* descriptors{};
+        VkImage image{};
+        VkImageAspectFlags aspect{};
+        bool initialized{};
+        u32 bytes_per_block{};
+        std::vector<VideoCommon::V2::GpuUnswizzle::Segment> segments;
+        boost::container::small_vector<VkBufferImageCopy, 16> copies;
+    };
+    void FlushDecodeBatch();
+    void EncodeDecodes(vk::CommandBuffer cmdbuf, std::span<const DecodeJob> jobs);
+    std::optional<BlockLinearUnswizzleLinearPass> linear_unswizzle_pass;
+    vk::Buffer decode_scratch;
+    VideoCommon::V2::TickRing decode_ring;
+    std::vector<DecodeJob> decode_batch;
+
+public:
     const Settings::ResolutionScalingInfo& resolution;
     std::array<std::vector<VkFormat>, VideoCore::Surface::MaxPixelFormat> view_formats;
 
@@ -438,6 +493,21 @@ public:
     /// once it ends.
     void MarkResolveShadowsUpToDate() const;
 
+    /// EDEN_NX2_V2_DYNRENDER: attachments for vkCmdBeginRendering (no resolve attachments).
+    [[nodiscard]] bool DynamicRenderingCapable() const noexcept {
+        return num_resolve_shadows == 0;
+    }
+    [[nodiscard]] const std::array<VkImageView, NUM_RT>& ColorViews() const noexcept {
+        return color_views;
+    }
+    [[nodiscard]] VkImageView DepthView() const noexcept {
+        return depth_view;
+    }
+    /// Guest GPU address range of each image (Images() order), for the barrier tracker.
+    [[nodiscard]] const std::array<std::pair<u64, u64>, 9>& GuestRanges() const noexcept {
+        return guest_ranges;
+    }
+
 private:
     static constexpr size_t NUM_MEMOIZED_RENDER_PASS_VARIANTS = 8;
 
@@ -450,6 +520,9 @@ private:
     u32 num_images = 0;
     std::array<VkImage, 9> images{};
     std::array<VkImageSubresourceRange, 9> image_ranges{};
+    std::array<VkImageView, NUM_RT> color_views{};
+    VkImageView depth_view{};
+    std::array<std::pair<u64, u64>, 9> guest_ranges{};
     std::array<size_t, NUM_RT> rt_map{};
     bool has_depth{};
     bool has_stencil{};
@@ -480,6 +553,8 @@ public:
     Image(Image&&) = default;
     Image& operator=(Image&&) = default;
 
+    u32 HostMipLevels() const noexcept;
+
     /// No memory was left to make it: the texture cache drops it instead of using it.
     [[nodiscard]] bool OutOfMemory() const noexcept {
         return !original_image && info.type != VideoCommon::ImageType::Buffer;
@@ -487,6 +562,27 @@ public:
 
     void UploadMemory(VkBuffer buffer, VkDeviceSize offset,
                       std::span<const VideoCommon::BufferImageCopy> copies);
+
+    /// P5b: the open submission used this image (track id for hoisting decisions).
+    void NoteV2Use() noexcept;
+
+    /// F4-09, recording thread: drops what only the caches' owner may touch (resolve shadows,
+    /// the scale/normal views and their heap slots, framebuffers), so the rest (device memory,
+    /// images, storage views) can be destroyed on the finish thread.
+    void DetachOwnerState();
+
+    /// Marks the image initialized; returns whether it already was (first upload discards).
+    bool TakeInitialized() noexcept {
+        return std::exchange(initialized, true);
+    }
+
+    bool v2_staging_upload = false; ///< UploadMemory's source is host-written staging
+
+    /// EDEN_NX2_V2_XFERQ: uploads the whole image on the transfer queue ahead of the open
+    /// submission (queue family ownership moves back to graphics at its start). False when it
+    /// must stay in order.
+    bool TryTransferUpload(VkBuffer buffer, VkDeviceSize offset,
+                           std::span<const VideoCommon::BufferImageCopy> copies);
 
     void UploadMemory(const StagingBufferRef& map,
                       std::span<const VideoCommon::BufferImageCopy> copies);
@@ -825,6 +921,12 @@ private:
 class Sampler {
 public:
     explicit Sampler(TextureCacheRuntime&, const Tegra::Texture::TSCEntry&);
+    ~Sampler();
+
+    Sampler(const Sampler&) = delete;
+    Sampler& operator=(const Sampler&) = delete;
+    Sampler(Sampler&&) noexcept = default;
+    Sampler& operator=(Sampler&&) noexcept = default;
 
     [[nodiscard]] VkSampler Handle() const noexcept {
         return *variants.front().sampler;
@@ -848,6 +950,7 @@ private:
         bool drop_reduction;
         bool drop_custom_border;
         bool srgb_border;
+        bool drop_compare;
         std::array<VkComponentSwizzle, 4> swizzle;
 
         bool operator==(const VariantKey&) const noexcept = default;
